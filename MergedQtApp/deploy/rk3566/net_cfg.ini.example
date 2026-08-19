@@ -1,0 +1,29 @@
+[paths]
+storage_root=/mnt/UDISK
+static_root=/mnt/UDISK/res/static
+video_dir=/mnt/UDISK/res/static/demoResources/images/video
+database=/var/lib/qt_ycest/demo.db
+
+[hardware]
+signal_board_uart=/dev/ttyS5
+qr_uart=/dev/ttyS1
+card_uart=/dev/ttyS2
+rs485_uart=/dev/ttyS4
+# RK3566 使用内核自动方向时保持为空
+rs485_dir_device=
+rtc_device=/dev/rtc0
+# 必须根据 /proc/bus/input/devices 或 /dev/input/by-path 配置
+key_device=
+
+[gstreamer]
+# EGLFS 正式模式由 Qt OpenGL 画布显示视频；保持为空以使用 appsink。
+video_sink=
+audio_sink=alsasink
+
+[audio]
+card=0
+device=default
+# 留空时程序从 amixer scontrols 自动选择
+mixer_control=
+# 仅在板级驱动提供功放控制字符设备时填写
+amp_device=

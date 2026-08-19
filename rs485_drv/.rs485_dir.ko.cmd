@@ -1,0 +1,1 @@
+cmd_/home/lubancat/face_media/rs485_drv/rs485_dir.ko := aarch64-linux-gnu-ld -r  -EL  -maarch64elf -T ./scripts/module-common.lds -T ./arch/arm64/kernel/module.lds  --build-id  -o /home/lubancat/face_media/rs485_drv/rs485_dir.ko /home/lubancat/face_media/rs485_drv/rs485_dir.o /home/lubancat/face_media/rs485_drv/rs485_dir.mod.o ;  true

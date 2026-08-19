@@ -1,0 +1,10 @@
+# RK3566 + rkximagesink native video: force the Xorg modesetting driver
+# to draw the pointer in software instead of updating the DRM hardware
+# cursor plane for every mouse sample. Install as:
+#   /etc/X11/xorg.conf.d/20-modesetting-swcursor.conf
+# and restart display-manager/Xorg.
+Section "Device"
+    Identifier "Rockchip Modesetting SWCursor"
+    Driver "modesetting"
+    Option "SWcursor" "true"
+EndSection

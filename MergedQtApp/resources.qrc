@@ -1,0 +1,94 @@
+<RCC version="1.0">
+    <qresource>
+        <file>static/images/show_company_image.png</file>
+        <file>static/icons/setting.png</file>
+        <file>static/icons/funtion.png</file>
+        <file>static/icons/media.png</file>
+	<file>static/icons/applications.png</file>
+	<file>static/icons/system.png</file>
+	<file>static/icons/ui_media.png</file>
+	<file>static/icons/shutdown.png</file>
+	<file>static/icons/debug.png</file>
+	<file>static/icons/file_manage.png</file>
+
+	<file>static/styles/net_error.png</file>
+	<file>static/styles/ipc_error.png</file>
+	<file>static/styles/mqtt_error.png</file>
+	<file>static/styles/connect_ok.png</file>
+	<file>static/styles/activities.png</file>
+	<file>static/styles/go-down.png</file>
+
+	<file>static/audio/pass.wav</file>
+        <file>static/audio/fail.wav</file>
+        
+        <!-- demoResources files -->
+        <file>static/demoResources/images/logo/BG01.jpg</file>
+        <file>static/demoResources/images/logo/back.bmp</file>
+        <file>static/demoResources/images/logo/logo1.png</file>
+        <file>static/demoResources/images/logo/net_cfg.ini</file>
+        <file>static/demoResources/images/logo/ycest_cfg.ini</file>
+        <file alias="static/config/facegate.ini">facegate.ini</file>
+        <file>static/demoResources/images/tl/-.png</file>
+        <file>static/demoResources/images/tl/0.png</file>
+        <file>static/demoResources/images/tl/1.png</file>
+        <file>static/demoResources/images/tl/2.png</file>
+        <file>static/demoResources/images/tl/3.png</file>
+        <file>static/demoResources/images/tl/4.png</file>
+        <file>static/demoResources/images/tl/5.png</file>
+        <file>static/demoResources/images/tl/6.png</file>
+        <file>static/demoResources/images/tl/7.png</file>
+        <file>static/demoResources/images/tl/8.png</file>
+        <file>static/demoResources/images/tl/9.png</file>
+        <file>static/demoResources/images/tl/A.png</file>
+        <file>static/demoResources/images/tl/B.png</file>
+        <file>static/demoResources/images/tl/C.png</file>
+        <file>static/demoResources/images/tl/D.png</file>
+        <file>static/demoResources/images/tl/E.png</file>
+        <file>static/demoResources/images/tl/F.png</file>
+        <file>static/demoResources/images/tl/G.png</file>
+        <file>static/demoResources/images/tl/H.png</file>
+        <file>static/demoResources/images/tl/I.png</file>
+        <file>static/demoResources/images/tl/J.png</file>
+        <file>static/demoResources/images/tl/K.png</file>
+        <file>static/demoResources/images/tl/L.png</file>
+        <file>static/demoResources/images/tl/M.png</file>
+        <file>static/demoResources/images/tl/N.png</file>
+        <file>static/demoResources/images/tl/O.png</file>
+        <file>static/demoResources/images/tl/P.png</file>
+        <file>static/demoResources/images/tl/Q.png</file>
+        <file>static/demoResources/images/tl/R.png</file>
+        <file>static/demoResources/images/tl/S.png</file>
+        <file>static/demoResources/images/tl/T.png</file>
+        <file>static/demoResources/images/tl/U.png</file>
+        <file>static/demoResources/images/tl/V.png</file>
+        <file>static/demoResources/images/tl/W.png</file>
+        <file>static/demoResources/images/tl/X.png</file>
+        <file>static/demoResources/images/tl/Y.png</file>
+        <file>static/demoResources/images/tl/Z.png</file>
+        <file>static/demoResources/images/tl/down.png</file>
+        <file>static/demoResources/images/tl/fault.png</file>
+        <file>static/demoResources/images/tl/fire.png</file>
+        <file>static/demoResources/images/tl/full.png</file>
+        <file>static/demoResources/images/tl/overload.png</file>
+        <file>static/demoResources/images/tl/repair.png</file>
+        <file>static/demoResources/images/tl/up.png</file>
+	<file>static/demoResources/images/pic/01.jpg</file>
+	<file>static/demoResources/images/pic/02.png</file>
+        
+        <!-- air files -->
+        <file>static/demoResources/images/air/cool.png</file>
+        <file>static/demoResources/images/air/fan.png</file>
+        <file>static/demoResources/images/air/hot.png</file>
+        <file>static/demoResources/images/air/level_1.png</file>
+        <file>static/demoResources/images/air/level_2.png</file>
+        <file>static/demoResources/images/air/level_3.png</file>
+        <file>static/demoResources/images/air/level_4.png</file>
+        
+        <!-- broad files -->
+        <file>static/demoResources/images/broad/Broadcasting.png</file>
+
+	<file>static/demoResources/images/video/YC-logo-White.mp4</file>
+
+
+    </qresource>
+</RCC>

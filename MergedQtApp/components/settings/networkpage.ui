@@ -1,0 +1,517 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>NetworkPage</class>
+ <widget class="QWidget" name="NetworkPage">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>600</width>
+    <height>516</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>NetworkPage</string>
+  </property>
+  <layout class="QVBoxLayout" name="verticalLayout">
+   <property name="spacing">
+    <number>20</number>
+   </property>
+   <property name="leftMargin">
+    <number>30</number>
+   </property>
+   <property name="topMargin">
+    <number>30</number>
+   </property>
+   <property name="rightMargin">
+    <number>30</number>
+   </property>
+   <property name="bottomMargin">
+    <number>30</number>
+   </property>
+   <item>
+    <widget class="QLabel" name="titleLabel">
+     <property name="styleSheet">
+      <string notr="true">font-size: 24px; font-weight: bold; color: #333333;</string>
+     </property>
+     <property name="text">
+      <string>网络连接设置</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="connectionTypeGroup">
+     <property name="styleSheet">
+      <string notr="true">QGroupBox {
+    font-size: 16px;
+    font-weight: bold;
+    color: #333333;
+    border: none;
+    margin-bottom: 10px;
+}
+</string>
+     </property>
+     <property name="title">
+      <string/>
+     </property>
+     <layout class="QHBoxLayout" name="horizontalLayout">
+      <item>
+       <widget class="QLabel" name="label">
+        <property name="styleSheet">
+         <string notr="true">font-size: 14px;
+color: #666666;</string>
+        </property>
+        <property name="text">
+         <string>选择网络类型:</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QComboBox" name="connectionTypeCombo">
+        <property name="minimumSize">
+         <size>
+          <width>200</width>
+          <height>36</height>
+         </size>
+        </property>
+        <property name="styleSheet">
+         <string notr="true">QComboBox {
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 0 12px;
+    font-size: 14px;
+    color: #333333;
+    background-color: white;
+}
+QComboBox:hover {
+    border-color: #409eff;
+}
+QComboBox::drop-down {
+    border: none;
+}
+
+QComboBox::down-arrow {
+    image: url(:static/styles/go-down.png);
+    width: 16px;
+    height: 16px;
+}
+</string>
+        </property>
+        <item>
+         <property name="text">
+          <string>有线网络</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>无线网络</string>
+         </property>
+        </item>
+       </widget>
+      </item>
+      <item>
+       <spacer name="horizontalSpacer">
+        <property name="orientation">
+         <enum>Qt::Horizontal</enum>
+        </property>
+        <property name="sizeHint" stdset="0">
+         <size>
+          <width>40</width>
+          <height>20</height>
+         </size>
+        </property>
+       </spacer>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QStackedWidget" name="networkStack">
+     <property name="sizeIncrement">
+      <size>
+       <width>540</width>
+       <height>235</height>
+      </size>
+     </property>
+     <property name="currentIndex">
+      <number>0</number>
+     </property>
+     <widget class="QWidget" name="page">
+      <widget class="QGroupBox" name="ipSettingsGroup">
+       <property name="geometry">
+        <rect>
+         <x>0</x>
+         <y>10</y>
+         <width>540</width>
+         <height>219</height>
+        </rect>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">QGroupBox {
+    font-size: 16px;
+    font-weight: bold;
+    color: #333333;
+    border: none;
+    margin-bottom: 10px;
+}
+</string>
+       </property>
+       <property name="title">
+        <string>IP设置</string>
+       </property>
+       <layout class="QGridLayout" name="gridLayout">
+        <property name="spacing">
+         <number>15</number>
+        </property>
+        <item row="2" column="0">
+         <widget class="QLabel" name="label_3">
+          <property name="styleSheet">
+           <string notr="true">font-size: 14px;
+color: #666666;</string>
+          </property>
+          <property name="text">
+           <string>子网掩码:</string>
+          </property>
+         </widget>
+        </item>
+        <item row="3" column="1">
+         <widget class="QLineEdit" name="gatewayEdit">
+          <property name="minimumSize">
+           <size>
+            <width>0</width>
+            <height>36</height>
+           </size>
+          </property>
+          <property name="styleSheet">
+           <string notr="true">QLineEdit {
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 0 12px;
+    font-size: 14px;
+    color: #333333;
+    background-color: white;
+}
+QLineEdit:hover {
+    border-color: #409eff;
+}
+QLineEdit:focus {
+    border-color: #409eff;
+}
+QLineEdit:disabled {
+    background-color: #f5f7fa;
+    color: #c0c4cc;
+}
+</string>
+          </property>
+          <property name="text">
+           <string/>
+          </property>
+         </widget>
+        </item>
+        <item row="1" column="0">
+         <widget class="QLabel" name="label_2">
+          <property name="styleSheet">
+           <string notr="true">font-size: 14px;
+color: #666666;</string>
+          </property>
+          <property name="text">
+           <string>IP地址:</string>
+          </property>
+         </widget>
+        </item>
+        <item row="3" column="0">
+         <widget class="QLabel" name="label_4">
+          <property name="styleSheet">
+           <string notr="true">font-size: 14px;
+color: #666666;</string>
+          </property>
+          <property name="text">
+           <string>网关:</string>
+          </property>
+         </widget>
+        </item>
+        <item row="1" column="1">
+         <widget class="QLineEdit" name="ipAddressEdit">
+          <property name="minimumSize">
+           <size>
+            <width>0</width>
+            <height>36</height>
+           </size>
+          </property>
+          <property name="styleSheet">
+           <string notr="true">QLineEdit {
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 0 12px;
+    font-size: 14px;
+    color: #333333;
+    background-color: white;
+}
+QLineEdit:hover {
+    border-color: #409eff;
+}
+QLineEdit:focus {
+    border-color: #409eff;
+}
+QLineEdit:disabled {
+    background-color: #f5f7fa;
+    color: #c0c4cc;
+}
+</string>
+          </property>
+          <property name="text">
+           <string/>
+          </property>
+         </widget>
+        </item>
+        <item row="2" column="1">
+         <widget class="QLineEdit" name="subnetMaskEdit">
+          <property name="minimumSize">
+           <size>
+            <width>0</width>
+            <height>36</height>
+           </size>
+          </property>
+          <property name="styleSheet">
+           <string notr="true">QLineEdit {
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 0 12px;
+    font-size: 14px;
+    color: #333333;
+    background-color: white;
+}
+QLineEdit:hover {
+    border-color: #409eff;
+}
+QLineEdit:focus {
+    border-color: #409eff;
+}
+QLineEdit:disabled {
+    background-color: #f5f7fa;
+    color: #c0c4cc;
+}
+</string>
+          </property>
+          <property name="text">
+           <string/>
+          </property>
+         </widget>
+        </item>
+        <item row="4" column="1">
+         <widget class="QLineEdit" name="dnsEdit">
+          <property name="minimumSize">
+           <size>
+            <width>0</width>
+            <height>36</height>
+           </size>
+          </property>
+          <property name="styleSheet">
+           <string notr="true">QLineEdit {
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 0 12px;
+    font-size: 14px;
+    color: #333333;
+    background-color: white;
+}
+QLineEdit:hover {
+    border-color: #409eff;
+}
+QLineEdit:focus {
+    border-color: #409eff;
+}
+QLineEdit:disabled {
+    background-color: #f5f7fa;
+    color: #c0c4cc;
+}
+</string>
+          </property>
+          <property name="text">
+           <string/>
+          </property>
+         </widget>
+        </item>
+        <item row="4" column="0">
+         <widget class="QLabel" name="label_5">
+          <property name="styleSheet">
+           <string notr="true">font-size: 14px;
+color: #666666;</string>
+          </property>
+          <property name="text">
+           <string>DNS服务器:</string>
+          </property>
+         </widget>
+        </item>
+        <item row="0" column="1">
+         <widget class="QComboBox" name="ipModeComboBox">
+          <property name="styleSheet">
+           <string notr="true">QComboBox {
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 0 36px 0 12px; 
+    font-size: 14px;
+    color: #333333;
+    background-color: white;
+}
+QComboBox:hover {
+    border-color: #409eff;
+}
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 32px;             
+    border: none;
+}
+
+QComboBox::down-arrow {
+    image: url(:static/styles/go-down.png);
+    width: 16px;
+    height: 16px;
+}
+</string>
+          </property>
+          <item>
+           <property name="text">
+            <string>动态(DHCP)</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
+            <string>静态IP</string>
+           </property>
+          </item>
+         </widget>
+        </item>
+       </layout>
+      </widget>
+     </widget>
+     <widget class="QWidget" name="page_2"/>
+    </widget>
+   </item>
+   <item>
+    <widget class="QWidget" name="mainCard" native="true">
+     <property name="styleSheet">
+      <string notr="true">QWidget#mainCard {
+    background-color: white;
+    border-radius: 12px;
+    padding: 20px;
+}
+</string>
+     </property>
+     <layout class="QVBoxLayout" name="verticalLayout_2">
+      <property name="spacing">
+       <number>20</number>
+      </property>
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <layout class="QHBoxLayout" name="horizontalLayout_2">
+     <property name="spacing">
+      <number>16</number>
+     </property>
+     <property name="leftMargin">
+      <number>0</number>
+     </property>
+     <property name="topMargin">
+      <number>0</number>
+     </property>
+     <property name="rightMargin">
+      <number>0</number>
+     </property>
+     <property name="bottomMargin">
+      <number>0</number>
+     </property>
+     <item>
+      <spacer name="horizontalSpacer_2">
+       <property name="orientation">
+        <enum>Qt::Horizontal</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>40</width>
+         <height>20</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+     <item>
+      <widget class="QPushButton" name="cancelButton">
+       <property name="minimumSize">
+        <size>
+         <width>100</width>
+         <height>40</height>
+        </size>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">QPushButton {
+    background-color: white;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    color: #606266;
+    font-size: 14px;
+}
+QPushButton:hover {
+    border-color: #409eff;
+    color: #409eff;
+}
+QPushButton:pressed {
+    border-color: #337ecc;
+    color: #337ecc;
+}
+</string>
+       </property>
+       <property name="text">
+        <string>取消</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="applyButton">
+       <property name="minimumSize">
+        <size>
+         <width>100</width>
+         <height>40</height>
+        </size>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">QPushButton {
+    background-color: #409eff;
+    border: none;
+    border-radius: 8px;
+    color: white;
+    font-size: 14px;
+}
+QPushButton:hover {
+    background-color: #66b1ff;
+}
+QPushButton:pressed {
+    background-color: #337ecc;
+}
+</string>
+       </property>
+       <property name="text">
+        <string>应用</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>

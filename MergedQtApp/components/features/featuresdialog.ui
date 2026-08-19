@@ -1,0 +1,377 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>FeaturesDialog</class>
+ <widget class="QDialog" name="FeaturesDialog">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>450</width>
+    <height>625</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>功能选项</string>
+  </property>
+  <property name="styleSheet">
+   <string notr="true">/* Element-UI 风格样式 */
+QDialog { 
+    background-color: #f5f7fa; 
+    border-radius: 8px;
+}
+
+/* 卡片样式 */
+QWidget#mainCard { 
+    background-color: white; 
+    border-radius: 12px; 
+    padding: 24px;
+}
+
+/* 标题样式 */
+QLabel#titleLabel {
+    color: #303133;
+    font-size: 20px;
+    font-weight: 600;
+    margin-bottom: 20px;
+}
+
+/* 分组框样式 */
+QGroupBox { 
+    border: none; 
+    margin-top: 0;
+    background-color: transparent;
+}
+
+QGroupBox::title { 
+    subcontrol-origin: margin; 
+    left: 0; 
+    top: 0; 
+    padding: 0;
+    background-color: transparent; 
+    color: #606266; 
+    font-size: 16px; 
+    font-weight: 500; 
+}
+
+/* 复选框样式 */
+QCheckBox { 
+    spacing: 12px; 
+    margin: 16px 0; 
+    color: #606266; 
+    font-size: 14px; 
+}
+
+QCheckBox::indicator { 
+    width: 20px; 
+    height: 20px; 
+    border: 2px solid #dcdfe6; 
+    border-radius: 4px; 
+    background-color: white; 
+
+}
+
+QCheckBox::indicator:hover { 
+    border-color: #409eff; 
+}
+
+QCheckBox::indicator:checked { 
+    background-color: #409eff; 
+    border-color: #409eff; 
+    image: url(:/icons/check.png); 
+}
+
+/* 状态标签样式 */
+QLabel#statusLabel { 
+    color: #909399; 
+    font-size: 14px; 
+    margin: 16px 0; 
+    padding: 12px; 
+    background-color: #ecf5ff; 
+    border: 1px solid #ebeef5; 
+    border-radius: 6px;
+}
+
+/* 按钮样式 */
+QPushButton { 
+    padding: 12px 24px; 
+    border: 1px solid #dcdfe6; 
+    border-radius: 6px; 
+    background-color: white; 
+    color: #606266; 
+    font-size: 14px; 
+    font-weight: 500; 
+    min-width: 120px;
+}
+
+QPushButton:hover { 
+    border-color: #409eff; 
+    background-color: #ecf5ff; 
+    color: #409eff; 
+}
+
+QPushButton:pressed { 
+    border-color: #337ecc; 
+    background-color: #d9ecff; 
+    color: #337ecc; 
+}
+
+QPushButton:default { 
+    border-color: #409eff; 
+    background-color: #409eff; 
+    color: white; 
+}
+
+QPushButton:default:hover { 
+    background-color: #66b1ff; 
+    border-color: #66b1ff; 
+}
+
+QPushButton:default:pressed { 
+    background-color: #337ecc; 
+    border-color: #337ecc; 
+}
+
+/* 分割线样式 */
+QFrame#divider { 
+    height: 1px; 
+    background-color: #ebeef5; 
+    margin: 20px 0;
+}</string>
+  </property>
+  <property name="modal">
+   <bool>false</bool>
+  </property>
+  <layout class="QVBoxLayout" name="verticalLayout">
+   <property name="spacing">
+    <number>0</number>
+   </property>
+   <property name="leftMargin">
+    <number>16</number>
+   </property>
+   <property name="topMargin">
+    <number>16</number>
+   </property>
+   <property name="rightMargin">
+    <number>16</number>
+   </property>
+   <property name="bottomMargin">
+    <number>16</number>
+   </property>
+   <item>
+    <layout class="QVBoxLayout" name="verticalLayout_3">
+     <property name="spacing">
+      <number>0</number>
+     </property>
+     <property name="leftMargin">
+      <number>0</number>
+     </property>
+     <property name="topMargin">
+      <number>0</number>
+     </property>
+     <property name="rightMargin">
+      <number>0</number>
+     </property>
+     <property name="bottomMargin">
+      <number>0</number>
+     </property>
+     <item>
+      <widget class="QLabel" name="titleLabel">
+       <property name="text">
+        <string>功能选项</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QGroupBox" name="featuresGroup">
+       <property name="title">
+        <string>请选择要启用的功能</string>
+       </property>
+       <layout class="QVBoxLayout" name="verticalLayout_2">
+        <property name="spacing">
+         <number>0</number>
+        </property>
+        <property name="leftMargin">
+         <number>0</number>
+        </property>
+        <property name="topMargin">
+         <number>16</number>
+        </property>
+        <property name="rightMargin">
+         <number>0</number>
+        </property>
+        <property name="bottomMargin">
+         <number>0</number>
+        </property>
+        <item>
+         <widget class="QCheckBox" name="feature1">
+          <property name="text">
+           <string>离线版梯控系统 V1</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QCheckBox" name="feature2">
+          <property name="text">
+           <string>网络版梯控系统 V1</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QCheckBox" name="feature3">
+          <property name="text">
+           <string>网络版梯控系统 V2</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QCheckBox" name="feature4">
+          <property name="text">
+           <string>电梯空调系统</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QCheckBox" name="feature5">
+          <property name="text">
+           <string>多媒体电梯系统</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QCheckBox" name="feature6">
+          <property name="text">
+           <string>电梯广播系统</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QCheckBox" name="feature7">
+          <property name="text">
+           <string>可视对讲系统</string>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </widget>
+     </item>
+     <item>
+      <widget class="QFrame" name="divider">
+       <property name="frameShape">
+        <enum>QFrame::HLine</enum>
+       </property>
+       <property name="frameShadow">
+        <enum>QFrame::Sunken</enum>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLabel" name="statusLabel">
+       <property name="text">
+        <string>请选择功能选项</string>
+       </property>
+       <property name="textInteractionFlags">
+        <set>Qt::LinksAccessibleByMouse</set>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <layout class="QHBoxLayout" name="horizontalLayout">
+       <property name="spacing">
+        <number>16</number>
+       </property>
+       <property name="leftMargin">
+        <number>0</number>
+       </property>
+       <property name="topMargin">
+        <number>0</number>
+       </property>
+       <property name="rightMargin">
+        <number>0</number>
+       </property>
+       <property name="bottomMargin">
+        <number>0</number>
+       </property>
+       <item>
+        <spacer name="horizontalSpacer">
+         <property name="orientation">
+          <enum>Qt::Horizontal</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>40</width>
+           <height>20</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+       <item>
+        <widget class="QPushButton" name="closeButton">
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+           <horstretch>0</horstretch>
+           <verstretch>0</verstretch>
+          </sizepolicy>
+         </property>
+         <property name="text">
+          <string>关闭</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="applyButton">
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+           <horstretch>0</horstretch>
+           <verstretch>0</verstretch>
+          </sizepolicy>
+         </property>
+         <property name="text">
+          <string>应用</string>
+         </property>
+         <property name="default">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </item>
+    </layout>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections>
+  <connection>
+   <sender>closeButton</sender>
+   <signal>clicked()</signal>
+   <receiver>FeaturesDialog</receiver>
+   <slot>reject()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>320</x>
+     <y>560</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>540</x>
+     <y>640</y>
+    </hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>applyButton</sender>
+   <signal>clicked()</signal>
+   <receiver>FeaturesDialog</receiver>
+   <slot>accept()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>420</x>
+     <y>560</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>275</x>
+     <y>325</y>
+    </hint>
+   </hints>
+  </connection>
+ </connections>
+</ui>

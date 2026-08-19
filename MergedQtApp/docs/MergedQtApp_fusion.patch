@@ -1,0 +1,2388 @@
+diff --git a/MergedQtApp.pro b/MergedQtApp.pro
+new file mode 100644
+index 0000000000000000000000000000000000000000..139d05cc7aa50fcb6df455e71b1a50720c714d51
+--- /dev/null
++++ b/MergedQtApp.pro
+@@ -0,0 +1,2 @@
++# Canonical project entry for the fused application.
++include(qt_ycest.pro)
+diff --git a/README_MERGED.md b/README_MERGED.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..6dbf93a1569a003dde761ac12db8406dc47d0b9c
+--- /dev/null
++++ b/README_MERGED.md
+@@ -0,0 +1,67 @@
++# MergedQtApp
++
++本目录是多媒体工程与 FaceGateQt 的单进程融合工程。正式运行结构为：
++
++```text
++AppShell（唯一 EGLFS 顶层窗口）
++├── QStackedWidget
++│   ├── 原多媒体 MainWindow
++│   └── FaceGateMainWindow
++├── ModeController
++├── DebugMousePresenceSensor
++└── CursorOverlay（全程序唯一实例）
++```
++
++## 关键行为
++
++- 只有 `main.cpp` 被融合工程编译为程序入口，只创建一个 `QApplication`。
++- 未设置平台变量时默认使用 `eglfs`；若外部已设置 `QT_QPA_PLATFORM`，入口尊重该值。
++- 禁止 `linuxfb` 的约束仍保留。
++- 默认显示多媒体模块。
++- 多媒体活动时，按住鼠标左键满 3 秒，传感器发出 `presenceDetected`，由 `ModeController` 切换到 FaceGate；提前释放会取消，右键仍完全用于原登录窗口。
++- `AppShell::simulatePresenceLost()` 保留了返回多媒体的开发测试路径，不包含自动返回定时器。
++- FaceGate 激活时启动人脸引擎、活体线程和摄像头；失活时停止摄像头和活体线程。数据库线程按原工程策略保留。
++- FaceGate 的管理面板是 `AppShell` 中的子控件，不再创建第二个全屏窗口。
++- FaceGate 独立入口不再设置 `QT_XCB_GL_INTEGRATION` 或强制 OpenGL 后端。
++
++## 配置
++
++- 外壳配置：`config/app_shell.ini`
++- FaceGate 配置：`facegate.ini`
++- 多媒体原配置保持原路径与语义
++
++可选外部覆盖：
++
++```sh
++export APP_SHELL_CONFIG=/path/to/app_shell.ini
++export FACEGATE_CONFIG=/path/to/facegate.ini
++export QT_QPA_PLATFORM=eglfs
++```
++
++## RK3566 构建
++
++在已经配置 Qt 5.12.8、GStreamer、librga、InspireFace 和 RKNN sysroot 的目标机或交叉编译环境中：
++
++```sh
++qmake MergedQtApp.pro
++make -j4
++```
++
++SDK 路径沿用 FaceGateQt 原工程，在 `qt_ycest.pro` 顶部可按实际交叉编译环境调整。
++
++## 运行
++
++将二进制放在本目录，确保 FaceGate 模型、数据库、音频和原多媒体静态资源仍使用各自原路径，然后执行：
++
++```sh
++chmod +x deploy/rk3566/run_merged_qt_app.sh
++deploy/rk3566/run_merged_qt_app.sh
++```
++
++桌面调试可由外部选择平台，例如：
++
++```sh
++QT_QPA_PLATFORM=xcb ./MergedQtApp
++```
++
++入口不会为 FaceGate 强制设置 XCB。
+diff --git a/components/cursoroverlay/CursorOverlay.cpp b/components/cursoroverlay/CursorOverlay.cpp
+index fcc153f1dfb181c25aecf4d753f4a0c0498b9266..a5240eaa41fcda90c0a15e17c562617a1060b360 100644
+--- a/components/cursoroverlay/CursorOverlay.cpp
++++ b/components/cursoroverlay/CursorOverlay.cpp
+@@ -83,11 +83,26 @@ CursorOverlay::~CursorOverlay()
+ 
+ void CursorOverlay::updatePos(const QPoint &p)
+ {
++    if (!overlayEnabled_) return;
+     QWidget *host = parentWidget();
+     if (!host) return;
+     moveToGlobalPosition(host->mapToGlobal(p));
+ }
+ 
++void CursorOverlay::setOverlayEnabled(bool enabled)
++{
++    overlayEnabled_ = enabled;
++    if (!enabled) {
++        hide();
++    }
++    qInfo() << "[CURSOR] software overlay enabled=" << overlayEnabled_;
++}
++
++bool CursorOverlay::isOverlayEnabled() const
++{
++    return overlayEnabled_;
++}
++
+ QWidget *CursorOverlay::hostForObject(QObject *object) const
+ {
+     QWidget *widget = qobject_cast<QWidget *>(object);
+@@ -159,7 +174,7 @@ void CursorOverlay::restoreBestVisibleHostLater()
+ 
+ bool CursorOverlay::eventFilter(QObject *watched, QEvent *event)
+ {
+-    if (!event || watched == this) return false;
++    if (!overlayEnabled_ || !event || watched == this) return false;
+ 
+     switch (event->type()) {
+     case QEvent::MouseMove: {
+@@ -251,6 +266,10 @@ void CursorOverlay::moveToGlobalPosition(const QPoint &globalPos)
+ 
+ void CursorOverlay::showAndRaise()
+ {
++    if (!overlayEnabled_) {
++        hide();
++        return;
++    }
+     if (!isVisible()) show();
+     raise();
+     if (hideTimer_) hideTimer_->start();
+diff --git a/components/cursoroverlay/CursorOverlay.h b/components/cursoroverlay/CursorOverlay.h
+index 722b29b4e091cc0c2cf59549cb912965527f4411..a065b1e525d5d4666bcd7279a625d49c9ef4fccd 100644
+--- a/components/cursoroverlay/CursorOverlay.h
++++ b/components/cursoroverlay/CursorOverlay.h
+@@ -20,6 +20,8 @@ public:
+     ~CursorOverlay() override;
+ 
+     void updatePos(const QPoint &p);
++    void setOverlayEnabled(bool enabled);
++    bool isOverlayEnabled() const;
+ 
+ protected:
+     bool eventFilter(QObject *watched, QEvent *event) override;
+@@ -39,6 +41,7 @@ private:
+     qint64 lastDiagnosticMs_ = 0;
+     quint64 moveEventsSinceDiagnostic_ = 0;
+     QTimer *hideTimer_ = nullptr;
++    bool overlayEnabled_ = true;
+ };
+ 
+ #endif // CURSOROVERLAY_H
+diff --git a/config/app_shell.ini b/config/app_shell.ini
+new file mode 100644
+index 0000000000000000000000000000000000000000..c49140c7793383169a0ba8aac4d8e4026e2e64c1
+--- /dev/null
++++ b/config/app_shell.ini
+@@ -0,0 +1,17 @@
++[application]
++initialMode=multimedia
++
++[display]
++platform=eglfs
++width=1024
++height=768
++
++[modeSwitch]
++presenceDriver=debug_mouse
++debugLeftHold=true
++leftHoldDurationMs=3000
++
++[cursor]
++enabled=true
++implementation=multimedia_eglfs_software
++hideNativeCursor=true
+diff --git a/deploy/rk3566/run_merged_qt_app.sh b/deploy/rk3566/run_merged_qt_app.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..f633d727938a35784c03194bbec7f8bc0d59900f
+--- /dev/null
++++ b/deploy/rk3566/run_merged_qt_app.sh
+@@ -0,0 +1,19 @@
++#!/bin/sh
++set -eu
++
++APP_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
++
++: "${QT_QPA_PLATFORM:=eglfs}"
++: "${QT_QPA_EGLFS_INTEGRATION:=eglfs_kms}"
++: "${QT_QPA_EGLFS_HIDECURSOR:=1}"
++: "${QT_QPA_EGLFS_FORCE888:=1}"
++: "${QT_QPA_EGLFS_SWAPINTERVAL:=1}"
++
++export QT_QPA_PLATFORM
++export QT_QPA_EGLFS_INTEGRATION
++export QT_QPA_EGLFS_HIDECURSOR
++export QT_QPA_EGLFS_FORCE888
++export QT_QPA_EGLFS_SWAPINTERVAL
++
++cd "$APP_DIR"
++exec "$APP_DIR/MergedQtApp" "$@"
+diff --git a/docs/fusion_baseline_audit.md b/docs/fusion_baseline_audit.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b96bea7167e44d9e895ecf2ca003ba9c8178d7d
+--- /dev/null
++++ b/docs/fusion_baseline_audit.md
+@@ -0,0 +1,43 @@
++# 融合基线审计
++
++## 原多媒体工程
++
++- 入口：`main.cpp`
++- 根界面：`MainWindow`
++- 播放界面：`MultimediaDemo`
++- 播放失活接口：`leaveAndStopVideo()`
++- 播放恢复接口：`resumeLocalPlaylistFromStart()`
++- 软件鼠标：`components/cursoroverlay/CursorOverlay`
++- 平台：入口默认 EGLFS/KMS，已禁止 LinuxFB
++
++## 原 FaceGateQt 工程
++
++- 原入口：`modules/facegate/FaceGateQt/main.cpp`（不进入融合工程 SOURCES）
++- 根界面：原 `MainWindow`，融合副本中仅为消除同名冲突改名为 `FaceGateMainWindow`
++- 摄像头：`CameraService`
++- 人脸引擎：`FaceEngine`
++- 活体线程：`LivenessWorker`
++- 数据库线程：`DatabaseWorker`
++- 运维线程：`MaintenanceWorker`
++- 管理界面：`AdminPanel`
++
++## XCB 依赖清单
++
++FaceGate 业务源码未发现 `QX11Info`、`XOpenDisplay`、`XFixes` 或 X11 Cursor API。唯一正式问题是原独立入口主动设置：
++
++- `QT_XCB_GL_INTEGRATION=xcb`
++- `QT_OPENGL=software`
++
++融合副本已移除这两项设置，平台由外部环境或融合入口默认值选择。
++
++## 模块边界
++
++- 多媒体适配器只调用多媒体窗口的生命周期包装，不包含 FaceGate 头文件。
++- FaceGate 适配器只调用 FaceGate 生命周期，不包含多媒体业务头文件。
++- 两者只通过 `IApplicationModule` 受 `ModeController` 控制。
++- `IPresenceSensor` 与 `DebugMousePresenceSensor` 位于外壳层，不直接操作页面、摄像头或播放器。
++- `CursorOverlay` 只由 `AppShell` 创建一次。
++
++## 未修改业务规则
++
++未修改人脸识别阈值、活体阈值、录入/查询/删除/打卡规则、数据库表结构、多媒体播放列表规则、图片轮播规则及两套原配置键。
+diff --git a/docs/fusion_implementation_report.md b/docs/fusion_implementation_report.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..5be6cb946f5d4b5f4f5ab52ad9446107da305151
+--- /dev/null
++++ b/docs/fusion_implementation_report.md
+@@ -0,0 +1,39 @@
++# 融合实施报告
++
++## 本轮目标
++
++建立单进程、单 `QApplication`、单 EGLFS 根窗口的融合外壳，并接入生命周期、统一软件鼠标和左键长按 3 秒临时人体感应驱动。
++
++## 主要修改
++
++- `main.cpp`：使用唯一 `AppShell`；平台从外部环境读取，未设置时默认 EGLFS；接入虚拟键盘焦点过滤器。
++- `shell/*`：新增应用外壳、模态控制器、模块接口、人体感应接口和调试鼠标驱动。
++- `modules/multimedia/*Adapter*`：包装原多媒体窗口生命周期。
++- `mainwindow.*`：移除业务窗口内软件鼠标所有权，增加播放激活/失活包装。
++- `modules/facegate/*Adapter*`：包装 FaceGate 生命周期和配置加载。
++- `modules/facegate/FaceGateQt/ui/MainWindow.*`：类名消冲突；摄像头/活体链路改为激活时启动、失活时停止；管理面板改为根窗口内子控件。
++- `components/cursoroverlay/CursorOverlay.*`：保留原实现，增加外壳配置启停接口。
++- `qt_ycest.pro`、`MergedQtApp.pro`：合并两套源文件与依赖，但不编译 FaceGate 独立入口。
++- `config/app_shell.ini`：新增独立外壳配置。
++
++## 业务逻辑影响
++
++未修改人脸识别、活体判定、数据库结构、人员管理、打卡、多媒体播放顺序或图片轮播业务规则。调整仅限入口、窗口层级、生命周期和平台设置。
++
++## 验证状态
++
++- 已完成源文件存在性、工程清单、QRC XML、唯一光标实例、XCB 强制设置、FaceGate 类名冲突和顶层 `showFullScreen()` 静态检查。
++- 已从两个未修改原工程重建融合前基线，生成 `docs/MergedQtApp_fusion.patch`，并通过 `git apply --check --binary` 校验。
++- 当前 Windows 工作环境没有 Qt 5.12.8/qmake、RK3566 sysroot、GStreamer/librga、InspireFace 与 RKNN 目标库，因此不能在本机完成目标二进制编译和 EGLFS 硬件运行。
++- 目标机仍需执行 `qmake MergedQtApp.pro && make -j4`，并完成摄像头、NPU、视频层、虚拟键盘及 100 次切换测试。
++
++## 剩余风险
++
++- FaceGate SDK 路径沿用原工程的绝对路径，目标构建环境不一致时需调整 `qt_ycest.pro`。
++- 摄像头与 NPU 只能在 RK3566 实机验证。
++- 原多媒体和 FaceGate 的业务弹窗虽都归属于统一根对象体系，仍需在 EGLFS 实机验证 Qt 5.12.8 的弹窗合成与软件光标层级。
++- 本阶段没有人体感应硬件，`presenceLost` 仅提供开发调用路径。
++
++## 回退点
++
++两个原工程目录未被修改。删除融合交付目录即可完整回退；原多媒体与 FaceGateQt 仍可分别按原工程构建。
+diff --git a/main.cpp b/main.cpp
+index 690d5a485efe7fd725b022f533cf2c336afc18ef..fb013e1bd8e18c4f39d4f592b37a749235dcadca 100644
+--- a/main.cpp
++++ b/main.cpp
+@@ -16,9 +16,11 @@
+ #include <QScreen>
+ #include <QPalette>
+ #include <QEventLoop>
++#include <QEvent>
++#include <QInputMethod>
+ #include <QRect>
+ 
+-#include "mainwindow.h"
++#include "shell/AppShell.h"
+ #include "components/splash/splashscreen.h"
+ #include "common/sql/dbstore.h"
+ #include "ic_board/ic_board.h"
+@@ -28,6 +30,33 @@
+ 
+ static QtMessageHandler g_oldHandler = nullptr;
+ 
++class VirtualKeyboardFocusFilter final : public QObject
++{
++public:
++    explicit VirtualKeyboardFocusFilter(QObject *parent = nullptr)
++        : QObject(parent)
++    {
++    }
++
++protected:
++    bool eventFilter(QObject *watched, QEvent *event) override
++    {
++        auto *widget = qobject_cast<QWidget *>(watched);
++        if (!widget || !widget->testAttribute(Qt::WA_InputMethodEnabled)) {
++            return QObject::eventFilter(watched, event);
++        }
++        if (event->type() == QEvent::FocusIn ||
++            event->type() == QEvent::MouseButtonRelease) {
++            QTimer::singleShot(80, []() {
++                if (QGuiApplication::inputMethod()) {
++                    QGuiApplication::inputMethod()->show();
++                }
++            });
++        }
++        return QObject::eventFilter(watched, event);
++    }
++};
++
+ static bool isLinuxFbPlatformValue(const QByteArray &value)
+ {
+     return value.trimmed().toLower().startsWith(QByteArrayLiteral("linuxfb"));
+@@ -154,9 +183,12 @@ int main(int argc, char *argv[])
+ {
+     removeLegacyLinuxFbArguments(argc, argv);
+ 
+-    // RK3566 正式运行固定使用 EGLFS/KMS。即使 shell 中残留了 linuxfb，
+-    // 也不允许再次进入 /dev/fb0 mmap 路径。仅保留 xcb 等显式桌面调试覆盖。
+-    QByteArray requestedQpa = qgetenv("QT_YCEST_QPA_PLATFORM").trimmed();
++    // 尊重标准 Qt 外部平台变量；未指定时，RK3566 正式运行默认 EGLFS。
++    // QT_YCEST_QPA_PLATFORM 仅作为兼容旧部署脚本的次级覆盖。
++    QByteArray requestedQpa = qgetenv("QT_QPA_PLATFORM").trimmed();
++    if (requestedQpa.isEmpty()) {
++        requestedQpa = qgetenv("QT_YCEST_QPA_PLATFORM").trimmed();
++    }
+     if (requestedQpa.toLower().startsWith("linuxfb")) {
+         requestedQpa.clear();
+     }
+@@ -166,6 +198,8 @@ int main(int argc, char *argv[])
+     qputenv("QT_QPA_PLATFORM", qpa);
+     qputenv("QT_YCEST_VIDEO_OUTPUT", QByteArrayLiteral("qt"));
+     qunsetenv("QT_QPA_FB_DRM");
++    qputenv("QT_IM_MODULE", QByteArrayLiteral("qtvirtualkeyboard"));
++    qputenv("QT_VIRTUALKEYBOARD_DESKTOP_DISABLE", QByteArrayLiteral("1"));
+ 
+     if (qpa.toLower().startsWith("eglfs")) {
+         if (qEnvironmentVariableIsEmpty("QT_QPA_EGLFS_INTEGRATION")) {
+@@ -210,6 +244,11 @@ int main(int argc, char *argv[])
+     QTextCodec::setCodecForLocale(QTextCodec::codecForName("UTF-8"));
+ 
+     QApplication a(argc, argv);
++    QApplication::setQuitOnLastWindowClosed(false);
++    QApplication::setApplicationName(QStringLiteral("MergedQtApp"));
++    QApplication::setApplicationVersion(QStringLiteral("1.0.0"));
++    VirtualKeyboardFocusFilter keyboardFilter(&a);
++    a.installEventFilter(&keyboardFilter);
+     qInfo() << "[EGLFS-CURSOR] configuration"
+             << "hideCursor=" << qgetenv("QT_QPA_EGLFS_HIDECURSOR")
+             << "platform=" << QGuiApplication::platformName()
+@@ -235,53 +274,50 @@ int main(int argc, char *argv[])
+     // EGLFS 只有一个原生窗口和一个 EGL surface。必须在根窗口首次 show()
+     // 之前创建包含 VideoHoleWidget(QOpenGLWidget) 的完整控件树，否则 Qt 5.12
+     // 可能在后续引入 OpenGL 子控件时得到全黑画面。
+-    QWidget eglfsRoot;
+-    eglfsRoot.setObjectName(QStringLiteral("eglfsRootWindow"));
+-    eglfsRoot.setWindowFlags(Qt::FramelessWindowHint);
+-    eglfsRoot.setAttribute(Qt::WA_StyledBackground, true);
+-    eglfsRoot.setAutoFillBackground(true);
+-    QPalette rootPalette = eglfsRoot.palette();
+-    rootPalette.setColor(QPalette::Window, Qt::black);
+-    eglfsRoot.setPalette(rootPalette);
+-
+     const QScreen *screen = QGuiApplication::primaryScreen();
+     const QRect screenGeometry = screen ? screen->geometry() : QRect(0, 0, 1024, 768);
+-    eglfsRoot.setGeometry(screenGeometry);
+-
+-    MainWindow w(&eglfsRoot);
+-    w.setGeometry(eglfsRoot.rect());
+-    w.show();
++    AppShell shell;
++    shell.setGeometry(screenGeometry);
++    if (!shell.initialize()) {
++        qCritical() << "[SHELL] initialization failed";
++        return EXIT_FAILURE;
++    }
+ 
+-    SplashScreen splash(&eglfsRoot);
+-    splash.setGeometry(eglfsRoot.rect());
++    SplashScreen splash(&shell);
++    splash.setGeometry(shell.rect());
+     splash.show();
+     splash.raise();
+ 
+     QObject::connect(&splash, &SplashScreen::splashFinished, [&]() {
+         splash.hide();
+-        w.setGeometry(eglfsRoot.rect());
+-        w.raise();
+-        w.setFocus();
+-        w.update();
+-        eglfsRoot.update();
++        if (QWidget *multimedia = shell.multimediaRootWidget()) {
++            multimedia->setGeometry(shell.rect());
++            multimedia->raise();
++            multimedia->setFocus();
++            multimedia->update();
++        }
++        shell.raiseCursorOverlay();
++        shell.update();
+         qInfo() << "[EGLFS] splash hidden, main view exposed";
+     });
+ 
+     // 完整控件树准备好后，只创建一次 EGLFS/KMS 全屏原生窗口。
+-    eglfsRoot.showFullScreen();
++    shell.showFullScreen();
+     splash.raise();
+     a.processEvents(QEventLoop::AllEvents, 100);
+ 
+     qInfo() << "[EGLFS] root shown"
+             << "platform=" << QGuiApplication::platformName()
+             << "screen=" << (screen ? screen->name() : QStringLiteral("<none>"))
+-            << "geometry=" << eglfsRoot.geometry()
++            << "geometry=" << shell.geometry()
+             << "atomic=" << qgetenv("QT_QPA_EGLFS_KMS_ATOMIC")
+             << "swapInterval=" << qgetenv("QT_QPA_EGLFS_SWAPINTERVAL")
+             << "videoOutput=" << qgetenv("QT_YCEST_VIDEO_OUTPUT");
+ 
+-    IcToast::instance(&w);
+-    IcIoBootstrap::startAll(&w);
++    IcToast::instance(shell.multimediaRootWidget());
++    IcIoBootstrap::startAll(shell.multimediaRootWidget());
++    QObject::connect(&a, &QCoreApplication::aboutToQuit,
++                     &shell, &AppShell::shutdown);
+ 
+     return a.exec();
+ }
+diff --git a/mainwindow.cpp b/mainwindow.cpp
+index 3f962b4a4d964f479fff7fbf103b627c4ddca2c3..bb37b73df2acb9d9d271064047c8f68df80e9600 100644
+--- a/mainwindow.cpp
++++ b/mainwindow.cpp
+@@ -110,11 +110,6 @@ MainWindow::MainWindow(QWidget *parent)
+ 
+     //this->centralWidget()->setMouseTracking(true);
+ 
+-    // 创建软件光标层
+-    QWidget *cursorHost = parentWidget() ? parentWidget() : this;
+-    cursor = new CursorOverlay(cursorHost);
+-    cursor->raise();   // 保证在最上层
+-
+     // 密码正确后返回菜单
+     auto *cast = qobject_cast<MultimediaDemo*>(app3Page);
+     if (cast) {
+@@ -461,7 +456,7 @@ MainWindow::MainWindow(QWidget *parent)
+     }
+ 
+ 
+-    if (cursor) cursor->hide();
++    moduleActive_ = true;
+ }
+ 
+ MainWindow::~MainWindow()
+@@ -469,6 +464,41 @@ MainWindow::~MainWindow()
+     delete ui;
+ }
+ 
++void MainWindow::activateModule()
++{
++    if (moduleActive_) {
++        qInfo() << "[MULTIMEDIA-ADAPTER] duplicate activate ignored";
++        return;
++    }
++
++    auto *multimedia = qobject_cast<MultimediaDemo *>(app3Page);
++    if (multimedia && stack && stack->currentWidget() == app3Page) {
++        multimedia->resumeLocalPlaylistFromStart();
++    }
++    moduleActive_ = true;
++    qInfo() << "[MULTIMEDIA-ADAPTER] playback resumed";
++}
++
++void MainWindow::deactivateModule()
++{
++    if (!moduleActive_) {
++        qInfo() << "[MULTIMEDIA-ADAPTER] duplicate deactivate ignored";
++        return;
++    }
++
++    auto *multimedia = qobject_cast<MultimediaDemo *>(app3Page);
++    if (multimedia) {
++        multimedia->leaveAndStopVideo();
++    }
++    moduleActive_ = false;
++    qInfo() << "[MULTIMEDIA-ADAPTER] playback paused";
++}
++
++bool MainWindow::isModuleActive() const
++{
++    return moduleActive_;
++}
++
+ 
+ void MainWindow::keyPressEvent(QKeyEvent *event)
+ {
+@@ -484,16 +514,6 @@ void MainWindow::keyPressEvent(QKeyEvent *event)
+     }
+ }
+ 
+-void MainWindow::mouseMoveEvent(QMouseEvent *event)
+-{
+-    if (cursor) {
+-        cursor->updatePos(event->pos());
+-    }
+-
+-    // 必须调用父类，否则按钮点击异常
+-    QMainWindow::mouseMoveEvent(event);
+-}
+-
+ void MainWindow::resizeEvent(QResizeEvent *event)
+ {
+     QMainWindow::resizeEvent(event);
+@@ -503,7 +523,6 @@ void MainWindow::resizeEvent(QResizeEvent *event)
+     // 2) 排队到事件循环后执行
+     QMetaObject::invokeMethod(udiskOverlay, "onHostResized", Qt::QueuedConnection);
+ 
+-    if (cursor) cursor->raise(); // 保证光标在最上层
+ }
+ 
+ 
+diff --git a/mainwindow.h b/mainwindow.h
+index 7c7c59e345c7d5d44466caa87fe6eed0b9b64087..91e360ad3d837b436ea120f44029f6ee96015a4f 100644
+--- a/mainwindow.h
++++ b/mainwindow.h
+@@ -31,7 +31,6 @@
+ #include "components/features/command_dialog.h"         // 调试对话框
+ #include "components/features/key_service.h"            // 按键业务
+ #include "components/multimedia/multimediademo.h"       // 多媒体演示组件
+-#include "components/cursoroverlay/CursorOverlay.h"     // 光标覆盖层
+ #include "components/udisk_status/udisk_status.h"       // U盘状态显示
+ #include "components/file_manager/file_manager_page.h"  // 文件管理页面
+ #include "components/settings/ftppage.h"
+@@ -74,6 +73,10 @@ public:
+      */
+     ~MainWindow();
+ 
++    void activateModule();
++    void deactivateModule();
++    bool isModuleActive() const;
++
+ protected:
+     /**
+      * @brief 键盘按键按下事件处理
+@@ -83,14 +86,6 @@ protected:
+      */
+     void keyPressEvent(QKeyEvent *event) override;
+     
+-    /**
+-     * @brief 鼠标移动事件处理
+-     * @param event 鼠标事件对象
+-     * 
+-     * 重写父类方法，处理鼠标移动。
+-     */
+-    void mouseMoveEvent(QMouseEvent *event) override;
+-    
+     /**
+      * @brief 窗口大小改变事件处理
+      * @param event 大小改变事件对象
+@@ -104,7 +99,6 @@ private:
+     QStackedWidget *stack = nullptr;                // 堆栈窗口，用于管理多个页面
+     QWidget *menuPage = nullptr;                    // 菜单页面
+     QWidget *app3Page = nullptr;                    // 应用页面3
+-    CursorOverlay *cursor;                          // 光标覆盖层
+     UdiskStatusOverlay *udiskOverlay = nullptr;     // U盘状态覆盖层
+     FileManagerPage *filePage = nullptr;            // 文件管理页面
+ 
+@@ -112,6 +106,7 @@ private:
+     KeyService *key = nullptr;
+ 
+     SettingsDialog *settingsDialog = nullptr;
++    bool moduleActive_ = false;
+ 
+     // 保存/读取 [feature]
+     void saveFeatureSettings(const FeatureSettings &settings);
+diff --git a/modules/facegate/FaceGateModuleAdapter.cpp b/modules/facegate/FaceGateModuleAdapter.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..5a6c8ae307457e9fea0698cb38c941bd0bd8db14
+--- /dev/null
++++ b/modules/facegate/FaceGateModuleAdapter.cpp
+@@ -0,0 +1,77 @@
++#include "FaceGateModuleAdapter.h"
++
++#include "modules/facegate/FaceGateQt/config/AppConfig.h"
++#include "modules/facegate/FaceGateQt/ui/MainWindow.h"
++
++#include <QDebug>
++#include <QFileInfo>
++
++FaceGateModuleAdapter::FaceGateModuleAdapter(QWidget *widgetParent,
++                                             const QString &configPath,
++                                             QObject *parent)
++    : QObject(parent),
++      widgetParent_(widgetParent),
++      configPath_(configPath)
++{
++}
++
++QWidget *FaceGateModuleAdapter::rootWidget()
++{
++    return window_;
++}
++
++bool FaceGateModuleAdapter::initialize()
++{
++    if (window_) {
++        return true;
++    }
++    if (!widgetParent_) {
++        qCritical() << "[FACEGATE-ADAPTER] missing widget parent";
++        return false;
++    }
++
++    if (!QFileInfo::exists(configPath_)) {
++        qWarning() << "[FACEGATE-ADAPTER] config does not exist; safe defaults will be used"
++                   << configPath_;
++    }
++    const AppConfig config = AppConfig::load(configPath_);
++    window_ = new FaceGateMainWindow(config, widgetParent_);
++    window_->setWindowFlags(Qt::Widget);
++    shutdown_ = false;
++    qInfo() << "[FACEGATE-ADAPTER] initialized"
++            << "config=" << configPath_;
++    return true;
++}
++
++void FaceGateModuleAdapter::activate()
++{
++    active_ = window_ && !shutdown_ && window_->activateModule();
++    qInfo() << "[FACEGATE-ADAPTER] activate result=" << active_;
++}
++
++void FaceGateModuleAdapter::deactivate()
++{
++    if (window_) {
++        window_->deactivateModule();
++    }
++    active_ = false;
++    qInfo() << "[FACEGATE-ADAPTER] deactivated";
++}
++
++void FaceGateModuleAdapter::shutdown()
++{
++    if (shutdown_) {
++        return;
++    }
++    active_ = false;
++    if (window_) {
++        window_->shutdownModule();
++    }
++    shutdown_ = true;
++    qInfo() << "[FACEGATE-ADAPTER] shutdown complete";
++}
++
++bool FaceGateModuleAdapter::isActive() const
++{
++    return active_ && window_ && window_->isModuleActive();
++}
+diff --git a/modules/facegate/FaceGateModuleAdapter.h b/modules/facegate/FaceGateModuleAdapter.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..4bc6e745ffb4b946cad4a6b87d2ee3368d08314d
+--- /dev/null
++++ b/modules/facegate/FaceGateModuleAdapter.h
+@@ -0,0 +1,37 @@
++#ifndef FACEGATEMODULEADAPTER_H
++#define FACEGATEMODULEADAPTER_H
++
++#include "shell/IApplicationModule.h"
++
++#include <QObject>
++#include <QPointer>
++#include <QString>
++
++class FaceGateMainWindow;
++class QWidget;
++
++class FaceGateModuleAdapter final : public QObject, public IApplicationModule
++{
++    Q_OBJECT
++
++public:
++    explicit FaceGateModuleAdapter(QWidget *widgetParent,
++                                   const QString &configPath,
++                                   QObject *parent = nullptr);
++
++    QWidget *rootWidget() override;
++    bool initialize() override;
++    void activate() override;
++    void deactivate() override;
++    void shutdown() override;
++    bool isActive() const override;
++
++private:
++    QPointer<QWidget> widgetParent_;
++    QPointer<FaceGateMainWindow> window_;
++    QString configPath_;
++    bool active_ = false;
++    bool shutdown_ = false;
++};
++
++#endif // FACEGATEMODULEADAPTER_H
+diff --git a/modules/facegate/FaceGateQt/facegate_resources.qrc b/modules/facegate/FaceGateQt/facegate_resources.qrc
+new file mode 100644
+index 0000000000000000000000000000000000000000..17da7bc0038f9f90e4a2d3057760f8ede436ce79
+--- /dev/null
++++ b/modules/facegate/FaceGateQt/facegate_resources.qrc
+@@ -0,0 +1,54 @@
++<RCC>
++    <qresource prefix="/">
++        <file>qml/EmbeddedVirtualKeyboard.qml</file>
++    </qresource>
++    <qresource prefix="/qss">
++        <file alias="shadcn_dialog.qss">resources/qss/shadcn_dialog.qss</file>
++        <file alias="admin_panel.qss">resources/qss/admin_panel.qss</file>
++    </qresource>
++    <qresource prefix="/icons/dialog">
++        <file alias="info.svg">resources/icons/dialog/info.svg</file>
++        <file alias="success.svg">resources/icons/dialog/success.svg</file>
++        <file alias="warning.svg">resources/icons/dialog/warning.svg</file>
++        <file alias="error.svg">resources/icons/dialog/error.svg</file>
++        <file alias="question.svg">resources/icons/dialog/question.svg</file>
++        <file alias="close.svg">resources/icons/dialog/close.svg</file>
++    </qresource>
++    <qresource prefix="/icons/nav">
++        <file alias="device.svg">resources/icons/nav/device.svg</file>
++        <file alias="users.svg">resources/icons/nav/users.svg</file>
++        <file alias="logs.svg">resources/icons/nav/logs.svg</file>
++        <file alias="sync.svg">resources/icons/nav/sync.svg</file>
++        <file alias="tools.svg">resources/icons/nav/tools.svg</file>
++        <file alias="settings.svg">resources/icons/nav/settings.svg</file>
++    </qresource>
++    <qresource prefix="/icons/info">
++        <file alias="serial.svg">resources/icons/info/serial.svg</file>
++        <file alias="ip.svg">resources/icons/info/ip.svg</file>
++        <file alias="mac.svg">resources/icons/info/mac.svg</file>
++        <file alias="version.svg">resources/icons/info/version.svg</file>
++        <file alias="uptime.svg">resources/icons/info/uptime.svg</file>
++        <file alias="people.svg">resources/icons/info/people.svg</file>
++        <file alias="face.svg">resources/icons/info/face.svg</file>
++        <file alias="logcount.svg">resources/icons/info/logcount.svg</file>
++        <file alias="storage.svg">resources/icons/info/storage.svg</file>
++        <file alias="cpu.svg">resources/icons/info/cpu.svg</file>
++        <file alias="memory.svg">resources/icons/info/memory.svg</file>
++        <file alias="temp.svg">resources/icons/info/temp.svg</file>
++        <file alias="npu.svg">resources/icons/info/npu.svg</file>
++    </qresource>
++    <qresource prefix="/icons/action">
++        <file alias="refresh.svg">resources/icons/action/refresh.svg</file>
++        <file alias="edit.svg">resources/icons/action/edit.svg</file>
++        <file alias="trash.svg">resources/icons/action/trash.svg</file>
++        <file alias="upload.svg">resources/icons/action/upload.svg</file>
++        <file alias="download.svg">resources/icons/action/download.svg</file>
++        <file alias="save.svg">resources/icons/action/save.svg</file>
++        <file alias="key.svg">resources/icons/action/key.svg</file>
++        <file alias="clock.svg">resources/icons/action/clock.svg</file>
++        <file alias="search.svg">resources/icons/action/search.svg</file>
++        <file alias="check.svg">resources/icons/action/check.svg</file>
++        <file alias="x.svg">resources/icons/action/x.svg</file>
++        <file alias="lock.svg">resources/icons/action/lock.svg</file>
++    </qresource>
++</RCC>
+diff --git a/modules/facegate/FaceGateQt/main.cpp b/modules/facegate/FaceGateQt/main.cpp
+index be4080995638eb69f53e6b900b201ee58dd31b88..58f560a209d5f1dd406501d3aa7c63f63ae547ae 100644
+--- a/modules/facegate/FaceGateQt/main.cpp
++++ b/modules/facegate/FaceGateQt/main.cpp
+@@ -49,19 +49,8 @@ protected:
+ 
+ int main(int argc, char *argv[])
+ {
+-    /*
+-     * face_test_threaded.cpp 使用的 RK3566 目标系统没有提供 rockchip_dri.so。
+-     * 因此让 Qt Widgets 界面保持在软件/ES 路径，避免闸机应用依赖
+-     * OpenGL/Mesa DRI，同时识别链路保持原 CPU/RKNN 分工。
+-     */
+-//    const QByteArray qpa = qgetenv("QT_QPA_PLATFORM");
+-
+-//    if (qpa.isEmpty() || qpa == "xcb") {
+-//        qputenv("QT_XCB_GL_INTEGRATION", QByteArray("xcb_egl"));
+-//        qputenv("QT_OPENGL", QByteArray("es2"));
+-    qputenv("QT_XCB_GL_INTEGRATION", QByteArray("xcb"));
+-    qputenv("QT_OPENGL", QByteArray("software"));
+-//    }
++    // 平台和 OpenGL 后端完全由外部环境选择。此入口不再强制 XCB，
++    // 因此既可独立调试，也不会污染融合程序的 EGLFS 正式运行路径。
+     /*
+      * 使用 Qt Virtual Keyboard 作为输入法。目标系统需要
+      * 在 Qt 插件路径中安装 qtvirtualkeyboard inputcontext 插件。
+@@ -95,7 +84,7 @@ int main(int argc, char *argv[])
+     const QString defaultConfigPath = QCoreApplication::applicationDirPath() + "/facegate.ini";
+     AppConfig config = AppConfig::load(configPath.isEmpty() ? defaultConfigPath : configPath);
+ 
+-    MainWindow window(config);
++    FaceGateMainWindow window(config);
+     window.showFullScreen();
+ 
+     return app.exec();
+diff --git a/modules/facegate/FaceGateQt/ui/MainWindow.cpp b/modules/facegate/FaceGateQt/ui/MainWindow.cpp
+index e6077178e8628429254599f6a1c6b1e5890d3460..d0154c7185b4a451997f9515bc2e8b5b9973dfa0 100644
+--- a/modules/facegate/FaceGateQt/ui/MainWindow.cpp
++++ b/modules/facegate/FaceGateQt/ui/MainWindow.cpp
+@@ -37,17 +37,89 @@
+ 
+ #include <algorithm>
+ 
+-MainWindow::MainWindow(const AppConfig &config, QWidget *parent)
++FaceGateMainWindow::FaceGateMainWindow(const AppConfig &config, QWidget *parent)
+     : QMainWindow(parent), config_(config)
+ {
+     buildUi();
+     startServices();
+ }
+ 
+-MainWindow::~MainWindow()
++FaceGateMainWindow::~FaceGateMainWindow()
+ {
++    shutdownModule();
++}
++
++bool FaceGateMainWindow::activateModule()
++{
++    if (shutdown_) {
++        qWarning() << "[FACEGATE-ADAPTER] activate ignored after shutdown";
++        return false;
++    }
++    if (moduleActive_) {
++        qInfo() << "[FACEGATE-ADAPTER] duplicate activate ignored";
++        return true;
++    }
++
++    const bool engineReady = faceEngine_.isReady() || faceEngine_.initialize(config_);
++    const bool livenessReady = !livenessEnabled_ ||
++                               liveness_.isReady() ||
++                               liveness_.start(config_);
++    if (!engineReady || !livenessReady) {
++        qWarning() << "[FACEGATE-ADAPTER] engine activation failed"
++                   << "faceEngine=" << engineReady
++                   << "liveness=" << livenessReady;
++        liveness_.stop();
++        moduleActive_ = false;
++        return false;
++    }
++
++    moduleActive_ = true;
++    controller_.configure(config_);
++    controller_.setFaceEngine(&faceEngine_);
++    controller_.setLivenessWorker(&liveness_);
++    controller_.setLivenessEnabled(livenessEnabled_);
++    controller_.resetToIdle(QStringLiteral("等待人脸"));
++    updateCameraPowerState();
++
++    const bool cameraReady = !currentUiNeedsCamera() || camera_.isRunning();
++    if (!cameraReady) {
++        qWarning() << "[FACEGATE-ADAPTER] camera activation failed";
++        moduleActive_ = false;
++        camera_.stop();
++        liveness_.stop();
++        clearCameraFrames();
++        return false;
++    }
++
++    qInfo() << "[FACEGATE-ADAPTER] camera and recognition chain activated";
++    return true;
++}
++
++void FaceGateMainWindow::deactivateModule()
++{
++    if (!moduleActive_ && !camera_.isRunning() && !liveness_.isReady()) {
++        return;
++    }
++
++    moduleActive_ = false;
++    if (adminPanel_) {
++        adminPanel_->close();
++    }
+     camera_.stop();
+     liveness_.stop();
++    controller_.resetToIdle(QStringLiteral("人脸模态已暂停"));
++    clearCameraFrames();
++    adminLivenessPending_ = false;
++    qInfo() << "[FACEGATE-ADAPTER] camera and recognition chain deactivated";
++}
++
++void FaceGateMainWindow::shutdownModule()
++{
++    if (shutdown_) {
++        return;
++    }
++    shutdown_ = true;
++    deactivateModule();
+     faceEngine_.shutdown();
+     if (databaseWorker_ && databaseThread_.isRunning()) {
+         QMetaObject::invokeMethod(databaseWorker_, "close", Qt::BlockingQueuedConnection);
+@@ -56,9 +128,15 @@ MainWindow::~MainWindow()
+     maintenanceThread_.wait();
+     databaseThread_.quit();
+     databaseThread_.wait();
++    qInfo() << "[FACEGATE-ADAPTER] services shutdown complete";
++}
++
++bool FaceGateMainWindow::isModuleActive() const
++{
++    return moduleActive_;
+ }
+ 
+-void MainWindow::buildUi()
++void FaceGateMainWindow::buildUi()
+ {
+     // 主界面采用中央预览区叠加左右信息面板的布局。
+     auto *central = new QWidget(this);
+@@ -154,31 +232,35 @@ void MainWindow::buildUi()
+         "QPushButton{font-size:16px;padding:10px 16px;border-radius:6px;}"
+     );
+ 
+-    connect(preview_, &CameraPreviewWidget::clicked, this, &MainWindow::handleAdminTap);
++    connect(preview_, &CameraPreviewWidget::clicked, this, &FaceGateMainWindow::handleAdminTap);
+ 
+-    connect(&clockTimer_, &QTimer::timeout, this, &MainWindow::updateClock);
++    connect(&clockTimer_, &QTimer::timeout, this, &FaceGateMainWindow::updateClock);
+     clockTimer_.start(1000);
+     updateClock();
+ 
+-    connect(&networkTimer_, &QTimer::timeout, this, &MainWindow::updateNetworkSummary);
++    connect(&networkTimer_, &QTimer::timeout, this, &FaceGateMainWindow::updateNetworkSummary);
+     networkTimer_.start(5000);
+     updateNetworkSummary();
+     layoutOverlayPanels();
+ }
+ 
+-void MainWindow::resizeEvent(QResizeEvent *event)
++void FaceGateMainWindow::resizeEvent(QResizeEvent *event)
+ {
+     QMainWindow::resizeEvent(event);
+     if (preview_ && centralWidget()) {
+         preview_->setGeometry(centralWidget()->rect());
+     }
+     layoutOverlayPanels();
++    if (adminPanel_ && adminPanel_->isVisible()) {
++        adminPanel_->setGeometry(rect());
++        adminPanel_->raise();
++    }
+ }
+ 
+ /**
+  * @brief 将侧边信息面板固定在 1024x768 闸机边缘。
+  */
+-void MainWindow::layoutOverlayPanels()
++void FaceGateMainWindow::layoutOverlayPanels()
+ {
+     QWidget *root = centralWidget();
+     if (!root || !leftOverlay_ || !rightOverlay_) {
+@@ -198,7 +280,7 @@ void MainWindow::layoutOverlayPanels()
+ /**
+  * @brief 刷新安静时钟浮层，不影响识别流程。
+  */
+-void MainWindow::updateClock()
++void FaceGateMainWindow::updateClock()
+ {
+     const QDateTime now = QDateTime::currentDateTime();
+     if (timeLabel_) {
+@@ -212,7 +294,7 @@ void MainWindow::updateClock()
+ /**
+  * @brief 从第一个活动的非 loopback 地址显示简洁在线/离线状态。
+  */
+-void MainWindow::updateNetworkSummary()
++void FaceGateMainWindow::updateNetworkSummary()
+ {
+     QString address;
+     const QList<QNetworkInterface> interfaces = QNetworkInterface::allInterfaces();
+@@ -245,7 +327,7 @@ void MainWindow::updateNetworkSummary()
+  * 摄像头帧始终是拷贝后的值对象。数据库任务投递给 DatabaseWorker
+  * 通过队列调用执行，验证流程不会直接调用 MySQL。
+  */
+-void MainWindow::startServices()
++void FaceGateMainWindow::startServices()
+ {
+     // 注册跨线程信号需要传递的自定义类型。
+     qRegisterMetaType<PersonInfo>("PersonInfo");
+@@ -467,15 +549,14 @@ void MainWindow::startServices()
+         gateLabel_->setText("闸机 " + message);
+     });
+ 
+-    faceEngine_.initialize(config_);
+-    liveness_.start(config_);
+-    updateCameraPowerState();
++    servicesInitialized_ = true;
++    qInfo() << "[FACEGATE-ADAPTER] UI/database services initialized; camera deferred";
+ }
+ 
+ /**
+  * @brief 创建专用数据库线程，并连接其结果信号。
+  */
+-void MainWindow::startDatabaseThread()
++void FaceGateMainWindow::startDatabaseThread()
+ {
+     databaseWorker_ = new DatabaseWorker(config_);
+     databaseWorker_->moveToThread(&databaseThread_);
+@@ -610,7 +691,7 @@ void MainWindow::startDatabaseThread()
+     databaseThread_.start();
+ }
+ 
+-void MainWindow::handleAdminTap()
++void FaceGateMainWindow::handleAdminTap()
+ {
+     if (!adminTapTimer_.isValid() || adminTapTimer_.elapsed() > 3000) {
+         adminTapTimer_.restart();
+@@ -634,7 +715,7 @@ void MainWindow::handleAdminTap()
+     }
+ }
+ 
+-void MainWindow::writeOperatorAudit(const QString &action,
++void FaceGateMainWindow::writeOperatorAudit(const QString &action,
+                                     const QString &targetType,
+                                     const QString &targetId,
+                                     const QString &result,
+@@ -654,7 +735,7 @@ void MainWindow::writeOperatorAudit(const QString &action,
+     QMetaObject::invokeMethod(databaseWorker_, "addOperatorAuditLog", Qt::QueuedConnection, Q_ARG(OperatorAuditLog, log));
+ }
+ 
+-void MainWindow::writeSystemEvent(const QString &eventType,
++void FaceGateMainWindow::writeSystemEvent(const QString &eventType,
+                                   const QString &level,
+                                   const QString &message,
+                                   const QString &detail)
+@@ -671,7 +752,7 @@ void MainWindow::writeSystemEvent(const QString &eventType,
+     QMetaObject::invokeMethod(databaseWorker_, "addSystemEventLog", Qt::QueuedConnection, Q_ARG(SystemEventLog, log));
+ }
+ 
+-bool MainWindow::promptAdminPasswordChange(const QString &oldPassword, bool forcePrompt)
++bool FaceGateMainWindow::promptAdminPasswordChange(const QString &oldPassword, bool forcePrompt)
+ {
+     Q_UNUSED(oldPassword);
+     Q_UNUSED(forcePrompt);
+@@ -687,7 +768,7 @@ bool MainWindow::promptAdminPasswordChange(const QString &oldPassword, bool forc
+     return !config_.adminPasswordChangeRequired;
+ }
+ 
+-void MainWindow::handleAdminPasswordChange(const QString &oldPassword, const QString &newPassword)
++void FaceGateMainWindow::handleAdminPasswordChange(const QString &oldPassword, const QString &newPassword)
+ {
+     QString errorText;
+     if (!config_.setAdminPassword(oldPassword, newPassword, &errorText)) {
+@@ -711,32 +792,33 @@ void MainWindow::handleAdminPasswordChange(const QString &oldPassword, const QSt
+     }
+ }
+ 
+-void MainWindow::openAdminPanel()
++void FaceGateMainWindow::openAdminPanel()
+ {
+     if (!adminPanel_) {
+-        adminPanel_ = new AdminPanel(config_);
++        adminPanel_ = new AdminPanel(config_, this);
++        adminPanel_->setWindowFlags(Qt::Widget);
+         adminPanel_->setAttribute(Qt::WA_DeleteOnClose);
+-        connect(adminPanel_, &AdminPanel::enrollRequested, this, &MainWindow::handleEnrollRequest);
+-        connect(adminPanel_, &AdminPanel::livenessEnabledChanged, this, &MainWindow::setLivenessEnabled);
+-        connect(adminPanel_, &AdminPanel::peopleRefreshRequested, this, &MainWindow::refreshAdminPeople);
+-        connect(adminPanel_, &AdminPanel::peopleImportRequested, this, &MainWindow::handlePeopleImport);
+-        connect(adminPanel_, &AdminPanel::passedLogsRefreshRequested, this, &MainWindow::refreshAdminPassedLogs);
++        connect(adminPanel_, &AdminPanel::enrollRequested, this, &FaceGateMainWindow::handleEnrollRequest);
++        connect(adminPanel_, &AdminPanel::livenessEnabledChanged, this, &FaceGateMainWindow::setLivenessEnabled);
++        connect(adminPanel_, &AdminPanel::peopleRefreshRequested, this, &FaceGateMainWindow::refreshAdminPeople);
++        connect(adminPanel_, &AdminPanel::peopleImportRequested, this, &FaceGateMainWindow::handlePeopleImport);
++        connect(adminPanel_, &AdminPanel::passedLogsRefreshRequested, this, &FaceGateMainWindow::refreshAdminPassedLogs);
+         connect(adminPanel_, &AdminPanel::syncTasksRefreshRequested, this, [this]() {
+             if (databaseWorker_) {
+                 QMetaObject::invokeMethod(databaseWorker_, "loadSyncTasks", Qt::QueuedConnection);
+             }
+         });
+-        connect(adminPanel_, &AdminPanel::maintenanceBackupRequested, this, &MainWindow::handleMaintenanceBackup);
+-        connect(adminPanel_, &AdminPanel::maintenanceCleanupRequested, this, &MainWindow::handleMaintenanceCleanup);
+-        connect(adminPanel_, &AdminPanel::deviceInfoRefreshRequested, this, &MainWindow::refreshAdminStorageStats);
+-        connect(adminPanel_, &AdminPanel::thresholdConfigSaveRequested, this, &MainWindow::handleThresholdConfigSave);
+-        connect(adminPanel_, &AdminPanel::networkConfigSaveRequested, this, &MainWindow::handleNetworkConfigSave);
+-        connect(adminPanel_, &AdminPanel::audioConfigSaveRequested, this, &MainWindow::handleAudioConfigSave);
+-        connect(adminPanel_, &AdminPanel::audioTestPlayRequested, this, &MainWindow::handleAudioTestPlay);
+-        connect(adminPanel_, &AdminPanel::adminPasswordChangeRequested, this, &MainWindow::handleAdminPasswordChange);
+-        connect(adminPanel_, &AdminPanel::personNoChangeRequested, this, &MainWindow::handlePersonNoChange);
+-        connect(adminPanel_, &AdminPanel::personEnabledChangeRequested, this, &MainWindow::handlePersonEnabledChange);
+-        connect(adminPanel_, &AdminPanel::personDeleteRequested, this, &MainWindow::handlePersonDelete);
++        connect(adminPanel_, &AdminPanel::maintenanceBackupRequested, this, &FaceGateMainWindow::handleMaintenanceBackup);
++        connect(adminPanel_, &AdminPanel::maintenanceCleanupRequested, this, &FaceGateMainWindow::handleMaintenanceCleanup);
++        connect(adminPanel_, &AdminPanel::deviceInfoRefreshRequested, this, &FaceGateMainWindow::refreshAdminStorageStats);
++        connect(adminPanel_, &AdminPanel::thresholdConfigSaveRequested, this, &FaceGateMainWindow::handleThresholdConfigSave);
++        connect(adminPanel_, &AdminPanel::networkConfigSaveRequested, this, &FaceGateMainWindow::handleNetworkConfigSave);
++        connect(adminPanel_, &AdminPanel::audioConfigSaveRequested, this, &FaceGateMainWindow::handleAudioConfigSave);
++        connect(adminPanel_, &AdminPanel::audioTestPlayRequested, this, &FaceGateMainWindow::handleAudioTestPlay);
++        connect(adminPanel_, &AdminPanel::adminPasswordChangeRequested, this, &FaceGateMainWindow::handleAdminPasswordChange);
++        connect(adminPanel_, &AdminPanel::personNoChangeRequested, this, &FaceGateMainWindow::handlePersonNoChange);
++        connect(adminPanel_, &AdminPanel::personEnabledChangeRequested, this, &FaceGateMainWindow::handlePersonEnabledChange);
++        connect(adminPanel_, &AdminPanel::personDeleteRequested, this, &FaceGateMainWindow::handlePersonDelete);
+         connect(adminPanel_, &AdminPanel::cameraRequiredChanged, this, [this](bool) {
+             updateCameraPowerState();
+         });
+@@ -744,18 +826,6 @@ void MainWindow::openAdminPanel()
+             adminModeActive_ = false;
+             adminLivenessPending_ = false;
+             controller_.resetToIdle("等待人脸");
+-            qInfo().noquote() << "管理员面板正在关闭，先恢复主窗口全屏";
+-
+-            /*
+-             * 管理窗口关闭前，先把主窗口重新映射并强制刷新一轮。
+-             * 这样管理窗口真正消失时，下面已经是主界面，不会短暂露出桌面。
+-             */
+-            showFullScreen();
+-            raise();
+-            activateWindow();
+-            repaint();
+-            QApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 50);
+-
+             updateCameraPowerState();
+         });
+         connect(adminPanel_, &QObject::destroyed, this, [this]() {
+@@ -778,14 +848,12 @@ void MainWindow::openAdminPanel()
+     refreshAdminPeople();
+     refreshAdminStorageStats();
+ 
+-    /*
+-     * 管理窗口直接盖在主窗口上方，不再隐藏主窗口。
+-     * 主窗口保留在下层，可以避免进入/退出管理界面时 X11 桌面被短暂露出。
+-     */
+-    showFullScreen();
+-    adminPanel_->showFullScreen();
++    // EGLFS 融合模式下管理面板保持为统一 AppShell 内的普通子控件，
++    // 不创建第二个全屏顶层窗口。
++    adminPanel_->setGeometry(rect());
++    adminPanel_->show();
+     adminPanel_->raise();
+-    adminPanel_->activateWindow();
++    adminPanel_->setFocus();
+     QApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 50);
+     updateCameraPowerState();
+ }
+@@ -799,7 +867,7 @@ void MainWindow::openAdminPanel()
+  * 活体反馈，因此不会执行底库识别、开闸，
+  * 也不会在后台写入识别记录。
+  */
+-void MainWindow::processAdminFrame(const CameraFrame &frame)
++void FaceGateMainWindow::processAdminFrame(const CameraFrame &frame)
+ {
+     if (!adminPanel_ || !adminPanel_->cameraRequired()) {
+         return;
+@@ -873,7 +941,7 @@ void MainWindow::processAdminFrame(const CameraFrame &frame)
+ }
+ 
+ 
+-bool MainWindow::currentUiNeedsCamera() const
++bool FaceGateMainWindow::currentUiNeedsCamera() const
+ {
+     if (!adminModeActive_) {
+         return true;
+@@ -881,9 +949,9 @@ bool MainWindow::currentUiNeedsCamera() const
+     return adminPanel_ && adminPanel_->cameraRequired();
+ }
+ 
+-void MainWindow::updateCameraPowerState()
++void FaceGateMainWindow::updateCameraPowerState()
+ {
+-    const bool needCamera = currentUiNeedsCamera();
++    const bool needCamera = moduleActive_ && currentUiNeedsCamera();
+     if (needCamera) {
+         if (!camera_.isRunning()) {
+             if (cameraLabel_) {
+@@ -926,7 +994,7 @@ void MainWindow::updateCameraPowerState()
+     }
+ }
+ 
+-void MainWindow::clearCameraFrames()
++void FaceGateMainWindow::clearCameraFrames()
+ {
+     latestFrame_ = QImage();
+     if (preview_) {
+@@ -939,7 +1007,7 @@ void MainWindow::clearCameraFrames()
+     }
+ }
+ 
+-void MainWindow::refreshAdminPeople()
++void FaceGateMainWindow::refreshAdminPeople()
+ {
+     if (databaseWorker_) {
+         const bool includeDeleted = adminPanel_ && adminPanel_->includeDeletedPeople();
+@@ -947,7 +1015,7 @@ void MainWindow::refreshAdminPeople()
+     }
+ }
+ 
+-void MainWindow::refreshAdminPassedLogs(const VerifyLogFilter &requestedFilter)
++void FaceGateMainWindow::refreshAdminPassedLogs(const VerifyLogFilter &requestedFilter)
+ {
+     if (databaseWorker_) {
+         VerifyLogFilter filter = requestedFilter;
+@@ -961,7 +1029,7 @@ void MainWindow::refreshAdminPassedLogs(const VerifyLogFilter &requestedFilter)
+     }
+ }
+ 
+-void MainWindow::handlePeopleImport(const QVector<PersonInfo> &people)
++void FaceGateMainWindow::handlePeopleImport(const QVector<PersonInfo> &people)
+ {
+     writeOperatorAudit("导入人员CSV", "person", "batch", "请求", QString("记录数=%1").arg(people.size()));
+     if (databaseWorker_) {
+@@ -969,7 +1037,7 @@ void MainWindow::handlePeopleImport(const QVector<PersonInfo> &people)
+     }
+ }
+ 
+-void MainWindow::handleMaintenanceBackup()
++void FaceGateMainWindow::handleMaintenanceBackup()
+ {
+     writeOperatorAudit("数据库备份", "maintenance", "sqlite", "请求", config_.backupDir);
+     if (maintenanceWorker_) {
+@@ -977,7 +1045,7 @@ void MainWindow::handleMaintenanceBackup()
+     }
+ }
+ 
+-void MainWindow::handleMaintenanceCleanup(int days)
++void FaceGateMainWindow::handleMaintenanceCleanup(int days)
+ {
+     writeOperatorAudit("清理日志抓拍", "maintenance", QString::number(days), "请求", "清理过期数据");
+     if (databaseWorker_) {
+@@ -988,7 +1056,7 @@ void MainWindow::handleMaintenanceCleanup(int days)
+     }
+ }
+ 
+-void MainWindow::refreshAdminStorageStats()
++void FaceGateMainWindow::refreshAdminStorageStats()
+ {
+     if (databaseWorker_) {
+         QMetaObject::invokeMethod(databaseWorker_, "loadStorageStats", Qt::QueuedConnection);
+@@ -996,7 +1064,7 @@ void MainWindow::refreshAdminStorageStats()
+     }
+ }
+ 
+-void MainWindow::handleThresholdConfigSave(float faceCosine, float duplicateFaceCosine, float faceQuality, float faceDetect, float liveness)
++void FaceGateMainWindow::handleThresholdConfigSave(float faceCosine, float duplicateFaceCosine, float faceQuality, float faceDetect, float liveness)
+ {
+     config_.faceCosineThreshold = qBound(0.0f, faceCosine, 1.0f);
+     config_.duplicateFaceCosineThreshold = qBound(0.0f, duplicateFaceCosine, config_.faceCosineThreshold);
+@@ -1022,7 +1090,7 @@ void MainWindow::handleThresholdConfigSave(float faceCosine, float duplicateFace
+     }
+ }
+ 
+-void MainWindow::handleNetworkConfigSave(bool dhcp, const QString &ip, const QString &netmask, const QString &gateway, const QString &dns)
++void FaceGateMainWindow::handleNetworkConfigSave(bool dhcp, const QString &ip, const QString &netmask, const QString &gateway, const QString &dns)
+ {
+     qDebug().noquote() << "MainWindow 收到网络设置："
+                        << "dhcp=" << dhcp
+@@ -1055,7 +1123,7 @@ void MainWindow::handleNetworkConfigSave(bool dhcp, const QString &ip, const QSt
+     }
+ }
+ 
+-void MainWindow::handleAudioConfigSave(const AppConfig &audioConfig)
++void FaceGateMainWindow::handleAudioConfigSave(const AppConfig &audioConfig)
+ {
+     config_.audioEnabled = audioConfig.audioEnabled;
+     config_.audioPlayer = audioConfig.audioPlayer;
+@@ -1103,13 +1171,13 @@ void MainWindow::handleAudioConfigSave(const AppConfig &audioConfig)
+     }
+ }
+ 
+-void MainWindow::handleAudioTestPlay(const QString &promptKey)
++void FaceGateMainWindow::handleAudioTestPlay(const QString &promptKey)
+ {
+     audio_.configure(config_);
+     audio_.testPlay(promptKey);
+ }
+ 
+-void MainWindow::handlePersonNoChange(qint64 personId, const QString &newPersonNo)
++void FaceGateMainWindow::handlePersonNoChange(qint64 personId, const QString &newPersonNo)
+ {
+     writeOperatorAudit("修改人员编号", "person", QString::number(personId), "请求", newPersonNo);
+     if (databaseWorker_) {
+@@ -1122,7 +1190,7 @@ void MainWindow::handlePersonNoChange(qint64 personId, const QString &newPersonN
+     }
+ }
+ 
+-void MainWindow::handlePersonEnabledChange(qint64 personId, bool enabled)
++void FaceGateMainWindow::handlePersonEnabledChange(qint64 personId, bool enabled)
+ {
+     writeOperatorAudit("修改人员权限", "person", QString::number(personId), "请求", enabled ? "启用" : "禁用");
+     if (databaseWorker_) {
+@@ -1135,7 +1203,7 @@ void MainWindow::handlePersonEnabledChange(qint64 personId, bool enabled)
+     }
+ }
+ 
+-void MainWindow::handlePersonDelete(qint64 personId)
++void FaceGateMainWindow::handlePersonDelete(qint64 personId)
+ {
+     writeOperatorAudit("删除人员", "person", QString::number(personId), "请求", "软删除");
+     if (databaseWorker_) {
+@@ -1150,7 +1218,7 @@ void MainWindow::handlePersonDelete(qint64 personId)
+ /**
+  * @brief 切换 MiniFASNet 活体检测，同时保持人脸识别运行。
+  */
+-void MainWindow::setLivenessEnabled(bool enabled)
++void FaceGateMainWindow::setLivenessEnabled(bool enabled)
+ {
+     livenessEnabled_ = enabled;
+     controller_.setLivenessEnabled(enabled);
+@@ -1171,7 +1239,7 @@ void MainWindow::setLivenessEnabled(bool enabled)
+  * 特征提取仍放在 FaceEngine 中，以集中管理 SDK 资源归属；
+  * 实际 MySQL 写入投递给 DatabaseWorker 执行。
+  */
+-void MainWindow::handleEnrollRequest(const PersonInfo &person, const QImage &image)
++void FaceGateMainWindow::handleEnrollRequest(const PersonInfo &person, const QImage &image)
+ {
+     if (image.isNull()) {
+         qWarning().noquote() << "请求录入时没有当前帧";
+@@ -1293,7 +1361,7 @@ void MainWindow::handleEnrollRequest(const PersonInfo &person, const QImage &ima
+     }
+ }
+ 
+-QString MainWindow::stateName(VerifyState state) const
++QString FaceGateMainWindow::stateName(VerifyState state) const
+ {
+     switch (state) {
+     case VerifyState::Idle: return "空闲";
+diff --git a/modules/facegate/FaceGateQt/ui/MainWindow.h b/modules/facegate/FaceGateQt/ui/MainWindow.h
+index 57db07376ba2e9b7b34325cabad0934ac6325efe..d2c50d20ef5307c79fc039d3b22c0bc80916ace8 100644
+--- a/modules/facegate/FaceGateQt/ui/MainWindow.h
++++ b/modules/facegate/FaceGateQt/ui/MainWindow.h
+@@ -27,12 +27,17 @@ class MaintenanceWorker;
+ class QLabel;
+ class QResizeEvent;
+ 
+-class MainWindow : public QMainWindow {
++class FaceGateMainWindow : public QMainWindow {
+     Q_OBJECT
+ 
+ public:
+-    explicit MainWindow(const AppConfig &config, QWidget *parent = nullptr);
+-    ~MainWindow() override;
++    explicit FaceGateMainWindow(const AppConfig &config, QWidget *parent = nullptr);
++    ~FaceGateMainWindow() override;
++
++    bool activateModule();
++    void deactivateModule();
++    void shutdownModule();
++    bool isModuleActive() const;
+ 
+ protected:
+     void resizeEvent(QResizeEvent *event) override;
+@@ -117,6 +122,9 @@ private:
+     VerificationController controller_;
+     GateOutputService gate_;
+     AudioService audio_;
++    bool servicesInitialized_ = false;
++    bool moduleActive_ = false;
++    bool shutdown_ = false;
+ };
+ 
+ #endif
+diff --git a/modules/multimedia/MultimediaModuleAdapter.cpp b/modules/multimedia/MultimediaModuleAdapter.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..2e81cab16878d8efb364a530d35def807af2dd80
+--- /dev/null
++++ b/modules/multimedia/MultimediaModuleAdapter.cpp
+@@ -0,0 +1,67 @@
++#include "MultimediaModuleAdapter.h"
++
++#include "mainwindow.h"
++
++#include <QDebug>
++
++MultimediaModuleAdapter::MultimediaModuleAdapter(QWidget *widgetParent, QObject *parent)
++    : QObject(parent),
++      widgetParent_(widgetParent)
++{
++}
++
++QWidget *MultimediaModuleAdapter::rootWidget()
++{
++    return window_;
++}
++
++bool MultimediaModuleAdapter::initialize()
++{
++    if (window_) {
++        return true;
++    }
++    if (!widgetParent_) {
++        qCritical() << "[MULTIMEDIA-ADAPTER] missing widget parent";
++        return false;
++    }
++    window_ = new MainWindow(widgetParent_);
++    window_->setWindowFlags(Qt::Widget);
++    shutdown_ = false;
++    qInfo() << "[MULTIMEDIA-ADAPTER] initialized";
++    return true;
++}
++
++void MultimediaModuleAdapter::activate()
++{
++    if (!window_ || shutdown_) {
++        active_ = false;
++        return;
++    }
++    window_->activateModule();
++    active_ = window_->isModuleActive();
++    qInfo() << "[MULTIMEDIA-ADAPTER] activate result=" << active_;
++}
++
++void MultimediaModuleAdapter::deactivate()
++{
++    if (window_) {
++        window_->deactivateModule();
++    }
++    active_ = false;
++    qInfo() << "[MULTIMEDIA-ADAPTER] deactivated";
++}
++
++void MultimediaModuleAdapter::shutdown()
++{
++    if (shutdown_) {
++        return;
++    }
++    deactivate();
++    shutdown_ = true;
++    qInfo() << "[MULTIMEDIA-ADAPTER] shutdown complete";
++}
++
++bool MultimediaModuleAdapter::isActive() const
++{
++    return active_ && window_ && window_->isModuleActive();
++}
+diff --git a/modules/multimedia/MultimediaModuleAdapter.h b/modules/multimedia/MultimediaModuleAdapter.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..28383c869bc3729dd5306c541d60e1a993643b8c
+--- /dev/null
++++ b/modules/multimedia/MultimediaModuleAdapter.h
+@@ -0,0 +1,33 @@
++#ifndef MULTIMEDIAMODULEADAPTER_H
++#define MULTIMEDIAMODULEADAPTER_H
++
++#include "shell/IApplicationModule.h"
++
++#include <QObject>
++#include <QPointer>
++
++class MainWindow;
++class QWidget;
++
++class MultimediaModuleAdapter final : public QObject, public IApplicationModule
++{
++    Q_OBJECT
++
++public:
++    explicit MultimediaModuleAdapter(QWidget *widgetParent, QObject *parent = nullptr);
++
++    QWidget *rootWidget() override;
++    bool initialize() override;
++    void activate() override;
++    void deactivate() override;
++    void shutdown() override;
++    bool isActive() const override;
++
++private:
++    QPointer<QWidget> widgetParent_;
++    QPointer<MainWindow> window_;
++    bool active_ = false;
++    bool shutdown_ = false;
++};
++
++#endif // MULTIMEDIAMODULEADAPTER_H
+diff --git a/qt_ycest.pro b/qt_ycest.pro
+index 57ce2d45a0121bcc2a5f800731b7b4b76086d4cc..4e48579d66e0d60762aff53b4641e1c5fa7ac46d 100644
+--- a/qt_ycest.pro
++++ b/qt_ycest.pro
+@@ -1,7 +1,7 @@
+-TARGET = qt_ycest
+-QT += core gui widgets opengl serialport network sql
++TARGET = MergedQtApp
++QT += core gui widgets opengl serialport network sql virtualkeyboard qml quick quickwidgets
+ 
+-CONFIG += c++11 link_pkgconfig
++CONFIG += c++17 thread link_pkgconfig
+ PKGCONFIG += gstreamer-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0
+ 
+ # EGLFS 视频链路强制使用 Rockchip RGA。只兼容不同 BSP 使用的
+@@ -26,6 +26,37 @@ DEFINES += QT_DEPRECATED_WARNINGS PNG_SKIP_iCCP_CHECK=1
+ # PKG_CONFIG_LIBDIR 指向 RK3566 sysroot，qmake 会通过 pkg-config 注入头文件与库。
+ DEFINES += QT_YCEST_RK3566
+ 
++# FaceGate SDK settings are kept separate from multimedia configuration.
++INSPIREFACE_ROOT = /home/lubancat/rk3566_inspireface/inspireface-sdk/inspireface-linux-aarch64-rk356x-rk3588-1.2.3/InspireFace
++SYSROOT = /opt/sysroot_ubuntu20
++RKNN_ROOT = /home/lubancat/rknn-toolkit2/rknpu2/runtime/Linux/librknn_api
++
++INCLUDEPATH += \
++    $$PWD \
++    $$PWD/shell \
++    $$PWD/modules/multimedia \
++    $$PWD/modules/facegate \
++    $$PWD/modules/facegate/FaceGateQt/config \
++    $$PWD/modules/facegate/FaceGateQt/audio \
++    $$PWD/modules/facegate/FaceGateQt/core \
++    $$PWD/modules/facegate/FaceGateQt/database \
++    $$PWD/modules/facegate/FaceGateQt/gate \
++    $$PWD/modules/facegate/FaceGateQt/ui
++
++!isEmpty(INSPIREFACE_ROOT) {
++    DEFINES += FACEGATE_WITH_INSPIREFACE
++    INCLUDEPATH += $$INSPIREFACE_ROOT/include
++    LIBS += -L$$INSPIREFACE_ROOT/lib -lInspireFace
++}
++
++!isEmpty(RKNN_ROOT) {
++    DEFINES += FACEGATE_WITH_RKNN
++    INCLUDEPATH += $$RKNN_ROOT/include
++    LIBS += -L$$SYSROOT/usr/lib/aarch64-linux-gnu -lrknnrt
++}
++
++unix: LIBS += -lpthread
++
+ #GST_INCDIR = /opt/sysroot_ubuntu20/usr/include/gstreamer-1.0
+ 
+ #GST_LIBDIR = /opt/sysroot_ubuntu20/usr/lib/aarch64-linux-gnu
+@@ -87,6 +118,29 @@ SOURCES += \
+     ic_board/rs485_driver_port.cpp \
+     ic_board/serial_init.cpp \
+     platform/rk3566_platform.cpp \
++    shell/AppShell.cpp \
++    shell/DebugMousePresenceSensor.cpp \
++    shell/ModeController.cpp \
++    modules/multimedia/MultimediaModuleAdapter.cpp \
++    modules/facegate/FaceGateModuleAdapter.cpp \
++    modules/facegate/FaceGateQt/config/AppConfig.cpp \
++    modules/facegate/FaceGateQt/audio/AudioService.cpp \
++    modules/facegate/FaceGateQt/core/CameraService.cpp \
++    modules/facegate/FaceGateQt/core/FaceEngine.cpp \
++    modules/facegate/FaceGateQt/core/LivenessWorker.cpp \
++    modules/facegate/FaceGateQt/core/MaintenanceWorker.cpp \
++    modules/facegate/FaceGateQt/core/SnapshotService.cpp \
++    modules/facegate/FaceGateQt/core/VerificationController.cpp \
++    modules/facegate/FaceGateQt/database/DatabaseWorker.cpp \
++    modules/facegate/FaceGateQt/database/MysqlFaceRepository.cpp \
++    modules/facegate/FaceGateQt/gate/GateOutputService.cpp \
++    modules/facegate/FaceGateQt/ui/AppMessageDialog.cpp \
++    modules/facegate/FaceGateQt/ui/AppPasswordDialog.cpp \
++    modules/facegate/FaceGateQt/ui/AdminLoginDialog.cpp \
++    modules/facegate/FaceGateQt/ui/AdminPanel.cpp \
++    modules/facegate/FaceGateQt/ui/CameraPreviewWidget.cpp \
++    modules/facegate/FaceGateQt/ui/FaceEnrollWidget.cpp \
++    modules/facegate/FaceGateQt/ui/MainWindow.cpp \
+     main.cpp \
+     mainwindow.cpp \
+     components/splash/splashscreen.cpp \
+@@ -145,6 +199,36 @@ HEADERS += \
+     ic_board/rs485_driver_port.h \
+     ic_board/serial_init.h \
+     platform/rk3566_platform.h \
++    shell/AppShell.h \
++    shell/DebugMousePresenceSensor.h \
++    shell/IApplicationModule.h \
++    shell/IPresenceSensor.h \
++    shell/ModeController.h \
++    modules/multimedia/MultimediaModuleAdapter.h \
++    modules/facegate/FaceGateModuleAdapter.h \
++    modules/facegate/FaceGateQt/config/AppConfig.h \
++    modules/facegate/FaceGateQt/audio/AudioService.h \
++    modules/facegate/FaceGateQt/core/CameraService.h \
++    modules/facegate/FaceGateQt/core/FaceEngine.h \
++    modules/facegate/FaceGateQt/core/ImageUtils.h \
++    modules/facegate/FaceGateQt/core/LivenessWorker.h \
++    modules/facegate/FaceGateQt/core/MaintenanceWorker.h \
++    modules/facegate/FaceGateQt/core/SnapshotService.h \
++    modules/facegate/FaceGateQt/core/VerificationController.h \
++    modules/facegate/FaceGateQt/core/VerificationTypes.h \
++    modules/facegate/FaceGateQt/database/DatabaseWorker.h \
++    modules/facegate/FaceGateQt/database/IFaceRepository.h \
++    modules/facegate/FaceGateQt/database/ISyncRepository.h \
++    modules/facegate/FaceGateQt/database/MysqlFaceRepository.h \
++    modules/facegate/FaceGateQt/database/RemoteSyncStub.h \
++    modules/facegate/FaceGateQt/gate/GateOutputService.h \
++    modules/facegate/FaceGateQt/ui/AppMessageDialog.h \
++    modules/facegate/FaceGateQt/ui/AppPasswordDialog.h \
++    modules/facegate/FaceGateQt/ui/AdminLoginDialog.h \
++    modules/facegate/FaceGateQt/ui/AdminPanel.h \
++    modules/facegate/FaceGateQt/ui/CameraPreviewWidget.h \
++    modules/facegate/FaceGateQt/ui/FaceEnrollWidget.h \
++    modules/facegate/FaceGateQt/ui/MainWindow.h \
+     mainwindow.h \
+     components/splash/splashscreen.h \
+     components/settings/settingsdialog.h \
+@@ -164,7 +248,8 @@ FORMS += \
+ 
+ # 资源文件
+ RESOURCES += \
+-    resources.qrc
++    resources.qrc \
++    modules/facegate/FaceGateQt/facegate_resources.qrc
+ 
+ # .pro.user files are user-specific and should be excluded from version control
+ # The following line is a comment to remind users that user-specific files should be handled appropriately
+diff --git a/shell/AppShell.cpp b/shell/AppShell.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..5dfdd6276316f217d1010c3c9ec8bba16a636f54
+--- /dev/null
++++ b/shell/AppShell.cpp
+@@ -0,0 +1,217 @@
++#include "AppShell.h"
++
++#include "DebugMousePresenceSensor.h"
++#include "ModeController.h"
++#include "components/cursoroverlay/CursorOverlay.h"
++#include "modules/facegate/FaceGateModuleAdapter.h"
++#include "modules/multimedia/MultimediaModuleAdapter.h"
++
++#include <QCoreApplication>
++#include <QDebug>
++#include <QDir>
++#include <QFileInfo>
++#include <QResizeEvent>
++#include <QSettings>
++#include <QStackedWidget>
++#include <QTimer>
++#include <QVBoxLayout>
++
++AppShell::AppShell(QWidget *parent)
++    : QWidget(parent)
++{
++    setObjectName(QStringLiteral("appShellRoot"));
++    setWindowFlags(Qt::FramelessWindowHint);
++    setAttribute(Qt::WA_StyledBackground, true);
++    setStyleSheet(QStringLiteral("#appShellRoot { background: black; }"));
++
++    auto *layout = new QVBoxLayout(this);
++    layout->setContentsMargins(0, 0, 0, 0);
++    layout->setSpacing(0);
++    stack_ = new QStackedWidget(this);
++    stack_->setObjectName(QStringLiteral("moduleStack"));
++    layout->addWidget(stack_);
++}
++
++AppShell::~AppShell()
++{
++    shutdown();
++}
++
++bool AppShell::initialize()
++{
++    if (initialized_) {
++        return true;
++    }
++
++    QSettings settings(shellConfigPath(), QSettings::IniFormat);
++#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
++    settings.setIniCodec("UTF-8");
++#endif
++    const QString initialMode =
++        settings.value(QStringLiteral("application/initialMode"), QStringLiteral("multimedia"))
++            .toString().trimmed().toLower();
++    const QString presenceDriver =
++        settings.value(QStringLiteral("modeSwitch/presenceDriver"), QStringLiteral("debug_mouse"))
++            .toString().trimmed().toLower();
++    const bool leftHoldEnabled =
++        settings.value(QStringLiteral("modeSwitch/debugLeftHold"), true).toBool();
++    const int leftHoldDurationMs =
++        settings.value(QStringLiteral("modeSwitch/leftHoldDurationMs"), 3000).toInt();
++    const bool cursorEnabled =
++        settings.value(QStringLiteral("cursor/enabled"), true).toBool();
++
++    if (initialMode != QStringLiteral("multimedia")) {
++        qWarning() << "[SHELL] unsupported initialMode; forcing multimedia" << initialMode;
++    }
++    if (presenceDriver != QStringLiteral("debug_mouse")) {
++        qCritical() << "[SHELL] unsupported presence driver" << presenceDriver;
++        return false;
++    }
++
++    multimediaModule_ = new MultimediaModuleAdapter(stack_, this);
++    faceGateModule_ = new FaceGateModuleAdapter(stack_, faceGateConfigPath(), this);
++    if (!multimediaModule_->initialize() || !faceGateModule_->initialize()) {
++        qCritical() << "[SHELL] module initialization failed";
++        return false;
++    }
++
++    stack_->addWidget(multimediaModule_->rootWidget());
++    stack_->addWidget(faceGateModule_->rootWidget());
++
++    // CursorOverlay is the sole cursor instance for both business modules.
++    cursor_ = new CursorOverlay(this);
++    cursor_->setOverlayEnabled(cursorEnabled);
++    modeController_ = new ModeController(stack_,
++                                         multimediaModule_,
++                                         faceGateModule_,
++                                         cursor_,
++                                         this);
++    presenceSensor_ = new DebugMousePresenceSensor(multimediaModule_->rootWidget(),
++                                                   leftHoldEnabled,
++                                                   leftHoldDurationMs,
++                                                   this);
++
++    connect(presenceSensor_, &DebugMousePresenceSensor::presenceDetected,
++            modeController_, &ModeController::handlePresenceDetected);
++    connect(presenceSensor_, &DebugMousePresenceSensor::presenceLost,
++            modeController_, &ModeController::handlePresenceLost);
++    connect(presenceSensor_, &DebugMousePresenceSensor::sensorFault,
++            this, [](const QString &message) {
++                qWarning() << "[PRESENCE] fault" << message;
++            });
++    connect(modeController_, &ModeController::stateChanged,
++            this, [this](ModeController::AppModeState state) {
++                if (presenceSensor_) {
++                    presenceSensor_->setMultimediaActive(
++                        state == ModeController::AppModeState::MultimediaActive);
++                }
++                raiseCursorOverlay();
++            });
++    connect(modeController_, &ModeController::switchFailed,
++            this, [](const QString &message) {
++                qWarning() << "[MODE] switch failed" << message;
++            });
++
++    if (!modeController_->start() || !presenceSensor_->start()) {
++        shutdown();
++        return false;
++    }
++    presenceSensor_->setMultimediaActive(true);
++
++    initialized_ = true;
++    shutdown_ = false;
++    qInfo() << "[SHELL] initialized"
++            << "config=" << shellConfigPath()
++            << "presenceDriver=" << presenceDriver
++            << "cursorEnabled=" << cursorEnabled
++            << "facegateConfig=" << faceGateConfigPath();
++    raiseCursorOverlay();
++    return true;
++}
++
++void AppShell::shutdown()
++{
++    if (shutdown_) {
++        return;
++    }
++    shutdown_ = true;
++    if (presenceSensor_) {
++        presenceSensor_->stop();
++    }
++    if (modeController_) {
++        modeController_->shutdown();
++    }
++    initialized_ = false;
++    qInfo() << "[SHELL] shutdown complete";
++}
++
++QWidget *AppShell::multimediaRootWidget() const
++{
++    return multimediaModule_ ? multimediaModule_->rootWidget() : nullptr;
++}
++
++void AppShell::simulatePresenceLost()
++{
++    if (presenceSensor_) {
++        presenceSensor_->simulatePresenceLost();
++    }
++}
++
++void AppShell::raiseCursorOverlay()
++{
++    QTimer::singleShot(0, this, [this]() {
++        if (cursor_) {
++            cursor_->raise();
++        }
++    });
++}
++
++void AppShell::resizeEvent(QResizeEvent *event)
++{
++    QWidget::resizeEvent(event);
++    if (cursor_) {
++        cursor_->raise();
++    }
++}
++
++QString AppShell::shellConfigPath() const
++{
++    const QByteArray overridePath = qgetenv("APP_SHELL_CONFIG");
++    if (!overridePath.trimmed().isEmpty()) {
++        return QString::fromLocal8Bit(overridePath);
++    }
++    const QString appDir = QCoreApplication::applicationDirPath();
++    const QString deployed = QDir(appDir).filePath(QStringLiteral("app_shell.ini"));
++    if (QFileInfo::exists(deployed)) {
++        return deployed;
++    }
++    const QString appConfig = QDir(appDir).filePath(QStringLiteral("config/app_shell.ini"));
++    if (QFileInfo::exists(appConfig)) {
++        return appConfig;
++    }
++    return QDir::current().filePath(QStringLiteral("config/app_shell.ini"));
++}
++
++QString AppShell::faceGateConfigPath() const
++{
++    const QByteArray overridePath = qgetenv("FACEGATE_CONFIG");
++    if (!overridePath.trimmed().isEmpty()) {
++        return QString::fromLocal8Bit(overridePath);
++    }
++    const QString appDir = QCoreApplication::applicationDirPath();
++    const QString deployed = QDir(appDir).filePath(QStringLiteral("facegate.ini"));
++    if (QFileInfo::exists(deployed)) {
++        return deployed;
++    }
++    const QString appModuleConfig =
++        QDir(appDir).filePath(QStringLiteral("modules/facegate/FaceGateQt/config/facegate.ini"));
++    if (QFileInfo::exists(appModuleConfig)) {
++        return appModuleConfig;
++    }
++    const QString currentConfig = QDir::current().filePath(QStringLiteral("facegate.ini"));
++    if (QFileInfo::exists(currentConfig)) {
++        return currentConfig;
++    }
++    return QDir::current().filePath(
++        QStringLiteral("modules/facegate/FaceGateQt/config/facegate.ini"));
++}
+diff --git a/shell/AppShell.h b/shell/AppShell.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..0c77e1a62d6a7eab19da4ffc67c0b9a9e721d4d6
+--- /dev/null
++++ b/shell/AppShell.h
+@@ -0,0 +1,47 @@
++#ifndef APPSHELL_H
++#define APPSHELL_H
++
++#include <QWidget>
++
++class CursorOverlay;
++class DebugMousePresenceSensor;
++class FaceGateModuleAdapter;
++class ModeController;
++class MultimediaModuleAdapter;
++class QResizeEvent;
++class QStackedWidget;
++
++class AppShell final : public QWidget
++{
++    Q_OBJECT
++
++public:
++    explicit AppShell(QWidget *parent = nullptr);
++    ~AppShell() override;
++
++    bool initialize();
++    void shutdown();
++    QWidget *multimediaRootWidget() const;
++
++public slots:
++    void simulatePresenceLost();
++    void raiseCursorOverlay();
++
++protected:
++    void resizeEvent(QResizeEvent *event) override;
++
++private:
++    QString shellConfigPath() const;
++    QString faceGateConfigPath() const;
++
++    QStackedWidget *stack_ = nullptr;
++    CursorOverlay *cursor_ = nullptr;
++    MultimediaModuleAdapter *multimediaModule_ = nullptr;
++    FaceGateModuleAdapter *faceGateModule_ = nullptr;
++    ModeController *modeController_ = nullptr;
++    DebugMousePresenceSensor *presenceSensor_ = nullptr;
++    bool initialized_ = false;
++    bool shutdown_ = false;
++};
++
++#endif // APPSHELL_H
+diff --git a/shell/DebugMousePresenceSensor.cpp b/shell/DebugMousePresenceSensor.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..f5ea6e26a303421505374450de5c430eae276121
+--- /dev/null
++++ b/shell/DebugMousePresenceSensor.cpp
+@@ -0,0 +1,152 @@
++#include "DebugMousePresenceSensor.h"
++
++#include <QApplication>
++#include <QDebug>
++#include <QEvent>
++#include <QMouseEvent>
++#include <QTimer>
++#include <QWidget>
++
++DebugMousePresenceSensor::DebugMousePresenceSensor(QWidget *multimediaRoot,
++                                                   bool leftHoldEnabled,
++                                                   int holdDurationMs,
++                                                   QObject *parent)
++    : IPresenceSensor(parent),
++      multimediaRoot_(multimediaRoot),
++      holdDurationMs_(qMax(100, holdDurationMs)),
++      leftHoldEnabled_(leftHoldEnabled)
++{
++    holdTimer_ = new QTimer(this);
++    holdTimer_->setSingleShot(true);
++    connect(holdTimer_, &QTimer::timeout, this, [this]() {
++        if (!running_ || !multimediaActive_ ||
++            !leftHoldEnabled_ || !holdingLeftButton_) {
++            cancelHold("timeout conditions changed");
++            return;
++        }
++
++        holdingLeftButton_ = false;
++        qInfo() << "[PRESENCE] left-button hold completed"
++                << "durationMs=" << holdDurationMs_;
++        emit presenceDetected();
++    });
++}
++
++DebugMousePresenceSensor::~DebugMousePresenceSensor()
++{
++    stop();
++}
++
++bool DebugMousePresenceSensor::start()
++{
++    if (running_) {
++        return true;
++    }
++    if (!qApp || !multimediaRoot_) {
++        emit sensorFault(QStringLiteral("debug mouse sensor has no application or multimedia root"));
++        return false;
++    }
++
++    qApp->installEventFilter(this);
++    running_ = true;
++    cancelHold("start");
++    qInfo() << "[PRESENCE] debug mouse driver started"
++            << "leftHoldEnabled=" << leftHoldEnabled_
++            << "holdDurationMs=" << holdDurationMs_;
++    return true;
++}
++
++void DebugMousePresenceSensor::stop()
++{
++    if (!running_) {
++        return;
++    }
++    if (qApp) {
++        qApp->removeEventFilter(this);
++    }
++    running_ = false;
++    cancelHold("stop");
++    qInfo() << "[PRESENCE] debug mouse driver stopped";
++}
++
++bool DebugMousePresenceSensor::isRunning() const
++{
++    return running_;
++}
++
++void DebugMousePresenceSensor::setMultimediaActive(bool active)
++{
++    multimediaActive_ = active;
++    if (!active) {
++        cancelHold("multimedia inactive");
++    }
++}
++
++void DebugMousePresenceSensor::simulatePresenceLost()
++{
++    if (!running_) {
++        qInfo() << "[PRESENCE] simulated presenceLost ignored: sensor stopped";
++        return;
++    }
++    qInfo() << "[PRESENCE] simulated presenceLost";
++    emit presenceLost();
++}
++
++bool DebugMousePresenceSensor::eventFilter(QObject *watched, QEvent *event)
++{
++    if (!event) {
++        return false;
++    }
++
++    // Release is observed globally so a hold cannot remain armed if the
++    // pointer leaves the multimedia child before the button is released.
++    if (event->type() == QEvent::MouseButtonRelease && holdingLeftButton_) {
++        const auto *mouseEvent = static_cast<QMouseEvent *>(event);
++        if (mouseEvent->button() == Qt::LeftButton) {
++            cancelHold("left button released before timeout");
++        }
++        return false;
++    }
++
++    if (event->type() == QEvent::UngrabMouse ||
++        event->type() == QEvent::WindowDeactivate) {
++        cancelHold("mouse grab or window activation lost");
++        return false;
++    }
++
++    if (!running_ || !multimediaActive_ || !leftHoldEnabled_ ||
++        event->type() != QEvent::MouseButtonPress ||
++        !isMultimediaObject(watched)) {
++        return false;
++    }
++
++    const auto *mouseEvent = static_cast<QMouseEvent *>(event);
++    if (mouseEvent->button() == Qt::LeftButton && !holdingLeftButton_) {
++        holdingLeftButton_ = true;
++        holdTimer_->start(holdDurationMs_);
++        qInfo() << "[PRESENCE] left-button hold started"
++                << "durationMs=" << holdDurationMs_;
++    }
++
++    return false;
++}
++
++bool DebugMousePresenceSensor::isMultimediaObject(QObject *object) const
++{
++    QWidget *widget = qobject_cast<QWidget *>(object);
++    return multimediaRoot_ && widget &&
++           (widget == multimediaRoot_.data() || multimediaRoot_->isAncestorOf(widget));
++}
++
++void DebugMousePresenceSensor::cancelHold(const char *reason)
++{
++    const bool wasHolding = holdingLeftButton_ || (holdTimer_ && holdTimer_->isActive());
++    if (holdTimer_) {
++        holdTimer_->stop();
++    }
++    holdingLeftButton_ = false;
++    if (wasHolding) {
++        qInfo() << "[PRESENCE] left-button hold cancelled"
++                << "reason=" << reason;
++    }
++}
+diff --git a/shell/DebugMousePresenceSensor.h b/shell/DebugMousePresenceSensor.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..95aaaac4893b55332734014b2bec569ca4364e11
+--- /dev/null
++++ b/shell/DebugMousePresenceSensor.h
+@@ -0,0 +1,48 @@
++#ifndef DEBUGMOUSEPRESENCESENSOR_H
++#define DEBUGMOUSEPRESENCESENSOR_H
++
++#include "IPresenceSensor.h"
++
++#include <QPointer>
++
++class QEvent;
++class QTimer;
++class QWidget;
++
++class DebugMousePresenceSensor final : public IPresenceSensor
++{
++    Q_OBJECT
++
++public:
++    explicit DebugMousePresenceSensor(QWidget *multimediaRoot,
++                                      bool leftHoldEnabled,
++                                      int holdDurationMs,
++                                      QObject *parent = nullptr);
++    ~DebugMousePresenceSensor() override;
++
++    bool start() override;
++    void stop() override;
++    bool isRunning() const override;
++
++    void setMultimediaActive(bool active);
++
++public slots:
++    void simulatePresenceLost();
++
++protected:
++    bool eventFilter(QObject *watched, QEvent *event) override;
++
++private:
++    bool isMultimediaObject(QObject *object) const;
++    void cancelHold(const char *reason);
++
++    QPointer<QWidget> multimediaRoot_;
++    int holdDurationMs_ = 3000;
++    bool running_ = false;
++    bool multimediaActive_ = false;
++    bool leftHoldEnabled_ = true;
++    bool holdingLeftButton_ = false;
++    QTimer *holdTimer_ = nullptr;
++};
++
++#endif // DEBUGMOUSEPRESENCESENSOR_H
+diff --git a/shell/IApplicationModule.h b/shell/IApplicationModule.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..97ebc0e5178641a14c006ef4b70282aca6dc5d9b
+--- /dev/null
++++ b/shell/IApplicationModule.h
+@@ -0,0 +1,19 @@
++#ifndef IAPPLICATIONMODULE_H
++#define IAPPLICATIONMODULE_H
++
++class QWidget;
++
++class IApplicationModule
++{
++public:
++    virtual ~IApplicationModule() = default;
++
++    virtual QWidget *rootWidget() = 0;
++    virtual bool initialize() = 0;
++    virtual void activate() = 0;
++    virtual void deactivate() = 0;
++    virtual void shutdown() = 0;
++    virtual bool isActive() const = 0;
++};
++
++#endif // IAPPLICATIONMODULE_H
+diff --git a/shell/IPresenceSensor.h b/shell/IPresenceSensor.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..68d9ceaa285e917c99c2a0c62a6dcdd72407a34f
+--- /dev/null
++++ b/shell/IPresenceSensor.h
+@@ -0,0 +1,29 @@
++#ifndef IPRESENCESENSOR_H
++#define IPRESENCESENSOR_H
++
++#include <QObject>
++#include <QString>
++
++class IPresenceSensor : public QObject
++{
++    Q_OBJECT
++
++public:
++    explicit IPresenceSensor(QObject *parent = nullptr)
++        : QObject(parent)
++    {
++    }
++
++    ~IPresenceSensor() override = default;
++
++    virtual bool start() = 0;
++    virtual void stop() = 0;
++    virtual bool isRunning() const = 0;
++
++signals:
++    void presenceDetected();
++    void presenceLost();
++    void sensorFault(const QString &message);
++};
++
++#endif // IPRESENCESENSOR_H
+diff --git a/shell/ModeController.cpp b/shell/ModeController.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..4f4a97b7bae57d1bb6207112c533f52aed047005
+--- /dev/null
++++ b/shell/ModeController.cpp
+@@ -0,0 +1,153 @@
++#include "ModeController.h"
++
++#include "IApplicationModule.h"
++#include "components/cursoroverlay/CursorOverlay.h"
++
++#include <QDebug>
++#include <QStackedWidget>
++#include <QTimer>
++
++ModeController::ModeController(QStackedWidget *stack,
++                               IApplicationModule *multimediaModule,
++                               IApplicationModule *faceGateModule,
++                               CursorOverlay *cursor,
++                               QObject *parent)
++    : QObject(parent),
++      stack_(stack),
++      multimediaModule_(multimediaModule),
++      faceGateModule_(faceGateModule),
++      cursor_(cursor)
++{
++}
++
++bool ModeController::start()
++{
++    if (started_) {
++        return true;
++    }
++    if (!stack_ || !multimediaModule_ || !faceGateModule_ ||
++        !multimediaModule_->rootWidget() || !faceGateModule_->rootWidget()) {
++        emit switchFailed(QStringLiteral("mode controller dependencies are incomplete"));
++        return false;
++    }
++
++    faceGateModule_->deactivate();
++    stack_->setCurrentWidget(multimediaModule_->rootWidget());
++    multimediaModule_->activate();
++    if (!multimediaModule_->isActive()) {
++        emit switchFailed(QStringLiteral("multimedia module activation failed"));
++        return false;
++    }
++
++    started_ = true;
++    setState(AppModeState::MultimediaActive);
++    raiseCursor();
++    qInfo() << "[MODE] initial multimedia mode active";
++    return true;
++}
++
++void ModeController::shutdown()
++{
++    if (state_ == AppModeState::ShuttingDown) {
++        return;
++    }
++    setState(AppModeState::ShuttingDown);
++    if (multimediaModule_) {
++        multimediaModule_->deactivate();
++    }
++    if (faceGateModule_) {
++        faceGateModule_->deactivate();
++    }
++    if (multimediaModule_) {
++        multimediaModule_->shutdown();
++    }
++    if (faceGateModule_) {
++        faceGateModule_->shutdown();
++    }
++    started_ = false;
++    qInfo() << "[MODE] modules shut down";
++}
++
++ModeController::AppModeState ModeController::state() const
++{
++    return state_;
++}
++
++void ModeController::handlePresenceDetected()
++{
++    if (!started_ || state_ != AppModeState::MultimediaActive) {
++        qInfo() << "[MODE] presenceDetected ignored"
++                << "state=" << static_cast<int>(state_);
++        return;
++    }
++
++    qInfo() << "[MODE] switching multimedia -> facegate";
++    setState(AppModeState::SwitchingToFaceGate);
++    multimediaModule_->deactivate();
++    stack_->setCurrentWidget(faceGateModule_->rootWidget());
++    faceGateModule_->activate();
++
++    if (!faceGateModule_->isActive()) {
++        qWarning() << "[MODE] facegate activation failed; rolling back";
++        faceGateModule_->deactivate();
++        stack_->setCurrentWidget(multimediaModule_->rootWidget());
++        multimediaModule_->activate();
++        setState(AppModeState::MultimediaActive);
++        raiseCursor();
++        emit switchFailed(QStringLiteral("facegate activation failed; multimedia restored"));
++        return;
++    }
++
++    setState(AppModeState::FaceGateActive);
++    raiseCursor();
++    qInfo() << "[MODE] facegate mode active";
++}
++
++void ModeController::handlePresenceLost()
++{
++    if (!started_ || state_ != AppModeState::FaceGateActive) {
++        qInfo() << "[MODE] presenceLost ignored"
++                << "state=" << static_cast<int>(state_);
++        return;
++    }
++
++    qInfo() << "[MODE] switching facegate -> multimedia";
++    setState(AppModeState::SwitchingToMultimedia);
++    faceGateModule_->deactivate();
++    stack_->setCurrentWidget(multimediaModule_->rootWidget());
++    multimediaModule_->activate();
++
++    if (!multimediaModule_->isActive()) {
++        qWarning() << "[MODE] multimedia activation failed; restoring facegate";
++        stack_->setCurrentWidget(faceGateModule_->rootWidget());
++        faceGateModule_->activate();
++        setState(faceGateModule_->isActive()
++                 ? AppModeState::FaceGateActive
++                 : AppModeState::SwitchingToMultimedia);
++        raiseCursor();
++        emit switchFailed(QStringLiteral("multimedia activation failed"));
++        return;
++    }
++
++    setState(AppModeState::MultimediaActive);
++    raiseCursor();
++    qInfo() << "[MODE] multimedia mode active";
++}
++
++void ModeController::setState(AppModeState state)
++{
++    if (state_ == state) {
++        return;
++    }
++    state_ = state;
++    emit stateChanged(state_);
++}
++
++void ModeController::raiseCursor()
++{
++    QTimer::singleShot(0, this, [this]() {
++        if (cursor_) {
++            cursor_->raise();
++        }
++    });
++}
+diff --git a/shell/ModeController.h b/shell/ModeController.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..f2682bb333ceca6d578052cc034ec65a1266d8ee
+--- /dev/null
++++ b/shell/ModeController.h
+@@ -0,0 +1,55 @@
++#ifndef MODECONTROLLER_H
++#define MODECONTROLLER_H
++
++#include <QObject>
++#include <QString>
++
++class CursorOverlay;
++class IApplicationModule;
++class QStackedWidget;
++
++class ModeController final : public QObject
++{
++    Q_OBJECT
++
++public:
++    enum class AppModeState {
++        MultimediaActive,
++        SwitchingToFaceGate,
++        FaceGateActive,
++        SwitchingToMultimedia,
++        ShuttingDown
++    };
++    Q_ENUM(AppModeState)
++
++    explicit ModeController(QStackedWidget *stack,
++                            IApplicationModule *multimediaModule,
++                            IApplicationModule *faceGateModule,
++                            CursorOverlay *cursor,
++                            QObject *parent = nullptr);
++
++    bool start();
++    void shutdown();
++    AppModeState state() const;
++
++public slots:
++    void handlePresenceDetected();
++    void handlePresenceLost();
++
++signals:
++    void stateChanged(ModeController::AppModeState state);
++    void switchFailed(const QString &message);
++
++private:
++    void setState(AppModeState state);
++    void raiseCursor();
++
++    QStackedWidget *stack_ = nullptr;
++    IApplicationModule *multimediaModule_ = nullptr;
++    IApplicationModule *faceGateModule_ = nullptr;
++    CursorOverlay *cursor_ = nullptr;
++    AppModeState state_ = AppModeState::SwitchingToMultimedia;
++    bool started_ = false;
++};
++
++#endif // MODECONTROLLER_H
