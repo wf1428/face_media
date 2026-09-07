@@ -1,321 +1,222 @@
 # MergedQtApp
 
-MergedQtApp 是运行在 RK3566 上的 Qt 5.12.8 单进程融合应用，将原多媒体系统与 FaceGateQt 人脸门禁系统合并到同一个 `QApplication` 和 EGLFS 顶层窗口中。
+MergedQtApp 是面向 RK3566 嵌入式终端的 Qt 综合应用，包含多媒体播放、人脸门禁、IC 卡与二维码业务、设备通信、网络管理和系统设置。
 
-## 工程结构
+工程将原多媒体系统与 FaceGate 人脸识别系统集成到同一进程，由统一应用外壳管理界面和模块生命周期，适用于 Qt EGLFS/KMS 全屏运行环境。
+
+## 系统架构
 
 ```text
-AppShell（唯一 EGLFS 顶层窗口）
-├── QStackedWidget
-│   ├── MultimediaModuleAdapter
-│   │   └── 原多媒体 MainWindow
-│   └── FaceGateModuleAdapter
-│       └── FaceGateMainWindow
-├── ModeController                 模式切换状态机
-├── Sr505PresenceSensor            /dev/sr505 人体感应适配
-├── LedFillLight                   /dev/led 补光灯适配
-└── CursorOverlay                  全程序唯一光标实例
+                           MergedQtApp
+                                │
+              ┌─────────────────┴─────────────────┐
+              │             AppShell              │
+              │  单一顶层窗口 / 模式与资源调度   │
+              └─────────────────┬─────────────────┘
+                                │
+          ┌─────────────────────┴─────────────────────┐
+          │                                           │
+┌─────────▼──────────┐                      ┌─────────▼──────────┐
+│   多媒体业务模块   │                      │   人脸门禁模块     │
+│ MultimediaModule  │                      │ FaceGateModule     │
+├────────────────────┤                      ├────────────────────┤
+│ 本地视频/图片轮播  │                      │ 摄像头采集与预览   │
+│ 网络直播与录播     │                      │ 人脸检测与识别     │
+│ GStreamer 播放     │                      │ RKNN 活体检测      │
+│ FTP 下载与文件管理 │                      │ 人员与通行记录     │
+│ 音量/网络/磁盘状态 │                      │ 录入与后台管理     │
+└─────────┬──────────┘                      └─────────┬──────────┘
+          │                                           │
+          └─────────────────────┬─────────────────────┘
+                                │
+        ┌───────────────────────▼────────────────────────┐
+        │              公共服务与设备业务层              │
+        │ MQTT / SQLite / IC卡 / 二维码 / RS485 / 串口  │
+        │ SR505 / 补光灯 / U盘 / 配置 / 日志 / 心跳     │
+        └───────────────────────┬────────────────────────┘
+                                │
+        ┌───────────────────────▼────────────────────────┐
+        │                 RK3566 平台层                  │
+        │ EGLFS/KMS / OpenGL ES / RGA / MPP / V4L2     │
+        │ ALSA / RTC / Linux 设备节点与系统接口          │
+        └────────────────────────────────────────────────┘
 ```
 
-主要目录：
+程序只创建一个 `QApplication` 和一个 EGLFS 顶层窗口。多媒体主界面与人脸门禁界面作为 `QStackedWidget` 的两个页面运行，避免多个原生窗口和 EGL Surface 竞争显示资源。
 
-| 路径 | 说明 |
+## 主要功能
+
+### 多媒体系统
+
+- 本地视频和图片混合轮播
+- HLS、RTSP、RTMP、SRT、UDP 和 HTTP-TS 等网络媒体播放
+- 直播切换、异常重试、无帧监测和播放恢复
+- 录播文件远程下载、更新和播放
+- GStreamer 解码、RGA 图像处理和 OpenGL 显示
+- 播放列表、音量控制、画面截图和播放状态上报
+- 网络状态、磁盘空间和 U 盘状态监测
+- 文件管理、FTP、MQTT、网络和系统设置
+
+### 门禁系统
+
+- USB/MIPI 摄像头采集与实时预览
+- InspireFace 人脸检测、特征提取和身份比对
+- RKNN 活体检测
+- 人脸注册、人员导入导出和人员信息管理
+- 识别结果、现场抓拍和通行记录
+- IC 卡、二维码、密码及人脸通行方式
+- 在线和离线业务模式
+- 管理员登录、参数配置和维护界面
+
+### 通信与设备
+
+- 通过本地 MQTT IPC 与 `mqttd` 通信
+- online_v1、online_v2 和 offline_v1 业务分流
+- IC 板、信号板、二维码扫描器和 RS485 通信
+- SQLite 本地数据存储与 MySQL 人脸业务支持
+- SR505 人体感应和 LED 补光灯控制
+- RTC、设备序列号、系统重启和运行心跳
+
+## 应用运行关系
+
+应用启动后默认进入多媒体模式。人体感应触发后，外壳暂停多媒体模块并激活人脸门禁模块；人脸模块按需启动摄像头、推理和活体检测。人脸业务结束且满足返回条件后，人脸模块释放运行资源，多媒体模块恢复原播放状态。
+
+```text
+应用启动
+   │
+   ▼
+多媒体模式 ── 人体感应 ──► 人脸门禁模式
+   ▲                            │
+   └──── 识别结束/现场无人 ─────┘
+```
+
+`ModeController` 负责切换顺序和状态保护，两个业务模块通过适配器提供统一的初始化、激活、停用和关闭接口。
+
+## 摄像头与图像处理
+
+人脸模块通过统一采集接口支持以下摄像头链路：
+
+| 摄像头类型 | 数据路径 |
 | --- | --- |
-| `shell/` | 应用外壳、模式控制、SR505 和补光灯 |
-| `modules/multimedia/` | 多媒体模块适配层 |
-| `modules/facegate/` | 人脸门禁模块及适配层 |
-| `modules/facegate/FaceGateQt/core/` | 摄像头、推理、活体和验证核心逻辑 |
-| `components/rga/` | Rockchip RGA 图像转换封装 |
-| `platform/` | RK3566 路径、设备节点和系统操作适配 |
-| `config/` | 融合外壳配置 |
-| `deploy/rk3566/` | RK3566 启动和部署脚本 |
+| MIPI | V4L2 → NV12/NV21 → RGA |
+| USB YUYV | V4L2 MMAP → YUYV → RGA → NV12 |
+| USB MJPEG | V4L2/GStreamer → MJPEG → MPP → NV12 |
 
-正式入口是根目录的 `main.cpp`。`MergedQtApp.pro` 是规范工程入口，并包含实际构建文件 `qt_ycest.pro`；FaceGateQt 自带的独立入口不参与融合程序构建。
+程序默认自动扫描可用的 V4L2/UVC 采集节点并选择匹配的后端。不同输入经过统一图像处理后，交由预览、人脸识别、活体检测和录入流程使用。
 
-## 模式切换逻辑
+## 目录结构
 
-应用默认进入多媒体界面，两条业务链路互斥运行：
-
-- 进入人脸模式前，多媒体模块暂停播放并保留当前直播或媒体目标。
-- 进入人脸模式后，启动人脸引擎、活体线程和摄像头采集链路。
-- 返回多媒体模式时，停止摄像头和活体线程，再恢复暂停前的媒体目标。
-- FaceGate 数据库线程按原有策略保留，不随每次界面切换重复创建。
-
-SR505 的当前规则如下：
-
-1. 只有多媒体主界面允许人体感应触发模式切换；设置页等受保护界面不会被强制切走。
-2. SR505 高电平切换到人脸识别界面。应用启动时读取到的初始高电平同样有效。
-3. 人脸识别界面中，如果已经检测到人脸，SR505 变为低电平不会中断识别。
-4. 如果没有检测到人脸、没有识别结果保持、也不在密码或管理界面，SR505 低电平会立即返回多媒体界面。
-5. 最终识别成功或失败后启动外壳返回计时，默认保持 5 秒；期间忽略 SR505 下降沿。
-6. 5 秒到期时：SR505 仍为高电平则继续停留在人脸界面并恢复识别；已经为低电平则返回多媒体界面。
-7. 密码输入和管理面板期间禁止人体感应切换，避免正在进行的操作被打断。
-
-外壳返回时间由 `config/app_shell.ini` 中的以下配置控制：
-
-```ini
-[modeSwitch]
-recognitionReturnMs=5000
+```text
+MergedQtApp/
+├── common/                  公共协议、数据访问、客户端和工作线程
+├── components/              多媒体、设置、输入、文件管理等通用组件
+├── config/                  应用外壳配置
+├── deploy/rk3566/           RK3566 启动与部署脚本
+├── device/                  设备配置与底层适配
+├── docs/                    接口、移植和专项设计文档
+├── ic_board/                IC 卡、二维码和门禁控制业务
+├── modules/
+│   ├── multimedia/          多媒体模块适配层
+│   └── facegate/            人脸门禁模块及 FaceGateQt
+├── platform/                RK3566 路径和系统能力封装
+├── shell/                   应用外壳、模式控制和模块接口
+├── static/                  图片、配置和默认媒体资源
+├── main.cpp                 融合应用入口
+├── mainwindow.cpp/.h/.ui    多媒体主窗口
+├── MergedQtApp.pro          qmake 工程入口
+└── qt_ycest.pro             源文件、依赖与链接配置
 ```
 
-FaceGate 配置中的 `verify/result_hold_ms` 属于识别模块内部结果状态，和外壳的 5 秒模式返回计时不是同一个参数。
+### 核心模块
 
-## 补光灯逻辑
-
-- 进入 FaceGate 并成功激活识别链路时，向 `/dev/led` 写入 `1`。
-- 最终通行成功时关闭补光灯。
-- 结果保持结束后，如果人体仍为高电平并继续识别，则重新打开补光灯。
-- 返回多媒体界面、应用启动和应用退出时都会主动关闭补光灯。
-- `/dev/led` 不存在或控制失败只记录警告，不阻止界面切换和人脸识别。
-
-## 摄像头自动适配
-
-默认摄像头来源为 `auto`。正常部署不需要修改配置文件，也不需要设置环境变量来区分 MIPI、USB YUYV 或 USB MJPEG 摄像头。
-
-自动探测过程：
-
-1. 按名称扫描 `/dev/video*`。
-2. 只接受驱动为 `uvcvideo`，并同时具有 `Video Capture` 和 `Streaming` 能力的 USB 节点；Metadata 节点会被排除。
-3. 使用 `VIDIOC_ENUM_FMT` 判断节点是否支持 `MJPG` 和 `YUYV`。
-4. 根据实际支持格式选择后端，而不是依赖固定的 `/dev/video9` 等节点编号。
-5. 所有 USB 候选均启动失败时，才回退到原 MIPI 链路。
-
-选择顺序：
-
-| 摄像头能力 | 处理方式 |
+| 模块 | 主要职责 |
 | --- | --- |
-| 同时支持 MJPEG、YUYV | 优先 MJPEG/MPP，失败后回退 YUYV |
-| 仅支持 MJPEG | 使用 MJPEG/MPP |
-| 仅支持 YUYV | 使用原 USB YUYV 链路 |
-| 没有可用 USB 摄像头 | 使用原 MIPI 链路 |
+| `shell/AppShell` | 创建统一窗口并装配两个业务模块 |
+| `shell/ModeController` | 管理多媒体和人脸模式切换 |
+| `components/multimedia` | 播放器、本地轮播、直播、状态监测和截图 |
+| `components/settings` | 网络、FTP、MQTT、音频及系统设置 |
+| `modules/facegate/FaceGateQt` | 人脸识别、活体、录入、记录和管理 |
+| `common` | 协议解析、串口客户端、数据库和公共任务 |
+| `ic_board` | IC 卡、二维码、在线/离线门禁及 RS485 |
+| `platform` | RK3566 文件路径、设备节点和系统调用 |
 
-双格式摄像头成功识别时会输出：
+## 技术栈
 
-```text
-[CAMERA-AUTO] dual-format USB camera; preferring MJPEG/MPP /dev/videoN
-```
-
-### MIPI 链路
-
-原 MIPI 实现保持不变：使用 V4L2 MMAP 采集 `[camera]` 中配置的 NV12 或 NV21 数据，再交给现有 RGA 和人脸处理流程。
-
-### USB YUYV 链路
-
-原 USB YUYV 实现保持独立：
-
-```text
-V4L2/UVC YUYV (MMAP)
-    -> RGA
-    -> NV12
-    -> RGB/预览/人脸检测与识别
-```
-
-摄像头不支持的白平衡、曝光等 UVC 控制只会产生警告，不应导致采集失败。例如：
-
-```text
-[CAMERA-BACKEND] USB control exposure_auto_priority: unsupported
-```
-
-### USB MJPEG/MPP 链路
-
-MJPEG 后端单独实现在：
-
-- `modules/facegate/FaceGateQt/core/UsbMjpegCaptureBackend.h`
-- `modules/facegate/FaceGateQt/core/UsbMjpegCaptureBackend.cpp`
-
-它没有与原 YUYV 或 MIPI 后端混写，管线为：
-
-```text
-v4l2src (mmap)
-    -> image/jpeg caps
-    -> jpegparse
-    -> mppjpegdec format=NV12
-    -> video/x-raw,format=NV12
-    -> appsink
-    -> RGA/RGB/预览/人脸检测与识别
-```
-
-`appsink` 只保留最新一帧，避免推理速度低于摄像头帧率时累积历史画面。MPP 解码输出可能带有 stride，后端按有效宽高复制 Y、UV 平面，向现有 `CameraService` 提供连续 NV12 数据。
-
-退出人脸模式时，MJPEG 后端先释放当前样本，将 GStreamer 管线切换到 `NULL`，再释放 bus、pipeline 和 MPP 资源。YUYV/MIPI 后端执行 `VIDIOC_STREAMOFF`、解除映射并关闭设备句柄。
-
-### 画面方向
-
-当前工程没有对摄像头画面做水平镜像。不同 USB 摄像头显示方向不一致，通常来自摄像头固件输出方向、传感器安装方向或镜头模组设计，而不是 MJPEG 解码产生的镜像。预览和送入检测识别的图像来自同一帧，若后续需要统一镜像，应同时作用于显示和算法输入，不能只翻转预览。
-
-## 配置文件
-
-### 外壳配置
-
-源码配置：`config/app_shell.ini`。
-
-程序查找顺序：
-
-1. `APP_SHELL_CONFIG` 指定的路径（仅作为可选调试覆盖）。
-2. 可执行文件同目录的 `app_shell.ini`。
-3. 可执行文件目录下的 `config/app_shell.ini`。
-4. 当前工作目录下的 `config/app_shell.ini`。
-
-主要配置：
-
-```ini
-[application]
-initialMode=multimedia
-
-[modeSwitch]
-presenceDriver=sr505
-sr505Device=/dev/sr505
-sr505ActiveHigh=true
-sr505ReconnectMs=1000
-recognitionReturnMs=5000
-
-[fillLight]
-device=/dev/led
-```
-
-目前仅支持以多媒体模式启动；其他 `initialMode` 值会记录警告并强制使用 `multimedia`。
-
-### FaceGate 配置
-
-RK3566 运行时路径固定为：
-
-```text
-/home/cat/face_media/modules/facegate/FaceGateQt/config/facegate.ini
-```
-
-如果目标文件不存在，程序会从资源中的根目录 `facegate.ini` 模板创建；已存在的运行配置不会被覆盖。
-
-摄像头主要参数：
-
-```ini
-[camera]
-device=/dev/video0
-width=640
-height=480
-pixel_format=nv12
-
-[camera_usb]
-device=auto
-width=640
-height=480
-fps=30
-```
-
-自动模式会自行判断 USB 原始格式，因此不需要手工把 `camera_usb/pixel_format` 改成 MJPEG。`QT_YCEST_CAMERA_SOURCE=auto|usb|mipi` 仍保留为开发诊断覆盖；未设置时就是 `auto`。
-
-## 构建依赖
-
-- Qt 5.12.8：Core、Gui、Widgets、OpenGL、SerialPort、Network、Sql、VirtualKeyboard、QML、Quick、QuickWidgets。
-- GStreamer 1.0：core、app、video、allocators、rtp 及运行时插件 `v4l2src`、`jpegparse`、`appsink`。
-- Rockchip MPP GStreamer 插件：`mppjpegdec`。
-- Rockchip RGA：必须提供 `librga.pc` 或 `rockchip_rga.pc`，工程不启用 CPU 图像转换回退。
-- InspireFace SDK、RKNN Runtime 和对应 RK3566 sysroot。
-- Linux V4L2/UVC 驱动及目标设备节点权限。
-
-`qt_ycest.pro` 顶部的 `INSPIREFACE_ROOT`、`RKNN_ROOT` 和 `SYSROOT` 需要与实际构建环境一致。
+- C++17
+- Qt 5.12.8
+- GStreamer 1.0
+- OpenGL ES 2.0
+- Rockchip RGA
+- Rockchip MPP
+- RKNN Runtime
+- InspireFace SDK
+- V4L2/UVC
+- SQLite / MySQL
+- MQTT / FTP
 
 ## 构建
 
-在已经配置 Qt、pkg-config 和交叉编译 sysroot 的环境中执行：
+构建前需要准备 RK3566 交叉编译工具链、Qt 5.12.8、目标 sysroot 和相关开发库。
+
+检查 `qt_ycest.pro` 中的 SDK 路径：
+
+```text
+INSPIREFACE_ROOT
+RKNN_ROOT
+SYSROOT
+```
+
+执行：
 
 ```sh
 qmake MergedQtApp.pro
 make -j4
 ```
 
-构建前可检查 MJPEG 所需插件：
+生成的可执行程序为：
 
-```sh
-gst-inspect-1.0 v4l2src
-gst-inspect-1.0 jpegparse
-gst-inspect-1.0 mppjpegdec
-gst-inspect-1.0 appsink
+```text
+MergedQtApp
 ```
+
+## 配置
+
+| 配置 | 说明 |
+| --- | --- |
+| `config/app_shell.ini` | 应用模式、人体感应和补光灯 |
+| `modules/facegate/FaceGateQt/config/facegate.ini` | 摄像头、模型、识别、数据库和音频 |
+| `static/demoResources/images/logo/ycest_cfg.ini` | 多媒体及界面配置 |
+| `static/demoResources/images/logo/net_cfg.ini` | 网络、协议和设备配置 |
+
+目标机上的模型、数据库、音频、媒体和静态资源需要保持工程约定的目录结构。
 
 ## 运行
 
-将二进制、配置、模型、数据库、音频和静态资源部署到约定目录后执行：
+RK3566 目标机使用：
 
 ```sh
 chmod +x deploy/rk3566/run_merged_qt_app.sh
 deploy/rk3566/run_merged_qt_app.sh
 ```
 
-脚本默认设置：
+启动脚本默认使用：
 
 ```text
 QT_QPA_PLATFORM=eglfs
 QT_QPA_EGLFS_INTEGRATION=eglfs_kms
-QT_QPA_EGLFS_FORCE888=1
-QT_QPA_EGLFS_SWAPINTERVAL=1
 ```
 
-若外部已经设置这些变量，脚本会尊重外部值。程序仍禁止 `linuxfb`。桌面调试可以显式执行：
+桌面环境调试可显式选择 XCB：
 
 ```sh
 QT_QPA_PLATFORM=xcb ./MergedQtApp
 ```
 
-## 摄像头验证与排障
+## 相关文档
 
-列出设备及能力：
-
-```sh
-v4l2-ctl --list-devices
-v4l2-ctl -d /dev/video9 -D
-v4l2-ctl -d /dev/video9 --list-formats-ext
-```
-
-独立验证 640x480@30 MJPEG 输入和 MPP 解码：
-
-```sh
-gst-launch-1.0 -e -v \
-  v4l2src device=/dev/video9 io-mode=mmap do-timestamp=true num-buffers=300 \
-  ! image/jpeg,width=640,height=480,framerate=30/1 \
-  ! jpegparse \
-  ! mppjpegdec format=NV12 \
-  ! video/x-raw,format=NV12 \
-  ! fakesink sync=false
-```
-
-设备节点编号可能随插拔变化，以上 `/dev/video9` 仅用于命令行验证；应用自动模式不依赖该固定编号。
-
-常见错误：
-
-- `The pixelformat 'YUYV' is invalid`：当前摄像头节点不支持 YUYV，应使用其枚举出的 MJPEG 格式。
-- `USB MJPEG pipeline did not reach PLAYING`：先用独立 GStreamer 命令确认 UVC 协商、插件和 MPP 解码器。
-- `Failed to set/query UVC probe control: -110`：UVC 控制传输超时，通常发生在 MPP 解码前，优先检查摄像头固件、USB 供电、线材、Hub 以及 Linux 4.19 挂起/恢复兼容性。
-- `USB VIDIOC_S_FMT failed (errno=5)`：UVC 格式协商返回 I/O 错误，不代表 YUYV 到 NV12 的 RGA 转换出错。
-- `rkisp-vir0: update sensor info failed -19` 或 `MIPI VIDIOC_STREAMON failed (errno=19)`：自动模式在 USB 后端全部失败后尝试 MIPI 回退，而设备上没有可用 MIPI 传感器时产生的次级错误。
-- `[FILL-LIGHT] cannot open LED device`：补光灯节点不存在，不影响摄像头和识别主链路。
-
-## USB 释放与发热说明
-
-回到多媒体界面后，可以用以下命令确认摄像头没有被进程占用：
-
-```sh
-fuser -v /dev/video9 /dev/video10
-```
-
-确认 USB 运行时电源状态：
-
-```sh
-USB_IF=$(readlink -f /sys/class/video4linux/video9/device)
-USB_DEV=$(dirname "$USB_IF")
-
-cat "$USB_DEV/power/control"
-cat "$USB_DEV/power/runtime_status"
-cat "$USB_DEV/power/autosuspend_delay_ms"
-cat "$USB_DEV/power/runtime_usage"
-```
-
-典型的正常释放结果是：
-
-```text
-control=auto
-runtime_status=suspended
-runtime_usage=0
-```
-
-`suspended` 表示软件采集链路已经释放并进入 USB 运行时挂起，不代表 USB 5V 已物理断开。摄像头在挂起后仍发热，通常与模组内部传感器、ISP、USB 桥或稳压电路继续供电有关。若产品要求多媒体模式下彻底断电降温，需要支持独立端口断电的 USB Hub，或增加由 GPIO 控制的 USB 5V 负载开关；单纯销毁 GStreamer/MPP 管线不能保证切断 VBUS。
+- [技术文档](docs/technical_doc.md)
+- [接口文档](docs/interface_doc.md)
+- [RK3566 移植说明](docs/rk3566_porting.md)
+- [性能文档](docs/performance_doc.md)
+- [FaceGate 设计说明](modules/facegate/FaceGateQt/docs/face_gate_design.md)
 
