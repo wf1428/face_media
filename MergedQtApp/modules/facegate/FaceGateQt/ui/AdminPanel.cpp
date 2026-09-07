@@ -34,6 +34,7 @@
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QHideEvent>
 #include <QHostAddress>
 #include <QInputDialog>
 #include <QJsonObject>
@@ -59,6 +60,7 @@
 #include <QSlider>
 #include <QSize>
 #include <QSizePolicy>
+#include <QShowEvent>
 #include <QStorageInfo>
 #include <QUrl>
 #include <QStackedWidget>
@@ -456,6 +458,99 @@ qint64 meminfoValueKb(const QString &text, const QString &key)
     return 0;
 }
 
+/** @brief 在专用线程内读取系统设备状态并维护 CPU 采样基线。 */
+class DeviceStatusCollector : public QObject {
+public:
+    DeviceStatusSnapshot collect()
+    {
+        DeviceStatusSnapshot snapshot;
+        snapshot.serialNumber = deviceSerialNumber();
+        snapshot.ipAddress = firstIpv4Address();
+        snapshot.macAddress = firstMacAddress();
+
+        const QStorageInfo storage = storageForApplicationData();
+        const qint64 total = storage.bytesTotal();
+        const qint64 free = storage.bytesFree();
+        const qint64 used = total > 0 ? qBound<qint64>(0, total - free, total) : 0;
+        snapshot.diskCapacity = total > 0
+            ? QString("%1 / %2").arg(formatBytes(used)).arg(formatBytes(total))
+            : QStringLiteral("--");
+        snapshot.diskRootPath = storage.rootPath();
+
+        QFile statFile(QStringLiteral("/proc/stat"));
+        if (statFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            const QList<QByteArray> fields = statFile.readLine().simplified().split(' ');
+            if (fields.size() >= 8 && fields.first() == "cpu") {
+                qint64 values[7] = {0, 0, 0, 0, 0, 0, 0};
+                for (int i = 0; i < 7; ++i) {
+                    values[i] = fields.value(i + 1).toLongLong();
+                }
+                const qint64 idle = values[3] + values[4];
+                const qint64 cpuTotal = values[0] + values[1] + values[2] + values[3]
+                    + values[4] + values[5] + values[6];
+                const qint64 totalDelta = cpuTotal - lastCpuTotal_;
+                const qint64 idleDelta = idle - lastCpuIdle_;
+                if (lastCpuTotal_ > 0 && totalDelta > 0) {
+                    const double usage =
+                        (1.0 - static_cast<double>(idleDelta) / static_cast<double>(totalDelta)) * 100.0;
+                    snapshot.cpuUsage = QString("%1%").arg(qBound(0.0, usage, 100.0), 0, 'f', 1);
+                }
+                lastCpuTotal_ = cpuTotal;
+                lastCpuIdle_ = idle;
+            }
+        }
+        if (snapshot.cpuUsage.isEmpty()) {
+            snapshot.cpuUsage = QStringLiteral("--");
+        }
+
+        QFile meminfoFile(QStringLiteral("/proc/meminfo"));
+        QString meminfoText;
+        if (meminfoFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            meminfoText = QString::fromLocal8Bit(meminfoFile.readAll());
+        } else {
+            qWarning().noquote() << "读取 /proc/meminfo 失败：" << meminfoFile.errorString();
+        }
+        if (meminfoText.trimmed().isEmpty()) {
+            QProcess cat;
+            cat.start(QStringLiteral("/bin/cat"), QStringList() << QStringLiteral("/proc/meminfo"));
+            if (cat.waitForFinished(800)) {
+                meminfoText = QString::fromLocal8Bit(cat.readAllStandardOutput());
+                qWarning().noquote() << "QFile 读取 meminfo 为空，已尝试 /bin/cat 兜底，输出长度："
+                                     << meminfoText.size();
+            } else {
+                qWarning().noquote() << "/bin/cat /proc/meminfo 超时或失败：" << cat.errorString();
+            }
+        }
+
+        const qint64 totalKb = meminfoValueKb(meminfoText, QStringLiteral("MemTotal"));
+        qint64 availableKb = meminfoValueKb(meminfoText, QStringLiteral("MemAvailable"));
+        const qint64 freeKb = meminfoValueKb(meminfoText, QStringLiteral("MemFree"));
+        const qint64 buffersKb = meminfoValueKb(meminfoText, QStringLiteral("Buffers"));
+        const qint64 cachedKb = meminfoValueKb(meminfoText, QStringLiteral("Cached"));
+        if (availableKb <= 0) {
+            availableKb = freeKb + buffersKb + cachedKb;
+        }
+        if (totalKb > 0) {
+            const qint64 usedKb = qBound<qint64>(0, totalKb - availableKb, totalKb);
+            const double usedPercent = static_cast<double>(usedKb) * 100.0 / static_cast<double>(totalKb);
+            snapshot.memoryUsage = QString("%1% (%2/%3)")
+                .arg(usedPercent, 0, 'f', 1)
+                .arg(formatBytes(usedKb * 1024))
+                .arg(formatBytes(totalKb * 1024));
+        } else {
+            snapshot.memoryUsage = QStringLiteral("--");
+        }
+
+        snapshot.temperature = currentTemperature();
+        snapshot.npuUsage = npuUsage();
+        return snapshot;
+    }
+
+private:
+    qint64 lastCpuTotal_ = 0;
+    qint64 lastCpuIdle_ = 0;
+};
+
 const int kEmbeddedKeyboardHeight = 300;
 const int kAdminSidebarWidth = 184;
 const int kAdminOuterMargin = 16;
@@ -506,6 +601,11 @@ AdminPanel::AdminPanel(const AppConfig &config, QWidget *parent)
     navList_ = new QListWidget(sidebar);
     navList_->setObjectName("navList");
     navList_->setIconSize(QSize(22, 22));
+    navList_->setMinimumHeight(0);
+    navList_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    navList_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    navList_->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    navList_->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
     navList_->addItem(new QListWidgetItem(QIcon(QStringLiteral(":/icons/nav/device.svg")), QStringLiteral("本机信息")));
     navList_->addItem(new QListWidgetItem(QIcon(QStringLiteral(":/icons/nav/users.svg")), QStringLiteral("人员管理")));
     navList_->addItem(new QListWidgetItem(QIcon(QStringLiteral(":/icons/nav/logs.svg")), QStringLiteral("识别记录")));
@@ -525,8 +625,8 @@ AdminPanel::AdminPanel(const AppConfig &config, QWidget *parent)
     sideLayout->addWidget(title);
     sideLayout->addWidget(subtitle);
     sideLayout->addSpacing(18);
-    sideLayout->addWidget(navList_);
-    sideLayout->addStretch();
+    // 导航列表占满标题与底部活体开关之间的区域；条目超出时由列表自身滚动。
+    sideLayout->addWidget(navList_, 1);
     sideLayout->addWidget(livenessCheck_);
     sideLayout->addWidget(backButton);
 
@@ -586,6 +686,7 @@ AdminPanel::AdminPanel(const AppConfig &config, QWidget *parent)
     connect(backButton, &QPushButton::clicked, this, &AdminPanel::close);
     connect(navList_, &QListWidget::currentRowChanged, this, [this](int row) {
         stack_->setCurrentIndex(row);
+        updateDeviceStatusRefreshState();
         if (row == kDeviceInfoPageIndex) {
             updateDeviceInfo();
             emit deviceInfoRefreshRequested();
@@ -604,7 +705,14 @@ AdminPanel::AdminPanel(const AppConfig &config, QWidget *parent)
     deviceStatusTimer_ = new QTimer(this);
     deviceStatusTimer_->setInterval(1000);
     connect(deviceStatusTimer_, &QTimer::timeout, this, &AdminPanel::updateDeviceInfo);
-    deviceStatusTimer_->start();
+
+    auto *deviceStatusCollector = new DeviceStatusCollector;
+    deviceStatusCollector_ = deviceStatusCollector;
+    deviceStatusCollector_->moveToThread(&deviceStatusThread_);
+    deviceStatusThread_.setObjectName(QStringLiteral("DeviceStatusThread"));
+    connect(&deviceStatusThread_, &QThread::finished,
+            deviceStatusCollector_, &QObject::deleteLater);
+    deviceStatusThread_.start();
 
     if (QGuiApplication::inputMethod()) {
         connect(QGuiApplication::inputMethod(), &QInputMethod::visibleChanged, this, [this]() {
@@ -630,6 +738,17 @@ AdminPanel::AdminPanel(const AppConfig &config, QWidget *parent)
     if (adminStyleFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
         setStyleSheet(QString::fromUtf8(adminStyleFile.readAll()));
     }
+}
+
+/** @brief 停止设备状态采集线程后销毁面板。 */
+AdminPanel::~AdminPanel()
+{
+    if (deviceStatusTimer_) {
+        deviceStatusTimer_->stop();
+    }
+    deviceStatusThread_.quit();
+    deviceStatusThread_.wait();
+    deviceStatusCollector_ = nullptr;
 }
 
 /** @return 人员录入和管理组合页面。 */
@@ -1191,7 +1310,7 @@ QWidget *AdminPanel::createDeviceInfoPage()
     layout->addWidget(title);
     layout->addWidget(hint);
     layout->addWidget(scrollArea, 1);
-    updateDeviceInfo();
+    updateDeviceSummaryLabels();
     return page;
 }
 
@@ -1520,6 +1639,14 @@ void AdminPanel::clearEnrollPreview()
     }
 }
 
+/** @brief 清除录入画面并在预览区域显示摄像头异常提示。 */
+void AdminPanel::setCameraUnavailableMessage(const QString &message)
+{
+    if (enrollWidget_) {
+        enrollWidget_->setCameraUnavailableMessage(message);
+    }
+}
+
 /** @brief 更新录入页面的人脸分析结果。 */
 void AdminPanel::setEnrollAnalysis(const QImage &image,
                                    const QImage &previewImage,
@@ -1590,6 +1717,7 @@ void AdminPanel::setNetworkPeople(const QJsonArray &records)
     refreshNetworkPeopleTable();
 }
 
+/** @brief 按正常/已删除视图过滤缓存记录，并重建网络人员表格。 */
 void AdminPanel::refreshNetworkPeopleTable()
 {
     if (!networkPeopleTable_) {
@@ -1679,6 +1807,7 @@ void AdminPanel::refreshNetworkPeopleTable()
     networkPeopleTable_->viewport()->update();
 }
 
+/** @brief 切换网络人员删除状态筛选，并同步页签样式。 */
 void AdminPanel::setNetworkDeletedView(bool deleted)
 {
     networkDeletedView_ = deleted;
@@ -1699,6 +1828,7 @@ void AdminPanel::setNetworkDeletedView(bool deleted)
     refreshNetworkPeopleTable();
 }
 
+/** @brief 在模态网格中展示指定网络人员的全部已同步人脸原图。 */
 void AdminPanel::showNetworkPersonFaces(int row)
 {
     if (!networkPeopleTable_ || row < 0 ||
@@ -1863,6 +1993,7 @@ void AdminPanel::showNetworkPersonFaces(int row)
     dialog.exec();
 }
 
+/** @brief 显示网络同步结果提示，并启动自动隐藏计时器。 */
 void AdminPanel::showNetworkSyncStatus(bool ok, const QString &text)
 {
     if (!networkSyncToast_ || text.trimmed().isEmpty()) {
@@ -1890,6 +2021,7 @@ void AdminPanel::showNetworkSyncStatus(bool ok, const QString &text)
     }
 }
 
+/** @brief 根据文本宽度将网络同步提示条定位到页面底部中央。 */
 void AdminPanel::positionNetworkSyncToast()
 {
     if (!networkPeoplePage_ || !networkSyncToast_) {
@@ -1923,6 +2055,7 @@ void AdminPanel::positionNetworkSyncToast()
     networkSyncToast_->setGeometry(x, y, toastWidth, toastHeight);
 }
 
+/** @brief 填充验证通过记录表，并在批量更新期间暂停重绘。 */
 void AdminPanel::setPassedVerifyLogs(const QVector<VerifyLogViewRecord> &records)
 {
     if (!passedLogTable_) {
@@ -1960,7 +2093,7 @@ void AdminPanel::setPassedVerifyLogs(const QVector<VerifyLogViewRecord> &records
 void AdminPanel::setStorageStats(const StorageStats &stats)
 {
     storageStats_ = stats;
-    updateDeviceInfo();
+    updateDeviceSummaryLabels();
 }
 
 /** @brief 填充同步任务表格。 */
@@ -2111,6 +2244,7 @@ void AdminPanel::requestImportPeopleFromUsb()
     emit peopleImportRequested();
 }
 
+/** @brief 切换导入忙碌状态，防止导入和导出任务并发启动。 */
 void AdminPanel::setPersonImportBusy(bool busy, const QString &message)
 {
     if (importPeopleButton_) {
@@ -2147,6 +2281,7 @@ void AdminPanel::requestExportPeopleToUsb()
     }
 }
 
+/** @brief 切换导出忙碌状态，防止导出和导入任务并发启动。 */
 void AdminPanel::setPersonExportBusy(bool busy, const QString &message)
 {
     if (exportPeopleButton_) {
@@ -2158,6 +2293,7 @@ void AdminPanel::setPersonExportBusy(bool busy, const QString &message)
     if (!message.isEmpty()) setStatusText(message);
 }
 
+/** @brief 切换到网络人员页，供同步完成后直接展示刷新结果。 */
 void AdminPanel::showNetworkPeoplePage()
 {
     if (personTabs_) personTabs_->setCurrentIndex(kNetworkPeopleTabIndex);
@@ -2411,134 +2547,107 @@ void AdminPanel::updateNetworkEditorsEnabled()
     }
 }
 
-/** @brief 刷新序列号、资源占用、温度和容量等设备信息。 */
+/** @brief 更新轻量摘要，并把系统状态读取投递到后台线程。 */
 void AdminPanel::updateDeviceInfo()
 {
-    // 0) 网络状态
-    if (serialLabel_) {
-        serialLabel_->setText(deviceSerialNumber());
-    }
-    if (ipLabel_) {
-        ipLabel_->setText(firstIpv4Address());
-    }
-    if (macLabel_) {
-        macLabel_->setText(firstMacAddress());
-    }
+    updateDeviceSummaryLabels();
+    requestDeviceStatusRefresh();
+}
 
-    // 1) 版本信息
+/** @brief 只更新不需要访问系统节点的设备信息。 */
+void AdminPanel::updateDeviceSummaryLabels()
+{
     if (versionLabel_) {
         const QString version = QCoreApplication::applicationVersion().isEmpty()
-            ? "FaceGate V1.0.0"
-            : "FaceGate V" + QCoreApplication::applicationVersion();
+            ? QStringLiteral("FaceGate V1.0.0")
+            : QStringLiteral("FaceGate V") + QCoreApplication::applicationVersion();
         versionLabel_->setText(version);
     }
     if (uptimeLabel_) {
         const qint64 startMs = qApp->property("appStartMsecsSinceEpoch").toLongLong();
         const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
-        uptimeLabel_->setText(startMs > 0 ? formatRunDuration((nowMs - startMs) / 1000) : "--");
+        uptimeLabel_->setText(startMs > 0
+            ? formatRunDuration((nowMs - startMs) / 1000)
+            : QStringLiteral("--"));
     }
-
-    // 2) 人脸数据信息
     if (peopleCapacityLabel_) {
         peopleCapacityLabel_->setText(QString("%1/3000").arg(storageStats_.personCount));
     }
     if (faceCapacityLabel_) {
-        faceCapacityLabel_->setText(QString("%1/3000").arg(storageStats_.faceFeatureCount));
+        faceCapacityLabel_->setText(
+            QStringLiteral("%1 张（%2 / 1 GiB，约 3000 张）")
+                .arg(storageStats_.faceFeatureCount)
+                .arg(formatBytes(storageStats_.registrationPhotoBytes)));
     }
     if (verifyLogCountLabel_) {
         verifyLogCountLabel_->setText(QString::number(storageStats_.verifyLogCount));
     }
+}
 
-    // 3) 存储容量状态
+/** @brief 仅在面板可见且停留在设备信息页时运行定时刷新。 */
+void AdminPanel::updateDeviceStatusRefreshState()
+{
+    if (!deviceStatusTimer_ || !stack_) {
+        return;
+    }
+    const bool shouldRefresh = isVisible()
+        && stack_->currentIndex() == kDeviceInfoPageIndex;
+    if (shouldRefresh) {
+        if (!deviceStatusTimer_->isActive()) {
+            deviceStatusTimer_->start();
+        }
+    } else {
+        deviceStatusTimer_->stop();
+    }
+}
+
+/** @brief 在专用线程执行一次设备状态采集，避免阻塞 GUI 事件循环。 */
+void AdminPanel::requestDeviceStatusRefresh()
+{
+    if (!isVisible() || !stack_ || stack_->currentIndex() != kDeviceInfoPageIndex
+        || !deviceStatusCollector_ || !deviceStatusThread_.isRunning()
+        || deviceStatusRequestPending_) {
+        return;
+    }
+
+    auto *collector = static_cast<DeviceStatusCollector *>(deviceStatusCollector_);
+    deviceStatusRequestPending_ = true;
+    const bool queued = QMetaObject::invokeMethod(
+        collector,
+        [this, collector]() {
+            const DeviceStatusSnapshot snapshot = collector->collect();
+            QMetaObject::invokeMethod(
+                this,
+                [this, snapshot]() {
+                    deviceStatusRequestPending_ = false;
+                    if (isVisible() && stack_
+                        && stack_->currentIndex() == kDeviceInfoPageIndex) {
+                        applyDeviceStatusSnapshot(snapshot);
+                    }
+                },
+                Qt::QueuedConnection);
+        },
+        Qt::QueuedConnection);
+    if (!queued) {
+        deviceStatusRequestPending_ = false;
+        qWarning() << "设备状态后台采集请求投递失败";
+    }
+}
+
+/** @brief 在 GUI 线程更新后台采集完成的设备状态标签。 */
+void AdminPanel::applyDeviceStatusSnapshot(const DeviceStatusSnapshot &snapshot)
+{
+    if (serialLabel_) serialLabel_->setText(snapshot.serialNumber);
+    if (ipLabel_) ipLabel_->setText(snapshot.ipAddress);
+    if (macLabel_) macLabel_->setText(snapshot.macAddress);
     if (diskCapacityLabel_) {
-        const QStorageInfo storage = storageForApplicationData();
-        const qint64 total = storage.bytesTotal();
-        const qint64 free = storage.bytesFree();
-        const qint64 used = total > 0 ? qBound<qint64>(0, total - free, total) : 0;
-        diskCapacityLabel_->setText(total > 0
-            ? QString("%1 / %2").arg(formatBytes(used)).arg(formatBytes(total))
-            : "--");
-        diskCapacityLabel_->setToolTip(storage.rootPath());
+        diskCapacityLabel_->setText(snapshot.diskCapacity);
+        diskCapacityLabel_->setToolTip(snapshot.diskRootPath);
     }
-
-    // 4) CPU 占用状态
-    if (cpuUsageLabel_) {
-        QFile file("/proc/stat");
-        if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            const QList<QByteArray> fields = file.readLine().simplified().split(' ');
-            if (fields.size() >= 8 && fields.first() == "cpu") {
-                qint64 values[7] = {0, 0, 0, 0, 0, 0, 0};
-                for (int i = 0; i < 7; ++i) {
-                    values[i] = fields.value(i + 1).toLongLong();
-                }
-                const qint64 idle = values[3] + values[4];
-                const qint64 total = values[0] + values[1] + values[2] + values[3] + values[4] + values[5] + values[6];
-                const qint64 totalDelta = total - lastCpuTotal_;
-                const qint64 idleDelta = idle - lastCpuIdle_;
-                if (lastCpuTotal_ > 0 && totalDelta > 0) {
-                    const double usage = (1.0 - static_cast<double>(idleDelta) / static_cast<double>(totalDelta)) * 100.0;
-                    cpuUsageLabel_->setText(QString("%1%").arg(qBound(0.0, usage, 100.0), 0, 'f', 1));
-                } else {
-                    cpuUsageLabel_->setText("--");
-                }
-                lastCpuTotal_ = total;
-                lastCpuIdle_ = idle;
-            }
-        }
-    }
-
-    // 4) 运行内存占用状态
-    if (memoryUsageLabel_) {
-        QFile file("/proc/meminfo");
-        QString meminfoText;
-        if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            meminfoText = QString::fromLocal8Bit(file.readAll());
-        } else {
-            qWarning().noquote() << "读取 /proc/meminfo 失败：" << file.errorString();
-        }
-
-        if (meminfoText.trimmed().isEmpty()) {
-            QProcess cat;
-            cat.start("/bin/cat", QStringList() << "/proc/meminfo");
-            if (cat.waitForFinished(800)) {
-                meminfoText = QString::fromLocal8Bit(cat.readAllStandardOutput());
-                qWarning().noquote() << "QFile 读取 meminfo 为空，已尝试 /bin/cat 兜底，输出长度：" << meminfoText.size();
-            } else {
-                qWarning().noquote() << "/bin/cat /proc/meminfo 超时或失败：" << cat.errorString();
-            }
-        }
-
-
-        qint64 totalKb = meminfoValueKb(meminfoText, "MemTotal");
-        qint64 availableKb = meminfoValueKb(meminfoText, "MemAvailable");
-        const qint64 freeKb = meminfoValueKb(meminfoText, "MemFree");
-        const qint64 buffersKb = meminfoValueKb(meminfoText, "Buffers");
-        const qint64 cachedKb = meminfoValueKb(meminfoText, "Cached");
-
-        if (availableKb <= 0) {
-            availableKb = freeKb + buffersKb + cachedKb;
-        }
-        
-
-        if (totalKb > 0) {
-            const qint64 usedKb = qBound<qint64>(0, totalKb - availableKb, totalKb);
-            const double usedPercent = static_cast<double>(usedKb) * 100.0 / static_cast<double>(totalKb);
-            memoryUsageLabel_->setText(QString("%1% (%2/%3)")
-                .arg(usedPercent, 0, 'f', 1)
-                .arg(formatBytes(usedKb * 1024))
-                .arg(formatBytes(totalKb * 1024)));
-        } else {
-            memoryUsageLabel_->setText("--");
-        }
-    }
-
-    // 5) 温度、NPU占用状态
-    if (temperatureLabel_) {
-        temperatureLabel_->setText(currentTemperature());
-    }
-    if (npuUsageLabel_) {
-        npuUsageLabel_->setText(npuUsage());
-    }
+    if (cpuUsageLabel_) cpuUsageLabel_->setText(snapshot.cpuUsage);
+    if (memoryUsageLabel_) memoryUsageLabel_->setText(snapshot.memoryUsage);
+    if (temperatureLabel_) temperatureLabel_->setText(snapshot.temperature);
+    if (npuUsageLabel_) npuUsageLabel_->setText(snapshot.npuUsage);
 }
 
 /** @return 人员表格当前行的人员主键；无选择时返回 0。 */
@@ -2691,8 +2800,30 @@ bool AdminPanel::eventFilter(QObject *watched, QEvent *event)
  */
 void AdminPanel::closeEvent(QCloseEvent *event)
 {
+    if (deviceStatusTimer_) {
+        deviceStatusTimer_->stop();
+    }
     qApp->removeEventFilter(this);
     hideEmbeddedKeyboard();
     emit closed();
     QDialog::closeEvent(event);
+}
+
+/** @brief 面板显示后，仅在设备信息页启动后台状态刷新。 */
+void AdminPanel::showEvent(QShowEvent *event)
+{
+    QDialog::showEvent(event);
+    updateDeviceStatusRefreshState();
+    if (stack_ && stack_->currentIndex() == kDeviceInfoPageIndex) {
+        updateDeviceInfo();
+    }
+}
+
+/** @brief 面板不可见时立即停止周期刷新。 */
+void AdminPanel::hideEvent(QHideEvent *event)
+{
+    if (deviceStatusTimer_) {
+        deviceStatusTimer_->stop();
+    }
+    QDialog::hideEvent(event);
 }

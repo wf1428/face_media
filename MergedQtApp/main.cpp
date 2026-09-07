@@ -29,6 +29,7 @@
 #include <QRect>
 
 #include "shell/AppShell.h"
+#include "components/input/InputCursorController.h"
 #include "components/splash/splashscreen.h"
 #include "common/sql/dbstore.h"
 #include "ic_board/ic_board.h"
@@ -114,8 +115,7 @@ static void removeLegacyLinuxFbArguments(int &argc, char **argv)
 /**
  * @brief 判断一条已知且无业务价值的 Qt 图形/输入警告是否应被抑制。
  *
- * 只过滤明确匹配的 libpng 配置、已拔出 evdev 鼠标及 DRM 硬件光标移动告警，
- * 其余消息保持原样输出。
+ * 只过滤明确匹配的 libpng 配置及已拔出 evdev 鼠标告警，其余消息保持原样输出。
  */
 static bool shouldDropPngWarning(QtMsgType type, const QString &msg)
 {
@@ -134,13 +134,6 @@ static bool shouldDropPngWarning(QtMsgType type, const QString &msg)
     // Qt 内部通常是 warning 级别输出（不同版本可能前缀不同），所以用 contains 做关键字匹配最稳。
     if (msg.contains("evdevmouse: Could not read from input device") &&
         msg.contains("No such device")) {
-        return true;
-    }
-
-    // RK3566 DSI 的 DRM 硬件光标 plane 移动失败（-EFAULT）。工程已使用
-    // Qt 子控件绘制软件光标，因此该 QPA warning 只会在移动鼠标时刷屏。
-    if (msg.contains("Failed to move cursor on screen") &&
-        msg.contains(": -14")) {
         return true;
     }
 
@@ -249,9 +242,6 @@ int main(int argc, char *argv[])
         if (qEnvironmentVariableIsEmpty("QT_QPA_EGLFS_INTEGRATION")) {
             qputenv("QT_QPA_EGLFS_INTEGRATION", QByteArrayLiteral("eglfs_kms"));
         }
-        if (qEnvironmentVariableIsEmpty("QT_QPA_EGLFS_HIDECURSOR")) {
-            qputenv("QT_QPA_EGLFS_HIDECURSOR", QByteArrayLiteral("1"));
-        }
         if (qEnvironmentVariableIsEmpty("QT_QPA_EGLFS_FORCE888")) {
             qputenv("QT_QPA_EGLFS_FORCE888", QByteArrayLiteral("1"));
         }
@@ -303,10 +293,9 @@ int main(int argc, char *argv[])
             << "facegate=" << Rk3566Platform::faceGateConfigPath();
     VirtualKeyboardFocusFilter keyboardFilter(&a);
     a.installEventFilter(&keyboardFilter);
-    qInfo() << "[EGLFS-CURSOR] configuration"
-            << "hideCursor=" << qgetenv("QT_QPA_EGLFS_HIDECURSOR")
-            << "platform=" << QGuiApplication::platformName()
-            << "softwareOverlay=event-driven";
+    InputCursorController inputCursorController(&a);
+    qInfo() << "[EGLFS-CURSOR] native KMS hardware cursor"
+            << "platform=" << QGuiApplication::platformName();
     const QString activePlatform = QGuiApplication::platformName().trimmed().toLower();
     const bool eglfsRequested = qpa.toLower().startsWith("eglfs");
     if (eglfsRequested &&
@@ -350,7 +339,6 @@ int main(int argc, char *argv[])
             activeRoot->setFocus();
             activeRoot->update();
         }
-        shell.raiseCursorOverlay();
         shell.update();
         qInfo() << "[EGLFS] splash hidden, main view exposed";
     });

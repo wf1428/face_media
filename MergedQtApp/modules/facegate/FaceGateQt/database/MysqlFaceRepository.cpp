@@ -8,6 +8,8 @@
 
 #include "MysqlFaceRepository.h"
 
+#include "common/storage_policy.h"
+
 #include <QCoreApplication>
 #include <QDataStream>
 #include <QDateTime>
@@ -337,6 +339,12 @@ bool MysqlFaceRepository::loadAllEnabledFaces(QVector<FaceRecord> &records)
     return true;
 }
 
+/**
+ * @brief 加载状态有效且已具备本地特征的网络人员人脸图库。
+ *
+ * 本地文件兼容模式没有网络人员表，按空图库成功返回；数据库模式下只选择
+ * IMAGE_READY 记录，避免把尚未完成图像校验的同步数据交给识别线程。
+ */
 bool MysqlFaceRepository::loadAllEnabledNetworkFaces(
         QVector<FaceRecord> &records)
 {
@@ -619,6 +627,10 @@ bool MysqlFaceRepository::loadStorageStats(StorageStats &stats)
         }
         *entry.target = q.value(0).toInt();
     }
+
+    const StoragePolicy::Usage registration = StoragePolicy::registrationUsage();
+    stats.faceFeatureCount = registration.fileCount;
+    stats.registrationPhotoBytes = registration.bytes;
 
     return true;
 }
@@ -1676,7 +1688,9 @@ bool MysqlFaceRepository::loadPassedVerifyLogsFromLocal(QVector<VerifyLogViewRec
 bool MysqlFaceRepository::loadStorageStatsFromLocal(StorageStats &stats)
 {
     stats.personCount = localPersons_.size();
-    stats.faceFeatureCount = localFeatures_.size();
+    const StoragePolicy::Usage registration = StoragePolicy::registrationUsage();
+    stats.faceFeatureCount = registration.fileCount;
+    stats.registrationPhotoBytes = registration.bytes;
     stats.verifyLogCount = localVerifyLogs_.size();
     return true;
 }

@@ -8,6 +8,7 @@
 
 #include "mqttipcclient.h"
 #include <QJsonDocument>
+#include <QTimer>
 
 /**
  * @brief 构造一个本地 IPC 客户端对象。
@@ -189,8 +190,8 @@ void MqttIpcClient::onSocketDisconnected()
  * 提取成功后，通过 frameReceived() 信号将帧数据交给上层处理。
  *
  * 为防止异常输入导致死循环或缓冲区无限增长，本函数包含以下保护措施：
- * - 单次调用最多提取 1000 帧；
- * - 当 readBuffer 超过 16 MB 时主动清空，以容纳 Base64 人脸消息。
+ * - 每轮最多向上层投递 4 帧，并通过事件循环继续处理积压；
+ * - 当 readBuffer 超过 64 MB 时主动清空；该上限覆盖mqttd的32 MB发送队列。
  */
 void MqttIpcClient::onSocketReadyRead()
 {
@@ -198,26 +199,44 @@ void MqttIpcClient::onSocketReadyRead()
     readBuffer.append(socket->readAll());
 
     QByteArray frame;
-    int guard = 0;
+    int consumed = 0;
+    while (extractOneFrame(readBuffer, consumed, frame)) {
+        if (!frame.isEmpty()) readyFrames.enqueue(frame);
+    }
+    if (consumed > 0) {
+        readBuffer.remove(0, consumed);
+    }
 
-    // 反复提取完整帧，直到缓冲区中不再存在可解析的完整数据
-    while (extractOneFrame(readBuffer, frame)) {
-        if (!frame.isEmpty()) {
-             emit frameReceived(frame);
-        }
-
-        // 防御性保护：避免异常输入导致无限循环
-        if (++guard > 1000) {
-            emit errorOccurred("提取帧次数过多，输入流可能异常");
-            break;
-        }
+    if (!frameDrainScheduled) {
+        processBufferedFrames();
     }
 
     // 防御性保护：避免长时间无法完成组帧导致缓冲区持续膨胀
     // FACE 删除消息可能携带 Base64 图片，分包未收完整时需要更大的缓冲区。
-    if (readBuffer.size() > 16 * 1024 * 1024) {
+    if (readBuffer.size() > 64 * 1024 * 1024) {
         emit errorOccurred("readBuffer 过大，已清空");
         readBuffer.clear();
+    }
+}
+
+void MqttIpcClient::processBufferedFrames()
+{
+    frameDrainScheduled = false;
+    int delivered = 0;
+
+    // 每轮只投递少量完整帧，让界面、IPC读取和人员落库任务之间都有调度机会。
+    while (delivered < maxFramesPerDrain && !readyFrames.isEmpty()) {
+        const QByteArray frame = readyFrames.dequeue();
+        if (!frame.isEmpty()) {
+            emit frameReceived(frame);
+        }
+        ++delivered;
+    }
+
+    // 完整帧仍有积压时由事件循环继续投递，半帧留在readBuffer等待下一次readyRead。
+    if (!readyFrames.isEmpty()) {
+        frameDrainScheduled = true;
+        QTimer::singleShot(0, this, &MqttIpcClient::processBufferedFrames);
     }
 }
 
@@ -240,31 +259,36 @@ void MqttIpcClient::onSocketError(QLocalSocket::LocalSocketError err)
  * - 否则查找第一个 '{'，并基于大括号配对规则提取完整 JSON；
  * - JSON 前允许存在 topic 或其他前缀，提取结果包含此前缀。
  *
- * @param buf 输入输出缓冲区。成功提取后，会移除对应帧数据。
+ * @param buf 输入缓冲区。
+ * @param offset 输入输出游标，成功提取或跳过空行后推进。
  * @param outFrame 输出参数，返回提取到的完整帧内容。
  * @return true 成功提取到一条完整帧。
  * @return false 当前数据不足以构成完整帧，需要等待更多输入。
  *
  * @note 该函数会正确处理 JSON 字符串中的转义字符以及字符串内部的大括号。
  */
-bool MqttIpcClient::extractOneFrame(QByteArray& buf, QByteArray& outFrame)
+bool MqttIpcClient::extractOneFrame(const QByteArray &buf,
+                                    int &offset,
+                                    QByteArray &outFrame)
 {
     outFrame.clear();
-    if (buf.isEmpty()) return false;
+    if (offset < 0) offset = 0;
+    if (offset >= buf.size()) return false;
 
     // 跳过前导空行，避免影响后续帧识别
-    while (!buf.isEmpty() && (buf[0] == '\n' || buf[0] == '\r')) {
-        buf.remove(0, 1);
+    while (offset < buf.size()
+           && (buf[offset] == '\n' || buf[offset] == '\r')) {
+        ++offset;
     }
-    if (buf.isEmpty()) return false;
+    if (offset >= buf.size()) return false;
 
     // 1) 日志行：以 '\n' 作为一帧结束标记
-    if (buf[0] == '[') {
-        int nl = buf.indexOf('\n');
+    if (buf[offset] == '[') {
+        const int nl = buf.indexOf('\n', offset);
         if (nl < 0) return false; // 当前日志行尚未接收完整
 
-        outFrame = buf.left(nl);
-        buf.remove(0, nl + 1);
+        outFrame = buf.mid(offset, nl - offset);
+        offset = nl + 1;
 
         // 去除可能存在的 '\r'
         if (!outFrame.isEmpty() && outFrame.endsWith('\r')) outFrame.chop(1);
@@ -272,7 +296,8 @@ bool MqttIpcClient::extractOneFrame(QByteArray& buf, QByteArray& outFrame)
     }
 
     // 2) 非日志数据：查找 JSON 起始位置
-    int lb = buf.indexOf('{');
+    const int frameStart = offset;
+    int lb = buf.indexOf('{', frameStart);
     if (lb < 0) {
         // 尚未出现 JSON 起始符，等待更多数据
         return false;
@@ -323,8 +348,8 @@ bool MqttIpcClient::extractOneFrame(QByteArray& buf, QByteArray& outFrame)
     }
 
     // 从缓冲区起始位置到 JSON 结束位置整体作为一帧，保留可能存在的前缀
-    outFrame = buf.left(endPos + 1);
-    buf.remove(0, endPos + 1);
+    outFrame = buf.mid(frameStart, endPos - frameStart + 1);
+    offset = endPos + 1;
 
     // 去除帧尾部可能残留的换行符
     while (!outFrame.isEmpty() && (outFrame.endsWith('\r') || outFrame.endsWith('\n'))) {

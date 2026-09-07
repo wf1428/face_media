@@ -81,6 +81,7 @@ bool MultimediaModuleAdapter::isActive() const
     return active_ && window_ && window_->isModuleActive();
 }
 
+/** @return 仅在多媒体主页面处于可切换状态时返回 true。 */
 bool MultimediaModuleAdapter::allowsPresenceSwitch() const
 {
     return isActive() && window_->allowsPresenceSwitch();

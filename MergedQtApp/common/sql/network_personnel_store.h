@@ -50,9 +50,12 @@ struct NetworkAccessDeductApplyResult
     bool ok = false;
     bool duplicate = false;
     bool countApplied = false;
+    bool amountApplied = false;
     bool skipped = false;
     qlonglong remainingCount = -1;
     qlonglong usedCount = -1;
+    double remainingAmount = -1.0;
+    double usedAmount = -1.0;
     QString error;
 };
 
@@ -129,6 +132,8 @@ public:
     NetworkPersonnelImportResult importSpreadsheetPersonnel(
             const QVector<QJsonObject> &records);
     QJsonArray pendingFaceImageRequests() const;
+    /** @return 指定人员尚未完整落盘、落库和提取特征的人脸补拉参数。 */
+    QJsonObject pendingFaceImageRequest(const QString &personId) const;
     NetworkPersonnelSyncResult applyFaceImages(const QJsonObject &envelope);
 
     /** @brief 保存通过图片的特征，并只清理校验失败的图片内容。 */
@@ -136,7 +141,9 @@ public:
                                      const QJsonArray &validatedFaces,
                                      const QJsonArray &failedFaces,
                                      bool *allFacesReady = nullptr,
-                                     QString *error = nullptr);
+                                     QString *error = nullptr,
+                                     QJsonArray *commitFailedFaces = nullptr,
+                                     QJsonArray *commitFaceNotices = nullptr);
 
     /** @brief 建立一笔 online_v1 二维码扫码事务。 */
     bool beginQrAccessTransaction(const QString &scanId,
@@ -189,7 +196,7 @@ public:
                                                    const QVariant &remainingCount,
                                                    const QVariant &usedCount);
 
-    /** @brief 按平台权威计数同步刷卡或人脸扣次结果，并按消息 ID 去重。 */
+    /** @brief 按平台权威次数/金额同步刷卡或人脸扣减结果，并按消息 ID 去重。 */
     NetworkAccessDeductApplyResult applyAccessDeductResult(
             const QString &messageId,
             const QString &method,
@@ -198,7 +205,24 @@ public:
             bool deducted,
             const QString &message,
             const QVariant &remainingCount,
-            const QVariant &usedCount);
+            const QVariant &usedCount,
+            const QVariant &remainingAmount,
+            const QVariant &usedAmount);
+
+    /** @brief 累加 MQTT 断线期间一次实际成功的本地通行。 */
+    bool recordOfflineAccessResult(const QString &method,
+                                   const QString &personId,
+                                   bool success,
+                                   QString *error = nullptr);
+
+    /** @brief 读取指定 accessResult method 尚未批量上报的聚合记录。 */
+    QJsonArray pendingOfflineAccessResults(const QString &method,
+                                           QString *error = nullptr);
+
+    /** @brief 批量消息提交成功后按快照次数消费记录，并保留期间新增次数。 */
+    bool consumeOfflineAccessResults(const QString &method,
+                                     const QJsonArray &records,
+                                     QString *error = nullptr);
 
     /** @brief 建立远程呼梯事务；同一请求ID及同人员同楼层待处理事务均会去重。 */
     NetworkRemoteCallContext beginRemoteCallTransaction(

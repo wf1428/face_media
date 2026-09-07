@@ -60,6 +60,9 @@ public:
     /** @brief 更新表单底部业务状态文本。 */
     void setStatusText(const QString &text);
 
+    /** @brief 清除录入画面并在预览区域显示摄像头异常提示。 */
+    void setCameraUnavailableMessage(const QString &message);
+
     /** @brief 预填人员编号和姓名。 */
     void setPersonFields(const QString &personNo, const QString &name);
 

@@ -17,6 +17,46 @@
 #include <QJsonObject>
 #include <QThread>
 
+#include <cmath>
+
+namespace {
+
+/** @return 与本地重复录入判断一致的 float 特征余弦相似度。 */
+float featureCosine(const QByteArray &left, const QByteArray &right)
+{
+    if (left.isEmpty() || left.size() != right.size()
+            || left.size() % static_cast<int>(sizeof(float)) != 0) {
+        return -1.0f;
+    }
+    const int count = left.size() / static_cast<int>(sizeof(float));
+    const float *l = reinterpret_cast<const float *>(left.constData());
+    const float *r = reinterpret_cast<const float *>(right.constData());
+    double dot = 0.0;
+    double leftNorm = 0.0;
+    double rightNorm = 0.0;
+    for (int index = 0; index < count; ++index) {
+        dot += static_cast<double>(l[index]) * static_cast<double>(r[index]);
+        leftNorm += static_cast<double>(l[index]) * static_cast<double>(l[index]);
+        rightNorm += static_cast<double>(r[index]) * static_cast<double>(r[index]);
+    }
+    if (leftNorm <= 0.0 || rightNorm <= 0.0) {
+        return -1.0f;
+    }
+    return static_cast<float>(dot / (std::sqrt(leftNorm) * std::sqrt(rightNorm)));
+}
+
+/** @brief 向 JSON 字符串数组追加非空且尚不存在的值。 */
+void appendUniqueString(QJsonArray *values, const QString &value)
+{
+    if (!values || value.trimmed().isEmpty()) return;
+    for (const QJsonValue &existing : *values) {
+        if (existing.toString() == value) return;
+    }
+    values->append(value);
+}
+
+} // namespace
+
 /** @brief 创建尚未分配引擎和控制器的 worker。 */
 FaceInferenceWorker::FaceInferenceWorker(QObject *parent)
     : QObject(parent)
@@ -130,6 +170,11 @@ void FaceInferenceWorker::processAdminFrame(const CameraFrame &frame)
     emit frameProcessed();
 }
 
+/**
+ * @brief 在同一推理线程事件中替换本地和网络图库。
+ *
+ * 两份图库连续写入后再处理下一帧，避免识别看到只更新一半的合并快照。
+ */
 void FaceInferenceWorker::updateRecognitionGalleries(
         const QVector<FaceRecord> &localRecords,
         const QVector<FaceRecord> &networkRecords)
@@ -196,14 +241,26 @@ void FaceInferenceWorker::extractEnrollmentFeature(const PersonInfo &person,
                                 duplicate, similarRecord, duplicateCosine);
 }
 
+/**
+ * @brief 对同步到本地的网络人员人脸图像逐张提取特征并校验重复项。
+ *
+ * 仅将图像可读、特征有效且人员内不重复的结果加入有效集合；失败项保留
+ * 原始标识和原因，供同步层决定回报或重新拉取。
+ */
 void FaceInferenceWorker::validateSyncedFaceImages(
         const QString &token,
         const QString &personId,
         const QJsonArray &faces,
         const AppConfig &config)
 {
+    struct Candidate {
+        QJsonObject face;
+        QByteArray feature;
+    };
+
     QJsonArray validatedFaces;
     QJsonArray failedFaces;
+    QVector<Candidate> extractedCandidates;
     const QString normalizedPersonId = personId.trimmed();
     if (token.trimmed().isEmpty() || normalizedPersonId.isEmpty()
             || faces.isEmpty()) {
@@ -269,7 +326,116 @@ void FaceInferenceWorker::validateSyncedFaceImages(
         face.insert(QStringLiteral("modelVersion"), feature.modelVersion);
         face.insert(QStringLiteral("faceQuality"), feature.quality);
         face.insert(QStringLiteral("recognitionQuality"), detectConfidence);
-        validatedFaces.append(face);
+        Candidate candidate;
+        candidate.face = face;
+        candidate.feature = feature.blob;
+        extractedCandidates.append(candidate);
+    }
+
+    const float duplicateThreshold = qBound(
+                0.0f, config.duplicateFaceCosineThreshold, 1.0f);
+    QVector<Candidate> acceptedCandidates;
+    for (Candidate candidate : extractedCandidates) {
+        const QString currentHash = candidate.face.value(
+                    QStringLiteral("faceHash")).toString().trimmed();
+
+        // 不同网络 personId 之间禁止保存相似人脸；当前 personId 自己的旧人脸
+        // 由本次最新下发的人脸替换。
+        QJsonArray replacedNetworkHashes;
+        QString conflictPersonId;
+        QString conflictPersonName;
+        float conflictCosine = -1.0f;
+        for (const FaceRecord &record : networkGallery_) {
+            const float cosine = featureCosine(
+                        record.feature.blob, candidate.feature);
+            if (cosine < duplicateThreshold) continue;
+
+            const QString existingPersonId = record.person.personNo.trimmed();
+            if (existingPersonId == normalizedPersonId) {
+                if (record.faceHash.trimmed() != currentHash) {
+                    appendUniqueString(&replacedNetworkHashes,
+                                       record.faceHash.trimmed());
+                }
+            } else if (cosine > conflictCosine) {
+                conflictCosine = cosine;
+                conflictPersonId = existingPersonId;
+                conflictPersonName = record.person.name.trimmed();
+            }
+        }
+        if (!conflictPersonId.isEmpty()) {
+            if (conflictPersonName.isEmpty()
+                    || conflictPersonName == conflictPersonId) {
+                conflictPersonName = QStringLiteral("其他网络人员");
+            }
+            QJsonObject failed = candidate.face;
+            failed.insert(
+                        QStringLiteral("message"),
+                        QStringLiteral("人脸与网络人员“%1”重复，相似度=%2。")
+                        .arg(conflictPersonName)
+                        .arg(conflictCosine, 0, 'f', 3));
+            failedFaces.append(failed);
+            if (firstFailureMessage.isEmpty()) {
+                firstFailureMessage = failed.value(
+                            QStringLiteral("message")).toString();
+            }
+            continue;
+        }
+
+        // 同一次响应中按顺序处理；后出现的相似人脸视为最新项，替换之前项。
+        for (int index = acceptedCandidates.size() - 1; index >= 0; --index) {
+            const float cosine = featureCosine(
+                        acceptedCandidates.at(index).feature,
+                        candidate.feature);
+            if (cosine < duplicateThreshold) continue;
+
+            const QJsonObject previousFace = acceptedCandidates.at(index).face;
+            const QString previousHash = previousFace.value(
+                        QStringLiteral("faceHash")).toString().trimmed();
+            if (previousHash != currentHash) {
+                appendUniqueString(&replacedNetworkHashes, previousHash);
+            }
+            const QJsonArray previousReplacements = previousFace.value(
+                        QStringLiteral("replaceNetworkFaceHashes")).toArray();
+            for (const QJsonValue &value : previousReplacements) {
+                appendUniqueString(&replacedNetworkHashes, value.toString());
+            }
+            acceptedCandidates.removeAt(index);
+        }
+
+        if (!replacedNetworkHashes.isEmpty()) {
+            candidate.face.insert(QStringLiteral("replaceNetworkFaceHashes"),
+                                  replacedNetworkHashes);
+        }
+
+        // 与本地人员相似时不拒绝网络同步，用最新网络特征替换相似度最高的
+        // 本地特征；数据库提交后会统一重载本地与网络图库。
+        qint64 localFeatureId = 0;
+        float localBestCosine = -1.0f;
+        QString localPersonNo;
+        for (const FaceRecord &record : gallery_) {
+            const float cosine = featureCosine(
+                        record.feature.blob, candidate.feature);
+            if (cosine >= duplicateThreshold && cosine > localBestCosine) {
+                localFeatureId = record.featureId;
+                localBestCosine = cosine;
+                localPersonNo = record.person.personNo;
+            }
+        }
+        if (localFeatureId > 0) {
+            candidate.face.insert(QStringLiteral("replaceLocalFeatureId"),
+                                  QString::number(localFeatureId));
+            candidate.face.insert(QStringLiteral("replaceLocalPersonNo"),
+                                  localPersonNo);
+            candidate.face.insert(QStringLiteral("replaceLocalCosine"),
+                                  localBestCosine);
+        }
+        candidate.face.insert(QStringLiteral("duplicateThreshold"),
+                              duplicateThreshold);
+        acceptedCandidates.append(candidate);
+    }
+
+    for (const Candidate &candidate : acceptedCandidates) {
+        validatedFaces.append(candidate.face);
     }
 
     emit syncedFaceImagesValidated(

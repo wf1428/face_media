@@ -25,9 +25,12 @@ public:
      * @return 成功时返回图片路径，失败时返回空字符串并填写 errorText。
      */
     QString saveVerifySnapshot(const QImage &image,
-                               const QString &personNo,
+                               const QString &personName,
                                const QString &result,
                                QString *errorText = nullptr) const;
+
+    /** @return 基于应用目录解析后的抓拍根路径。 */
+    QString rootPath() const;
 
 private:
     /** @return 基于应用目录解析并确保存在的抓拍根路径。 */

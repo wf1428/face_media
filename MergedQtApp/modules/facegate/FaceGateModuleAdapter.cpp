@@ -50,6 +50,10 @@ bool FaceGateModuleAdapter::initialize()
     window_->setWindowFlags(Qt::Widget);
     connect(window_, &FaceGateMainWindow::recognitionSucceeded,
             this, &FaceGateModuleAdapter::recognitionSucceeded);
+    connect(window_, &FaceGateMainWindow::recognitionFinished,
+            this, &FaceGateModuleAdapter::recognitionFinished);
+    connect(window_, &FaceGateMainWindow::facePresenceChanged,
+            this, &FaceGateModuleAdapter::facePresenceChanged);
     shutdown_ = false;
     qInfo() << "[FACEGATE-ADAPTER] initialized"
             << "config=" << configPath_;
@@ -93,6 +97,7 @@ bool FaceGateModuleAdapter::isActive() const
     return active_ && window_ && window_->isModuleActive();
 }
 
+/** @return 仅在门禁识别主页处于可切换状态时返回 true。 */
 bool FaceGateModuleAdapter::allowsPresenceSwitch() const
 {
     return isActive() && window_->allowsPresenceSwitch();

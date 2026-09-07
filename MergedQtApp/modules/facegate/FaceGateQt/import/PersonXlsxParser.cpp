@@ -1,6 +1,9 @@
 /**
  * @file PersonXlsxParser.cpp
  * @brief 不依赖外部命令的轻量 XLSX/ZIP/XML 网络人员解析器。
+ *
+ * @author Dulin
+ * @date 2026-08-28
  */
 
 #include "PersonXlsxParser.h"
@@ -21,6 +24,7 @@
 
 namespace {
 
+/** @return data 中指定偏移处的小端 16 位无符号整数；越界时返回 0。 */
 quint16 little16(const QByteArray &data, int offset)
 {
     if (offset < 0 || offset + 2 > data.size()) return 0;
@@ -28,6 +32,7 @@ quint16 little16(const QByteArray &data, int offset)
     return quint16(p[0]) | (quint16(p[1]) << 8);
 }
 
+/** @return data 中指定偏移处的小端 32 位无符号整数；越界时返回 0。 */
 quint32 little32(const QByteArray &data, int offset)
 {
     if (offset < 0 || offset + 4 > data.size()) return 0;
@@ -36,17 +41,20 @@ quint32 little32(const QByteArray &data, int offset)
             | (quint32(p[2]) << 16) | (quint32(p[3]) << 24);
 }
 
+/** @brief ZIP 中央目录记录提供的压缩数据定位信息。 */
 struct ZipEntry
 {
-    quint16 method = 0;
-    quint32 compressedSize = 0;
-    quint32 uncompressedSize = 0;
-    quint32 localOffset = 0;
+    quint16 method = 0;            /**< ZIP 压缩方法，0=存储，8=Deflate。 */
+    quint32 compressedSize = 0;    /**< 压缩后字节数。 */
+    quint32 uncompressedSize = 0;  /**< 解压后字节数。 */
+    quint32 localOffset = 0;       /**< 本地文件头在归档中的偏移。 */
 };
 
+/** @brief 只实现 XLSX 所需 ZIP 目录读取和单项解压的轻量归档读取器。 */
 class XlsxArchive
 {
 public:
+    /** @brief 读取归档并建立文件名到中央目录项的索引。 */
     bool open(const QString &path, QString *error)
     {
         QFile file(path);
@@ -100,6 +108,7 @@ public:
         return true;
     }
 
+    /** @brief 读取并按 ZIP 方法解压指定内部文件。 */
     QByteArray read(const QString &name, QString *error) const
     {
         const auto it = entries_.constFind(name);
@@ -150,13 +159,15 @@ public:
         return output;
     }
 
+    /** @return 归档中包含指定内部文件时返回 true。 */
     bool contains(const QString &name) const { return entries_.contains(name); }
 
 private:
-    QByteArray bytes_;
-    QHash<QString, ZipEntry> entries_;
+    QByteArray bytes_;                  /**< 完整 ZIP 文件内容。 */
+    QHash<QString, ZipEntry> entries_;  /**< 中央目录索引。 */
 };
 
+/** @brief 将工作簿关系中的相对目标归一化为 xl/ 下的归档路径。 */
 QString normalizedTarget(QString target)
 {
     target.replace(QLatin1Char('\\'), QLatin1Char('/'));
@@ -166,6 +177,7 @@ QString normalizedTarget(QString target)
     return target;
 }
 
+/** @return 名为“人员列表”的工作表路径；不存在时回退到第一张工作表。 */
 QString worksheetPath(const XlsxArchive &archive, QString *error)
 {
     const QByteArray workbookXml = archive.read(QStringLiteral("xl/workbook.xml"), error);
@@ -205,6 +217,7 @@ QString worksheetPath(const XlsxArchive &archive, QString *error)
     return QString();
 }
 
+/** @return sharedStrings.xml 中按索引排列的共享字符串；文件缺失时返回空列表。 */
 QStringList sharedStrings(const XlsxArchive &archive, QString *error)
 {
     QStringList strings;
@@ -230,6 +243,7 @@ QStringList sharedStrings(const XlsxArchive &archive, QString *error)
     return strings;
 }
 
+/** @return Excel 单元格引用中的零基列号，例如 A=0、AA=26。 */
 int columnIndex(const QString &cellReference)
 {
     int result = 0;
@@ -240,6 +254,7 @@ int columnIndex(const QString &cellReference)
     return result - 1;
 }
 
+/** @brief 流式解析工作表 XML，并按单元格引用补齐稀疏列。 */
 QVector<QStringList> worksheetRows(const QByteArray &xml,
                                    const QStringList &strings,
                                    QString *error)
@@ -287,12 +302,14 @@ QVector<QStringList> worksheetRows(const QByteArray &xml,
     return rows;
 }
 
+/** @return row 中指定表头对应的去空白文本；列不存在时返回空字符串。 */
 QString cell(const QStringList &row, const QHash<QString, int> &columns, const QString &name)
 {
     const int index = columns.value(name, -1);
     return index >= 0 && index < row.size() ? row.at(index).trimmed() : QString();
 }
 
+/** @return 逗号分隔、去空白并移除空项后的文本列表。 */
 QStringList commaValues(const QString &text)
 {
     QStringList values = text.split(QLatin1Char(','), QString::SkipEmptyParts);
@@ -301,6 +318,7 @@ QStringList commaValues(const QString &text)
     return values;
 }
 
+/** @return “剩余/总额”文本解析结果；缺失总额时沿用剩余额。 */
 QPair<double, double> moneyPair(QString text)
 {
     text.remove(QChar(0x00a5));
@@ -312,6 +330,7 @@ QPair<double, double> moneyPair(QString text)
     return qMakePair(firstOk ? first : 0.0, secondOk ? second : (firstOk ? first : 0.0));
 }
 
+/** @return “剩余/总次数”文本解析结果；缺失总次数时沿用剩余次数。 */
 QPair<qlonglong, qlonglong> countPair(const QString &text)
 {
     const QStringList parts = text.split(QLatin1Char('/'));
@@ -322,6 +341,7 @@ QPair<qlonglong, qlonglong> countPair(const QString &text)
     return qMakePair(firstOk ? first : 0, secondOk ? second : (firstOk ? first : 0));
 }
 
+/** @brief 将“周几 + 起止时间”文本转换为网络人员库的定时规则数组。 */
 QJsonArray parseTimingRules(const QString &text)
 {
     QJsonArray result;
@@ -352,6 +372,7 @@ QJsonArray parseTimingRules(const QString &text)
     return result;
 }
 
+/** @brief 将“设备:楼层,楼层”分组文本转换为设备楼层权限数组。 */
 QJsonArray parseFloors(const QString &text)
 {
     QJsonArray result;
@@ -378,6 +399,12 @@ QJsonArray parseFloors(const QString &text)
     return result;
 }
 
+/**
+ * @brief 把固定表头的一行人员数据映射为数据库导入 JSON。
+ *
+ * 金额、次数、期限、定时和楼层等复合文本在此归一化，确保 XLS 与 XLSX
+ * 两种读取器向入库层提供完全一致的数据结构。
+ */
 QJsonObject makeRecordData(const QStringList &row, const QHash<QString, int> &columns)
 {
     const QString now = QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
@@ -488,6 +515,7 @@ QJsonObject makeRecordData(const QStringList &row, const QHash<QString, int> &co
 
 } // namespace
 
+/** @brief 解包 XLSX、读取人员工作表并交给统一行解析流程。 */
 PersonXlsxParseResult PersonXlsxParser::parse(const QString &filePath)
 {
     PersonXlsxParseResult result;
@@ -509,6 +537,12 @@ PersonXlsxParseResult PersonXlsxParser::parse(const QString &filePath)
     return parseRows(rows, QStringLiteral("XLSX"));
 }
 
+/**
+ * @brief 校验固定表头，跳过说明/示例/空行，并生成文件内账号唯一的人员记录。
+ *
+ * 单行字段缺失或账号重复属于非致命问题，记录到 warnings 后继续处理其余行；
+ * 缺少必要列或最终没有有效人员记录时才返回整体错误。
+ */
 PersonXlsxParseResult PersonXlsxParser::parseRows(const QVector<QStringList> &rows,
                                                   const QString &formatName)
 {

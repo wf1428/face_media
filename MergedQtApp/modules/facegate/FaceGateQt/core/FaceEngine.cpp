@@ -174,12 +174,18 @@ void FaceEngine::setGallery(const QVector<FaceRecord> &records)
     rebuildRecognitionGallery();
 }
 
+/**
+ * @brief 替换网络人员图库并重建统一识别快照。
+ *
+ * 只保存数据库线程提供的值副本，避免推理过程跨线程访问数据库对象。
+ */
 void FaceEngine::setNetworkGallery(const QVector<FaceRecord> &records)
 {
     networkGallery_ = records;
     rebuildRecognitionGallery();
 }
 
+/** @brief 合并本地与网络图库，使单帧识别只遍历一个稳定快照。 */
 void FaceEngine::rebuildRecognitionGallery()
 {
     gallery_ = localGallery_;

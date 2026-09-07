@@ -9,6 +9,7 @@
 #include "DatabaseWorker.h"
 
 #include <QDebug>
+#include <QFile>
 
 /** @brief 使用配置构造仓储对象；连接在 open() 所在线程创建。 */
 DatabaseWorker::DatabaseWorker(const AppConfig &config, QObject *parent)
@@ -213,18 +214,21 @@ void DatabaseWorker::addPersonFace(const PersonInfo &person, const FaceFeatureDa
 {
     if (!opened_) {
         qWarning().noquote() << "跳过录入：数据库未打开";
+        QFile::remove(imagePath);
         emit enrollFinished(false, repository_.lastError().isEmpty() ? "数据库未打开" : repository_.lastError());
         return;
     }
 
     if (person.personNo.trimmed().isEmpty() || person.name.trimmed().isEmpty()) {
         qWarning().noquote() << "拒绝录入：人员编号或姓名为空";
+        QFile::remove(imagePath);
         emit enrollFinished(false, "人员编号和姓名不能为空");
         return;
     }
 
     if (feature.blob.isEmpty()) {
         qWarning().noquote() << "拒绝录入：特征数据为空";
+        QFile::remove(imagePath);
         emit enrollFinished(false, "人脸特征为空");
         return;
     }
@@ -234,6 +238,7 @@ void DatabaseWorker::addPersonFace(const PersonInfo &person, const FaceFeatureDa
     const bool ok = repository_.addPersonFace(person, feature, imagePath);
     if (!ok) {
         qWarning().noquote() << "保存录入人脸失败：" << repository_.lastError();
+        QFile::remove(imagePath);
     }
     emit enrollFinished(ok, ok ? "人脸录入完成" : repository_.lastError());
     if (ok) {

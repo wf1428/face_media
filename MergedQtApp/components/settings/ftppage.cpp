@@ -9,6 +9,7 @@
 #include "ftppage.h"
 
 #include <QRegularExpression>
+#include "common/storage_policy.h"
 #include "platform/rk3566_platform.h"
 
 
@@ -232,6 +233,20 @@ FtpPage::FtpPage(QWidget *parent) : QWidget(parent)
                 return;
             }
 
+            QString quotaError;
+            if (!StoragePolicy::canCommitMediaFile(
+                        finalFile, partFile, &quotaError)) {
+                QFile::remove(partFile);
+                setStatusText(QStringLiteral("媒体目录容量不足"));
+                showToast(quotaError, 3500);
+                appendLog(quotaError);
+                emit ftpDownloadStorageRejected(
+                            QFileInfo(finalFile).fileName(), quotaError);
+                curlMode = CurlMode::Idle;
+                clearAutoDownloadState();
+                return;
+            }
+
             QFile::remove(finalFile);   // 若已有旧文件，先删
             if (!QFile::rename(partFile, finalFile)) {
                 setStatusText(QStringLiteral("下载完成但改名失败"));
@@ -331,6 +346,17 @@ FtpPage::FtpPage(QWidget *parent) : QWidget(parent)
         httpDownloading_ = false;
 
         if (ok) {
+               QString quotaError;
+               if (!StoragePolicy::canCommitMediaFile(
+                           finalFile, partFile, &quotaError)) {
+                   QFile::remove(partFile);
+                   setStatusText(QStringLiteral("媒体目录容量不足"));
+                   showToast(quotaError, 3500);
+                   appendLog(quotaError);
+                   emit ftpDownloadStorageRejected(
+                               QFileInfo(finalFile).fileName(), quotaError);
+                   return;
+               }
                // 用 rename 原子替换，避免半截文件
                QFile::remove(finalFile); // 若存在旧文件，先删（也可以不删，用 rename 覆盖策略取决于系统）
                if (QFile::rename(partFile, finalFile)) {
@@ -1553,6 +1579,15 @@ bool FtpPage::checkDownloadSpaceOrReport(const QString &host, int port,
         return false;
     }
 
+    QString quotaError;
+    if (!StoragePolicy::canStoreMediaFile(localPath, remoteSize, &quotaError)) {
+        setStatusText(QStringLiteral("媒体目录容量不足"));
+        showToast(quotaError, 3500);
+        appendLog(quotaError);
+        emit ftpDownloadStorageRejected(displayName, quotaError);
+        return false;
+    }
+
     if (remoteSize > bytesBeforeDownloadLimit) {
         const QString msg = QStringLiteral("存储空间不足：文件大小=%1 bytes，仅可写入=%2 bytes")
                 .arg(remoteSize)
@@ -1825,6 +1860,17 @@ void FtpPage::startHttpMp4DownloadByProcess(const QString& urlStr, const QString
     // 4) 临时文件 + 最终文件
     const QString partFile = localFile + ".part";
 
+    const qint64 mediaWritable = StoragePolicy::mediaWritableBytes(localFile);
+    if (mediaWritable == 0) {
+        const QString reason = QStringLiteral(
+                    "媒体目录容量不足：视频和图片总量限制为 2 GiB");
+        setStatusText(QStringLiteral("媒体目录容量不足"));
+        showToast(reason, 3500);
+        appendLog(reason);
+        emit ftpDownloadStorageRejected(QFileInfo(localFile).fileName(), reason);
+        return;
+    }
+
     // 5) 若已有任务在跑，先终止
     if (httpProc->state() != QProcess::NotRunning) {
         appendLog(QStringLiteral("已有HTTP下载任务，终止旧任务"));
@@ -1850,6 +1896,10 @@ void FtpPage::startHttpMp4DownloadByProcess(const QString& urlStr, const QString
          << "--connect-timeout" << "8"
          << "--max-time" << "0"
          << url;
+    if (mediaWritable > 0) {
+        args.insert(args.size() - 1, QStringLiteral("--max-filesize"));
+        args.insert(args.size() - 1, QString::number(mediaWritable));
+    }
 
     setStatusText(QStringLiteral("正在HTTP下载..."));
     showToast(QStringLiteral("开始HTTP下载..."), 1500);
@@ -2211,6 +2261,16 @@ void FtpPage::handleAutoDownloadPreflightFinished(int exitCode, QProcess::ExitSt
         clearAutoDownloadState();
         setStatusText(QStringLiteral("存储空间不足"));
         showToast(QStringLiteral("存储空间不足"), 3000);
+        appendLog(storageReason);
+        emit ftpDownloadStorageRejected(displayName, storageReason);
+        return;
+    }
+
+    if (!StoragePolicy::canStoreMediaFile(
+                localPath, remoteSize, &storageReason)) {
+        clearAutoDownloadState();
+        setStatusText(QStringLiteral("媒体目录容量不足"));
+        showToast(storageReason, 3500);
         appendLog(storageReason);
         emit ftpDownloadStorageRejected(displayName, storageReason);
         return;

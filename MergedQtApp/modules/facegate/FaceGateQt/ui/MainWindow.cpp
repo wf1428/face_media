@@ -19,10 +19,13 @@
 #include "PersonImportWorker.h"
 #include "SnapshotService.h"
 #include "common/face_image_sync_bridge.h"
+#include "common/storage_policy.h"
 #include "ic_board/ic_event_bridge.h"
+#include "platform/rk3566_platform.h"
 
 #include <QAbstractSocket>
 #include <QApplication>
+#include <QBuffer>
 #include <QLabel>
 #include <QCoreApplication>
 #include <QDateTime>
@@ -162,12 +165,17 @@ void FaceGateMainWindow::deactivateModule()
     }
     faceFramePending_ = false;
     faceAccessPending_ = false;
+    if (facePresent_) {
+        facePresent_ = false;
+        emit facePresenceChanged(false);
+    }
     passwordAccessActive_ = false;
     ++passwordAccessGeneration_;
     if (passwordAccessButton_) {
         passwordAccessButton_->setEnabled(true);
     }
     pendingFaceAccessLog_ = VerifyLog();
+    hideSuccessfulAccess();
     liveness_.stop();
     clearCameraFrames();
     adminLivenessPending_ = false;
@@ -229,6 +237,11 @@ bool FaceGateMainWindow::isModuleActive() const
     return moduleActive_;
 }
 
+/**
+ * @return 仅在门禁主页没有管理、密码通行或本窗口模态交互时返回 true。
+ *
+ * 外壳据此避免在用户输入密码或操作管理界面时自动切换模块。
+ */
 bool FaceGateMainWindow::allowsPresenceSwitch() const
 {
     if (!moduleActive_ || adminLoginActive_ || adminModeActive_ ||
@@ -298,6 +311,7 @@ void FaceGateMainWindow::buildUi()
 
     recognitionLabel_ = new QLabel("就绪", rightOverlay_);
     recognitionLabel_->setObjectName("primaryStatus");
+    recognitionLabel_->hide();
     gateLabel_ = new QLabel("闸机空闲", rightOverlay_);
     gateLabel_->setObjectName("infoChip");
     gateLabel_->setMinimumHeight(44);
@@ -321,11 +335,37 @@ void FaceGateMainWindow::buildUi()
     passwordAccessButton_->setMinimumHeight(48);
     passwordAccessButton_->setCursor(Qt::PointingHandCursor);
 
-    rightLayout->addWidget(recognitionLabel_);
+    successfulAccessCard_ = new QWidget(rightOverlay_);
+    successfulAccessCard_->setObjectName(QStringLiteral("successfulAccessCard"));
+    auto *successfulAccessLayout = new QVBoxLayout(successfulAccessCard_);
+    successfulAccessLayout->setContentsMargins(8, 8, 8, 8);
+    successfulAccessLayout->setSpacing(6);
+
+    successfulAccessImageLabel_ = new QLabel(successfulAccessCard_);
+    successfulAccessImageLabel_->setObjectName(
+                QStringLiteral("successfulAccessImage"));
+    successfulAccessImageLabel_->setAlignment(Qt::AlignCenter);
+    successfulAccessImageLabel_->setMinimumHeight(108);
+    successfulAccessImageLabel_->setMaximumHeight(132);
+    successfulAccessImageLabel_->setSizePolicy(
+                QSizePolicy::Expanding, QSizePolicy::Fixed);
+
+    successfulAccessNameLabel_ = new QLabel(successfulAccessCard_);
+    successfulAccessNameLabel_->setObjectName(
+                QStringLiteral("successfulAccessName"));
+    successfulAccessNameLabel_->setAlignment(Qt::AlignCenter);
+    successfulAccessNameLabel_->setWordWrap(true);
+    successfulAccessNameLabel_->setMinimumHeight(28);
+
+    successfulAccessLayout->addWidget(successfulAccessImageLabel_);
+    successfulAccessLayout->addWidget(successfulAccessNameLabel_);
+    successfulAccessCard_->hide();
+
     rightLayout->addWidget(gateLabel_);
     rightLayout->addWidget(livenessLabel_);
     rightLayout->addWidget(galleryLabel_);
     rightLayout->addWidget(passwordAccessButton_);
+    rightLayout->addWidget(successfulAccessCard_);
     rightLayout->addStretch();
     rightLayout->addWidget(hintLabel_);
 
@@ -349,6 +389,11 @@ void FaceGateMainWindow::buildUi()
         "#passwordAccessButton:pressed{background:rgba(73,209,255,78);}"
         "#passwordAccessButton:disabled{color:#71838d;border-color:rgba(255,255,255,30);"
         "background:rgba(255,255,255,12);}"
+        "#successfulAccessCard{background:rgba(35,180,105,34);"
+        "border:1px solid rgba(80,220,145,125);border-radius:6px;}"
+        "#successfulAccessImage{background:rgba(0,0,0,115);"
+        "border:1px solid rgba(255,255,255,40);border-radius:4px;}"
+        "#successfulAccessName{color:#ecfff4;font-size:15px;font-weight:700;}"
         "QPushButton{font-size:16px;padding:10px 16px;border-radius:6px;}"
     );
 
@@ -363,6 +408,11 @@ void FaceGateMainWindow::buildUi()
     connect(&networkTimer_, &QTimer::timeout, this, &FaceGateMainWindow::updateNetworkSummary);
     networkTimer_.start(5000);
     updateNetworkSummary();
+
+    successfulAccessTimer_.setSingleShot(true);
+    successfulAccessTimer_.setInterval(5000);
+    connect(&successfulAccessTimer_, &QTimer::timeout,
+            this, &FaceGateMainWindow::hideSuccessfulAccess);
     layoutOverlayPanels();
 }
 
@@ -374,6 +424,7 @@ void FaceGateMainWindow::resizeEvent(QResizeEvent *event)
         preview_->setGeometry(centralWidget()->rect());
     }
     layoutOverlayPanels();
+    updateSuccessfulAccessThumbnail();
     if (adminPanel_ && adminPanel_->isVisible()) {
         adminPanel_->setGeometry(rect());
         adminPanel_->raise();
@@ -398,6 +449,67 @@ void FaceGateMainWindow::layoutOverlayPanels()
     }
     leftOverlay_->raise();
     rightOverlay_->raise();
+}
+
+/** @brief 在右侧栏显示本次成功通行的抓拍缩略图和人员姓名。 */
+void FaceGateMainWindow::showSuccessfulAccess(const VerifyLog &log)
+{
+    if (!successfulAccessCard_ || !successfulAccessImageLabel_
+            || !successfulAccessNameLabel_) {
+        return;
+    }
+
+    const QString snapshotPath = log.snapshotPath.trimmed();
+    QPixmap snapshot(snapshotPath);
+    if (snapshotPath.isEmpty() || snapshot.isNull()) {
+        qWarning().noquote() << "成功通行缩略图加载失败：" << snapshotPath;
+        hideSuccessfulAccess();
+        return;
+    }
+
+    successfulAccessPixmap_ = snapshot;
+    const QString displayName = log.nameSnapshot.trimmed().isEmpty()
+            ? QStringLiteral("已授权人员") : log.nameSnapshot.trimmed();
+    successfulAccessNameLabel_->setText(displayName);
+    successfulAccessCard_->show();
+    successfulAccessTimer_.start();
+
+    // show() 后布局才会给图片标签分配最终宽度，下一轮事件循环再等比缩放。
+    QTimer::singleShot(0, this, [this]() {
+        updateSuccessfulAccessThumbnail();
+    });
+}
+
+/** @brief 按缩略图标签当前尺寸等比刷新成功抓拍。 */
+void FaceGateMainWindow::updateSuccessfulAccessThumbnail()
+{
+    if (!successfulAccessCard_ || !successfulAccessCard_->isVisible()
+            || !successfulAccessImageLabel_ || successfulAccessPixmap_.isNull()) {
+        return;
+    }
+
+    const QSize targetSize = successfulAccessImageLabel_->contentsRect().size();
+    if (!targetSize.isValid()) {
+        return;
+    }
+    successfulAccessImageLabel_->setPixmap(successfulAccessPixmap_.scaled(
+                targetSize, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+}
+
+/** @brief 隐藏并清理成功通行缩略图。 */
+void FaceGateMainWindow::hideSuccessfulAccess()
+{
+    successfulAccessTimer_.stop();
+    successfulAccessPixmap_ = QPixmap();
+    if (successfulAccessImageLabel_) {
+        successfulAccessImageLabel_->clear();
+    }
+    if (successfulAccessNameLabel_) {
+        successfulAccessNameLabel_->clear();
+    }
+    if (successfulAccessCard_) {
+        successfulAccessCard_->hide();
+    }
 }
 
 /**
@@ -539,6 +651,9 @@ void FaceGateMainWindow::startServices()
             QMetaObject::invokeMethod(
                         databaseWorker_, "reloadGallery",
                         Qt::QueuedConnection);
+            QMetaObject::invokeMethod(
+                        databaseWorker_, "loadStorageStats",
+                        Qt::QueuedConnection);
         }
     });
     connect(&audio_, &AudioService::audioStatus, this, [](const QString &message) {
@@ -605,8 +720,17 @@ void FaceGateMainWindow::startServices()
         cameraLabel_->setText("摄像头 " + message);
     });
     connect(&camera_, &CameraService::cameraError, this, [this](const QString &message) {
+        const QString userMessage = QStringLiteral("请检查摄像头是否连接");
         qWarning().noquote() << "摄像头错误：" << message;
         cameraLabel_->setText("摄像头 " + message);
+        latestFrame_ = QImage();
+        latestEnrollmentPreview_ = QImage();
+        if (preview_) {
+            preview_->setCameraUnavailableMessage(userMessage);
+        }
+        if (adminPanel_ && adminPanel_->cameraRequired()) {
+            adminPanel_->setCameraUnavailableMessage(userMessage);
+        }
         writeSystemEvent("camera", "error", "摄像头错误", message);
     });
 
@@ -682,8 +806,13 @@ void FaceGateMainWindow::startServices()
 
     connect(faceInferenceWorker_, &FaceInferenceWorker::facesUpdated, this,
         [this](const QVector<DetectedFace> &faces) {
-            if (adminModeActive_ || passwordAccessActive_) {
+            if (!moduleActive_ || adminModeActive_ || passwordAccessActive_) {
                 return;
+            }
+            const bool present = !faces.isEmpty();
+            if (facePresent_ != present) {
+                facePresent_ = present;
+                emit facePresenceChanged(present);
             }
             preview_->setFaces(faces);
         });
@@ -724,7 +853,10 @@ void FaceGateMainWindow::startServices()
                 }
             }
             QString snapshotError;
-            enriched.snapshotPath = SnapshotService(config_).saveVerifySnapshot(latestFrame_, enriched.personNo, enriched.result, &snapshotError);
+            const QString snapshotName = enriched.nameSnapshot.trimmed().isEmpty()
+                    ? QStringLiteral("已授权人员") : enriched.nameSnapshot.trimmed();
+            enriched.snapshotPath = SnapshotService(config_).saveVerifySnapshot(
+                        latestFrame_, snapshotName, enriched.result, &snapshotError);
             if (enriched.snapshotPath.isEmpty() && !snapshotError.isEmpty()) {
                 qWarning().noquote() << snapshotError;
             }
@@ -764,8 +896,13 @@ void FaceGateMainWindow::startServices()
                     || enriched.result == QStringLiteral("liveness_failed");
             if (config_.saveFailedSnapshot && uploadFailure) {
                 QString snapshotError;
-                const QString personNo = enriched.personNo.isEmpty() ? QStringLiteral("unknown") : enriched.personNo;
-                enriched.snapshotPath = SnapshotService(config_).saveVerifySnapshot(latestFrame_, personNo, enriched.result, &snapshotError);
+                QString snapshotName = enriched.nameSnapshot.trimmed();
+                if (snapshotName.isEmpty()) {
+                    snapshotName = enriched.result == QStringLiteral("stranger")
+                            ? QStringLiteral("陌生人") : QStringLiteral("活体失败");
+                }
+                enriched.snapshotPath = SnapshotService(config_).saveVerifySnapshot(
+                            latestFrame_, snapshotName, enriched.result, &snapshotError);
                 if (enriched.snapshotPath.isEmpty() && !snapshotError.isEmpty()) {
                     qWarning().noquote() << snapshotError;
                 }
@@ -779,8 +916,29 @@ void FaceGateMainWindow::startServices()
                 audio_.playPrompt(AudioService::Prompt::VerifyFailed);
             }
             recognitionLabel_->setText(enriched.failReason);
+            emit recognitionFinished();
             if (databaseWorker_) {
                 QMetaObject::invokeMethod(databaseWorker_, "addVerifyLog", Qt::QueuedConnection, Q_ARG(VerifyLog, enriched));
+            }
+            QJsonObject accessRecord;
+            accessRecord.insert(QStringLiteral("type"), QStringLiteral("face"));
+            accessRecord.insert(QStringLiteral("name"),
+                                enriched.nameSnapshot.trimmed().isEmpty()
+                                ? (enriched.result == QStringLiteral("stranger")
+                                   ? QStringLiteral("陌生人") : QStringLiteral("未知人员"))
+                                : enriched.nameSnapshot.trimmed());
+            accessRecord.insert(QStringLiteral("success"), false);
+            accessRecord.insert(QStringLiteral("reason"), enriched.failReason);
+            if (!enriched.snapshotPath.isEmpty()) {
+                accessRecord.insert(QStringLiteral("snapshotPath"), enriched.snapshotPath);
+            }
+            if (!enriched.faceHash.trimmed().isEmpty()) {
+                accessRecord.insert(QStringLiteral("faceHash"), enriched.faceHash.trimmed());
+            }
+            QString accessLogError;
+            if (!StoragePolicy::appendAccessRecord(
+                        SnapshotService(config_).rootPath(), accessRecord, &accessLogError)) {
+                qWarning().noquote() << accessLogError;
             }
             if (uploadFailure) {
                 IcEventBridge::instance()->emitFaceUploadRequested(
@@ -827,12 +985,13 @@ void FaceGateMainWindow::startServices()
                 lastPassedTimer_.restart();
                 audio_.playPrompt(AudioService::Prompt::VerifyPassed);
                 const QString successText = config_.privacyMode
-                        ? QStringLiteral("验证通过\n已授权人员")
-                        : QStringLiteral("验证通过\n%1").arg(
+                        ? QStringLiteral("验证通过  已授权人员")
+                        : QStringLiteral("验证通过  %1").arg(
                               completedLog.nameSnapshot.isEmpty()
                               ? completedLog.personNo : completedLog.nameSnapshot);
                 recognitionLabel_->setText(successText);
                 preview_->setStateText(successText);
+                showSuccessfulAccess(completedLog);
                 emit recognitionSucceeded();
             }
             gateLabel_->setText(QStringLiteral("楼层权限 已下发"));
@@ -860,8 +1019,32 @@ void FaceGateMainWindow::startServices()
                                       Q_ARG(VerifyLog, completedLog));
         }
         if (matchesPending) {
+            QJsonObject accessRecord;
+            accessRecord.insert(QStringLiteral("type"), QStringLiteral("face"));
+            accessRecord.insert(QStringLiteral("name"),
+                                completedLog.nameSnapshot.trimmed().isEmpty()
+                                ? QStringLiteral("已授权人员")
+                                : completedLog.nameSnapshot.trimmed());
+            accessRecord.insert(QStringLiteral("success"), success);
+            if (!completedLog.failReason.trimmed().isEmpty()) {
+                accessRecord.insert(QStringLiteral("reason"), completedLog.failReason.trimmed());
+            }
+            if (!completedLog.snapshotPath.trimmed().isEmpty()) {
+                accessRecord.insert(QStringLiteral("snapshotPath"), completedLog.snapshotPath.trimmed());
+            }
+            if (!completedLog.faceHash.trimmed().isEmpty()) {
+                accessRecord.insert(QStringLiteral("faceHash"), completedLog.faceHash.trimmed());
+            }
+            QString accessLogError;
+            if (!StoragePolicy::appendAccessRecord(
+                        SnapshotService(config_).rootPath(), accessRecord, &accessLogError)) {
+                qWarning().noquote() << accessLogError;
+            }
+        }
+        if (matchesPending) {
             faceAccessPending_ = false;
             pendingFaceAccessLog_ = VerifyLog();
+            emit recognitionFinished();
         }
         qInfo().noquote() << "[FACE-ACCESS] completed" << detail;
     }, Qt::QueuedConnection);
@@ -938,6 +1121,21 @@ void FaceGateMainWindow::startServices()
                                           Qt::QueuedConnection,
                                           Q_ARG(VerifyLog, completedLog));
             }
+            QJsonObject accessRecord;
+            accessRecord.insert(QStringLiteral("type"), QStringLiteral("password"));
+            accessRecord.insert(QStringLiteral("name"),
+                                completedLog.nameSnapshot.trimmed().isEmpty()
+                                ? QStringLiteral("未知人员")
+                                : completedLog.nameSnapshot.trimmed());
+            accessRecord.insert(QStringLiteral("success"), success);
+            if (!completedLog.failReason.trimmed().isEmpty()) {
+                accessRecord.insert(QStringLiteral("reason"), completedLog.failReason.trimmed());
+            }
+            QString accessLogError;
+            if (!StoragePolicy::appendAccessRecord(
+                        SnapshotService(config_).rootPath(), accessRecord, &accessLogError)) {
+                qWarning().noquote() << accessLogError;
+            }
         }
 
         qInfo().noquote() << "[PASSWORD-ACCESS] completed" << detail;
@@ -955,10 +1153,6 @@ void FaceGateMainWindow::startServices()
             }
         });
     }, Qt::QueuedConnection);
-
-    connect(&gate_, &GateOutputService::gateStatus, this, [this](const QString &message) {
-        gateLabel_->setText("闸机 " + message);
-    });
 
     servicesInitialized_ = true;
     qInfo() << "[FACEGATE-ADAPTER] UI/database services initialized; camera deferred";
@@ -1176,6 +1370,11 @@ void FaceGateMainWindow::handleAdminTap()
     }
 }
 
+/**
+ * @brief 暂停人脸验证，采集人员密码并提交本地通行权限校验。
+ *
+ * generation 计数用于丢弃前一次异步密码校验的迟到结果，避免覆盖当前界面状态。
+ */
 void FaceGateMainWindow::handlePasswordAccess()
 {
     if (!moduleActive_ || adminModeActive_ || adminLoginActive_) {
@@ -1521,8 +1720,10 @@ void FaceGateMainWindow::updateCameraPowerState()
         if (cameraLabel_) {
             cameraLabel_->setText("摄像头 正在停止");
         }
-        camera_.stop();
     }
+    // 即使采集线程因初始化错误自行把 running_ 置为 false，也必须 join，
+    // 否则后续进入新增人员页重新启动时会覆盖 joinable 的 std::thread。
+    camera_.stop();
     clearCameraFrames();
     if (cameraLabel_) {
         cameraLabel_->setText("摄像头 已停止");
@@ -2022,7 +2223,7 @@ void FaceGateMainWindow::handleEnrollRequest(const PersonInfo &person, const QIm
         }
     }
 
-    QDir dir(QCoreApplication::applicationDirPath());
+    QDir dir(Rk3566Platform::applicationRoot());
     if (!dir.exists("enrollments")) {
         dir.mkdir("enrollments");
     }
@@ -2039,8 +2240,16 @@ void FaceGateMainWindow::handleEnrollRequest(const PersonInfo &person, const QIm
         .arg(QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss_zzz"));
     const QString imagePath = dir.absoluteFilePath(fileName);
 
-    if (!image.save(imagePath, "JPG", 92)) {
-        const QString message = "保存录入截图失败";
+    QByteArray encodedImage;
+    QBuffer imageBuffer(&encodedImage);
+    imageBuffer.open(QIODevice::WriteOnly);
+    const bool encoded = image.save(&imageBuffer, "JPG", 92);
+    imageBuffer.close();
+    QString storageError;
+    if (!encoded || !StoragePolicy::writeRegistrationPhoto(
+                imagePath, encodedImage, &storageError)) {
+        const QString message = storageError.isEmpty()
+                ? QStringLiteral("保存录入截图失败") : storageError;
         qWarning().noquote() << message << imagePath;
         if (adminPanel_) {
             adminPanel_->setStatusText(message);

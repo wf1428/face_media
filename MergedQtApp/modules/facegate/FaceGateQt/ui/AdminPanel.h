@@ -13,6 +13,8 @@
 #include <QHash>
 #include <QImage>
 #include <QJsonArray>
+#include <QString>
+#include <QThread>
 #include <QVector>
 
 #include "AppConfig.h"
@@ -30,6 +32,21 @@ class QTabWidget;
 class QTimer;
 class QQuickWidget;
 class QWidget;
+class QHideEvent;
+class QShowEvent;
+
+/** @brief 后台线程采集的一次设备运行状态快照。 */
+struct DeviceStatusSnapshot {
+    QString serialNumber;
+    QString ipAddress;
+    QString macAddress;
+    QString diskCapacity;
+    QString diskRootPath;
+    QString cpuUsage;
+    QString memoryUsage;
+    QString temperature;
+    QString npuUsage;
+};
 
 /**
  * @brief 人脸门禁管理员综合面板。
@@ -44,11 +61,17 @@ public:
     /** @brief 按当前配置创建导航、内容页和内嵌虚拟键盘。 */
     explicit AdminPanel(const AppConfig &config, QWidget *parent = nullptr);
 
+    /** @brief 停止设备状态采集线程。 */
+    ~AdminPanel() override;
+
     /** @brief 更新录入页面的最新原图和预览图。 */
     void setCurrentFrame(const QImage &image, const QImage &previewImage);
 
     /** @brief 清除录入预览。 */
     void clearEnrollPreview();
+
+    /** @brief 在录入预览区域显示摄像头异常提示。 */
+    void setCameraUnavailableMessage(const QString &message);
 
     /** @brief 更新录入页面的人脸分析结果。 */
     void setEnrollAnalysis(const QImage &image,
@@ -172,16 +195,32 @@ protected:
     /** @brief 关闭时发出 closed() 并继续基类关闭流程。 */
     void closeEvent(QCloseEvent *event) override;
 
+    /** @brief 面板显示后按当前页面启停设备状态刷新。 */
+    void showEvent(QShowEvent *event) override;
+
+    /** @brief 面板隐藏时停止设备状态刷新。 */
+    void hideEvent(QHideEvent *event) override;
+
 private:
     /** @return 人员录入和管理组合页面。 */
     QWidget *createPersonManagementPage();
 
     /** @return 人员列表页面。 */
     QWidget *createPeoplePage();
+
+    /** @return 网络人员与已删除人员切换页面。 */
     QWidget *createNetworkPeoplePage();
+
+    /** @brief 按当前删除状态筛选并重建网络人员表格。 */
     void refreshNetworkPeopleTable();
+
+    /** @brief 切换正常/已删除网络人员视图并刷新表格。 */
     void setNetworkDeletedView(bool deleted);
+
+    /** @brief 显示指定表格行对应人员的全部人脸原图。 */
     void showNetworkPersonFaces(int row);
+
+    /** @brief 将网络同步提示条定位到网络人员页底部中央。 */
     void positionNetworkSyncToast();
 
     /** @return 验证日志查询页面。 */
@@ -249,6 +288,18 @@ private:
 
     /** @brief 刷新序列号、资源占用、温度和容量等设备信息。 */
     void updateDeviceInfo();
+
+    /** @brief 只更新无需系统采样的版本、运行时间和数据库容量信息。 */
+    void updateDeviceSummaryLabels();
+
+    /** @brief 根据页面和面板可见性启停设备状态定时刷新。 */
+    void updateDeviceStatusRefreshState();
+
+    /** @brief 向后台采集线程投递一次状态读取请求。 */
+    void requestDeviceStatusRefresh();
+
+    /** @brief 在 GUI 线程把后台快照更新到标签。 */
+    void applyDeviceStatusSnapshot(const DeviceStatusSnapshot &snapshot);
 
     /** @brief 根据当前文本焦点和点击对象更新虚拟键盘。 */
     void updateEmbeddedKeyboardVisibility();
@@ -340,8 +391,9 @@ private:
     QLabel *faceDetectValueLabel_ = nullptr;
     QLabel *livenessValueLabel_ = nullptr;
     QTimer *deviceStatusTimer_ = nullptr;
-    qint64 lastCpuTotal_ = 0; /**< 上次 /proc/stat CPU 总计采样。 */
-    qint64 lastCpuIdle_ = 0;  /**< 上次 /proc/stat CPU 空闲采样。 */
+    QThread deviceStatusThread_;
+    QObject *deviceStatusCollector_ = nullptr;
+    bool deviceStatusRequestPending_ = false;
     bool passedLogsLoaded_ = false; /**< 验证日志页是否已完成首次加载。 */
 };
 

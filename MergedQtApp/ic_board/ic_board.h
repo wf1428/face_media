@@ -35,7 +35,6 @@ struct IcSerialConfig {
 
     QString rs485Dev    = Rk3566Platform::rs485Device(); /**< RS485 串口节点。 */
     int rs485Baud       = 9600;                           /**< RS485 波特率，bit/s。 */
-    QString rs485DirDev = Rk3566Platform::rs485DirectionDevice(); /**< 可选外部方向控制节点。 */
 
 };
 

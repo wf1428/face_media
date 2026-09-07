@@ -155,7 +155,8 @@ struct SystemEventLog {
 /** @brief 本地存储关键表的记录数量汇总。 */
 struct StorageStats {
     int personCount = 0;       /**< 人员记录数。 */
-    int faceFeatureCount = 0;  /**< 人脸特征记录数。 */
+    int faceFeatureCount = 0;  /**< 本地与网络注册照片的实际文件数。 */
+    qint64 registrationPhotoBytes = 0; /**< 本地与网络注册照片实际占用字节数。 */
     int verifyLogCount = 0;    /**< 验证日志记录数。 */
 };
 

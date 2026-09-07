@@ -93,7 +93,16 @@ public:
     /** @brief 发布刷卡器命令异步发送结果。 */
     void emitCardReaderCommandFinished(const QString &sourceTag, bool ok, const QString &reason);
 
+    /** @return 当前网络链路和外网探测均可用时返回 true。 */
+    bool networkAvailable() const;
+
+    /** @brief 更新进程级网络可用状态；相同状态不会重复发出变化信号。 */
+    void updateNetworkAvailability(bool available);
+
 signals:
+    /** @brief 网络可用状态实际发生变化。 */
+    void networkAvailabilityChanged(bool available);
+
     /** @brief 在线模式卡片通过事件。 */
     void cardPassed(const QString &cardId, const QString &floor, const QByteArray &rawFrame);
 
@@ -154,6 +163,9 @@ signals:
 
     /** @brief 刷卡器命令发送完成回执。 */
     void cardReaderCommandFinished(const QString &sourceTag, bool ok, const QString &reason);
+
+private:
+    bool networkAvailable_ = true;
 };
 
 #endif // IC_EVENT_BRIDGE_H

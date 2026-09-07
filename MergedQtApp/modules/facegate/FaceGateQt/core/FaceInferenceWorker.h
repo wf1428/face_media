@@ -72,7 +72,7 @@ public slots:
                                   const QString &imagePath,
                                   float duplicateThreshold);
 
-    /** @brief 对服务器同步图片执行单人脸、检测置信度、质量和特征提取校验，不做活体检测。 */
+    /** @brief 校验同步图片质量，并按本地去重阈值处理网络与本地图库冲突，不做活体检测。 */
     void validateSyncedFaceImages(const QString &token,
                                   const QString &personId,
                                   const QJsonArray &faces,

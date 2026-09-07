@@ -12,6 +12,7 @@
 #include <QElapsedTimer>
 #include <QMainWindow>
 #include <QPointer>
+#include <QPixmap>
 #include <QThread>
 #include <QTimer>
 
@@ -20,7 +21,6 @@
 #include "CameraService.h"
 #include "DatabaseWorker.h"
 #include "FaceInferenceWorker.h"
-#include "GateOutputService.h"
 #include "LivenessWorker.h"
 
 class AdminPanel;
@@ -60,12 +60,18 @@ public:
     /** @return 门禁模块当前活动时返回 true。 */
     bool isModuleActive() const;
 
-    /** @return true on the recognition screen, false during password/admin UI. */
+    /** @return 仅在识别主页且未进行密码或管理交互时返回 true。 */
     bool allowsPresenceSwitch() const;
 
 signals:
     /** Emitted after the final access decision succeeds and the result is shown. */
     void recognitionSucceeded();
+
+    /** @brief 最终人脸识别结果（成功或失败）已经显示。 */
+    void recognitionFinished();
+
+    /** @brief 主识别画面中的人脸检测状态发生变化。 */
+    void facePresenceChanged(bool present);
 
 protected:
     /** @brief 窗口尺寸变化后重新布局左右覆盖面板。 */
@@ -160,8 +166,6 @@ private:
     /** @brief 修改管理员密码并持久化配置。 */
     void handleAdminPasswordChange(const QString &oldPassword, const QString &newPassword);
 
-    /** @return 用户完成或按策略跳过密码修改时返回 true。 */
-
     /** @brief 异步写入管理员操作审计记录。 */
     void writeOperatorAudit(const QString &action, const QString &targetType, const QString &targetId, const QString &result, const QString &detail);
 
@@ -179,6 +183,15 @@ private:
 
     /** @brief 按窗口尺寸布局左右覆盖信息面板。 */
     void layoutOverlayPanels();
+
+    /** @brief 在右侧栏显示本次成功通行的抓拍缩略图和人员姓名。 */
+    void showSuccessfulAccess(const VerifyLog &log);
+
+    /** @brief 按缩略图标签当前尺寸等比刷新成功抓拍。 */
+    void updateSuccessfulAccessThumbnail();
+
+    /** @brief 隐藏并清理成功通行缩略图。 */
+    void hideSuccessfulAccess();
 
     /** @brief 根据模块活动态和当前页面需求启停摄像头。 */
     void updateCameraPowerState();
@@ -205,6 +218,9 @@ private:
     QLabel *livenessLabel_ = nullptr;
     QLabel *galleryLabel_ = nullptr;
     QLabel *hintLabel_ = nullptr;
+    QWidget *successfulAccessCard_ = nullptr;
+    QLabel *successfulAccessImageLabel_ = nullptr;
+    QLabel *successfulAccessNameLabel_ = nullptr;
     QPushButton *passwordAccessButton_ = nullptr;
     QWidget *leftOverlay_ = nullptr;
     QWidget *rightOverlay_ = nullptr;
@@ -230,6 +246,8 @@ private:
     QElapsedTimer adminTapTimer_;        /**< 管理入口点击时间窗口。 */
     QTimer clockTimer_;
     QTimer networkTimer_;
+    QTimer successfulAccessTimer_;
+    QPixmap successfulAccessPixmap_;
     QThread faceInferenceThread_;
     FaceInferenceWorker *faceInferenceWorker_ = nullptr;
     QThread databaseThread_;
@@ -243,7 +261,6 @@ private:
 
     CameraService camera_;
     LivenessWorker liveness_;
-    GateOutputService gate_;
     AudioService audio_;
     bool faceAccessPending_ = false;
     bool passwordAccessActive_ = false;
@@ -251,6 +268,7 @@ private:
     VerifyLog pendingFaceAccessLog_;
     bool faceEngineReady_ = false;       /**< 推理引擎已经初始化。 */
     bool faceFramePending_ = false;      /**< 已有一帧在推理线程处理中。 */
+    bool facePresent_ = false;           /**< 最近一帧主识别画面是否检测到人脸。 */
     bool enrollmentPending_ = false;     /**< 已提交一项录入特征任务。 */
     bool servicesInitialized_ = false;   /**< 后台线程和服务已经启动。 */
     bool moduleActive_ = false;          /**< 模块当前处于前台活动态。 */

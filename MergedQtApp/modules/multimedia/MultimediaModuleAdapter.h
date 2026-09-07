@@ -44,7 +44,7 @@ public:
     /** @return 多媒体模块当前活动时返回 true。 */
     bool isActive() const override;
 
-    /** @return true only on the MultimediaDemo main screen. */
+    /** @return 仅在多媒体主页面允许外壳执行在场切换。 */
     bool allowsPresenceSwitch() const override;
 
 private:

@@ -128,6 +128,8 @@ public:
     void pause();
     /** @brief 停止播放并清除画布中的最后一帧。 */
     void stop();
+    /** @brief 完整释放并重新创建 playbin，用于清除硬件解码器异常上下文。 */
+    bool recreatePipeline();
     /** @brief 跳转到指定毫秒位置。 */
     void seekMs(int ms);
 
@@ -153,6 +155,8 @@ public:
     qint64 lastVideoFrameMSecs() const { return lastVideoFrameMs_.loadAcquire(); }
     /** @return 最近音频帧到达的单调时钟毫秒值。 */
     qint64 lastAudioFrameMSecs() const { return lastAudioFrameMs_.loadAcquire(); }
+    /** @return 最近一个压缩视频 buffer 进入解码器的单调时钟毫秒值。 */
+    qint64 lastDecoderInputMSecs() const { return decoderInputLastBufferMs_.loadAcquire(); }
 
     /** @brief 设置配置文件指定的播放区域；rect 使用目标控件父窗口坐标。 */
     void setDisplayRect(const QRect &rect);
@@ -174,6 +178,8 @@ signals:
     void positionChanged(int positionMs, int durationMs);
     /** @brief 视频探针观测到有效帧，参数为单调时钟毫秒值。 */
     void videoFrameArrived(qint64 msecs);
+    /** @brief MPP输出持续失速或时间轴异常，需要上层原地重建当前直播管线。 */
+    void liveTimelineFaultDetected(const QString &reason);
     /** @brief 音频探针观测到有效帧，参数为单调时钟毫秒值。 */
     void audioFrameArrived(qint64 msecs);
     /** @brief 快照转换成功。 */
@@ -194,6 +200,8 @@ private slots:
     void pollBus();
     /** @brief 周期读取播放位置和时长。 */
     void pollPosition();
+    /** @brief 周期输出 RTSP/RTP、解码、RGA 和 GUI 端到端诊断数据。 */
+    void pollPlaybackDiagnostics();
 
 private:
     /** @brief 三槽帧邮箱中单个槽位的所有权状态。 */
@@ -275,6 +283,8 @@ private:
     void finishFrameMailboxRead(int slotIndex, quint64 sequence);
     /** @brief 清空邮箱状态并使遗留帧无效。 */
     void resetFrameMailbox();
+    /** @brief 新媒体开始前清空长时运行诊断基线。 */
+    void resetPlaybackDiagnostics();
 
     /** @brief 在同步总线回调中绑定硬件视频窗口句柄。 */
     static GstBusSyncReply busSyncHandler(GstBus *bus, GstMessage *message, gpointer userData);
@@ -282,6 +292,18 @@ private:
     static GstPadProbeReturn videoPadProbe(GstPad *pad, GstPadProbeInfo *info, gpointer userData);
     /** @brief 记录音频帧到达时间并节流发送监测信号。 */
     static GstPadProbeReturn audioPadProbe(GstPad *pad, GstPadProbeInfo *info, gpointer userData);
+    /** @brief 统计送入视频解码器的压缩帧、关键帧和损坏标志。 */
+    static GstPadProbeReturn decoderInputPadProbe(GstPad *pad,
+                                                  GstPadProbeInfo *info,
+                                                  gpointer userData);
+    /** @brief 统计视频解码器输出帧及其相对管线时钟的 PTS 偏移。 */
+    static GstPadProbeReturn decoderOutputPadProbe(GstPad *pad,
+                                                   GstPadProbeInfo *info,
+                                                   gpointer userData);
+    /** @brief 统计进入 jitterbuffer 前的原始视频 RTP 时间戳、序号和到达节奏。 */
+    static GstPadProbeReturn rtpInputPadProbe(GstPad *pad,
+                                              GstPadProbeInfo *info,
+                                              gpointer userData);
     /** @brief 接收 appsink 样本，RGA 转换后写入帧邮箱。 */
     static GstFlowReturn appSinkNewSample(GstElement *sink, gpointer userData);
     /** @brief 把音频 appsink 样本送入进程内共享混音器。 */
@@ -290,10 +312,10 @@ private:
     static void sourceSetup(GstElement *playbin, GstElement *source, gpointer userData);
     /** @brief 在 element 创建时调整解码器和解析器属性。 */
     static void elementSetup(GstElement *playbin, GstElement *element, gpointer userData);
-    /** @brief 为 HLS H.264 caps 查询补充 AU 对齐要求。 */
-    static GstPadProbeReturn hlsH264ParserQueryProbe(GstPad *pad,
-                                                     GstPadProbeInfo *info,
-                                                     gpointer userData);
+    /** @brief 为 HLS/RTSP H.264 caps 查询补充 AU 对齐要求。 */
+    static GstPadProbeReturn h264ParserQueryProbe(GstPad *pad,
+                                                  GstPadProbeInfo *info,
+                                                  gpointer userData);
 
 private:
     QPointer<QWidget> videoWidget_;
@@ -316,11 +338,14 @@ private:
     mutable QMutex frameMailboxMutex_; /**< 保护三槽邮箱的所有权和序列状态。 */
     QTimer busTimer_;
     QTimer positionTimer_;
+    QTimer playbackDiagnosticTimer_;
+    QElapsedTimer playbackDiagnosticElapsed_;
 
     bool prepared_ = false;
     bool playing_ = false;
     bool playRequested_ = false;
     bool preloadMode_ = false;
+    bool invalidRtcpDestinationWarningLogged_ = false;
     std::atomic_bool shuttingDown_ {false}; /**< 析构期间阻止回调继续投递。 */
     float volume01_ = 1.0f;
     int sourceWidth_ = 0;
@@ -333,7 +358,13 @@ private:
     QAtomicInt sourceSizeKnown_ {0};
     QAtomicInt guiDeliveryEventPending_ {0};
     QAtomicInt mediaGeneration_ {1};
-    QAtomicInt hlsAuAlignmentEnabled_ {0};
+    QAtomicInt h264AuAlignmentEnabled_ {0};
+    QAtomicInt liveRtspMode_ {0};
+    QAtomicInt liveDecoderAuAligned_ {-1};
+    QAtomicInt liveDecoderCapsLogged_ {0};
+    QAtomicInt liveWaitingForKeyframe_ {0};
+    QAtomicInt liveCreditRecoveryPending_ {0};
+    QAtomicInt liveCreditOverLimitConsecutiveAus_ {0};
     QAtomicInteger<qint64> lastVideoFrameMs_ {0};
     QAtomicInteger<qint64> lastAudioFrameMs_ {0};
     QAtomicInteger<qint64> lastVideoSignalMs_ {0};
@@ -353,6 +384,77 @@ private:
     QAtomicInteger<qint64> guiMaxQueueLagMs_ {0};
     QAtomicInteger<qint64> guiMaxEndToEndLagMs_ {0};
     QAtomicInt firstRgaSuccessLogged_ {0};
+    QAtomicInteger<quint64> qosMessageCount_ {0};
+    QAtomicInteger<quint64> qosLastProcessed_ {0};
+    QAtomicInteger<quint64> qosLastDropped_ {0};
+    QAtomicInteger<qint64> qosMaxLateNs_ {0};
+    QString qosLastSource_;             /**< 最近一条 QoS 消息的来源元素。 */
+    QAtomicInteger<quint64> jitterVideoTooLateDrops_ {0};
+    QAtomicInteger<quint64> jitterVideoLatencyDrops_ {0};
+    QAtomicInteger<quint64> jitterAudioTooLateDrops_ {0};
+    QAtomicInteger<quint64> jitterAudioLatencyDrops_ {0};
+    QAtomicInteger<quint64> jitterUnknownTooLateDrops_ {0};
+    QAtomicInteger<quint64> jitterUnknownLatencyDrops_ {0};
+    QAtomicInteger<quint64> decoderInputFrames_ {0};
+    QAtomicInteger<quint64> decoderInputKeyFrames_ {0};
+    QAtomicInteger<quint64> decoderInputCorruptedFrames_ {0};
+    QAtomicInteger<quint64> decoderOutputFrames_ {0};
+    QAtomicInteger<quint64> decoderOutputCorruptedFrames_ {0};
+    QAtomicInteger<qint64> decoderInputLastBufferMs_ {0};
+    QAtomicInteger<qint64> decoderInputMaxGapMs_ {0};
+    QAtomicInteger<qint64> decoderInputPtsOffsetNs_ {0};
+    QAtomicInteger<qint64> decoderInputMaxAbsPtsOffsetNs_ {0};
+    QAtomicInt decoderInputPtsOffsetValid_ {0};
+    QAtomicInteger<qint64> decoderOutputLastBufferMs_ {0};
+    QAtomicInteger<qint64> decoderOutputMaxGapMs_ {0};
+    QAtomicInteger<qint64> decoderOutputPtsOffsetNs_ {0};
+    QAtomicInteger<qint64> decoderOutputMaxAbsPtsOffsetNs_ {0};
+    QAtomicInt decoderOutputPtsOffsetValid_ {0};
+    QAtomicInteger<quint64> liveAuReceived_ {0};
+    QAtomicInteger<quint64> liveAuAccepted_ {0};
+    QAtomicInteger<quint64> liveAuDropped_ {0};
+    QAtomicInteger<qint64> liveInFlightAus_ {0};
+    QAtomicInteger<qint64> liveMaximumInFlightAus_ {0};
+    QAtomicInteger<qint64> liveLatestInputPtsNs_ {0};
+    QAtomicInteger<qint64> liveLatestOutputPtsNs_ {0};
+    QAtomicInteger<qint64> liveDecoderLagNs_ {0};
+    QAtomicInteger<qint64> liveMaximumDecoderLagNs_ {0};
+    QAtomicInt liveLatestInputPtsValid_ {0};
+    QAtomicInt liveLatestOutputPtsValid_ {0};
+    QAtomicInteger<qint64> appSinkPtsOffsetNs_ {0};
+    QAtomicInteger<qint64> appSinkMaxAbsPtsOffsetNs_ {0};
+    QAtomicInt appSinkPtsOffsetValid_ {0};
+
+    QAtomicInteger<quint64> rtpVideoRawPackets_ {0};
+    QAtomicInteger<quint64> rtpVideoTimestampChanges_ {0};
+    QAtomicInteger<quint64> rtpVideoTimestampAdvanceTicks_ {0};
+    QAtomicInteger<quint64> rtpVideoArrivalAdvanceUs_ {0};
+    QAtomicInteger<quint64> rtpVideoSequenceGaps_ {0};
+    QAtomicInteger<quint64> rtpVideoSequenceReorders_ {0};
+    QAtomicInteger<quint64> rtpVideoTimestampBackwards_ {0};
+    QAtomicInteger<quint64> rtpVideoTimestampJumps_ {0};
+    QAtomicInteger<quint64> rtpVideoSsrcChanges_ {0};
+    QAtomicInteger<quint32> rtpVideoLastTimestamp_ {0};
+    QAtomicInteger<quint32> rtpVideoLastSequence_ {0};
+    QAtomicInteger<quint32> rtpVideoLastSsrc_ {0};
+    QAtomicInteger<quint32> rtpVideoLastPayloadType_ {0};
+    QAtomicInteger<qint64> rtpVideoLastTimestampArrivalUs_ {0};
+    QAtomicInteger<qint64> rtpVideoClockRate_ {0};
+    QAtomicInt rtpVideoPreviousPacketValid_ {0};
+    int timelineFaultConsecutiveIntervals_ = 0;
+
+    quint64 diagnosticLastAppSinkSamples_ = 0;
+    quint64 diagnosticLastRgaFrames_ = 0;
+    quint64 diagnosticLastRgaSkippedFrames_ = 0;
+    quint64 diagnosticLastMailboxOverwrites_ = 0;
+    quint64 diagnosticLastMailboxNoSlotDrops_ = 0;
+    quint64 diagnosticLastGuiDeliveredFrames_ = 0;
+    quint64 diagnosticLastRtpPushed_ = 0;
+    quint64 diagnosticLastRtpLost_ = 0;
+    quint64 diagnosticLastRtpLate_ = 0;
+    quint64 diagnosticLastRtpDuplicates_ = 0;
+    quint64 diagnosticLastSinkRendered_ = 0;
+    quint64 diagnosticLastSinkDropped_ = 0;
 
     std::array<FrameMailboxSlot, kFrameMailboxSlotCount> frameMailboxSlots_; /**< 帧邮箱固定槽位。 */
     int frameMailboxWidth_ = 0;

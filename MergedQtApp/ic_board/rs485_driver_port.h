@@ -11,7 +11,6 @@
 
 #include <QObject>
 #include <QSerialPort>
-#include <QFile>
 #include <QTimer>
 #include <QByteArray>
 
@@ -20,7 +19,7 @@
 /**
  * @brief RK3566 RS485 串口收发封装。
  *
- * 优先请求内核 TIOCSRS485 自动方向；配置了兼容方向设备时使用 0/1 外部控制。
+ * 通过 TIOCSRS485 请求内核自动控制 UART RTS/DE 方向。
  * 接收数据以“连续字节间空闲超时”聚合成帧，协议边界由上层解释。
  */
 class Rs485DriverPort : public QObject {
@@ -32,21 +31,20 @@ public:
     /**
      * @brief 打开 RS485 串口并配置收发方向控制。
      *
-     * RK3566 优先使用内核 TIOCSRS485；仅当 dirDev 存在时沿用旧硬件的
-     * 0/1 外部方向控制。内核 ioctl 不可用时继续依赖驱动或收发器自动方向。
+     * RK3566 使用内核 TIOCSRS485 配置 UART 自动方向；内核 ioctl 不可用时
+     * 继续依赖设备树中已经启用的驱动或收发器自动方向。
      */
     bool open(const QString& ttyDev = Rk3566Platform::rs485Device(),
               int baud = 9600,
-              const QString& dirDev = Rk3566Platform::rs485DirectionDevice(),
               QSerialPort::DataBits db = QSerialPort::Data8,
               QSerialPort::Parity par = QSerialPort::NoParity,
               QSerialPort::StopBits sb = QSerialPort::OneStop);
 
-    /** @brief 停止接收定时器、恢复接收方向并关闭设备。 */
+    /** @brief 停止接收定时器并关闭串口。 */
     void close();
 
     /**
-     * @brief 完整发送一帧，并在外部方向模式下等待发送结束后切回接收。
+     * @brief 完整发送一帧，收发方向由内核 UART 驱动自动控制。
      * @param frame 待发送数据；空帧视为成功。
      * @param writeTimeoutMs 每次等待串口发送完成的超时，单位 ms。
      */
@@ -59,7 +57,7 @@ signals:
     /** @brief 连续数据静默达到配置时长后输出聚合帧。 */
     void frameReceived(const QByteArray& frame);
 
-    /** @brief 输出串口、方向设备或发送错误。 */
+    /** @brief 输出串口或发送错误。 */
     void errorOccured(const QString& err);
 
 private slots:
@@ -73,19 +71,9 @@ private:
     /** @brief 对串口文件描述符应用 TIOCSRS485 自动方向配置。 */
     bool configureKernelRs485();
 
-    /** @brief 在外部方向设备上写入 1，切换为发送。 */
-    bool setDirTx();
-
-    /** @brief 在外部方向设备上写入 0，切换为接收。 */
-    bool setDirRx();
-
-private:
     QSerialPort serial_;              /**< RS485 数据串口。 */
-    QFile dirDev_;                    /**< 可选的旧硬件方向控制字符设备。 */
     QTimer rxIdleTimer_;              /**< 接收字节间空闲成帧单次定时器。 */
     QByteArray rxBuf_;                /**< 当前尚未因空闲超时输出的数据。 */
     int interByteTimeoutMs_ = 10;     /**< 字节间空闲阈值，单位 ms。 */
-    bool externalDirection_ = false;  /**< 是否使用 dirDev_ 控制 DE/RE。 */
-    bool kernelDirection_ = false;    /**< TIOCSRS485 配置是否成功。 */
 };
 #endif // RS485_DRIVER_PORT_H

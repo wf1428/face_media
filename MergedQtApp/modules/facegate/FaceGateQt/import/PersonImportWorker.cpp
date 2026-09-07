@@ -1,6 +1,9 @@
 /**
  * @file PersonImportWorker.cpp
  * @brief XLS/XLSX 人员表后台导入任务实现。
+ *
+ * @author Dulin
+ * @date 2026-08-28
  */
 
 #include "PersonImportWorker.h"
@@ -13,16 +16,24 @@
 
 #include <QFile>
 
+/** @brief 创建尚未启动的后台导入对象。 */
 PersonImportWorker::PersonImportWorker(QObject *parent)
     : QObject(parent)
 {
 }
 
+/** @brief 原子设置取消标志，供 U 盘轮询和解析前检查。 */
 void PersonImportWorker::cancel()
 {
     cancelled_.store(true);
 }
 
+/**
+ * @brief 复制并解析 U 盘中的人员表，再批量写入网络人员数据库。
+ *
+ * 源文件先复制到本机临时目录，确保 U 盘卸载后解析和入库仍可继续；
+ * 每条退出路径都删除临时副本，避免长期占用设备存储空间。
+ */
 void PersonImportWorker::run()
 {
     emit progress(QStringLiteral("正在检测U盘并查找 person 目录下的人员表…"));
@@ -33,6 +44,7 @@ void PersonImportWorker::run()
     }
 
     emit progress(QStringLiteral("已复制 %1，正在解析人员资料…").arg(source.sourceFileName));
+    // 旧版 XLS 使用 OLE/BIFF8 解析器，XLSX 使用 ZIP/XML 解析器，输出统一行模型。
     const bool legacyXls = source.temporaryPath.endsWith(
                 QStringLiteral(".xls"), Qt::CaseInsensitive);
     const PersonXlsxParseResult parsed = legacyXls
@@ -54,6 +66,7 @@ void PersonImportWorker::run()
     for (const PersonSpreadsheetRecord &record : parsed.records) records.append(record.data);
 
     emit progress(QStringLiteral("已解析 %1 人，正在核对并更新数据库…").arg(records.size()));
+    // 入库完成后关闭线程关联的数据库连接，再删除本地临时文件。
     NetworkPersonnelStore store;
     const NetworkPersonnelImportResult imported = store.importSpreadsheetPersonnel(records);
     DbStore::close();

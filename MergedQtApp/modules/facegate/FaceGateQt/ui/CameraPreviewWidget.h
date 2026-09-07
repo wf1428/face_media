@@ -9,15 +9,15 @@
 #ifndef CAMERA_PREVIEW_WIDGET_H
 #define CAMERA_PREVIEW_WIDGET_H
 
-#include <QWidget>
 #include <QImage>
 
+#include "OpenGlImageWidget.h"
 #include "VerificationTypes.h"
 
 class QResizeEvent;
 
 /** @brief 门禁主界面的摄像头预览、状态和人脸框绘制控件。 */
-class CameraPreviewWidget : public QWidget {
+class CameraPreviewWidget : public OpenGlImageWidget {
     Q_OBJECT
 
 public:
@@ -29,6 +29,9 @@ public:
 
     /** @brief 清除动态图像和相关缓存。 */
     void clearFrame();
+
+    /** @brief 在无摄像头画面时显示居中的设备异常提示。 */
+    void setCameraUnavailableMessage(const QString &message);
 
     /** @brief 更新需要叠加绘制的人脸列表。 */
     void setFaces(const QVector<DetectedFace> &faces);
@@ -47,8 +50,8 @@ signals:
     void clicked();
 
 protected:
-    /** @brief 绘制静态背景、等比视频、人脸框和状态面板。 */
-    void paintEvent(QPaintEvent *event) override;
+    /** @brief 用 OpenGL 纹理绘制视频，再叠加人脸框和状态面板。 */
+    void paintGL() override;
 
     /** @brief 转换鼠标按下为 clicked() 信号。 */
     void mousePressEvent(QMouseEvent *event) override;
@@ -75,6 +78,7 @@ private:
     QSize staticBackgroundCanvasSize_;   /**< staticBackground_ 对应的控件尺寸。 */
     QVector<DetectedFace> faces_;        /**< 当前人脸叠加数据。 */
     QString stateText_ = "等待中";       /**< 当前状态提示。 */
+    QString cameraUnavailableMessage_;   /**< 无画面时居中显示的摄像头异常提示。 */
     VerifyState state_ = VerifyState::Idle; /**< 当前验证状态。 */
     int sideOverlayWidth_ = 0;           /**< 单侧信息覆盖区宽度，单位 px。 */
 };

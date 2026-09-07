@@ -7,8 +7,10 @@
  */
 
 #include "CameraCaptureBackend.h"
+#include "UsbMjpegCaptureBackend.h"
 
 #include <QByteArray>
+#include <QDebug>
 #include <QDir>
 #include <QtGlobal>
 
@@ -398,6 +400,54 @@ QString findUsbVideoNode(int *fd)
     return QString();
 }
 
+/** @brief 自动探测阶段记录一个 UVC 视频节点支持的原始像素格式。 */
+struct UsbCameraCandidate {
+    QString devicePath;
+    bool supportsYuyv = false;
+    bool supportsMjpeg = false;
+};
+
+/** @return 全部具有 Video Capture/Streaming 能力的 UVC 节点及其格式。 */
+std::vector<UsbCameraCandidate> probeUsbCameraCandidates()
+{
+    std::vector<UsbCameraCandidate> candidates;
+    QDir dev(QStringLiteral("/dev"));
+    const QStringList entries =
+        dev.entryList(QStringList() << QStringLiteral("video*"),
+                      QDir::System | QDir::Files | QDir::NoDotAndDotDot,
+                      QDir::Name);
+    for (const QString &entry : entries) {
+        const QString path = dev.absoluteFilePath(entry);
+        int fd = -1;
+        if (!queryUsbVideoNode(path, true, &fd)) {
+            continue;
+        }
+
+        UsbCameraCandidate candidate;
+        candidate.devicePath = path;
+        for (__u32 index = 0;; ++index) {
+            v4l2_fmtdesc format{};
+            format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            format.index = index;
+            if (xioctl(fd, VIDIOC_ENUM_FMT, &format) < 0) {
+                break;
+            }
+            candidate.supportsYuyv =
+                candidate.supportsYuyv ||
+                format.pixelformat == V4L2_PIX_FMT_YUYV;
+            candidate.supportsMjpeg =
+                candidate.supportsMjpeg ||
+                format.pixelformat == V4L2_PIX_FMT_MJPEG;
+        }
+        ::close(fd);
+
+        if (candidate.supportsYuyv || candidate.supportsMjpeg) {
+            candidates.push_back(candidate);
+        }
+    }
+    return candidates;
+}
+
 /** @brief 记录摄像头控制项不支持等非致命兼容警告。 */
 void appendControlWarning(QStringList *warnings,
                           const QString &name,
@@ -783,9 +833,228 @@ private:
     std::vector<MappedBuffer> buffers_;
 };
 
+/**
+ * @brief 自动选择摄像头的代理后端。
+ *
+ * 按 UVC 节点逐个选择采集链路：双格式节点优先使用 MJPEG/MPP，失败后
+ * 再回退 YUYV；单格式节点沿用对应后端。没有可用 USB 摄像头时把原配置
+ * 交给 MIPI 后端。
+ */
+class AutoCaptureBackend final : public ICameraCaptureBackend {
+public:
+    /** @brief 关闭当前选中的实际后端。 */
+    ~AutoCaptureBackend() override
+    {
+        close();
+    }
+
+    /**
+     * @brief 双格式 USB 优先 MJPEG/MPP，失败后回退 YUYV，最后回退 MIPI。
+     *
+     * 前序候选的失败信息会保留为兼容警告，便于诊断为何发生后端回退。
+     */
+    bool open(const CameraProfile &profile, QString *error) override
+    {
+        close();
+        selectionWarnings_.clear();
+
+        const std::vector<UsbCameraCandidate> candidates =
+            probeUsbCameraCandidates();
+
+        const auto tryYuyv =
+            [this, &profile](const UsbCameraCandidate &candidate) -> bool {
+            CameraProfile usbProfile = usbProfileFor(
+                profile, candidate.devicePath, QStringLiteral("yuyv"));
+            auto backend = std::make_unique<UsbCaptureBackend>();
+            QString backendError;
+            if (backend->open(usbProfile, &backendError)) {
+                selected_ = std::move(backend);
+                selectedKind_ = QStringLiteral("USB YUYV");
+                return true;
+            }
+            selectionWarnings_.append(
+                QStringLiteral("Auto USB YUYV %1 failed: %2")
+                    .arg(candidate.devicePath, backendError));
+            return false;
+        };
+
+        const auto tryMjpeg =
+            [this, &profile](const UsbCameraCandidate &candidate) -> bool {
+            CameraProfile usbProfile = usbProfileFor(
+                profile, candidate.devicePath, QStringLiteral("mjpeg"));
+            auto backend = createUsbMjpegCaptureBackend();
+            if (!backend) {
+                selectionWarnings_.append(QStringLiteral(
+                    "USB MJPEG backend is unavailable on this platform"));
+                return false;
+            }
+            QString backendError;
+            if (backend->open(usbProfile, &backendError)) {
+                selected_ = std::move(backend);
+                selectedKind_ = QStringLiteral("USB MJPEG/MPP");
+                return true;
+            }
+            selectionWarnings_.append(
+                QStringLiteral("Auto USB MJPEG %1 failed: %2")
+                    .arg(candidate.devicePath, backendError));
+            return false;
+        };
+
+        for (const UsbCameraCandidate &candidate : candidates) {
+            if (candidate.supportsYuyv && candidate.supportsMjpeg) {
+                qInfo().noquote()
+                    << "[CAMERA-AUTO] dual-format USB camera; preferring MJPEG/MPP"
+                    << candidate.devicePath;
+                if (tryMjpeg(candidate) || tryYuyv(candidate)) {
+                    return true;
+                }
+                continue;
+            }
+            if (candidate.supportsYuyv && tryYuyv(candidate)) {
+                return true;
+            }
+            if (candidate.supportsMjpeg && tryMjpeg(candidate)) {
+                return true;
+            }
+        }
+
+        CameraProfile mipiProfile = profile;
+        mipiProfile.source = CameraSourceType::Mipi;
+        auto mipiBackend = std::make_unique<MipiCaptureBackend>();
+        QString mipiError;
+        if (mipiBackend->open(mipiProfile, &mipiError)) {
+            selected_ = std::move(mipiBackend);
+            selectedKind_ = QStringLiteral("MIPI");
+            return true;
+        }
+
+        if (error) {
+            QStringList details = selectionWarnings_;
+            details.append(QStringLiteral("MIPI fallback failed: %1").arg(mipiError));
+            *error = details.join(QStringLiteral("; "));
+        }
+        close();
+        return false;
+    }
+
+    /** @brief 把帧等待请求转发给已选后端。 */
+    CameraWaitResult waitForFrame(int timeoutMs, QString *error) override
+    {
+        if (!selected_) {
+            if (error) {
+                *error = QStringLiteral("Auto camera backend is not open");
+            }
+            return CameraWaitResult::Error;
+        }
+        return selected_->waitForFrame(timeoutMs, error);
+    }
+
+    /** @brief 从已选后端取出一帧。 */
+    bool dequeue(CapturedCameraBuffer *buffer, QString *error) override
+    {
+        if (!selected_) {
+            if (error) {
+                *error = QStringLiteral("Auto camera backend is not open");
+            }
+            return false;
+        }
+        return selected_->dequeue(buffer, error);
+    }
+
+    /** @brief 把已处理帧归还给已选后端。 */
+    bool requeue(const CapturedCameraBuffer &buffer, QString *error) override
+    {
+        if (!selected_) {
+            if (error) {
+                *error = QStringLiteral("Auto camera backend is not open");
+            }
+            return false;
+        }
+        return selected_->requeue(buffer, error);
+    }
+
+    /** @brief 关闭并释放已选后端，清空选择状态。 */
+    void close() override
+    {
+        if (selected_) {
+            selected_->close();
+            selected_.reset();
+        }
+        selectedKind_.clear();
+    }
+
+    /** @return 已选后端的实际采集尺寸。 */
+    QSize captureSize() const override
+    {
+        return selected_ ? selected_->captureSize() : QSize();
+    }
+
+    /** @return 已选后端输出格式；未选择时返回 NV12 默认值。 */
+    RgaImageProcessor::PixelFormat normalizedOutputFormat() const override
+    {
+        return selected_ ? selected_->normalizedOutputFormat()
+                         : RgaImageProcessor::PixelFormat::Nv12;
+    }
+
+    /** @return 已选后端的输入格式诊断名称。 */
+    QString inputFormatName() const override
+    {
+        return selected_ ? selected_->inputFormatName() : QString();
+    }
+
+    /** @return 已选后端的输入内存模式名称。 */
+    QString inputMemoryName() const override
+    {
+        return selected_ ? selected_->inputMemoryName() : QString();
+    }
+
+    /** @return 自动选择结果与实际后端状态摘要。 */
+    QString statusMessage() const override
+    {
+        return selected_
+                   ? QStringLiteral("Auto-selected %1: %2")
+                         .arg(selectedKind_, selected_->statusMessage())
+                   : QStringLiteral("Auto camera is not running");
+    }
+
+    /** @return 自动选择失败记录与已选后端警告的合并列表。 */
+    QStringList warnings() const override
+    {
+        QStringList result = selectionWarnings_;
+        if (selected_) {
+            result.append(selected_->warnings());
+        }
+        return result;
+    }
+
+private:
+    /** @brief 从基础配置生成指定 USB 节点和像素格式的候选配置。 */
+    static CameraProfile usbProfileFor(const CameraProfile &base,
+                                       const QString &devicePath,
+                                       const QString &pixelFormat)
+    {
+        CameraProfile result = base;
+        result.source = CameraSourceType::Usb;
+        result.devicePath = devicePath;
+        result.width = base.width > 0 ? base.width : 640;
+        result.height = base.height > 0 ? base.height : 480;
+        result.fps = base.fps > 0 ? base.fps : 30;
+        result.pixelFormat = pixelFormat;
+        return result;
+    }
+
+    std::unique_ptr<ICameraCaptureBackend> selected_; /**< 当前实际工作的采集后端。 */
+    QString selectedKind_;                           /**< 自动选择结果名称。 */
+    QStringList selectionWarnings_;                  /**< 前序候选的失败诊断。 */
+};
+
 } // namespace
 #endif
 
+/**
+ * @brief 按摄像头来源创建采集后端。
+ * @return 非 Linux 平台返回空指针；Linux 平台返回自动、USB 或 MIPI 后端。
+ */
 std::unique_ptr<ICameraCaptureBackend>
 createCameraCaptureBackend(CameraSourceType source)
 {
@@ -793,6 +1062,9 @@ createCameraCaptureBackend(CameraSourceType source)
     Q_UNUSED(source)
     return std::unique_ptr<ICameraCaptureBackend>();
 #else
+    if (source == CameraSourceType::Auto) {
+        return std::unique_ptr<ICameraCaptureBackend>(new AutoCaptureBackend);
+    }
     if (source == CameraSourceType::Usb) {
         return std::unique_ptr<ICameraCaptureBackend>(new UsbCaptureBackend);
     }

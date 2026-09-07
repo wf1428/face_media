@@ -20,6 +20,7 @@
 
 #include "AppConfig.h"
 #include "MainWindow.h"
+#include "components/input/InputCursorController.h"
 
 namespace {
 
@@ -74,6 +75,7 @@ int main(int argc, char *argv[])
     app.setProperty("appStartMsecsSinceEpoch", QDateTime::currentMSecsSinceEpoch());
     VirtualKeyboardFocusFilter keyboardFilter(&app);
     app.installEventFilter(&keyboardFilter);
+    InputCursorController inputCursorController(&app);
     /*
      * AdminPanel 全屏显示时 MainWindow 会被隐藏。如果 Qt 保持
      * 默认“最后一个窗口关闭即退出”的行为，关闭 AdminPanel 会导致应用退出，

@@ -58,7 +58,7 @@ public:
     QString cameraPixelFormat = "nv12";
 
     // 摄像头来源及 USB UVC 采集/控制参数；尺寸单位 px，帧率单位 fps。
-    QString cameraSource = "mipi";
+    QString cameraSource = "auto";
     QString usbCameraDevice = "auto";
     int usbCameraWidth = 640;
     int usbCameraHeight = 480;

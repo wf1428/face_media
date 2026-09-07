@@ -9,7 +9,7 @@
 #include "EnrollPreviewWidget.h"
 
 #include <QPainter>
-#include <QPaintEvent>
+#include <QPalette>
 #include <QPen>
 #include <QSizePolicy>
 #include <QStyle>
@@ -18,7 +18,7 @@
 
 /** @brief 创建空录入预览控件。 */
 EnrollPreviewWidget::EnrollPreviewWidget(QWidget *parent)
-    : QWidget(parent)
+    : OpenGlImageWidget(parent)
 {
     setMinimumSize(220, 170);
     setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
@@ -38,6 +38,10 @@ void EnrollPreviewWidget::setFrame(const QImage &previewImage,
                                    const QVector<DetectedFace> &faces)
 {
     previewImage_ = previewImage;
+    if (!previewImage_.isNull()) {
+        cameraUnavailableMessage_.clear();
+    }
+    setOpenGlImage(previewImage_);
     sourceSize_ = sourceSize;
     faces_ = faces;
     update();
@@ -47,25 +51,46 @@ void EnrollPreviewWidget::setFrame(const QImage &previewImage,
 void EnrollPreviewWidget::clearFrame()
 {
     previewImage_ = QImage();
+    cameraUnavailableMessage_.clear();
+    clearOpenGlImage();
     sourceSize_ = QSize();
     faces_.clear();
     update();
 }
 
-/** @brief 绘制等比图像，并将原始人脸坐标映射到预览区域。 */
-void EnrollPreviewWidget::paintEvent(QPaintEvent *event)
+/** @brief 清除旧画面并在录入预览中央显示摄像头异常提示。 */
+void EnrollPreviewWidget::setCameraUnavailableMessage(const QString &message)
 {
-    Q_UNUSED(event)
+    clearFrame();
+    cameraUnavailableMessage_ = message;
+    update();
+}
 
-    QPainter painter(this);
-    QStyleOption option;
-    option.initFrom(this);
-    style()->drawPrimitive(QStyle::PE_Widget, &option, &painter, this);
+/** @brief 用 OpenGL 纹理绘制等比图像，并叠加检测框。 */
+void EnrollPreviewWidget::paintGL()
+{
+    clearOpenGlSurface(palette().color(QPalette::Window));
+    {
+        QPainter backgroundPainter(this);
+        QStyleOption option;
+        option.initFrom(this);
+        style()->drawPrimitive(QStyle::PE_Widget, &option, &backgroundPainter, this);
 
-    if (previewImage_.isNull()) {
-        painter.setPen(QColor(113, 133, 144));
-        painter.drawText(rect(), Qt::AlignCenter, QStringLiteral("等待摄像头画面"));
-        return;
+        if (previewImage_.isNull()) {
+            backgroundPainter.setRenderHint(QPainter::TextAntialiasing, true);
+            const bool cameraUnavailable = !cameraUnavailableMessage_.isEmpty();
+            backgroundPainter.setPen(cameraUnavailable ? Qt::white : QColor(113, 133, 144));
+            QFont messageFont = backgroundPainter.font();
+            messageFont.setPointSize(cameraUnavailable ? 16 : 15);
+            messageFont.setBold(cameraUnavailable);
+            backgroundPainter.setFont(messageFont);
+            backgroundPainter.drawText(
+                rect().adjusted(24, 24, -24, -24),
+                Qt::AlignCenter | Qt::TextWordWrap,
+                cameraUnavailable ? cameraUnavailableMessage_
+                                  : QStringLiteral("等待摄像头画面"));
+            return;
+        }
     }
 
     QSize drawSize = previewImage_.size();
@@ -76,17 +101,19 @@ void EnrollPreviewWidget::paintEvent(QPaintEvent *event)
                                  (height() - drawSize.height()) / 2),
                           drawSize);
 
-    painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
-    painter.drawImage(imageRect, previewImage_);
+    drawOpenGlImage(imageRect);
 
     if (!sourceSize_.isValid()) {
         return;
     }
 
+    // 纹理绘制完成后使用新的 QPainter 会话，避免检测文字继承原生 GL 状态。
+    QPainter painter(this);
     QPen pen(QColor(48, 230, 122));
     pen.setWidth(2);
     painter.setPen(pen);
     painter.setRenderHint(QPainter::Antialiasing, false);
+    painter.setRenderHint(QPainter::TextAntialiasing, true);
 
     const qreal scaleX = static_cast<qreal>(imageRect.width()) / sourceSize_.width();
     const qreal scaleY = static_cast<qreal>(imageRect.height()) / sourceSize_.height();

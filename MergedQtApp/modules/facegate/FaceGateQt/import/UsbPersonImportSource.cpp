@@ -1,6 +1,9 @@
 /**
  * @file UsbPersonImportSource.cpp
  * @brief U 盘人员表导入源实现；挂载、复制和卸载均不在界面线程执行。
+ *
+ * @author Dulin
+ * @date 2026-08-28
  */
 
 #include "UsbPersonImportSource.h"
@@ -17,13 +20,15 @@
 
 namespace {
 
+/** @brief 一次人员表查找使用的 USB 卷信息。 */
 struct UsbVolume
 {
-    QString device;
-    QString mountPoint;
-    bool mounted = false;
+    QString device;      /**< 块设备节点。 */
+    QString mountPoint;  /**< 已有或临时挂载目录。 */
+    bool mounted = false; /**< 卷当前是否处于挂载状态。 */
 };
 
+/** @brief 还原 /proc/mounts 对空格、制表符和反斜杠的八进制转义。 */
 QString decodeMountField(QString value)
 {
     value.replace(QStringLiteral("\\040"), QStringLiteral(" "));
@@ -32,6 +37,7 @@ QString decodeMountField(QString value)
     return value;
 }
 
+/** @return 当前已挂载的 /dev/sd* USB 卷。 */
 QList<UsbVolume> mountedUsbVolumes()
 {
     QList<UsbVolume> result;
@@ -52,6 +58,10 @@ QList<UsbVolume> mountedUsbVolumes()
     return result;
 }
 
+/**
+ * @brief 枚举尚未挂载的 USB 块设备。
+ * @return 优先返回分区节点；没有分区时才返回整盘节点。
+ */
 QStringList unmountedUsbDevices(const QList<UsbVolume> &mounted)
 {
     QSet<QString> mountedDevices;
@@ -74,6 +84,7 @@ QStringList unmountedUsbDevices(const QList<UsbVolume> &mounted)
     return partitions.isEmpty() ? wholeDevices : partitions;
 }
 
+/** @brief 执行有限时长的挂载命令，并保留标准错误作为失败原因。 */
 bool runProcess(const QString &program, const QStringList &arguments, QString *error)
 {
     QProcess process;
@@ -98,6 +109,7 @@ bool runProcess(const QString &program, const QStringList &arguments, QString *e
     return true;
 }
 
+/** @return person 目录中最新的非临时 XLS/XLSX 文件路径。 */
 QString newestWorkbook(const QString &mountPoint)
 {
     const QDir personDir(QDir(mountPoint).absoluteFilePath(QStringLiteral("person")));
@@ -115,12 +127,17 @@ QString newestWorkbook(const QString &mountPoint)
     return QString();
 }
 
+/** @brief 卸载指定卷；空挂载点视为无需处理。 */
 bool unmountVolume(const QString &mountPoint, QString *error)
 {
     if (mountPoint.isEmpty()) return true;
     return runProcess(QStringLiteral("umount"), QStringList() << mountPoint, error);
 }
 
+/**
+ * @brief 将卷中最新人员表复制到本机唯一临时文件。
+ * @return 包含来源文件名和临时路径的复制结果。
+ */
 UsbPersonImportFile copyWorkbook(const UsbVolume &volume)
 {
     UsbPersonImportFile result;
@@ -153,6 +170,12 @@ UsbPersonImportFile copyWorkbook(const UsbVolume &volume)
 
 } // namespace
 
+/**
+ * @brief 轮询 U 盘并把人员表复制到本机，完成后再返回调用方。
+ *
+ * 未挂载设备以只读方式挂载。若卸载失败，会删除已经复制的临时文件并返回失败，
+ * 避免界面误以为介质已经可以安全拔出。
+ */
 UsbPersonImportFile UsbPersonImportSource::waitAndCopy(int timeoutMs,
                                                        const std::atomic_bool *cancelled)
 {

@@ -22,7 +22,6 @@ INCLUDEPATH += \
     $$PWD/core \
     $$PWD/database \
     $$PWD/import \
-    $$PWD/gate \
     $$PWD/ui \
     $$PWD/../../.. \
     $$PWD/../../../components/rga
@@ -51,12 +50,14 @@ unix: LIBS += -lpthread -lz
 SOURCES += \
     main.cpp \
     ../../../common/face_image_sync_bridge.cpp \
+    ../../../common/storage_policy.cpp \
     ../../../common/sql/dbstore.cpp \
     ../../../common/sql/network_personnel_store.cpp \
     ../../../platform/rk3566_platform.cpp \
     config/AppConfig.cpp \
     audio/AudioService.cpp \
     ../../../components/rga/RgaImageProcessor.cpp \
+    ../../../components/input/InputCursorController.cpp \
     core/CameraCaptureBackend.cpp \
     core/CameraService.cpp \
     core/FaceEngine.cpp \
@@ -74,7 +75,6 @@ SOURCES += \
     import/PersonXlsxParser.cpp \
     import/UsbPersonExportTarget.cpp \
     import/UsbPersonImportSource.cpp \
-    gate/GateOutputService.cpp \
     ui/AccessPasswordDialog.cpp \
     ui/AppMessageDialog.cpp \
     ui/AppPasswordDialog.cpp \
@@ -87,6 +87,7 @@ SOURCES += \
 
 HEADERS += \
     ../../../common/face_image_sync_bridge.h \
+    ../../../common/storage_policy.h \
     ../../../common/sql/dbstore.h \
     ../../../common/sql/network_personnel_store.h \
     ../../../platform/rk3566_platform.h \
@@ -94,6 +95,7 @@ HEADERS += \
     config/CameraProfile.h \
     audio/AudioService.h \
     ../../../components/rga/RgaImageProcessor.h \
+    ../../../components/input/InputCursorController.h \
     core/CameraCaptureBackend.h \
     core/CameraService.h \
     core/FaceEngine.h \
@@ -116,7 +118,6 @@ HEADERS += \
     import/PersonXlsxParser.h \
     import/UsbPersonExportTarget.h \
     import/UsbPersonImportSource.h \
-    gate/GateOutputService.h \
     ui/AccessPasswordDialog.h \
     ui/AppMessageDialog.h \
     ui/AppPasswordDialog.h \

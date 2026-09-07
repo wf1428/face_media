@@ -13,7 +13,6 @@ QDialog {
     color: #f6f9ff;
     font-size: 24px;
     font-weight: 800;
-    letter-spacing: 1px;
 }
 
 #adminSubtitle {
@@ -320,10 +319,15 @@ QScrollBar:vertical, QScrollBar:horizontal {
 QScrollBar:vertical { width: 12px; }
 QScrollBar:horizontal { height: 12px; }
 
-QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+QScrollBar::handle:vertical {
     background: #405571;
     border-radius: 6px;
     min-height: 30px;
+}
+
+QScrollBar::handle:horizontal {
+    background: #405571;
+    border-radius: 6px;
     min-width: 30px;
 }
 
@@ -331,9 +335,37 @@ QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {
     background: #536b8a;
 }
 
-QScrollBar::add-line, QScrollBar::sub-line {
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical,
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+    background: #162236;
+    border: none;
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    background: #162236;
+    border: none;
     width: 0px;
     height: 0px;
+}
+
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    background: #162236;
+    border: none;
+    width: 0px;
+    height: 0px;
+}
+
+QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical,
+QScrollBar::left-arrow:horizontal, QScrollBar::right-arrow:horizontal {
+    background: #162236;
+    border: none;
+    width: 0px;
+    height: 0px;
+}
+
+QAbstractScrollArea::corner {
+    background: #162236;
+    border: none;
 }
 
 #embeddedKeyboard, #loginEmbeddedKeyboard, #passwordEmbeddedKeyboard {

@@ -28,6 +28,7 @@
 #include <QGuiApplication>
 #include <QPixmap>
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <QThread>
 #include <QAtomicInt>
 #include <QFontMetrics>
@@ -219,6 +220,8 @@ private slots:
     void onLiveStreamInterrupted(const QString& reason, bool keepLiveRetry);
     /** @brief 强制释放当前直播播放器后回退本地轮播。 */
     void forceStopCurrentLivePlayerForFallback(const QString& reason);
+    /** @brief 上游仍有压缩数据但无解码输出时，原地完整重建直播管线。 */
+    void restartLivePipelineAfterDecoderStall(const QString& reason);
 
     /** @brief 启动直播首帧/持续无帧 watchdog。 */
     void startLiveWatchdog();
@@ -283,13 +286,15 @@ private:
     // 直播流配置
     bool m_isLiveMode = false;
     bool m_modulePlaybackSuspended = false; /**< 人体感应切换模块期间暂存播放状态。 */
-    bool m_resumeLiveAfterModuleSwitch = false; /**< 返回多媒体界面时是否恢复 LIVE。 */
+    bool m_resumeLiveAfterModuleSwitch = false; /**< 返回多媒体界面时是否仍需要 LIVE 业务目标。 */
+    bool m_resumeLiveDirectlyAfterModuleSwitch = false; /**< 返回时是否直接打开 LIVE；false 表示恢复本地并后台重试。 */
 
     QTimer* m_liveWatchdogTimer = nullptr;
     qint64 m_lastLiveFrameMs = 0;       // 最近一次真实解码视频帧时间
     qint64 m_liveWatchdogStartMs = 0;   // watchdog 启动时间，用于首次出帧保护
     int m_liveTimeoutMs = 10000;         /**< 连续 10 秒无新帧判定直播中断。 */
     int m_liveStartupGraceMs = 10000;   /**< 启动后 10 秒仍无首帧则回退本地轮播。 */
+    int m_liveDecoderInputActiveWindowMs = 3000; /**< 此窗口内仍有解码输入则判为解码器停滞。 */
     bool m_liveSourceValidated = false;  // 当前LIVE地址是否曾经输出过真实解码视频帧
     bool m_liveRecovering = false;
 
@@ -314,6 +319,8 @@ private:
 
     QTimer *m_liveRetryTimer = nullptr;  /**< 直播探测失败后的重试定时器。 */
     int m_liveRetryIntervalMs = 10000;
+    QElapsedTimer m_liveProbeFailureLogElapsed; /**< 持续探测失败时限制状态日志的打印频率。 */
+    QString m_liveProbeFailureLogUrl;    /**< 当前受失败日志限流的直播地址。 */
     qint64 m_localPlayerBusyUntilMs = 0; // 本地视频切文件保护窗口，避免 LIVE 后台探测抢占 GStreamer
 
     // 音量设置

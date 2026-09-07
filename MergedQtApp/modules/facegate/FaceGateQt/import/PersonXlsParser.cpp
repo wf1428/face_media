@@ -1,6 +1,9 @@
 /**
  * @file PersonXlsParser.cpp
  * @brief 自包含的 OLE Compound File 与 BIFF8 只读解析实现。
+ *
+ * @author Dulin
+ * @date 2026-08-28
  */
 
 #include "PersonXlsParser.h"
@@ -22,6 +25,7 @@ namespace {
 constexpr quint32 kEndOfChain = 0xFFFFFFFEu;
 constexpr quint32 kFreeSector = 0xFFFFFFFFu;
 
+/** @return data 中指定偏移处的小端 16 位整数；越界时返回 0。 */
 quint16 read16(const QByteArray &data, int offset)
 {
     if (offset < 0 || offset + 2 > data.size()) return 0;
@@ -29,6 +33,7 @@ quint16 read16(const QByteArray &data, int offset)
     return quint16(p[0]) | (quint16(p[1]) << 8);
 }
 
+/** @return data 中指定偏移处的小端 32 位整数；越界时返回 0。 */
 quint32 read32(const QByteArray &data, int offset)
 {
     if (offset < 0 || offset + 4 > data.size()) return 0;
@@ -37,11 +42,13 @@ quint32 read32(const QByteArray &data, int offset)
             | (quint32(p[2]) << 16) | (quint32(p[3]) << 24);
 }
 
+/** @return 由相邻两个小端 32 位值组成的 64 位整数。 */
 quint64 read64(const QByteArray &data, int offset)
 {
     return quint64(read32(data, offset)) | (quint64(read32(data, offset + 4)) << 32);
 }
 
+/** @return 按 IEEE 754 位模式读取的双精度值。 */
 double readDouble(const QByteArray &data, int offset)
 {
     const quint64 bits = read64(data, offset);
@@ -50,6 +57,7 @@ double readDouble(const QByteArray &data, int offset)
     return value;
 }
 
+/** @return 指定位置的 UTF-16LE 文本；范围无效时返回空字符串。 */
 QString utf16Text(const QByteArray &data, int offset, int characterCount)
 {
     if (characterCount <= 0 || offset < 0 || offset + characterCount * 2 > data.size()) {
@@ -63,6 +71,7 @@ QString utf16Text(const QByteArray &data, int offset, int characterCount)
     return QString::fromUtf16(characters.constData(), characters.size());
 }
 
+/** @return BIFF8 单字节压缩 Unicode 文本；范围无效时返回空字符串。 */
 QString compressedUnicodeText(const QByteArray &data, int offset, int characterCount)
 {
     if (characterCount <= 0 || offset < 0 || offset + characterCount > data.size()) {
@@ -76,9 +85,15 @@ QString compressedUnicodeText(const QByteArray &data, int offset, int characterC
     return text;
 }
 
+/** @brief 只读解析 OLE Compound File FAT、Mini FAT、目录和 Workbook 数据流。 */
 class CompoundFile
 {
 public:
+    /**
+     * @brief 校验 OLE 头并建立 FAT、Mini FAT 与目录索引。
+     *
+     * 所有扇区链都检测越界和循环，避免损坏文件导致无限循环或越界读取。
+     */
     bool open(const QString &filePath, QString *error)
     {
         QFile file(filePath);
@@ -184,6 +199,7 @@ public:
         return true;
     }
 
+    /** @return 名为 Workbook 或 Book 的 BIFF 数据流。 */
     QByteArray workbookStream(QString *error) const
     {
         for (const DirectoryEntry &entry : directory_) {
@@ -201,14 +217,16 @@ public:
     }
 
 private:
+    /** @brief OLE 目录中的存储对象定位信息。 */
     struct DirectoryEntry
     {
-        QString name;
-        quint8 type = 0;
-        quint32 startSector = kEndOfChain;
-        quint64 size = 0;
+        QString name;                           /**< 目录项名称。 */
+        quint8 type = 0;                        /**< OLE 对象类型。 */
+        quint32 startSector = kEndOfChain;      /**< 数据链首扇区。 */
+        quint64 size = 0;                       /**< 数据流长度，单位字节。 */
     };
 
+    /** @return 指定普通扇区的完整数据；编号或范围无效时返回空数组。 */
     QByteArray sectorBytes(quint32 sector) const
     {
         if (sector > 0xFFFFFFFAu) return QByteArray();
@@ -217,6 +235,7 @@ private:
         return bytes_.mid(int(offset), sectorSize_);
     }
 
+    /** @brief 沿 FAT 链读取普通扇区，并按 expectedSize 截断结果。 */
     QByteArray readRegularChain(quint32 startSector, qint64 expectedSize, QString *error) const
     {
         if (expectedSize > std::numeric_limits<int>::max()) {
@@ -256,6 +275,7 @@ private:
         return result;
     }
 
+    /** @brief 沿 Mini FAT 链从根 Mini Stream 读取小数据流。 */
     QByteArray readMiniChain(quint32 startSector, qint64 expectedSize, QString *error) const
     {
         if (expectedSize > std::numeric_limits<int>::max()) {
@@ -288,31 +308,35 @@ private:
         return result;
     }
 
-    QByteArray bytes_;
-    int majorVersion_ = 3;
-    int sectorSize_ = 512;
-    int miniSectorSize_ = 64;
-    quint32 miniCutoff_ = 4096;
-    QVector<quint32> fat_;
-    QVector<quint32> miniFat_;
-    QVector<DirectoryEntry> directory_;
-    DirectoryEntry root_;
-    QByteArray rootMiniStream_;
+    QByteArray bytes_;                 /**< 完整 OLE 文件内容。 */
+    int majorVersion_ = 3;             /**< OLE 主版本，3 或 4。 */
+    int sectorSize_ = 512;             /**< 普通扇区大小，单位字节。 */
+    int miniSectorSize_ = 64;          /**< Mini FAT 扇区大小，单位字节。 */
+    quint32 miniCutoff_ = 4096;        /**< 使用 Mini FAT 的数据流长度阈值。 */
+    QVector<quint32> fat_;             /**< 普通扇区链表。 */
+    QVector<quint32> miniFat_;         /**< 小扇区链表。 */
+    QVector<DirectoryEntry> directory_; /**< OLE 目录项。 */
+    DirectoryEntry root_;              /**< 根存储目录项。 */
+    QByteArray rootMiniStream_;         /**< Mini FAT 的承载数据流。 */
 };
 
+/** @brief 跨 SST 与 CONTINUE 记录连续读取字节的游标。 */
 class SegmentedBytes
 {
 public:
+    /** @brief 绑定按 BIFF 记录边界切分的数据段。 */
     explicit SegmentedBytes(const QVector<QByteArray> &segments)
         : segments_(segments)
     {
     }
 
+    /** @return 当前数据段尚未读取的字节数。 */
     int remaining() const
     {
         return segment_ < segments_.size() ? segments_.at(segment_).size() - offset_ : 0;
     }
 
+    /** @brief 移动到下一 CONTINUE 数据段。 */
     bool nextSegment()
     {
         if (segment_ + 1 >= segments_.size()) return false;
@@ -321,6 +345,7 @@ public:
         return true;
     }
 
+    /** @brief 读取一个字节，必要时跨越数据段边界。 */
     bool readByte(quint8 *value)
     {
         QByteArray byte;
@@ -329,6 +354,7 @@ public:
         return true;
     }
 
+    /** @brief 读取一个小端 16 位整数。 */
     bool readUnsigned16(quint16 *value)
     {
         QByteArray bytes;
@@ -337,6 +363,7 @@ public:
         return true;
     }
 
+    /** @brief 读取一个小端 32 位整数。 */
     bool readUnsigned32(quint32 *value)
     {
         QByteArray bytes;
@@ -345,6 +372,7 @@ public:
         return true;
     }
 
+    /** @brief 跨段读取指定字节数。 */
     bool readRaw(int count, QByteArray *output)
     {
         output->clear();
@@ -359,12 +387,14 @@ public:
         return true;
     }
 
+    /** @brief 跨段跳过指定字节数。 */
     bool skipRaw(int count)
     {
         QByteArray ignored;
         return readRaw(count, &ignored);
     }
 
+    /** @return 仅从当前段取得最多 count 个字节。 */
     QByteArray takeFromCurrent(int count)
     {
         const int take = qMin(count, remaining());
@@ -374,11 +404,16 @@ public:
     }
 
 private:
-    QVector<QByteArray> segments_;
-    int segment_ = 0;
-    int offset_ = 0;
+    QVector<QByteArray> segments_; /**< SST 主记录及其 CONTINUE 数据段。 */
+    int segment_ = 0;              /**< 当前数据段索引。 */
+    int offset_ = 0;               /**< 当前段内偏移。 */
 };
 
+/**
+ * @brief 解析一条可跨 CONTINUE 记录的 BIFF8 SST 字符串。
+ *
+ * BIFF8 允许续接段改变单字节/双字节编码标志，因此每次跨段都重新读取标志位。
+ */
 bool parseSstString(SegmentedBytes *cursor, QString *text, QString *error)
 {
     quint16 characterCount = 0;
@@ -425,6 +460,7 @@ bool parseSstString(SegmentedBytes *cursor, QString *text, QString *error)
     return true;
 }
 
+/** @brief 解析 SST 及其 CONTINUE 记录，生成按索引排列的共享字符串表。 */
 QStringList parseSharedStrings(const QVector<QByteArray> &segments, QString *error)
 {
     QStringList strings;
@@ -450,6 +486,7 @@ QStringList parseSharedStrings(const QVector<QByteArray> &segments, QString *err
     return strings;
 }
 
+/** @return BIFF8 短 Unicode 字符串。 */
 QString shortUnicodeString(const QByteArray &data, int offset)
 {
     if (offset + 2 > data.size()) return QString();
@@ -459,6 +496,7 @@ QString shortUnicodeString(const QByteArray &data, int offset)
                            : compressedUnicodeText(data, offset + 2, count);
 }
 
+/** @return BIFF8 常规 Unicode 字符串。 */
 QString unicodeString(const QByteArray &data, int offset)
 {
     if (offset + 3 > data.size()) return QString();
@@ -468,6 +506,7 @@ QString unicodeString(const QByteArray &data, int offset)
                            : compressedUnicodeText(data, offset + 3, count);
 }
 
+/** @return 解码后的 BIFF RK 压缩数值。 */
 double rkValue(quint32 encoded)
 {
     const bool dividedBy100 = (encoded & 0x01u) != 0;
@@ -482,6 +521,10 @@ double rkValue(quint32 encoded)
     return dividedBy100 ? value / 100.0 : value;
 }
 
+/**
+ * @brief 按 XF 格式把 BIFF 数值转换为日期、补零文本或普通数值文本。
+ * @param date1904  工作簿使用 1904 日期系统时为 true。
+ */
 QString formatNumber(double value,
                      quint16 xfIndex,
                      const QVector<quint16> &xfFormats,
@@ -522,6 +565,7 @@ QString formatNumber(double value,
     return QString::number(value, 'g', 15);
 }
 
+/** @brief 扩展稀疏二维行并设置指定单元格；异常行列号直接忽略。 */
 void setCell(QVector<QStringList> *rows, int row, int column, const QString &value)
 {
     if (row < 0 || row > 100000 || column < 0 || column > 255) return;
@@ -531,13 +575,20 @@ void setCell(QVector<QStringList> *rows, int row, int column, const QString &val
     target[column] = value;
 }
 
+/** @brief BIFF BOUNDSHEET 记录中的工作表定位信息。 */
 struct SheetDescriptor
 {
-    quint32 offset = 0;
-    QString name;
-    quint8 type = 0;
+    quint32 offset = 0; /**< 工作表子流在 Workbook 中的偏移。 */
+    QString name;       /**< 工作表名称。 */
+    quint8 type = 0;    /**< 工作表类型，0 表示普通工作表。 */
 };
 
+/**
+ * @brief 解析 BIFF8 全局记录和目标工作表单元格记录。
+ *
+ * 优先选择“人员列表”工作表，否则使用第一张普通工作表；公式单元格使用
+ * 缓存结果，字符串结果需等待紧随其后的 STRING 记录。
+ */
 bool parseWorkbook(const QByteArray &workbook,
                    QVector<QStringList> *rows,
                    QString *error)
@@ -697,6 +748,7 @@ bool parseWorkbook(const QByteArray &workbook,
 
 } // namespace
 
+/** @brief 从 OLE Workbook 流解析 BIFF8 行，并复用 XLSX 的统一人员映射。 */
 PersonXlsxParseResult PersonXlsParser::parse(const QString &filePath)
 {
     PersonXlsxParseResult result;

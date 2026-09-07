@@ -2,7 +2,7 @@ TARGET = MergedQtApp
 QT += core gui widgets opengl serialport network sql virtualkeyboard qml quick quickwidgets
 
 CONFIG += c++17 thread link_pkgconfig
-PKGCONFIG += gstreamer-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0
+PKGCONFIG += gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0 gstreamer-rtp-1.0
 
 # EGLFS 视频链路强制使用 Rockchip RGA。只兼容不同 BSP 使用的
 # pkg-config 包名；如果开发文件不存在则直接中止构建，不启用 CPU 回退。
@@ -41,7 +41,6 @@ INCLUDEPATH += \
     $$PWD/modules/facegate/FaceGateQt/core \
     $$PWD/modules/facegate/FaceGateQt/database \
     $$PWD/modules/facegate/FaceGateQt/import \
-    $$PWD/modules/facegate/FaceGateQt/gate \
     $$PWD/modules/facegate/FaceGateQt/ui \
     $$PWD/components/rga
 
@@ -61,6 +60,7 @@ unix: LIBS += -lpthread -lz
 
 SOURCES += \
     common/face_image_sync_bridge.cpp \
+    common/storage_policy.cpp \
     common/clients/icboard_client.cpp \
     common/clients/signalboard_client.cpp \
     common/protocols/icboard_decoder.cpp \
@@ -71,8 +71,8 @@ SOURCES += \
     common/sql/network_personnel_store.cpp \
     common/workers/icboard_worker.cpp \
     common/workers/signalboard_worker.cpp \
-    components/cursoroverlay/CursorOverlay.cpp \
     components/rga/RgaImageProcessor.cpp \
+    components/input/InputCursorController.cpp \
     components/cursoroverlay/keyboard_dialog.cpp \
     components/features/command_dialog.cpp \
     components/features/key_service.cpp \
@@ -110,6 +110,7 @@ SOURCES += \
     ic_board/serial_init.cpp \
     platform/rk3566_platform.cpp \
     shell/AppShell.cpp \
+    shell/LedFillLight.cpp \
     shell/Sr505PresenceSensor.cpp \
     shell/ModeController.cpp \
     modules/multimedia/MultimediaModuleAdapter.cpp \
@@ -117,6 +118,7 @@ SOURCES += \
     modules/facegate/FaceGateQt/config/AppConfig.cpp \
     modules/facegate/FaceGateQt/audio/AudioService.cpp \
     modules/facegate/FaceGateQt/core/CameraCaptureBackend.cpp \
+    modules/facegate/FaceGateQt/core/UsbMjpegCaptureBackend.cpp \
     modules/facegate/FaceGateQt/core/CameraService.cpp \
     modules/facegate/FaceGateQt/core/FaceEngine.cpp \
     modules/facegate/FaceGateQt/core/FaceInferenceWorker.cpp \
@@ -133,12 +135,12 @@ SOURCES += \
     modules/facegate/FaceGateQt/import/PersonXlsxParser.cpp \
     modules/facegate/FaceGateQt/import/UsbPersonExportTarget.cpp \
     modules/facegate/FaceGateQt/import/UsbPersonImportSource.cpp \
-    modules/facegate/FaceGateQt/gate/GateOutputService.cpp \
     modules/facegate/FaceGateQt/ui/AccessPasswordDialog.cpp \
     modules/facegate/FaceGateQt/ui/AppMessageDialog.cpp \
     modules/facegate/FaceGateQt/ui/AppPasswordDialog.cpp \
     modules/facegate/FaceGateQt/ui/AdminLoginDialog.cpp \
     modules/facegate/FaceGateQt/ui/AdminPanel.cpp \
+    modules/facegate/FaceGateQt/ui/OpenGlImageWidget.cpp \
     modules/facegate/FaceGateQt/ui/CameraPreviewWidget.cpp \
     modules/facegate/FaceGateQt/ui/EnrollPreviewWidget.cpp \
     modules/facegate/FaceGateQt/ui/FaceEnrollWidget.cpp \
@@ -157,6 +159,7 @@ SOURCES += \
 
 HEADERS += \
     common/face_image_sync_bridge.h \
+    common/storage_policy.h \
     common/clients/icboard_client.h \
     common/clients/signalboard_client.h \
     common/debug/probe_log.h \
@@ -168,8 +171,8 @@ HEADERS += \
     common/sql/network_personnel_store.h \
     common/workers/icboard_worker.h \
     common/workers/signalboard_worker.h \
-    components/cursoroverlay/CursorOverlay.h \
     components/rga/RgaImageProcessor.h \
+    components/input/InputCursorController.h \
     components/cursoroverlay/keyboard_dialog.h \
     components/features/command_dialog.h \
     components/features/key_service.h \
@@ -207,6 +210,7 @@ HEADERS += \
     ic_board/serial_init.h \
     platform/rk3566_platform.h \
     shell/AppShell.h \
+    shell/LedFillLight.h \
     shell/Sr505PresenceSensor.h \
     shell/IApplicationModule.h \
     shell/IPresenceSensor.h \
@@ -217,6 +221,7 @@ HEADERS += \
     modules/facegate/FaceGateQt/config/CameraProfile.h \
     modules/facegate/FaceGateQt/audio/AudioService.h \
     modules/facegate/FaceGateQt/core/CameraCaptureBackend.h \
+    modules/facegate/FaceGateQt/core/UsbMjpegCaptureBackend.h \
     modules/facegate/FaceGateQt/core/CameraService.h \
     modules/facegate/FaceGateQt/core/FaceEngine.h \
     modules/facegate/FaceGateQt/core/FaceInferenceWorker.h \
@@ -238,12 +243,12 @@ HEADERS += \
     modules/facegate/FaceGateQt/import/PersonXlsxParser.h \
     modules/facegate/FaceGateQt/import/UsbPersonExportTarget.h \
     modules/facegate/FaceGateQt/import/UsbPersonImportSource.h \
-    modules/facegate/FaceGateQt/gate/GateOutputService.h \
     modules/facegate/FaceGateQt/ui/AccessPasswordDialog.h \
     modules/facegate/FaceGateQt/ui/AppMessageDialog.h \
     modules/facegate/FaceGateQt/ui/AppPasswordDialog.h \
     modules/facegate/FaceGateQt/ui/AdminLoginDialog.h \
     modules/facegate/FaceGateQt/ui/AdminPanel.h \
+    modules/facegate/FaceGateQt/ui/OpenGlImageWidget.h \
     modules/facegate/FaceGateQt/ui/CameraPreviewWidget.h \
     modules/facegate/FaceGateQt/ui/EnrollPreviewWidget.h \
     modules/facegate/FaceGateQt/ui/FaceEnrollWidget.h \

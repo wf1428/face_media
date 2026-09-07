@@ -16,6 +16,20 @@ static IcEventBridge *s = new IcEventBridge();
     return s;
 }
 
+bool IcEventBridge::networkAvailable() const
+{
+    return networkAvailable_;
+}
+
+void IcEventBridge::updateNetworkAvailability(bool available)
+{
+    if (networkAvailable_ == available) {
+        return;
+    }
+    networkAvailable_ = available;
+    emit networkAvailabilityChanged(available);
+}
+
 /** @brief 发布卡片通过信息给 MQTT 网关等订阅者。 */
 void IcEventBridge::emitCardPassed(const QString &cardId, const QString &floor, const QByteArray &rawFrame)
 {

@@ -1,0 +1,1 @@
+cmd_/home/lubancat/face_media/led_drv/led_drv.ko := aarch64-linux-gnu-ld -r  -EL  -maarch64elf -T ./scripts/module-common.lds -T ./arch/arm64/kernel/module.lds  --build-id  -o /home/lubancat/face_media/led_drv/led_drv.ko /home/lubancat/face_media/led_drv/led_drv.o /home/lubancat/face_media/led_drv/led_drv.mod.o ;  true

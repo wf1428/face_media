@@ -156,7 +156,9 @@ CameraProfile AppConfig::activeCameraProfile() const
         return profile;
     }
 
-    profile.source = CameraSourceType::Mipi;
+    profile.source = cameraSource == QStringLiteral("auto")
+                         ? CameraSourceType::Auto
+                         : CameraSourceType::Mipi;
     profile.devicePath = cameraDevice;
     profile.width = cameraWidth;
     profile.height = cameraHeight;
@@ -265,14 +267,16 @@ AppConfig AppConfig::load(const QString &iniPath)
         QString::fromLocal8Bit(qgetenv("QT_YCEST_CAMERA_SOURCE"))
             .trimmed()
             .toLower();
-    if (cameraSource.isEmpty() || cameraSource == QStringLiteral("mipi")) {
+    if (cameraSource.isEmpty() || cameraSource == QStringLiteral("auto")) {
+        cfg.cameraSource = QStringLiteral("auto");
+    } else if (cameraSource == QStringLiteral("mipi")) {
         cfg.cameraSource = QStringLiteral("mipi");
     } else if (cameraSource == QStringLiteral("usb")) {
         cfg.cameraSource = QStringLiteral("usb");
     } else {
         qWarning() << "[CAMERA-CONFIG] invalid QT_YCEST_CAMERA_SOURCE="
-                   << cameraSource << "; using mipi";
-        cfg.cameraSource = QStringLiteral("mipi");
+                   << cameraSource << "; using auto";
+        cfg.cameraSource = QStringLiteral("auto");
     }
     qInfo() << "[CAMERA-CONFIG] selected source=" << cfg.cameraSource;
 

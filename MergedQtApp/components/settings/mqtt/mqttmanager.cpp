@@ -9,6 +9,8 @@
 #include "mqttmanager.h"
 
 #include <QDebug>
+#include <QCryptographicHash>
+#include <QDir>
 #include <QFile>
 #include <QJsonArray>
 #include <QDateTime>
@@ -21,12 +23,15 @@
 #include <QSet>
 #include <QStringList>
 #include <QThread>
+#include <QTime>
 #include <QUuid>
 
 #include <algorithm>
 #include <cmath>
 
 #include "common/face_image_sync_bridge.h"
+#include "common/sql/dbstore.h"
+#include "common/storage_policy.h"
 #include "ic_mqtt_gateway.h"
 #include "ic_board/ic_event_bridge.h"
 #include "ic_board/rs485_floor_frame_builder.h"
@@ -34,6 +39,60 @@
 #include <unistd.h>
 
 namespace {
+
+QString accessSnapshotRoot()
+{
+    return QDir(Rk3566Platform::applicationRoot()).filePath(
+                QStringLiteral("data/snapshots"));
+}
+
+QString accessPersonName(const QString &personId)
+{
+    const QString normalized = personId.trimmed();
+    if (normalized.isEmpty()) {
+        return QStringLiteral("未登记人员");
+    }
+    QList<QVariantMap> rows = DbStore::query(
+                QStringLiteral(
+                    "SELECT name FROM network_person WHERE person_id=? LIMIT 1"),
+                {normalized});
+    if (!rows.isEmpty()) {
+        const QString name = rows.first().value(QStringLiteral("name"))
+                .toString().trimmed();
+        if (!name.isEmpty()) return name;
+    }
+    rows = DbStore::query(
+                QStringLiteral(
+                    "SELECT name FROM person WHERE person_no=? LIMIT 1"),
+                {normalized});
+    if (!rows.isEmpty()) {
+        const QString name = rows.first().value(QStringLiteral("name"))
+                .toString().trimmed();
+        if (!name.isEmpty()) return name;
+    }
+    return QStringLiteral("未登记人员");
+}
+
+void appendCredentialAccessRecord(const QString &type,
+                                  const QString &personId,
+                                  const QString &credential,
+                                  bool success,
+                                  const QString &reason)
+{
+    QJsonObject record;
+    record.insert(QStringLiteral("type"), type);
+    record.insert(QStringLiteral("name"), accessPersonName(personId));
+    record.insert(QStringLiteral("credential"), credential);
+    record.insert(QStringLiteral("success"), success);
+    if (!reason.trimmed().isEmpty()) {
+        record.insert(QStringLiteral("reason"), reason.trimmed());
+    }
+    QString error;
+    if (!StoragePolicy::appendAccessRecord(
+                accessSnapshotRoot(), record, &error)) {
+        qWarning().noquote() << error;
+    }
+}
 
 QJsonArray failedFacesFromPayload(const QJsonObject &payload,
                                   const QString &message)
@@ -212,6 +271,403 @@ bool parseFloorControl(const QJsonObject &data,
     }
     *authorization = value;
     *rs485Frame = frame;
+    return true;
+}
+
+QString faceImageRequestKey(const QJsonObject &payload)
+{
+    const QString messageId = payload.value(QStringLiteral("id"))
+            .toString().trimmed();
+    const QString deviceId = payload.value(QStringLiteral("deviceId"))
+            .toString().trimmed();
+    if (!messageId.isEmpty()) {
+        return QStringLiteral("%1\n%2").arg(deviceId, messageId);
+    }
+    return QString::fromLatin1(QCryptographicHash::hash(
+        QJsonDocument(payload).toJson(QJsonDocument::Compact),
+        QCryptographicHash::Sha256).toHex());
+}
+
+QString faceImageContentKey(const QJsonObject &payload)
+{
+    const QJsonObject data = payload.value(QStringLiteral("data")).toObject();
+    QByteArray content = data.value(QStringLiteral("personId"))
+            .toString().trimmed().toUtf8();
+    const QJsonArray faces = data.value(QStringLiteral("faces")).toArray();
+    for (const QJsonValue &value : faces) {
+        const QJsonObject face = value.toObject();
+        content.append('\n');
+        content.append(face.value(QStringLiteral("faceHash"))
+                       .toString().trimmed().toUtf8());
+        content.append('\n');
+        content.append(face.value(QStringLiteral("name"))
+                       .toString().trimmed().toUtf8());
+    }
+    return QString::fromLatin1(QCryptographicHash::hash(
+        content, QCryptographicHash::Sha256).toHex());
+}
+
+struct FloorLimitAction
+{
+    int floor = 0;
+    bool open = false;
+};
+
+int onlineV1FloorBit(int floor)
+{
+    if (floor >= 1 && floor <= 120) return floor - 1;
+    if (floor >= -8 && floor <= -1) return floor + 128;
+    return -1;
+}
+
+QByteArray onlineV1FloorLimitBits()
+{
+    const QString stored = DbStore::getConfig(
+                QStringLiteral("online_v1_floor_limit_bits"),
+                QString(128, QLatin1Char('0'))).toString().trimmed();
+    const QByteArray bits = stored.toLatin1();
+    if (bits.size() != 128) return QByteArray(128, '0');
+    for (char bit : bits) {
+        if (bit != '0' && bit != '1') return QByteArray(128, '0');
+    }
+    return bits;
+}
+
+bool saveOnlineV1FloorLimitBits(const QByteArray &bits,
+                                QString *error)
+{
+    if (bits.size() != 128) {
+        if (error) *error = QStringLiteral("楼层状态长度错误");
+        return false;
+    }
+
+    if (!DbStore::setConfig(QStringLiteral("online_v1_floor_limit_bits"),
+                            QString::fromLatin1(bits))) {
+        if (error) *error = DbStore::lastError();
+        return false;
+    }
+
+    DbStore::checkpoint();
+    return true;
+}
+
+QJsonArray onlineV1FloorSchedules()
+{
+    const QByteArray raw = DbStore::getConfig(
+                QStringLiteral("online_v1_floor_schedules"),
+                QStringLiteral("[]")).toString().trimmed().toUtf8();
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(raw, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isArray()) {
+        return QJsonArray();
+    }
+    return document.array();
+}
+
+QByteArray onlineV1FloorScheduleBits()
+{
+    const QString stored = DbStore::getConfig(
+                QStringLiteral("online_v1_floor_schedule_bits"),
+                QString(128, QLatin1Char('0'))).toString().trimmed();
+    const QByteArray bits = stored.toLatin1();
+    if (bits.size() != 128) return QByteArray(128, '0');
+    for (char bit : bits) {
+        if (bit != '0' && bit != '1') return QByteArray(128, '0');
+    }
+    return bits;
+}
+
+QSet<int> onlineV1FloorScheduleFloors(const QJsonArray &schedules)
+{
+    QSet<int> floors;
+    for (const QJsonValue &scheduleValue : schedules) {
+        const QJsonArray values = scheduleValue.toObject()
+                .value(QStringLiteral("floors")).toArray();
+        for (const QJsonValue &floorValue : values) {
+            if (floorValue.isDouble()) floors.insert(floorValue.toInt());
+        }
+    }
+    return floors;
+}
+
+int onlineV1FloorOpenStatus(const QByteArray &openBits, int floor)
+{
+    const int bit = onlineV1FloorBit(floor);
+    if (bit < 0 || bit >= openBits.size()) return 0;
+    return openBits.at(bit) == '1' ? 1 : 0;
+}
+
+QByteArray onlineV1FloorLimitBatchFrame(const QByteArray &openBits)
+{
+    // 完全沿用 online_v2 批量交通梯帧："OPEN" + 128 个限行状态字符。
+    // 分层板位序为 -8~-1、1~120；状态字符 0=开放、1=限行。
+    QByteArray restrictionBits(128, '1');
+    for (int floor = -8; floor <= -1; ++floor) {
+        const int stateBit = onlineV1FloorBit(floor);
+        const int boardBit = floor + 8;
+        restrictionBits[boardBit] = openBits.at(stateBit) == '1' ? '0' : '1';
+    }
+    for (int floor = 1; floor <= 120; ++floor) {
+        const int stateBit = onlineV1FloorBit(floor);
+        const int boardBit = floor + 7;
+        restrictionBits[boardBit] = openBits.at(stateBit) == '1' ? '0' : '1';
+    }
+
+    QByteArray frame("OPEN");
+    frame.append(restrictionBits);
+    return frame;
+}
+
+QString onlineV1FloorOpenHex(const QByteArray &openBits)
+{
+    QByteArray bytes(16, '\0');
+    for (int bit = 0; bit < openBits.size() && bit < 128; ++bit) {
+        if (openBits.at(bit) != '1') continue;
+        const int byteIndex = 15 - bit / 8;
+        const int oldValue = static_cast<unsigned char>(bytes.at(byteIndex));
+        bytes[byteIndex] = static_cast<char>(oldValue | (1 << (bit % 8)));
+    }
+    return QStringLiteral("0x")
+            + QString::fromLatin1(bytes.toHex().toUpper());
+}
+
+QJsonObject floorLimitResponseData(const QByteArray &openBits,
+                                   const QList<int> &floors,
+                                   int code)
+{
+    QJsonArray statuses;
+    for (int floor : floors) {
+        QJsonObject item;
+        item.insert(QStringLiteral("floor"), floor);
+        item.insert(QStringLiteral("status"),
+                    onlineV1FloorOpenStatus(openBits, floor));
+        statuses.append(item);
+    }
+
+    QJsonObject data;
+    data.insert(QStringLiteral("code"), code);
+    data.insert(QStringLiteral("floors"), statuses);
+    data.insert(QStringLiteral("floorHex"), onlineV1FloorOpenHex(openBits));
+    return data;
+}
+
+QList<int> allTrafficFloors()
+{
+    QList<int> floors;
+    floors.reserve(128);
+    for (int floor = 1; floor <= 120; ++floor) floors.append(floor);
+    for (int floor = -8; floor <= -1; ++floor) floors.append(floor);
+    return floors;
+}
+
+bool jsonIntegerInRange(const QJsonValue &value,
+                        int minimum,
+                        int maximum,
+                        int *result)
+{
+    if (!value.isDouble()) return false;
+    const double number = value.toDouble();
+    if (std::floor(number) != number
+            || number < static_cast<double>(minimum)
+            || number > static_cast<double>(maximum)) {
+        return false;
+    }
+    if (result) *result = static_cast<int>(number);
+    return true;
+}
+
+bool normalizeOnlineV1FloorSchedules(const QJsonObject &data,
+                                     QJsonArray *normalizedSchedules,
+                                     QString *error)
+{
+    if (!normalizedSchedules) return false;
+    *normalizedSchedules = QJsonArray();
+
+    const QJsonValue schedulesValue = data.value(QStringLiteral("schedules"));
+    if (!schedulesValue.isArray()) {
+        if (error) *error = QStringLiteral("schedules 必须是数组");
+        return false;
+    }
+
+    static const QRegularExpression timePattern(
+                QStringLiteral("^(?:[01][0-9]|2[0-3]):[0-5][0-9]$"));
+    QHash<QString, int> actionBySlot;
+    QSet<QString> scheduleHashes;
+    const QJsonArray schedules = schedulesValue.toArray();
+    for (const QJsonValue &scheduleValue : schedules) {
+        if (!scheduleValue.isObject()) {
+            if (error) *error = QStringLiteral("schedules 元素必须是对象");
+            return false;
+        }
+
+        const QJsonObject input = scheduleValue.toObject();
+        const QJsonValue hashValue = input.value(QStringLiteral("hash"));
+        const QString hash = hashValue.toString().trimmed();
+        if (!hashValue.isString() || hash.isEmpty()) {
+            if (error) *error = QStringLiteral("hash 必须是非空字符串");
+            return false;
+        }
+        if (scheduleHashes.contains(hash)) {
+            if (error) *error = QStringLiteral("schedules 中存在重复 hash");
+            return false;
+        }
+        scheduleHashes.insert(hash);
+
+        int action = -1;
+        if (!jsonIntegerInRange(input.value(QStringLiteral("action")),
+                                0, 1, &action)) {
+            if (error) *error = QStringLiteral("action 只能为 0 或 1");
+            return false;
+        }
+
+        const QString time = input.value(QStringLiteral("time"))
+                .toString().trimmed();
+        if (!timePattern.match(time).hasMatch()
+                || !QTime::fromString(time, QStringLiteral("HH:mm")).isValid()) {
+            if (error) *error = QStringLiteral("time 格式必须为 HH:mm");
+            return false;
+        }
+
+        const QJsonValue weekDaysValue = input.value(QStringLiteral("weekDays"));
+        const QJsonValue floorsValue = input.value(QStringLiteral("floors"));
+        if (!weekDaysValue.isArray() || weekDaysValue.toArray().isEmpty()) {
+            if (error) *error = QStringLiteral("weekDays 必须是非空数组");
+            return false;
+        }
+        if (!floorsValue.isArray() || floorsValue.toArray().isEmpty()) {
+            if (error) *error = QStringLiteral("floors 必须是非空数组");
+            return false;
+        }
+
+        QSet<int> weekDaySet;
+        for (const QJsonValue &weekDayValue : weekDaysValue.toArray()) {
+            int weekDay = 0;
+            if (!jsonIntegerInRange(weekDayValue, 1, 7, &weekDay)) {
+                if (error) *error = QStringLiteral("weekDays 只能为 1~7");
+                return false;
+            }
+            weekDaySet.insert(weekDay);
+        }
+
+        QSet<int> floorSet;
+        for (const QJsonValue &floorValue : floorsValue.toArray()) {
+            int floor = 0;
+            if (!jsonIntegerInRange(floorValue, -8, 120, &floor)
+                    || floor == 0) {
+                if (error) {
+                    *error = QStringLiteral(
+                                "floors 楼层范围为 -8~-1、1~120");
+                }
+                return false;
+            }
+            floorSet.insert(floor);
+        }
+
+        QList<int> weekDays = weekDaySet.values();
+        QList<int> floors = floorSet.values();
+        std::sort(weekDays.begin(), weekDays.end());
+        std::sort(floors.begin(), floors.end());
+
+        for (int weekDay : weekDays) {
+            for (int floor : floors) {
+                const QString slot = QStringLiteral("%1|%2|%3")
+                        .arg(time).arg(weekDay).arg(floor);
+                if (actionBySlot.contains(slot)
+                        && actionBySlot.value(slot) != action) {
+                    if (error) {
+                        *error = QStringLiteral(
+                                    "同一楼层在相同星期和时间存在冲突 action");
+                    }
+                    return false;
+                }
+                actionBySlot.insert(slot, action);
+            }
+        }
+
+        QJsonArray normalizedWeekDays;
+        for (int weekDay : weekDays) normalizedWeekDays.append(weekDay);
+        QJsonArray normalizedFloors;
+        for (int floor : floors) normalizedFloors.append(floor);
+
+        QJsonObject normalized;
+        normalized.insert(QStringLiteral("action"), action);
+        normalized.insert(QStringLiteral("time"), time);
+        normalized.insert(QStringLiteral("weekDays"), normalizedWeekDays);
+        normalized.insert(QStringLiteral("floors"), normalizedFloors);
+        normalized.insert(QStringLiteral("hash"), hash);
+        normalizedSchedules->append(normalized);
+    }
+    return true;
+}
+
+bool saveOnlineV1FloorSchedules(const QJsonArray &schedules,
+                                const QByteArray &scheduleBits,
+                                bool resetExecutionMinute,
+                                QString *error)
+{
+    if (scheduleBits.size() != 128) {
+        if (error) *error = QStringLiteral("定时楼层状态长度错误");
+        return false;
+    }
+    if (!DbStore::transactionBegin()) {
+        if (error) *error = DbStore::lastError();
+        return false;
+    }
+
+    const QString schedulesJson = QString::fromUtf8(
+                QJsonDocument(schedules).toJson(QJsonDocument::Compact));
+    const bool schedulesSaved = DbStore::setConfig(
+                QStringLiteral("online_v1_floor_schedules"), schedulesJson);
+    const bool stateSaved = schedulesSaved && DbStore::setConfig(
+                QStringLiteral("online_v1_floor_schedule_bits"),
+                QString::fromLatin1(scheduleBits));
+    // config.value 为 NOT NULL；QString() 会被 Qt SQL 绑定为 NULL。
+    const bool markerSaved = !resetExecutionMinute
+            ? stateSaved
+            : stateSaved && DbStore::setConfig(
+                  QStringLiteral("online_v1_floor_schedule_last_minute"),
+                  QStringLiteral(""));
+    if (!markerSaved || !DbStore::transactionCommit()) {
+        const QString dbError = DbStore::lastError();
+        DbStore::transactionRollback();
+        if (error) *error = dbError;
+        return false;
+    }
+    DbStore::checkpoint();
+    return true;
+}
+
+bool saveOnlineV1FloorScheduleExecution(const QByteArray &scheduleBits,
+                                        const QByteArray &currentFloorBits,
+                                        const QString &minuteKey,
+                                        QString *error)
+{
+    if (scheduleBits.size() != 128
+            || currentFloorBits.size() != 128
+            || minuteKey.trimmed().isEmpty()) {
+        if (error) *error = QStringLiteral("定时执行状态错误");
+        return false;
+    }
+    if (!DbStore::transactionBegin()) {
+        if (error) *error = DbStore::lastError();
+        return false;
+    }
+    const bool stateSaved = DbStore::setConfig(
+                QStringLiteral("online_v1_floor_schedule_bits"),
+                QString::fromLatin1(scheduleBits));
+    const bool currentStateSaved = stateSaved && DbStore::setConfig(
+                QStringLiteral("online_v1_floor_limit_bits"),
+                QString::fromLatin1(currentFloorBits));
+    const bool markerSaved = currentStateSaved && DbStore::setConfig(
+                QStringLiteral("online_v1_floor_schedule_last_minute"),
+                minuteKey);
+    if (!markerSaved || !DbStore::transactionCommit()) {
+        const QString dbError = DbStore::lastError();
+        DbStore::transactionRollback();
+        if (error) *error = dbError;
+        return false;
+    }
+    DbStore::checkpoint();
     return true;
 }
 
@@ -579,6 +1035,27 @@ MqttManager::MqttManager(QObject *parent)
         });
     }
 
+    personnelSyncThread_ = new QThread(this);
+    personnelSyncWorker_ = new QObject();
+    personnelSyncStore_ = new NetworkPersonnelStore();
+    personnelSyncWorker_->moveToThread(personnelSyncThread_);
+    connect(personnelSyncThread_, &QThread::finished,
+            personnelSyncWorker_, &QObject::deleteLater);
+    personnelSyncThread_->start();
+
+    networkFaceRefreshDebounceTimer_ = new QTimer(this);
+    networkFaceRefreshDebounceTimer_->setSingleShot(true);
+    networkFaceRefreshDebounceTimer_->setInterval(
+                networkFaceRefreshDebounceMs_);
+    connect(networkFaceRefreshDebounceTimer_, &QTimer::timeout,
+            this, &MqttManager::flushNetworkFaceRefresh);
+
+    networkFaceRefreshMaxTimer_ = new QTimer(this);
+    networkFaceRefreshMaxTimer_->setSingleShot(true);
+    networkFaceRefreshMaxTimer_->setInterval(networkFaceRefreshMaxMs_);
+    connect(networkFaceRefreshMaxTimer_, &QTimer::timeout,
+            this, &MqttManager::flushNetworkFaceRefresh);
+
     faceUploadThread_ = new QThread(this);
     faceUploadWorker_ = new QObject();
     faceUploadWorker_->moveToThread(faceUploadThread_);
@@ -592,12 +1069,70 @@ MqttManager::MqttManager(QObject *parent)
     connect(onlineQrV1Timer_, &QTimer::timeout,
             this, &MqttManager::onOnlineV1QrTimeout);
 
+    floorScheduleTimer_ = new QTimer(this);
+    floorScheduleTimer_->setInterval(floorScheduleCheckIntervalMs_);
+    connect(floorScheduleTimer_, &QTimer::timeout,
+            this, &MqttManager::onOnlineV1FloorScheduleTick);
+    floorScheduleTimer_->start();
+
+    faceImageReconnectResponseTimer_ = new QTimer(this);
+    faceImageReconnectResponseTimer_->setSingleShot(true);
+    faceImageReconnectResponseTimer_->setInterval(
+                faceImageReconnectResponseTimeoutMs_);
+    connect(faceImageReconnectResponseTimer_, &QTimer::timeout,
+            this, [this]() {
+        const QStringList personIds =
+                faceImageReconnectAwaitingPersons_.values();
+        faceImageReconnectAwaitingPersons_.clear();
+        for (const QString &personId : personIds) {
+            const auto it = pendingFaceImageRequests_.constFind(personId);
+            if (it == pendingFaceImageRequests_.cend()
+                    || !it.value().awaitingResponse) {
+                continue;
+            }
+            const QJsonObject requestPayload = it.value().requestPayload;
+            const QString message = QStringLiteral(
+                        "重连补发人脸图像请求后10秒内未收到响应，图像同步失败。");
+            const bool submitted = publishFaceImagesResult(
+                        requestPayload,
+                        personId,
+                        false,
+                        message,
+                        QJsonArray());
+            emit logMessage(QStringLiteral(
+                                "重连补发人脸图像响应超时：personId=%1 "
+                                "Imagesresult=%2")
+                            .arg(personId,
+                                 submitted ? QStringLiteral("submitted")
+                                           : QStringLiteral("failed")));
+        }
+    });
+
     IcEventBridge *icBridge = IcEventBridge::instance();
+    mqttReconnectRequiredAfterNetworkLoss_ = !icBridge->networkAvailable();
+    connect(icBridge, &IcEventBridge::networkAvailabilityChanged,
+            this, [this](bool available) {
+        if (!available) {
+            mqttReconnectRequiredAfterNetworkLoss_ = true;
+            emit logMessage(QStringLiteral(
+                                "网络已断开，后续成功通行将计入离线批量记录"));
+            return;
+        }
+
+        emit logMessage(QStringLiteral(
+                            "网络已恢复，等待MQTT重新确认连接后补报离线通行"));
+        if (ipc_ && ipc_->isConnected()) {
+            ipc_->sendRawLine("{\"cmd\":\"status\"}\n");
+        }
+    }, Qt::QueuedConnection);
     connect(icBridge, &IcEventBridge::onlineV1QrScanned,
             this, &MqttManager::onOnlineV1QrScanned,
             Qt::QueuedConnection);
     connect(icBridge, &IcEventBridge::faceAccessFinished,
             this, &MqttManager::onOnlineV1FaceAccessFinished,
+            Qt::QueuedConnection);
+    connect(icBridge, &IcEventBridge::passwordAccessFinished,
+            this, &MqttManager::onOnlineV1PasswordAccessFinished,
             Qt::QueuedConnection);
     connect(icBridge, &IcEventBridge::faceUploadRequested,
             this, &MqttManager::onOnlineV1FaceUploadRequested,
@@ -689,6 +1224,13 @@ MqttManager::MqttManager(QObject *parent)
 
 MqttManager::~MqttManager()
 {
+    if (personnelSyncThread_) {
+        personnelSyncThread_->quit();
+        personnelSyncThread_->wait();
+    }
+    personnelSyncWorker_ = nullptr;
+    delete personnelSyncStore_;
+    personnelSyncStore_ = nullptr;
     if (faceUploadThread_) {
         faceUploadThread_->quit();
         faceUploadThread_->wait();
@@ -829,6 +1371,73 @@ void MqttManager::registerBuiltinMessageHandlers()
     });
     registerMessageHandler(remoteCallHandler);
 
+    auto *floorLimitHandler =
+            new MqttCallbackMessageHandler(QStringLiteral("online_v1_floor_limit"),
+                                           messageRouter_);
+    const QStringList floorLimitMethods = {
+        QStringLiteral("floorLimit"),
+        QStringLiteral("floorLimit.query")
+    };
+    for (const QString &floorLimitMethod : floorLimitMethods) {
+        floorLimitHandler->addMethod(
+                    floorLimitMethod,
+                    [this](const QString &topic,
+                           const QJsonObject &payload,
+                           const QString &method) {
+            return handleOnlineV1FloorLimit(topic, payload, method);
+        });
+    }
+    registerMessageHandler(floorLimitHandler);
+
+    auto *floorScheduleHandler =
+            new MqttCallbackMessageHandler(QStringLiteral("online_v1_floor_schedule"),
+                                           messageRouter_);
+    const QStringList floorScheduleMethods = {
+        QStringLiteral("floorSchedule"),
+        QStringLiteral("floorSchedule.query"),
+        QStringLiteral("floorSchedule.delete")
+    };
+    for (const QString &floorScheduleMethod : floorScheduleMethods) {
+        floorScheduleHandler->addMethod(
+                    floorScheduleMethod,
+                    [this](const QString &topic,
+                           const QJsonObject &payload,
+                           const QString &method) {
+            return handleOnlineV1FloorSchedule(topic, payload, method);
+        });
+    }
+    registerMessageHandler(floorScheduleHandler);
+
+    auto *elevatorModeHandler =
+            new MqttCallbackMessageHandler(QStringLiteral("online_v1_elevator_mode"),
+                                           messageRouter_);
+    const QStringList elevatorModeMethods = {
+        QStringLiteral("elevatorMode"),
+        QStringLiteral("elevatorMode.query")
+    };
+    for (const QString &elevatorModeMethod : elevatorModeMethods) {
+        elevatorModeHandler->addMethod(
+                    elevatorModeMethod,
+                    [this](const QString &topic,
+                           const QJsonObject &payload,
+                           const QString &method) {
+            return handleOnlineV1ElevatorMode(topic, payload, method);
+        });
+    }
+    registerMessageHandler(elevatorModeHandler);
+
+    auto *heartbeatHandler =
+            new MqttCallbackMessageHandler(QStringLiteral("online_v1_heartbeat"),
+                                           messageRouter_);
+    heartbeatHandler->addMethod(
+                QStringLiteral("heartbeat"),
+                [this](const QString &topic,
+                       const QJsonObject &payload,
+                       const QString &method) {
+        return handleOnlineV1Heartbeat(topic, payload, method);
+    });
+    registerMessageHandler(heartbeatHandler);
+
     auto *onlineQrHandler =
             new MqttCallbackMessageHandler(QStringLiteral("online_v1_qr"),
                                            messageRouter_);
@@ -878,6 +1487,633 @@ void MqttManager::registerBuiltinMessageHandlers()
                        const QString &) {
         return handleStreamUrlMessage(topic, payload);
     });
+}
+
+bool MqttManager::handleOnlineV1FloorLimit(const QString &topic,
+                                           const QJsonObject &payloadObj,
+                                           const QString &method)
+{
+    if (method != QStringLiteral("floorLimit")
+            && method != QStringLiteral("floorLimit.query")) {
+        return false;
+    }
+
+    const QString requestTopic = topic.trimmed();
+    const bool onlineV1Active = cfg_.publishTopic.trimmed()
+            .startsWith(QStringLiteral("device/ycLinux/"))
+            && cfg_.publishTopic.trimmed().endsWith(QStringLiteral("/event"));
+    const bool ycLinuxRequest = requestTopic.startsWith(
+                QStringLiteral("device/ycLinux/"))
+            && requestTopic.endsWith(QStringLiteral("/request"));
+    if (!onlineV1Active || !ycLinuxRequest) return false;
+
+    const QString expectedDeviceId = cfg_.clientId.trimmed().isEmpty()
+            ? cfg_.deviceName.trimmed() : cfg_.clientId.trimmed();
+    const QString messageId = payloadObj.value(QStringLiteral("id"))
+            .toString().trimmed();
+    const QString messageDeviceId = payloadObj.value(QStringLiteral("deviceId"))
+            .toString().trimmed();
+    if (messageDeviceId.isEmpty()
+            || (!expectedDeviceId.isEmpty() && messageDeviceId != expectedDeviceId)) {
+        emit logMessage(QStringLiteral(
+                            "floorLimit 下行 deviceId 不匹配: method=%1 deviceId=%2")
+                        .arg(method, messageDeviceId));
+        return true;
+    }
+    if (messageId.isEmpty()) {
+        emit logMessage(QStringLiteral("floorLimit 下行参数错误: method=%1")
+                        .arg(method));
+        return true;
+    }
+
+    if (method == QStringLiteral("floorLimit.query")) {
+        const QByteArray state = onlineV1FloorLimitBits();
+        publishOnlineV1Event(QStringLiteral("floorLimit"),
+                             floorLimitResponseData(state,
+                                                    allTrafficFloors(),
+                                                    0),
+                             messageId,
+                             QStringLiteral("floorLimit.query"));
+        emit logMessage(QStringLiteral("floorLimit.query 已回报当前128位楼层状态"));
+        return true;
+    }
+
+    if (!payloadObj.value(QStringLiteral("data")).isObject()) {
+        emit logMessage(QStringLiteral("floorLimit 下行参数错误: method=%1")
+                        .arg(method));
+        return true;
+    }
+
+    const QJsonObject requestData = payloadObj.value(QStringLiteral("data")).toObject();
+    const QJsonValue floorsValue = requestData.value(QStringLiteral("floors"));
+    const QJsonArray floorsArray = floorsValue.toArray();
+    QList<FloorLimitAction> actions;
+    QList<int> responseFloors;
+    QHash<int, bool> actionsByFloor;
+    QString validationError;
+
+    if (!floorsValue.isArray() || floorsArray.isEmpty()) {
+        validationError = QStringLiteral("floors 必须是非空数组");
+    }
+    for (const QJsonValue &value : floorsArray) {
+        if (!validationError.isEmpty()) break;
+        if (!value.isObject()) {
+            validationError = QStringLiteral("floors 元素必须是对象");
+            break;
+        }
+        const QJsonObject item = value.toObject();
+        const QJsonValue floorValue = item.value(QStringLiteral("floor"));
+        const QJsonValue actionValue = item.value(QStringLiteral("action"));
+        const double floorNumber = floorValue.toDouble();
+        const double actionNumber = actionValue.toDouble();
+        if (!floorValue.isDouble() || std::floor(floorNumber) != floorNumber
+                || floorNumber < -8.0 || floorNumber > 120.0
+                || floorNumber == 0.0) {
+            validationError = QStringLiteral("floor 超出范围（允许 -8~-1、1~120）");
+            break;
+        }
+        if (!actionValue.isDouble() || std::floor(actionNumber) != actionNumber
+                || (actionNumber != 0.0 && actionNumber != 1.0)) {
+            validationError = QStringLiteral("action 只能为 0 或 1");
+            break;
+        }
+
+        const int floor = static_cast<int>(floorNumber);
+        const bool open = static_cast<int>(actionNumber) == 1;
+        if (actionsByFloor.contains(floor)) {
+            if (actionsByFloor.value(floor) != open) {
+                validationError = QStringLiteral("同一楼层存在冲突 action");
+            }
+            continue;
+        }
+        actionsByFloor.insert(floor, open);
+        FloorLimitAction action;
+        action.floor = floor;
+        action.open = open;
+        actions.append(action);
+        responseFloors.append(floor);
+    }
+
+    if (!validationError.isEmpty()) {
+        const QByteArray state = onlineV1FloorLimitBits();
+        publishOnlineV1Event(QStringLiteral("floorLimit"),
+                             floorLimitResponseData(state, responseFloors, -1),
+                             messageId,
+                             QStringLiteral("floorLimit"));
+        emit logMessage(QStringLiteral("floorLimit 下行参数错误: %1")
+                        .arg(validationError));
+        return true;
+    }
+
+    QByteArray state = onlineV1FloorLimitBits();
+    for (const FloorLimitAction &action : actions) {
+        const int bit = onlineV1FloorBit(action.floor);
+        state[bit] = action.open ? '1' : '0';
+    }
+
+    int responseCode = 0;
+    QString saveError;
+    if (!saveOnlineV1FloorLimitBits(state, &saveError)) {
+        responseCode = -1;
+        state = onlineV1FloorLimitBits();
+        emit logMessage(QStringLiteral("floorLimit 状态保存失败: %1")
+                        .arg(saveError));
+    }
+
+    if (responseCode == 0) {
+        const QByteArray rs485Payload = onlineV1FloorLimitBatchFrame(
+                    state);
+        const QString sourceTag = QStringLiteral("onlineV1FloorLimit:%1:batch")
+                .arg(messageId);
+        IcEventBridge::instance()->requestRs485Send(rs485Payload, sourceTag);
+        emit logMessage(QStringLiteral(
+                            "floorLimit -> RS485全量帧: floors=%1 len=%2 frame=%3")
+                        .arg(actions.size())
+                        .arg(rs485Payload.size())
+                        .arg(QString::fromLatin1(rs485Payload.toHex(' '))));
+    }
+
+    publishOnlineV1Event(QStringLiteral("floorLimit"),
+                         floorLimitResponseData(state,
+                                                responseFloors,
+                                                responseCode),
+                         messageId,
+                         QStringLiteral("floorLimit"));
+    return true;
+}
+
+bool MqttManager::handleOnlineV1FloorSchedule(const QString &topic,
+                                              const QJsonObject &payloadObj,
+                                              const QString &method)
+{
+    if (method != QStringLiteral("floorSchedule")
+            && method != QStringLiteral("floorSchedule.query")
+            && method != QStringLiteral("floorSchedule.delete")) {
+        return false;
+    }
+
+    const QString requestTopic = topic.trimmed();
+    const bool onlineV1Active = cfg_.publishTopic.trimmed()
+            .startsWith(QStringLiteral("device/ycLinux/"))
+            && cfg_.publishTopic.trimmed().endsWith(QStringLiteral("/event"));
+    const bool ycLinuxRequest = requestTopic.startsWith(
+                QStringLiteral("device/ycLinux/"))
+            && requestTopic.endsWith(QStringLiteral("/request"));
+    if (!onlineV1Active || !ycLinuxRequest) return false;
+
+    const QString expectedDeviceId = cfg_.clientId.trimmed().isEmpty()
+            ? cfg_.deviceName.trimmed() : cfg_.clientId.trimmed();
+    const QString messageId = payloadObj.value(QStringLiteral("id"))
+            .toString().trimmed();
+    const QString messageDeviceId = payloadObj.value(QStringLiteral("deviceId"))
+            .toString().trimmed();
+    if (messageDeviceId.isEmpty()
+            || (!expectedDeviceId.isEmpty() && messageDeviceId != expectedDeviceId)) {
+        emit logMessage(QStringLiteral(
+                            "floorSchedule 下行 deviceId 不匹配: method=%1 deviceId=%2")
+                        .arg(method, messageDeviceId));
+        return true;
+    }
+    if (messageId.isEmpty()) {
+        emit logMessage(QStringLiteral("floorSchedule 下行缺少 id"));
+        return true;
+    }
+
+    auto publishSchedules = [this, &messageId](int code,
+                                               const QJsonArray &schedules,
+                                               const QString &message) {
+        QJsonObject data;
+        data.insert(QStringLiteral("code"), code);
+        data.insert(QStringLiteral("schedules"), schedules);
+        if (!message.trimmed().isEmpty()) {
+            data.insert(QStringLiteral("message"), message.trimmed());
+        }
+        publishOnlineV1Event(QStringLiteral("floorSchedule"),
+                             data,
+                             messageId,
+                             QStringLiteral("floorSchedule"));
+    };
+
+    if (method == QStringLiteral("floorSchedule.query")) {
+        publishSchedules(200, onlineV1FloorSchedules(), QString());
+        emit logMessage(QStringLiteral("floorSchedule.query 已回报当前定时规则"));
+        return true;
+    }
+
+    if (method == QStringLiteral("floorSchedule.delete")) {
+        const QJsonValue dataValue = payloadObj.value(QStringLiteral("data"));
+        if (!dataValue.isObject()) {
+            const QString error = QStringLiteral(
+                        "floorSchedule.delete data 必须是对象");
+            publishSchedules(400, onlineV1FloorSchedules(), error);
+            emit logMessage(error);
+            return true;
+        }
+
+        const QJsonValue hashListValue = dataValue.toObject().value(
+                    QStringLiteral("hashList"));
+        if (!hashListValue.isArray() || hashListValue.toArray().isEmpty()) {
+            const QString error = QStringLiteral("hashList 必须是非空数组");
+            publishSchedules(400, onlineV1FloorSchedules(), error);
+            emit logMessage(QStringLiteral("floorSchedule.delete 参数错误: %1")
+                            .arg(error));
+            return true;
+        }
+
+        QSet<QString> requestedHashes;
+        for (const QJsonValue &hashValue : hashListValue.toArray()) {
+            const QString hash = hashValue.toString().trimmed();
+            if (!hashValue.isString() || hash.isEmpty()) {
+                const QString error = QStringLiteral(
+                            "hashList 元素必须是非空字符串");
+                publishSchedules(400, onlineV1FloorSchedules(), error);
+                emit logMessage(QStringLiteral(
+                                    "floorSchedule.delete 参数错误: %1")
+                                .arg(error));
+                return true;
+            }
+            requestedHashes.insert(hash);
+        }
+
+        const QJsonArray oldSchedules = onlineV1FloorSchedules();
+        QJsonArray remainingSchedules;
+        QJsonArray deletedHashes;
+        QSet<QString> deletedHashSet;
+        for (const QJsonValue &scheduleValue : oldSchedules) {
+            const QString hash = scheduleValue.toObject()
+                    .value(QStringLiteral("hash")).toString().trimmed();
+            if (!hash.isEmpty() && requestedHashes.contains(hash)) {
+                if (!deletedHashSet.contains(hash)) {
+                    deletedHashSet.insert(hash);
+                    deletedHashes.append(hash);
+                }
+                continue;
+            }
+            remainingSchedules.append(scheduleValue);
+        }
+
+        if (deletedHashes.isEmpty()) {
+            publishSchedules(200, oldSchedules, QString());
+            emit logMessage(QStringLiteral(
+                                "floorSchedule.delete 未找到匹配hash，按幂等成功处理"));
+            return true;
+        }
+
+        const QByteArray oldScheduleBits = onlineV1FloorScheduleBits();
+        QByteArray remainingScheduleBits(128, '0');
+        const QSet<int> remainingFloors = onlineV1FloorScheduleFloors(
+                    remainingSchedules);
+        for (int floor : remainingFloors) {
+            const int bit = onlineV1FloorBit(floor);
+            remainingScheduleBits[bit] = oldScheduleBits.at(bit);
+        }
+
+        QString saveError;
+        if (!saveOnlineV1FloorSchedules(remainingSchedules,
+                                        remainingScheduleBits,
+                                        false,
+                                        &saveError)) {
+            const QString error = saveError.trimmed().isEmpty()
+                    ? QStringLiteral("定时规则删除保存失败") : saveError;
+            publishSchedules(500, onlineV1FloorSchedules(), error);
+            emit logMessage(QStringLiteral("floorSchedule.delete 保存失败: %1")
+                            .arg(error));
+            return true;
+        }
+
+        publishSchedules(200, remainingSchedules, QString());
+        emit logMessage(QStringLiteral(
+                            "floorSchedule.delete 删除完成: deleted=%1 remaining=%2")
+                        .arg(deletedHashes.size())
+                        .arg(remainingSchedules.size()));
+        return true;
+    }
+
+    if (!payloadObj.value(QStringLiteral("data")).isObject()) {
+        const QString error = QStringLiteral("floorSchedule data 必须是对象");
+        publishSchedules(400, onlineV1FloorSchedules(), error);
+        emit logMessage(error);
+        return true;
+    }
+
+    QJsonArray normalizedSchedules;
+    QString validationError;
+    if (!normalizeOnlineV1FloorSchedules(
+                payloadObj.value(QStringLiteral("data")).toObject(),
+                &normalizedSchedules,
+                &validationError)) {
+        publishSchedules(400, onlineV1FloorSchedules(), validationError);
+        emit logMessage(QStringLiteral("floorSchedule 参数错误: %1")
+                        .arg(validationError));
+        return true;
+    }
+
+    const QJsonArray oldSchedules = onlineV1FloorSchedules();
+    const QByteArray normalizedJson = QJsonDocument(normalizedSchedules)
+            .toJson(QJsonDocument::Compact);
+    const QByteArray oldJson = QJsonDocument(oldSchedules)
+            .toJson(QJsonDocument::Compact);
+    if (normalizedJson == oldJson) {
+        publishSchedules(200, oldSchedules, QString());
+        emit logMessage(QStringLiteral(
+                            "floorSchedule 内容未变化，保留当前执行分钟标记"));
+        return true;
+    }
+
+    const QSet<int> newScheduleFloors = onlineV1FloorScheduleFloors(
+                normalizedSchedules);
+    const QByteArray currentFloorBits = onlineV1FloorLimitBits();
+    QByteArray newScheduleBits(128, '0');
+    for (int floor : newScheduleFloors) {
+        const int bit = onlineV1FloorBit(floor);
+        // 保存规则不改变硬件；定时状态从设备当前状态开始，等待下一个命中时间覆盖。
+        newScheduleBits[bit] = currentFloorBits.at(bit);
+    }
+
+    QString saveError;
+    if (!saveOnlineV1FloorSchedules(normalizedSchedules,
+                                    newScheduleBits,
+                                    true,
+                                    &saveError)) {
+        const QString error = saveError.trimmed().isEmpty()
+                ? QStringLiteral("定时规则保存失败") : saveError;
+        publishSchedules(500, onlineV1FloorSchedules(), error);
+        emit logMessage(QStringLiteral("floorSchedule 保存失败: %1").arg(error));
+        return true;
+    }
+
+    publishSchedules(200, normalizedSchedules, QString());
+    emit logMessage(QStringLiteral("floorSchedule 已全量覆盖: rules=%1 floors=%2")
+                    .arg(normalizedSchedules.size())
+                    .arg(newScheduleFloors.size()));
+
+    // 新规则若恰好命中当前分钟，应立即执行，不等待下一个5秒周期。
+    onOnlineV1FloorScheduleTick();
+    return true;
+}
+
+bool MqttManager::handleOnlineV1ElevatorMode(const QString &topic,
+                                             const QJsonObject &payloadObj,
+                                             const QString &method)
+{
+    if (method != QStringLiteral("elevatorMode")
+            && method != QStringLiteral("elevatorMode.query")) {
+        return false;
+    }
+
+    const QString requestTopic = topic.trimmed();
+    const bool onlineV1Active = cfg_.publishTopic.trimmed()
+            .startsWith(QStringLiteral("device/ycLinux/"))
+            && cfg_.publishTopic.trimmed().endsWith(QStringLiteral("/event"));
+    const bool ycLinuxRequest = requestTopic.startsWith(
+                QStringLiteral("device/ycLinux/"))
+            && requestTopic.endsWith(QStringLiteral("/request"));
+    if (!onlineV1Active || !ycLinuxRequest) return false;
+
+    const QString expectedDeviceId = cfg_.clientId.trimmed().isEmpty()
+            ? cfg_.deviceName.trimmed() : cfg_.clientId.trimmed();
+    const QString messageId = payloadObj.value(QStringLiteral("id"))
+            .toString().trimmed();
+    const QString messageDeviceId = payloadObj.value(QStringLiteral("deviceId"))
+            .toString().trimmed();
+    if (messageDeviceId.isEmpty()
+            || (!expectedDeviceId.isEmpty() && messageDeviceId != expectedDeviceId)) {
+        emit logMessage(QStringLiteral(
+                            "elevatorMode 下行 deviceId 不匹配: method=%1 deviceId=%2")
+                        .arg(method, messageDeviceId));
+        return true;
+    }
+    if (messageId.isEmpty()) {
+        emit logMessage(QStringLiteral("elevatorMode 下行缺少 id"));
+        return true;
+    }
+
+    auto publishState = [this, &messageId](
+            int code,
+            const Rs485FloorFrameBuilder::ElevatorModeState &state,
+            const QString &message) {
+        QJsonObject data;
+        data.insert(QStringLiteral("code"), code);
+        data.insert(QStringLiteral("masterSwitch"), state.masterSwitch ? 1 : 0);
+        data.insert(QStringLiteral("delay"), state.delay ? 1 : 0);
+        data.insert(QStringLiteral("parking"), state.parking ? 1 : 0);
+        data.insert(QStringLiteral("driver"), state.driver ? 1 : 0);
+        data.insert(QStringLiteral("independent"), state.independent ? 1 : 0);
+        data.insert(QStringLiteral("ext1"), state.ext1 ? 1 : 0);
+        data.insert(QStringLiteral("ext2"), state.ext2 ? 1 : 0);
+        data.insert(QStringLiteral("ext3"), state.ext3 ? 1 : 0);
+        data.insert(QStringLiteral("ext4"), state.ext4 ? 1 : 0);
+        if (!message.trimmed().isEmpty()) {
+            data.insert(QStringLiteral("message"), message.trimmed());
+        }
+        publishOnlineV1Event(QStringLiteral("elevatorMode"),
+                             data,
+                             messageId,
+                             QStringLiteral("elevatorMode"));
+    };
+
+    if (method == QStringLiteral("elevatorMode.query")) {
+        publishState(200, Rs485FloorFrameBuilder::elevatorModeState(), QString());
+        emit logMessage(QStringLiteral("elevatorMode.query 已回报当前模式状态"));
+        return true;
+    }
+
+    const QJsonValue dataValue = payloadObj.value(QStringLiteral("data"));
+    if (!dataValue.isObject()) {
+        const QString error = QStringLiteral("elevatorMode data 必须是对象");
+        publishState(400, Rs485FloorFrameBuilder::elevatorModeState(), error);
+        emit logMessage(error);
+        return true;
+    }
+
+    const QJsonObject data = dataValue.toObject();
+    const QStringList fields = {
+        QStringLiteral("masterSwitch"),
+        QStringLiteral("delay"),
+        QStringLiteral("parking"),
+        QStringLiteral("driver"),
+        QStringLiteral("independent"),
+        QStringLiteral("ext1"),
+        QStringLiteral("ext2"),
+        QStringLiteral("ext3"),
+        QStringLiteral("ext4")
+    };
+    QHash<QString, int> switches;
+    QString validationError;
+    for (const QString &field : fields) {
+        int value = 0;
+        if (!jsonIntegerInRange(data.value(field), 0, 1, &value)) {
+            validationError = QStringLiteral("%1 只能为整数0或1").arg(field);
+            break;
+        }
+        switches.insert(field, value);
+    }
+    if (!validationError.isEmpty()) {
+        publishState(400, Rs485FloorFrameBuilder::elevatorModeState(),
+                     validationError);
+        emit logMessage(QStringLiteral("elevatorMode 参数错误: %1")
+                        .arg(validationError));
+        return true;
+    }
+
+    Rs485FloorFrameBuilder::ElevatorModeState state;
+    state.masterSwitch = switches.value(QStringLiteral("masterSwitch")) == 1;
+    state.delay = switches.value(QStringLiteral("delay")) == 1;
+    state.parking = switches.value(QStringLiteral("parking")) == 1;
+    state.driver = switches.value(QStringLiteral("driver")) == 1;
+    state.independent = switches.value(QStringLiteral("independent")) == 1;
+    state.ext1 = switches.value(QStringLiteral("ext1")) == 1;
+    state.ext2 = switches.value(QStringLiteral("ext2")) == 1;
+    state.ext3 = switches.value(QStringLiteral("ext3")) == 1;
+    state.ext4 = switches.value(QStringLiteral("ext4")) == 1;
+
+    QString saveError;
+    if (!Rs485FloorFrameBuilder::saveElevatorModeState(state, &saveError)) {
+        const QString error = saveError.trimmed().isEmpty()
+                ? QStringLiteral("电梯模式保存失败") : saveError;
+        publishState(500, Rs485FloorFrameBuilder::elevatorModeState(), error);
+        emit logMessage(QStringLiteral("elevatorMode 保存失败: %1").arg(error));
+        return true;
+    }
+
+    // 保存后立即下发完整当前状态；串口最终出口会在总开关开启时覆盖高8位，
+    // 总开关关闭时则原样恢复113～120层的楼层权限。
+    const QByteArray frame = onlineV1FloorLimitBatchFrame(
+                onlineV1FloorLimitBits());
+    const QString sourceTag = QStringLiteral("onlineV1ElevatorMode:%1")
+            .arg(messageId);
+    IcEventBridge::instance()->requestRs485Send(frame, sourceTag);
+    emit logMessage(QStringLiteral(
+                        "elevatorMode -> RS485: masterSwitch=%1 frame=%2")
+                    .arg(state.masterSwitch ? 1 : 0)
+                    .arg(QString::fromLatin1(frame.toHex(' '))));
+
+    publishState(200, state, QString());
+    return true;
+}
+
+void MqttManager::onOnlineV1FloorScheduleTick()
+{
+    const QString eventTopic = cfg_.publishTopic.trimmed();
+    const bool onlineV1Active = eventTopic.startsWith(
+                QStringLiteral("device/ycLinux/"))
+            && eventTopic.endsWith(QStringLiteral("/event"));
+    if (!onlineV1Active) return;
+
+    const QJsonArray schedules = onlineV1FloorSchedules();
+    if (schedules.isEmpty()) return;
+
+    const QDateTime now = QDateTime::currentDateTime();
+    const QString minuteKey = now.toString(QStringLiteral("yyyy-MM-dd HH:mm"));
+    const QString lastMinute = DbStore::getConfig(
+                QStringLiteral("online_v1_floor_schedule_last_minute"),
+                QString()).toString().trimmed();
+    if (lastMinute == minuteKey) return;
+
+    const QString currentTime = now.time().toString(QStringLiteral("HH:mm"));
+    const int currentWeekDay = now.date().dayOfWeek();
+    QHash<int, bool> actionsByFloor;
+    for (const QJsonValue &scheduleValue : schedules) {
+        const QJsonObject schedule = scheduleValue.toObject();
+        if (schedule.value(QStringLiteral("time")).toString() != currentTime) {
+            continue;
+        }
+
+        bool weekDayMatched = false;
+        for (const QJsonValue &weekDayValue :
+             schedule.value(QStringLiteral("weekDays")).toArray()) {
+            if (weekDayValue.toInt() == currentWeekDay) {
+                weekDayMatched = true;
+                break;
+            }
+        }
+        if (!weekDayMatched) continue;
+
+        const bool open = schedule.value(QStringLiteral("action")).toInt() == 1;
+        for (const QJsonValue &floorValue :
+             schedule.value(QStringLiteral("floors")).toArray()) {
+            actionsByFloor.insert(floorValue.toInt(), open);
+        }
+    }
+    if (actionsByFloor.isEmpty()) return;
+
+    QList<int> floors = actionsByFloor.keys();
+    std::sort(floors.begin(), floors.end());
+    QByteArray scheduleBits = onlineV1FloorScheduleBits();
+    QByteArray currentFloorBits = onlineV1FloorLimitBits();
+    for (int floor : floors) {
+        const int bit = onlineV1FloorBit(floor);
+        const char state = actionsByFloor.value(floor) ? '1' : '0';
+        scheduleBits[bit] = state;
+        // 到达定时时间后，定时动作成为该楼层最新的设备当前状态。
+        currentFloorBits[bit] = state;
+    }
+
+    QString saveError;
+    if (!saveOnlineV1FloorScheduleExecution(scheduleBits,
+                                            currentFloorBits,
+                                            minuteKey,
+                                            &saveError)) {
+        emit logMessage(QStringLiteral("floorSchedule 到时状态保存失败: %1")
+                        .arg(saveError));
+        return;
+    }
+
+    const QByteArray frame = onlineV1FloorLimitBatchFrame(currentFloorBits);
+    const QString sourceTag = QStringLiteral("onlineV1FloorSchedule:%1:batch")
+            .arg(minuteKey);
+    IcEventBridge::instance()->requestRs485Send(frame, sourceTag);
+    emit logMessage(QStringLiteral(
+                        "floorSchedule 到时执行全量帧: minute=%1 floors=%2 len=%3 frame=%4")
+                    .arg(minuteKey)
+                    .arg(floors.size())
+                    .arg(frame.size())
+                    .arg(QString::fromLatin1(frame.toHex(' '))));
+}
+
+bool MqttManager::handleOnlineV1Heartbeat(const QString &topic,
+                                          const QJsonObject &payloadObj,
+                                          const QString &method)
+{
+    if (method != QStringLiteral("heartbeat")) return false;
+
+    const QString requestTopic = topic.trimmed();
+    const bool onlineV1Active = cfg_.publishTopic.trimmed()
+            .startsWith(QStringLiteral("device/ycLinux/"))
+            && cfg_.publishTopic.trimmed().endsWith(QStringLiteral("/event"));
+    const bool ycLinuxRequest = requestTopic.startsWith(
+                QStringLiteral("device/ycLinux/"))
+            && requestTopic.endsWith(QStringLiteral("/request"));
+    if (!onlineV1Active || !ycLinuxRequest) return false;
+
+    const QString expectedDeviceId = cfg_.clientId.trimmed().isEmpty()
+            ? cfg_.deviceName.trimmed() : cfg_.clientId.trimmed();
+    const QString messageId = payloadObj.value(QStringLiteral("id"))
+            .toString().trimmed();
+    const QString messageDeviceId = payloadObj.value(QStringLiteral("deviceId"))
+            .toString().trimmed();
+    if (messageDeviceId.isEmpty()
+            || (!expectedDeviceId.isEmpty() && messageDeviceId != expectedDeviceId)) {
+        emit logMessage(QStringLiteral("heartbeat 下行 deviceId 不匹配: %1")
+                        .arg(messageDeviceId));
+        return true;
+    }
+    if (messageId.isEmpty() || !payloadObj.value(QStringLiteral("data")).isObject()) {
+        emit logMessage(QStringLiteral("heartbeat 下行参数错误"));
+        return true;
+    }
+
+    const QString now = QDateTime::currentDateTime().toString(
+                QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+    QJsonObject data;
+    data.insert(QStringLiteral("code"), 200);
+    data.insert(QStringLiteral("time"), now);
+    publishOnlineV1Event(QStringLiteral("heartbeat"),
+                         data,
+                         messageId,
+                         QStringLiteral("heartbeat"),
+                         now);
+    return true;
 }
 
 /**
@@ -946,6 +2182,9 @@ bool MqttManager::handleOnlineV1RemoteCall(const QString &topic,
     }
 
     const int floor = static_cast<int>(floorNumber);
+    const bool modeFloorOccupied =
+            Rs485FloorFrameBuilder::shouldRejectModeOccupiedFloors(
+                QList<int>{floor});
     QString buildError;
     const QByteArray frame = Rs485FloorFrameBuilder::buildSingleFloor(
                 floor, &buildError);
@@ -976,6 +2215,17 @@ bool MqttManager::handleOnlineV1RemoteCall(const QString &topic,
 
     const QString sourceTag = QStringLiteral("onlineV1RemoteCall:%1")
             .arg(messageId);
+    if (modeFloorOccupied) {
+        const QString reason = QStringLiteral("楼层已被电梯模式占用");
+        emit logMessage(QStringLiteral(
+                            "remoteCall 已拒绝，未下发RS485: id=%1 floor=%2 reason=%3")
+                        .arg(messageId)
+                        .arg(floor)
+                        .arg(reason));
+        onOnlineV1RemoteCallRs485Finished(sourceTag, false, reason);
+        return true;
+    }
+
     IcEventBridge::instance()->requestRs485Send(frame, sourceTag);
     emit logMessage(QStringLiteral(
                         "remoteCall -> RS485请求: id=%1 personId=%2 floor=%3 frame=%4")
@@ -1016,6 +2266,9 @@ void MqttManager::onOnlineV1RemoteCallRs485Finished(const QString &sourceTag,
         eventData.insert(QStringLiteral("floor"), context.floor);
         eventData.insert(QStringLiteral("success"), success);
         eventData.insert(QStringLiteral("source"), context.source);
+        if (!success && !reason.trimmed().isEmpty()) {
+            eventData.insert(QStringLiteral("reason"), reason.trimmed());
+        }
         const QString accessResultId = QUuid::createUuid().toString(
                     QUuid::WithoutBraces);
         const bool published = publishOnlineV1Event(
@@ -1178,23 +2431,55 @@ bool MqttManager::handlePersonnelSync(const QString &topic,
                          payloadObj.value(QStringLiteral("id")).toString(),
                          requestTopic));
 
-    NetworkPersonnelSyncResult result;
-    if (method == QStringLiteral("sync.fullPersonnel")) {
-        result = networkPersonnelStore_.applyFullPersonnel(payloadObj);
-    } else if (method == QStringLiteral("sync.checkAllPersonHash")) {
-        result = networkPersonnelStore_.checkAllPersonHashes(payloadObj);
-    } else if (method == QStringLiteral("sync.deletePersonnel")) {
-        result = networkPersonnelStore_.deletePersonnel(payloadObj);
-    } else {
+    if (method != QStringLiteral("sync.fullPersonnel")
+            && method != QStringLiteral("sync.checkAllPersonHash")
+            && method != QStringLiteral("sync.deletePersonnel")) {
         return false;
     }
 
-    if (result.ok) {
-        FaceImageSyncBridge *bridge = FaceImageSyncBridge::instance();
-        bridge->reportPersonnelList(
-                    networkPersonnelStore_.networkPersonnelList());
-        bridge->requestNetworkFaceGalleryRefresh();
+    if (!personnelSyncWorker_ || !personnelSyncThread_
+            || !personnelSyncThread_->isRunning() || !personnelSyncStore_) {
+        NetworkPersonnelSyncResult result;
+        if (method == QStringLiteral("sync.fullPersonnel")) {
+            result = networkPersonnelStore_.applyFullPersonnel(payloadObj);
+        } else if (method == QStringLiteral("sync.checkAllPersonHash")) {
+            result = networkPersonnelStore_.checkAllPersonHashes(payloadObj);
+        } else {
+            result = networkPersonnelStore_.deletePersonnel(payloadObj);
+        }
+        completePersonnelSync(requestTopic, payloadObj, method, result);
+        return true;
     }
+
+    NetworkPersonnelStore *workerStore = personnelSyncStore_;
+    QMetaObject::invokeMethod(
+                personnelSyncWorker_,
+                [this, workerStore, requestTopic, payloadObj, method]() {
+        NetworkPersonnelSyncResult result;
+        if (method == QStringLiteral("sync.fullPersonnel")) {
+            result = workerStore->applyFullPersonnel(payloadObj);
+        } else if (method == QStringLiteral("sync.checkAllPersonHash")) {
+            result = workerStore->checkAllPersonHashes(payloadObj);
+        } else {
+            result = workerStore->deletePersonnel(payloadObj);
+        }
+        QMetaObject::invokeMethod(
+                    this,
+                    [this, requestTopic, payloadObj, method, result]() {
+            completePersonnelSync(requestTopic, payloadObj, method, result);
+        },
+        Qt::QueuedConnection);
+    },
+    Qt::QueuedConnection);
+    return true;
+}
+
+void MqttManager::completePersonnelSync(
+        const QString &requestTopic,
+        const QJsonObject &payloadObj,
+        const QString &method,
+        const NetworkPersonnelSyncResult &result)
+{
 
     QString responseTopic = requestTopic;
     if (responseTopic.endsWith(QStringLiteral("/request"))) {
@@ -1239,6 +2524,7 @@ bool MqttManager::handlePersonnelSync(const QString &topic,
 
     // fullPersonnel 回执先提交，再针对该人员自动补拉缺失的人脸原图。
     // HASH_UNCHANGED 也会检查图片文件，便于上次拉取失败后由下一次全量同步重试。
+    bool waitingForFaceImages = false;
     if (result.ok && method == QStringLiteral("sync.fullPersonnel")) {
         QString personId = result.data.value(QStringLiteral("personId"))
                 .toString().trimmed();
@@ -1247,10 +2533,62 @@ bool MqttManager::handlePersonnelSync(const QString &topic,
                     .value(QStringLiteral("personId")).toString().trimmed();
         }
         if (!personId.isEmpty()) {
-            requestFaceImagesForPerson(personId);
+            waitingForFaceImages = !networkPersonnelStore_
+                    .pendingFaceImageRequest(personId).isEmpty();
+            bool faceWorkInProgress = faceImageWorkActive_
+                    && currentFaceImageWork_.personId == personId;
+            if (!faceWorkInProgress) {
+                for (const PendingFaceImageWork &work : pendingFaceImageWork_) {
+                    if (work.personId == personId) {
+                        faceWorkInProgress = true;
+                        break;
+                    }
+                }
+            }
+            if (waitingForFaceImages && faceWorkInProgress) {
+                emit logMessage(QStringLiteral(
+                                    "重复fullPersonnel已回执，该人员图片正在处理，"
+                                    "不重复发送face.requestImages: personId=%1")
+                                .arg(personId));
+            } else {
+                requestFaceImagesForPerson(personId);
+            }
         }
     }
-    return true;
+    if (result.ok) {
+        if (method == QStringLiteral("sync.deletePersonnel")) {
+            flushNetworkFaceRefresh();
+        } else if (method == QStringLiteral("sync.fullPersonnel")
+                   && !waitingForFaceImages) {
+            scheduleNetworkFaceRefresh();
+        }
+    }
+}
+
+void MqttManager::scheduleNetworkFaceRefresh()
+{
+    if (!networkFaceRefreshDebounceTimer_ || !networkFaceRefreshMaxTimer_) {
+        flushNetworkFaceRefresh();
+        return;
+    }
+    networkFaceRefreshDebounceTimer_->start(networkFaceRefreshDebounceMs_);
+    if (!networkFaceRefreshMaxTimer_->isActive()) {
+        networkFaceRefreshMaxTimer_->start(networkFaceRefreshMaxMs_);
+    }
+}
+
+void MqttManager::flushNetworkFaceRefresh()
+{
+    if (networkFaceRefreshDebounceTimer_) {
+        networkFaceRefreshDebounceTimer_->stop();
+    }
+    if (networkFaceRefreshMaxTimer_) {
+        networkFaceRefreshMaxTimer_->stop();
+    }
+    FaceImageSyncBridge *bridge = FaceImageSyncBridge::instance();
+    bridge->reportPersonnelList(networkPersonnelStore_.networkPersonnelList());
+    bridge->requestNetworkFaceGalleryRefresh();
+    emit logMessage(QStringLiteral("网络人员批次刷新已执行"));
 }
 
 bool MqttManager::publishOnlineV1QrEvent(const QString &method,
@@ -1264,7 +2602,8 @@ bool MqttManager::publishOnlineV1QrEvent(const QString &method,
 bool MqttManager::publishOnlineV1Event(const QString &method,
                                        const QJsonObject &data,
                                        const QString &messageId,
-                                       const QString &tag)
+                                       const QString &tag,
+                                       const QString &eventTime)
 {
     const QString eventTopic = cfg_.publishTopic.trimmed();
     const bool onlineV1Active = eventTopic.startsWith(QStringLiteral("device/ycLinux/"))
@@ -1282,15 +2621,94 @@ bool MqttManager::publishOnlineV1Event(const QString &method,
     payload.insert(QStringLiteral("id"), messageId.trimmed());
     payload.insert(QStringLiteral("deviceId"), deviceId);
     payload.insert(QStringLiteral("data"), data);
-    payload.insert(QStringLiteral("time"),
-                   QDateTime::currentDateTime().toString(
-                       QStringLiteral("yyyy-MM-dd HH:mm:ss")));
+    const QString payloadTime = eventTime.trimmed().isEmpty()
+            ? QDateTime::currentDateTime().toString(
+                  QStringLiteral("yyyy-MM-dd HH:mm:ss"))
+            : eventTime.trimmed();
+    payload.insert(QStringLiteral("time"), payloadTime);
 
     QJsonObject packet;
     packet.insert(QStringLiteral("cmd"), QStringLiteral("publish"));
     packet.insert(QStringLiteral("topic"), eventTopic);
     packet.insert(QStringLiteral("payload"), payload);
     return publishJsonPacket(packet, tag);
+}
+
+bool MqttManager::recordOfflineAccessResult(const QString &method,
+                                            const QString &personId)
+{
+    QString dbError;
+    const bool recorded = networkPersonnelStore_.recordOfflineAccessResult(
+                method, personId, true, &dbError);
+    emit logMessage(QStringLiteral(
+                        "MQTT断线通行%1: method=%2 personId=%3 reason=%4")
+                    .arg(recorded ? QStringLiteral("已累计")
+                                  : QStringLiteral("累计失败"),
+                         method,
+                         personId.trimmed(),
+                         dbError));
+    return recorded;
+}
+
+bool MqttManager::shouldRecordOfflineAccess() const
+{
+    return !mqttBrokerConnected_
+            || mqttReconnectRequiredAfterNetworkLoss_
+            || !IcEventBridge::instance()->networkAvailable();
+}
+
+void MqttManager::flushOfflineAccessResults()
+{
+    if (shouldRecordOfflineAccess()) return;
+
+    const QStringList methods = {
+        QStringLiteral("card.accessResult"),
+        QStringLiteral("qr.accessResult"),
+        QStringLiteral("face.accessResult"),
+        QStringLiteral("password.accessResult")
+    };
+    for (const QString &method : methods) {
+        QString dbError;
+        const QJsonArray records =
+                networkPersonnelStore_.pendingOfflineAccessResults(method, &dbError);
+        if (!dbError.isEmpty()) {
+            emit logMessage(QStringLiteral("读取离线通行记录失败: method=%1 reason=%2")
+                            .arg(method, dbError));
+            continue;
+        }
+        if (records.isEmpty()) continue;
+
+        QJsonObject data;
+        data.insert(QStringLiteral("records"), records);
+        const QString messageId = QUuid::createUuid().toString(
+                    QUuid::WithoutBraces);
+        const bool submitted = publishOnlineV1Event(
+                    method,
+                    data,
+                    messageId,
+                    QStringLiteral("offline-access-result"));
+        if (!submitted) {
+            emit logMessage(QStringLiteral(
+                                "离线通行批量补报提交失败，保留本地记录: "
+                                "method=%1 id=%2 records=%3")
+                            .arg(method, messageId)
+                            .arg(records.size()));
+            continue;
+        }
+
+        if (!networkPersonnelStore_.consumeOfflineAccessResults(
+                    method, records, &dbError)) {
+            emit logMessage(QStringLiteral(
+                                "离线通行批量补报已提交，但消费本地快照失败: "
+                                "method=%1 id=%2 reason=%3")
+                            .arg(method, messageId, dbError));
+            continue;
+        }
+        emit logMessage(QStringLiteral(
+                            "离线通行批量补报已提交: method=%1 id=%2 records=%3")
+                        .arg(method, messageId)
+                        .arg(records.size()));
+    }
 }
 
 void MqttManager::onOnlineV1FaceAccessFinished(
@@ -1305,6 +2723,15 @@ void MqttManager::onOnlineV1FaceAccessFinished(
     const bool onlineV1Active = eventTopic.startsWith(QStringLiteral("device/ycLinux/"))
             && eventTopic.endsWith(QStringLiteral("/event"));
     if (!onlineV1Active) {
+        return;
+    }
+
+    if (shouldRecordOfflineAccess()) {
+        if (success && !personId.trimmed().isEmpty()) {
+            // 人脸链路已在发出完成信号前原子扣减本地次数/金额，避免断线分支重复扣减。
+            recordOfflineAccessResult(
+                        QStringLiteral("face.accessResult"), personId);
+        }
         return;
     }
 
@@ -1327,6 +2754,52 @@ void MqttManager::onOnlineV1FaceAccessFinished(
                         "人脸控梯事件%1: method=face.accessResult personId=%2 floors=%3 result=%4 reason=%5")
                     .arg(published ? QStringLiteral("已提交") : QStringLiteral("提交失败"),
                          personId, floors,
+                         success ? QStringLiteral("true") : QStringLiteral("false"),
+                         reason));
+}
+
+void MqttManager::onOnlineV1PasswordAccessFinished(
+        const QString &personId,
+        const QString &floors,
+        const QByteArray &rs485Frame,
+        bool success,
+        const QString &reason)
+{
+    const QString eventTopic = cfg_.publishTopic.trimmed();
+    const bool onlineV1Active = eventTopic.startsWith(QStringLiteral("device/ycLinux/"))
+            && eventTopic.endsWith(QStringLiteral("/event"));
+    if (!onlineV1Active || personId.trimmed().isEmpty()) {
+        return;
+    }
+
+    if (shouldRecordOfflineAccess()) {
+        if (success) {
+            // 密码链路已在发出完成信号前扣减本地次数/金额，此处只累计补报次数。
+            recordOfflineAccessResult(
+                        QStringLiteral("password.accessResult"), personId);
+        }
+        return;
+    }
+
+    Q_UNUSED(rs485Frame)
+
+    QJsonObject data;
+    data.insert(QStringLiteral("personId"), personId.trimmed());
+    data.insert(QStringLiteral("success"), success);
+    if (!success && !reason.trimmed().isEmpty()) {
+        data.insert(QStringLiteral("reason"), reason.trimmed());
+    }
+
+    const QString messageId = QUuid::createUuid().toString(
+                QUuid::WithoutBraces);
+    const bool published = publishOnlineV1Event(
+                QStringLiteral("password.accessResult"), data, messageId,
+                QStringLiteral("password-access-result"));
+    emit logMessage(QStringLiteral(
+                        "密码控梯事件%1: method=password.accessResult personId=%2 "
+                        "floors=%3 result=%4 reason=%5")
+                    .arg(published ? QStringLiteral("已提交") : QStringLiteral("提交失败"),
+                         personId.trimmed(), floors,
                          success ? QStringLiteral("true") : QStringLiteral("false"),
                          reason));
 }
@@ -1437,10 +2910,22 @@ void MqttManager::onOnlineV1CardAccessFinished(
         bool success,
         const QString &reason)
 {
+    appendCredentialAccessRecord(QStringLiteral("card"), personId,
+                                 cardId, success, reason);
+
     const QString eventTopic = cfg_.publishTopic.trimmed();
     const bool onlineV1Active = eventTopic.startsWith(QStringLiteral("device/ycLinux/"))
             && eventTopic.endsWith(QStringLiteral("/event"));
     if (!onlineV1Active) {
+        return;
+    }
+
+    if (shouldRecordOfflineAccess()) {
+        if (success && !personId.trimmed().isEmpty()) {
+            // 刷卡链路已在发出完成信号前原子扣减本地次数/金额，避免断线分支重复扣减。
+            recordOfflineAccessResult(
+                        QStringLiteral("card.accessResult"), personId);
+        }
         return;
     }
 
@@ -1513,11 +2998,22 @@ bool MqttManager::handleOnlineV1AccessDeductResult(
     const QVariant usedCount = data.value(QStringLiteral("usedCount")).isDouble()
             ? data.value(QStringLiteral("usedCount")).toVariant()
             : QVariant();
+    const QVariant remainingAmount =
+            data.value(QStringLiteral("remainingAmount")).isDouble()
+            ? data.value(QStringLiteral("remainingAmount")).toVariant()
+            : (data.value(QStringLiteral("passRemainingAmount")).isDouble()
+               ? data.value(QStringLiteral("passRemainingAmount")).toVariant()
+               : QVariant());
+    const QVariant usedAmount = data.value(QStringLiteral("usedAmount")).isDouble()
+            ? data.value(QStringLiteral("usedAmount")).toVariant()
+            : (data.value(QStringLiteral("passUsedAmount")).isDouble()
+               ? data.value(QStringLiteral("passUsedAmount")).toVariant()
+               : QVariant());
 
     const NetworkAccessDeductApplyResult applyResult =
             networkPersonnelStore_.applyAccessDeductResult(
                 messageId, method, personId, code, deducted, message,
-                remainingCount, usedCount);
+                remainingCount, usedCount, remainingAmount, usedAmount);
     if (!applyResult.ok) {
         emit logMessage(QStringLiteral("处理 %1 失败: %2")
                         .arg(method, applyResult.error));
@@ -1526,13 +3022,21 @@ bool MqttManager::handleOnlineV1AccessDeductResult(
     if (applyResult.duplicate) {
         emit logMessage(QStringLiteral("重复 %1 已忽略: id=%2")
                         .arg(method, messageId));
-    } else if (applyResult.countApplied) {
+    } else if (applyResult.countApplied || applyResult.amountApplied) {
+        QStringList synced;
+        if (applyResult.countApplied) {
+            synced.append(QStringLiteral("次数 remainingCount=%1 usedCount=%2")
+                          .arg(applyResult.remainingCount)
+                          .arg(applyResult.usedCount));
+        }
+        if (applyResult.amountApplied) {
+            synced.append(QStringLiteral("金额 remainingAmount=%1 usedAmount=%2")
+                          .arg(applyResult.remainingAmount, 0, 'f', 6)
+                          .arg(applyResult.usedAmount, 0, 'f', 6));
+        }
         emit logMessage(QStringLiteral(
-                            "%1 已确认，扣减完成并同步本地次数: "
-                            "personId=%2 remainingCount=%3 usedCount=%4")
-                        .arg(method, personId)
-                        .arg(applyResult.remainingCount)
-                        .arg(applyResult.usedCount));
+                            "%1 已确认，扣减完成并同步本地状态: personId=%2 %3")
+                        .arg(method, personId, synced.join(QLatin1Char(' '))));
     } else if (applyResult.skipped && code == 200) {
         emit logMessage(QStringLiteral(
                             "%1 已确认但未重复扣次: personId=%2 deducted=%3 message=%4")
@@ -1540,7 +3044,7 @@ bool MqttManager::handleOnlineV1AccessDeductResult(
                              deducted ? QStringLiteral("true") : QStringLiteral("false"),
                              message));
     } else {
-        emit logMessage(QStringLiteral("%1 未扣本地次数: code=%2 reason=%3")
+        emit logMessage(QStringLiteral("%1 未同步本地次数/金额: code=%2 reason=%3")
                         .arg(method)
                         .arg(code)
                         .arg(message));
@@ -1564,11 +3068,40 @@ void MqttManager::onOnlineV1QrScanned(const QString &qrCode)
                     QStringLiteral("二维码格式错误"));
         return;
     }
-    if (pendingOnlineQr_.active) {
+    if (pendingOnlineQr_.active || pendingOfflineQr_.active) {
         IcEventBridge::instance()->emitToastFailRequested(
                     QStringLiteral("二维码正在处理中，请稍候"));
-        emit logMessage(QStringLiteral("忽略重复扫码，当前 qrCode=%1")
-                        .arg(pendingOnlineQr_.qrCode));
+        emit logMessage(QStringLiteral("忽略重复扫码，已有二维码任务正在处理"));
+        return;
+    }
+
+    if (shouldRecordOfflineAccess()) {
+        const NetworkAccessResult access = offlineAccessService_.checkQrCode(
+                    value, QDateTime::currentDateTime());
+        if (!access.pass) {
+            const QString failureReason = access.reason.trimmed().isEmpty()
+                    ? QStringLiteral("二维码离线权限校验失败")
+                    : access.reason.trimmed();
+            emit logMessage(QStringLiteral(
+                                "MQTT断线二维码通行拒绝: qrCode=%1 reason=%2")
+                            .arg(value, failureReason));
+            appendCredentialAccessRecord(QStringLiteral("qr"),
+                                         access.personId, value,
+                                         false, failureReason);
+            IcEventBridge::instance()->emitToastFailRequested(failureReason);
+            return;
+        }
+
+        pendingOfflineQr_ = PendingOfflineQrAccess{};
+        pendingOfflineQr_.active = true;
+        pendingOfflineQr_.sourceTag = QStringLiteral("offlineMqttQr:")
+                + QUuid::createUuid().toString(QUuid::WithoutBraces);
+        pendingOfflineQr_.access = access;
+        IcEventBridge::instance()->requestRs485Send(
+                    access.rs485Frame, pendingOfflineQr_.sourceTag);
+        emit logMessage(QStringLiteral(
+                            "MQTT断线二维码已通过本地校验并下发RS485: personId=%1")
+                        .arg(access.personId));
         return;
     }
 
@@ -1728,6 +3261,21 @@ bool MqttManager::handleOnlineV1QrMessage(const QString &topic,
             publishOnlineV1QrAccessResult(false, validationError);
             return true;
         }
+        pendingOnlineQr_.personId = authorization.personId;
+
+        QList<int> authorizedFloors;
+        for (const QString &floor : authorization.floors) {
+            authorizedFloors.append(floor.toInt());
+        }
+        if (Rs485FloorFrameBuilder::shouldRejectModeOccupiedFloors(
+                    authorizedFloors)) {
+            const QString reason = QStringLiteral("楼层已被电梯模式占用");
+            emit logMessage(QStringLiteral(
+                                "qr.floorControl 已拒绝，未下发RS485: id=%1 reason=%2")
+                            .arg(messageId, reason));
+            publishOnlineV1QrAccessResult(false, reason);
+            return true;
+        }
 
         bool duplicate = false;
         bool changed = false;
@@ -1846,10 +3394,18 @@ bool MqttManager::publishOnlineV1QrAccessResult(bool success,
     if (pendingOnlineQr_.accessResultReported) return false;
     pendingOnlineQr_.accessResultReported = true;
 
+    appendCredentialAccessRecord(QStringLiteral("qr"),
+                                 pendingOnlineQr_.personId,
+                                 pendingOnlineQr_.qrCode,
+                                 success, failureReason);
+
     const QString messageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
     QJsonObject data;
     data.insert(QStringLiteral("qrCode"), pendingOnlineQr_.qrCode);
     data.insert(QStringLiteral("success"), success);
+    if (!success && !failureReason.trimmed().isEmpty()) {
+        data.insert(QStringLiteral("reason"), failureReason.trimmed());
+    }
     const bool submitted = publishOnlineV1QrEvent(
                 QStringLiteral("qr.accessResult"),
                 data,
@@ -1882,6 +3438,49 @@ void MqttManager::onOnlineV1QrRs485Finished(const QString &sourceTag,
                                             bool success,
                                             const QString &reason)
 {
+    const QString offlinePrefix = QStringLiteral("offlineMqttQr:");
+    if (sourceTag.startsWith(offlinePrefix)) {
+        if (!pendingOfflineQr_.active
+                || pendingOfflineQr_.sourceTag != sourceTag) {
+            emit logMessage(QStringLiteral("收到过期的 MQTT 断线 QR RS485 结果: %1")
+                            .arg(sourceTag));
+            return;
+        }
+
+        const NetworkAccessResult access = pendingOfflineQr_.access;
+        pendingOfflineQr_ = PendingOfflineQrAccess{};
+        if (!success) {
+            const QString failureReason = reason.trimmed().isEmpty()
+                    ? QStringLiteral("RS485发送失败") : reason.trimmed();
+            emit logMessage(QStringLiteral(
+                                "MQTT断线二维码RS485失败: personId=%1 reason=%2")
+                            .arg(access.personId, failureReason));
+            appendCredentialAccessRecord(QStringLiteral("qr"),
+                                         access.personId,
+                                         access.credential,
+                                         false, failureReason);
+            IcEventBridge::instance()->emitToastFailRequested(failureReason);
+            return;
+        }
+
+        if (!offlineAccessService_.recordSuccessfulAccess(access)) {
+            emit logMessage(QStringLiteral(
+                                "MQTT断线二维码通行本地次数/金额扣减失败: personId=%1")
+                            .arg(access.personId));
+        }
+        appendCredentialAccessRecord(QStringLiteral("qr"),
+                                     access.personId,
+                                     access.credential,
+                                     true, QString());
+        recordOfflineAccessResult(QStringLiteral("qr.accessResult"),
+                                  access.personId);
+        IcEventBridge::instance()->emitToastPassRequested();
+        if (!shouldRecordOfflineAccess()) {
+            flushOfflineAccessResults();
+        }
+        return;
+    }
+
     const QString prefix = QStringLiteral("onlineV1Qr:");
     if (!sourceTag.startsWith(prefix)) return;
 
@@ -1898,6 +3497,36 @@ void MqttManager::onOnlineV1QrRs485Finished(const QString &sourceTag,
     if (!networkPersonnelStore_.recordQrRs485Result(
                 scanId, success, reason, &dbError)) {
         emit logMessage(QStringLiteral("保存二维码 RS485 结果失败: %1").arg(dbError));
+    }
+
+    if (shouldRecordOfflineAccess()) {
+        if (success && !pendingOnlineQr_.personId.trimmed().isEmpty()) {
+            NetworkAccessResult access;
+            access.pass = true;
+            access.personId = pendingOnlineQr_.personId.trimmed();
+            access.credential = pendingOnlineQr_.qrCode;
+            access.credentialType = QStringLiteral("QR_CODE");
+            if (!offlineAccessService_.initialize()
+                    || !offlineAccessService_.recordSuccessfulAccess(access)) {
+                emit logMessage(QStringLiteral(
+                                    "MQTT断线二维码通行本地次数/金额扣减失败: personId=%1")
+                                .arg(access.personId));
+            }
+            recordOfflineAccessResult(QStringLiteral("qr.accessResult"),
+                                      access.personId);
+            IcEventBridge::instance()->emitToastPassRequested();
+        } else if (!success) {
+            IcEventBridge::instance()->emitToastFailRequested(
+                        reason.trimmed().isEmpty()
+                        ? QStringLiteral("设备开启失败") : reason.trimmed());
+        }
+        networkPersonnelStore_.finishQrAccessTransaction(
+                    scanId,
+                    success ? QStringLiteral("OFFLINE_RECORDED")
+                            : QStringLiteral("RS485_FAILED"),
+                    reason);
+        clearPendingOnlineV1Qr();
+        return;
     }
     publishOnlineV1QrAccessResult(
                 success,
@@ -1951,7 +3580,8 @@ void MqttManager::clearPendingOnlineV1Qr()
     pendingOnlineQr_ = PendingOnlineQrAccess{};
 }
 
-bool MqttManager::requestFaceImagesForPerson(const QString &personId)
+bool MqttManager::requestFaceImagesForPerson(const QString &personId,
+                                             bool reconnectRetry)
 {
     const QString normalizedPersonId = personId.trimmed();
     if (normalizedPersonId.isEmpty()) {
@@ -1975,23 +3605,26 @@ bool MqttManager::requestFaceImagesForPerson(const QString &personId)
                         .arg(normalizedPersonId));
         return false;
     }
-    if (!networkPersonnelStore_.initialize()) {
-        emit logMessage(QStringLiteral(
-                            "自动人脸图像请求失败：数据库未就绪，personId=%1")
-                        .arg(normalizedPersonId));
-        return false;
-    }
-
-    const QJsonArray requests =
-            networkPersonnelStore_.pendingFaceImageRequests();
     QJsonObject requestData;
-    for (const QJsonValue &requestValue : requests) {
-        const QJsonObject candidate = requestValue.toObject();
-        if (candidate.value(QStringLiteral("personId")).toString().trimmed()
-                == normalizedPersonId) {
-            requestData = candidate;
-            break;
+    if (reconnectRetry) {
+        requestData = pendingFaceImageRequests_.value(
+                    normalizedPersonId).requestData;
+        if (requestData.isEmpty()) {
+            emit logMessage(QStringLiteral(
+                                "人脸图像断线补发被忽略：待处理请求已完成，personId=%1")
+                            .arg(normalizedPersonId));
+            return false;
         }
+    } else {
+        if (!networkPersonnelStore_.initialize()) {
+            emit logMessage(QStringLiteral(
+                                "自动人脸图像请求失败：数据库未就绪，personId=%1")
+                            .arg(normalizedPersonId));
+            return false;
+        }
+
+        requestData = networkPersonnelStore_.pendingFaceImageRequest(
+                    normalizedPersonId);
     }
     const QJsonArray hashes = requestData.value(QStringLiteral("faceHashes")).toArray();
     if (requestData.isEmpty() || hashes.isEmpty()) {
@@ -2019,14 +3652,68 @@ bool MqttManager::requestFaceImagesForPerson(const QString &personId)
     packet.insert(QStringLiteral("topic"), eventTopic);
     packet.insert(QStringLiteral("payload"), payload);
     const bool submitted = publishJsonPacket(
-                packet, QStringLiteral("face-request-images-auto"));
+                packet,
+                reconnectRetry
+                    ? QStringLiteral("face-request-images-reconnect-retry")
+                    : QStringLiteral("face-request-images-auto"));
+    if (submitted) {
+        PendingFaceImageRequest pending =
+                pendingFaceImageRequests_.value(normalizedPersonId);
+        pending.requestData = requestData;
+        pending.requestPayload = payload;
+        pending.awaitingResponse = true;
+        pendingFaceImageRequests_.insert(normalizedPersonId, pending);
+    }
     emit logMessage(QStringLiteral(
-                        "fullPersonnel自动请求人脸图像：personId=%1 count=%2 result=%3")
+                        "%1人脸图像请求：personId=%2 count=%3 result=%4")
+                    .arg(reconnectRetry
+                         ? QStringLiteral("MQTT断线重连后补发")
+                         : QStringLiteral("fullPersonnel自动"))
                     .arg(normalizedPersonId)
                     .arg(hashes.size())
                     .arg(submitted ? QStringLiteral("submitted")
                                    : QStringLiteral("failed")));
     return submitted;
+}
+
+void MqttManager::resendPendingFaceImageRequestsAfterReconnect()
+{
+    if (!mqttBrokerConnected_ || faceImageReconnectRetryPersons_.isEmpty()) {
+        return;
+    }
+
+    const QStringList personIds = faceImageReconnectRetryPersons_.values();
+    faceImageReconnectRetryPersons_.clear();
+    for (const QString &personId : personIds) {
+        const auto it = pendingFaceImageRequests_.constFind(personId);
+        if (it == pendingFaceImageRequests_.cend()
+                || !it.value().awaitingResponse) {
+            continue;
+        }
+
+        const bool submitted = requestFaceImagesForPerson(personId, true);
+        const auto updated = pendingFaceImageRequests_.constFind(personId);
+        if (updated != pendingFaceImageRequests_.cend()
+                && updated.value().awaitingResponse) {
+            faceImageReconnectAwaitingPersons_.insert(personId);
+        }
+        emit logMessage(QStringLiteral(
+                            "MQTT重连后补发一次人脸图像请求：personId=%1 "
+                            "result=%2")
+                        .arg(personId,
+                             submitted ? QStringLiteral("submitted")
+                                       : QStringLiteral("failed")));
+    }
+
+    if (!faceImageReconnectAwaitingPersons_.isEmpty()
+            && faceImageReconnectResponseTimer_) {
+        faceImageReconnectResponseTimer_->start(
+                    faceImageReconnectResponseTimeoutMs_);
+        emit logMessage(QStringLiteral(
+                            "已补发%1个人脸图像请求，等待响应超时=%2秒")
+                        .arg(faceImageReconnectAwaitingPersons_.size())
+                        .arg(faceImageReconnectResponseTimeoutMs_ / 1000));
+    }
 }
 
 bool MqttManager::handleFaceImages(const QString &topic,
@@ -2051,20 +3738,87 @@ bool MqttManager::handleFaceImages(const QString &topic,
     const QString personId = payloadObj.value(QStringLiteral("data"))
             .toObject().value(QStringLiteral("personId"))
             .toString().trimmed();
-    FaceImageSyncBridge *bridge = FaceImageSyncBridge::instance();
-    if (!personId.isEmpty()
-            && faceValidationTokenByPerson_.contains(personId)) {
-        const QString message = QStringLiteral(
-                    "该人员的人脸图像正在校验，请稍后重新同步。");
-        publishFaceImagesResult(
-                    payloadObj, personId, false, message,
-                    failedFacesFromPayload(payloadObj, message));
-        bridge->reportSyncStatus(false, message);
+    auto pendingRequest = pendingFaceImageRequests_.find(personId);
+    if (pendingRequest != pendingFaceImageRequests_.end()
+            && pendingRequest.value().awaitingResponse) {
+        pendingRequest.value().awaitingResponse = false;
+        faceImageReconnectRetryPersons_.remove(personId);
+        faceImageReconnectAwaitingPersons_.remove(personId);
+        if (faceImageReconnectAwaitingPersons_.isEmpty()
+                && faceImageReconnectResponseTimer_) {
+            faceImageReconnectResponseTimer_->stop();
+        }
+        emit logMessage(QStringLiteral(
+                            "已收到face.responseImages，取消该人员的断线补发等待：personId=%1")
+                        .arg(personId));
+    }
+    const QString requestKey = faceImageRequestKey(payloadObj);
+    const QString contentKey = faceImageContentKey(payloadObj);
+    if (activeFaceImageRequestKeys_.contains(requestKey)
+            || activeFaceImageContentKeys_.contains(contentKey)) {
+        emit logMessage(QStringLiteral(
+                            "重复face.responseImages处于排队或处理中，已合并: "
+                            "personId=%1 id=%2")
+                        .arg(personId,
+                             payloadObj.value(QStringLiteral("id")).toString()));
         return true;
     }
 
-    const NetworkPersonnelSyncResult result =
-            networkPersonnelStore_.applyFaceImages(payloadObj);
+    PendingFaceImageWork work;
+    work.requestKey = requestKey;
+    work.contentKey = contentKey;
+    work.personId = personId;
+    work.responsePayload = payloadObj;
+    activeFaceImageRequestKeys_.insert(requestKey);
+    activeFaceImageContentKeys_.insert(contentKey);
+    pendingFaceImageWork_.enqueue(work);
+    emit logMessage(QStringLiteral(
+                        "face.responseImages已进入串行队列: personId=%1 pending=%2")
+                    .arg(personId)
+                    .arg(pendingFaceImageWork_.size()));
+    QTimer::singleShot(0, this, &MqttManager::processNextFaceImageWork);
+    return true;
+}
+
+void MqttManager::processNextFaceImageWork()
+{
+    if (faceImageWorkActive_ || pendingFaceImageWork_.isEmpty()) {
+        return;
+    }
+
+    faceImageWorkActive_ = true;
+    currentFaceImageWork_ = pendingFaceImageWork_.dequeue();
+
+    const QJsonObject payload = currentFaceImageWork_.responsePayload;
+    if (!personnelSyncWorker_ || !personnelSyncThread_
+            || !personnelSyncThread_->isRunning() || !personnelSyncStore_) {
+        onFaceImagesPrepared(networkPersonnelStore_.applyFaceImages(payload));
+        return;
+    }
+
+    NetworkPersonnelStore *workerStore = personnelSyncStore_;
+    QMetaObject::invokeMethod(
+                personnelSyncWorker_,
+                [this, workerStore, payload]() {
+        const NetworkPersonnelSyncResult result =
+                workerStore->applyFaceImages(payload);
+        QMetaObject::invokeMethod(
+                    this,
+                    [this, result]() { onFaceImagesPrepared(result); },
+                    Qt::QueuedConnection);
+    },
+    Qt::QueuedConnection);
+}
+
+void MqttManager::onFaceImagesPrepared(
+        const NetworkPersonnelSyncResult &result)
+{
+    if (!faceImageWorkActive_) {
+        return;
+    }
+    const QJsonObject payloadObj = currentFaceImageWork_.responsePayload;
+    const QString personId = currentFaceImageWork_.personId;
+    FaceImageSyncBridge *bridge = FaceImageSyncBridge::instance();
     QString message = result.data.value(QStringLiteral("message"))
             .toString().trimmed();
     if (!result.ok) {
@@ -2075,15 +3829,14 @@ bool MqttManager::handleFaceImages(const QString &topic,
                     payloadObj, personId, false, message,
                     failedFacesFromPayload(payloadObj, message));
         bridge->reportSyncStatus(false, message);
-        bridge->reportPersonnelList(
-                    networkPersonnelStore_.networkPersonnelList());
         emit logMessage(QStringLiteral(
                             "人员图像保存失败，未删除人员聚合数据: "
                             "personId=%1 code=%2 message=%3")
                         .arg(personId,
                              result.data.value(QStringLiteral("code")).toString(),
                              message));
-        return true;
+        finishCurrentFaceImageWork();
+        return;
     }
 
     const QJsonArray faceItems = result.data.value(
@@ -2097,9 +3850,8 @@ bool MqttManager::handleFaceImages(const QString &topic,
                     payloadObj, personId, false, message,
                     failedFacesFromPayload(payloadObj, message));
         bridge->reportSyncStatus(false, message);
-        bridge->reportPersonnelList(
-                    networkPersonnelStore_.networkPersonnelList());
-        return true;
+        finishCurrentFaceImageWork();
+        return;
     }
 
     const QString token = QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -2118,7 +3870,7 @@ bool MqttManager::handleFaceImages(const QString &topic,
                         initialFailedFaces,
                         QStringLiteral("人脸图像校验失败，请重新录入人脸。")),
                     QJsonArray(), QJsonArray());
-        return true;
+        return;
     }
 
     bridge->reportSyncStatus(
@@ -2146,7 +3898,18 @@ bool MqttManager::handleFaceImages(const QString &topic,
                     .arg(personId)
                     .arg(faceItems.size())
                     .arg(token));
-    return true;
+}
+
+void MqttManager::finishCurrentFaceImageWork()
+{
+    if (!faceImageWorkActive_) {
+        return;
+    }
+    activeFaceImageRequestKeys_.remove(currentFaceImageWork_.requestKey);
+    activeFaceImageContentKeys_.remove(currentFaceImageWork_.contentKey);
+    currentFaceImageWork_ = PendingFaceImageWork();
+    faceImageWorkActive_ = false;
+    QTimer::singleShot(0, this, &MqttManager::processNextFaceImageWork);
 }
 
 void MqttManager::onStoredFaceValidationFinished(
@@ -2203,14 +3966,79 @@ void MqttManager::onStoredFaceValidationFinished(
                     QStringLiteral("人脸图像校验失败，请重新录入人脸。"));
     }
 
-    bool allFacesReady = false;
-    QString finalizeError;
-    const bool finalized = networkPersonnelStore_.finalizeFaceImageValidation(
-                pending.personId,
-                finalValidatedFaces,
-                finalFailedFaces,
-                &allFacesReady,
-                &finalizeError);
+    if (!personnelSyncWorker_ || !personnelSyncThread_
+            || !personnelSyncThread_->isRunning() || !personnelSyncStore_) {
+        bool allFacesReady = false;
+        QString finalizeError;
+        QJsonArray commitFailedFaces;
+        QJsonArray commitFaceNotices;
+        const bool finalized = networkPersonnelStore_.finalizeFaceImageValidation(
+                    pending.personId,
+                    finalValidatedFaces,
+                    finalFailedFaces,
+                    &allFacesReady,
+                    &finalizeError,
+                    &commitFailedFaces,
+                    &commitFaceNotices);
+        completeStoredFaceValidation(
+                    pending, personMatches, finalMessage, finalFailedFaces,
+                    finalized, allFacesReady, finalizeError,
+                    commitFailedFaces, commitFaceNotices);
+        return;
+    }
+
+    NetworkPersonnelStore *workerStore = personnelSyncStore_;
+    QMetaObject::invokeMethod(
+                personnelSyncWorker_,
+                [this, workerStore, pending, personMatches, finalMessage,
+                 finalValidatedFaces, finalFailedFaces]() {
+        bool allFacesReady = false;
+        QString finalizeError;
+        QJsonArray commitFailedFaces;
+        QJsonArray commitFaceNotices;
+        const bool finalized = workerStore->finalizeFaceImageValidation(
+                    pending.personId,
+                    finalValidatedFaces,
+                    finalFailedFaces,
+                    &allFacesReady,
+                    &finalizeError,
+                    &commitFailedFaces,
+                    &commitFaceNotices);
+        QMetaObject::invokeMethod(
+                    this,
+                    [this, pending, personMatches, finalMessage,
+                     finalFailedFaces, finalized, allFacesReady,
+                     finalizeError, commitFailedFaces, commitFaceNotices]() {
+            completeStoredFaceValidation(
+                        pending, personMatches, finalMessage, finalFailedFaces,
+                        finalized, allFacesReady, finalizeError,
+                        commitFailedFaces, commitFaceNotices);
+        },
+        Qt::QueuedConnection);
+    },
+    Qt::QueuedConnection);
+}
+
+void MqttManager::completeStoredFaceValidation(
+        const PendingFaceImageValidation &pending,
+        bool personMatches,
+        const QString &validationMessage,
+        const QJsonArray &validationFailedFaces,
+        bool finalized,
+        bool allFacesReady,
+        const QString &finalizeError,
+        const QJsonArray &commitFailedFaces,
+        const QJsonArray &commitFaceNotices)
+{
+    QJsonArray finalFailedFaces = validationFailedFaces;
+    QString finalMessage = validationMessage;
+    if (!commitFailedFaces.isEmpty()) {
+        finalFailedFaces = mergeFailedFaces(
+                    finalFailedFaces, commitFailedFaces);
+        finalMessage = firstFailedFaceMessage(
+                    finalFailedFaces,
+                    QStringLiteral("人脸图像校验失败，请重新录入人脸。"));
+    }
     const bool finalResult = finalized
             && personMatches
             && finalFailedFaces.isEmpty()
@@ -2226,6 +4054,8 @@ void MqttManager::onStoredFaceValidationFinished(
         }
     } else if (finalResult) {
         finalMessage = QStringLiteral("人脸图像同步成功。");
+    } else if (!finalizeError.isEmpty()) {
+        finalMessage = finalizeError;
     } else if (finalMessage.isEmpty()) {
         finalMessage = QStringLiteral("人脸图像校验失败，请重新录入人脸。");
     }
@@ -2234,18 +4064,18 @@ void MqttManager::onStoredFaceValidationFinished(
                             pending.personId,
                             finalResult,
                             finalMessage,
-                            finalFailedFaces);
+                            finalFailedFaces,
+                            commitFaceNotices);
     FaceImageSyncBridge *bridge = FaceImageSyncBridge::instance();
     bridge->reportSyncStatus(finalResult, finalMessage);
-    bridge->reportPersonnelList(
-                networkPersonnelStore_.networkPersonnelList());
-    bridge->requestNetworkFaceGalleryRefresh();
+    scheduleNetworkFaceRefresh();
     emit logMessage(QStringLiteral(
                         "人脸图像校验完成: personId=%1 result=%2 message=%3")
                     .arg(pending.personId,
                          finalResult ? QStringLiteral("true")
-                                     : QStringLiteral("false"),
-                         finalMessage));
+                                      : QStringLiteral("false"),
+                          finalMessage));
+    finishCurrentFaceImageWork();
 }
 
 bool MqttManager::publishFaceImagesResult(
@@ -2253,11 +4083,18 @@ bool MqttManager::publishFaceImagesResult(
         const QString &personId,
         bool result,
         const QString &message,
-        const QJsonArray &failedFaces)
+        const QJsonArray &failedFaces,
+        const QJsonArray &faceNotices)
 {
     const QString eventTopic = cfg_.publishTopic.trimmed();
     if (eventTopic.isEmpty()) {
         emit logMessage(QStringLiteral("Imagesresult 发布失败：publishTopic为空"));
+        return false;
+    }
+    if (!mqttBrokerConnected_) {
+        emit logMessage(QStringLiteral(
+                            "Imagesresult暂缓提交：MQTT Broker未连接，personId=%1")
+                        .arg(personId));
         return false;
     }
 
@@ -2273,38 +4110,131 @@ bool MqttManager::publishFaceImagesResult(
                 ? cfg_.deviceName.trimmed() : cfg_.clientId.trimmed();
     }
 
-    QJsonObject data;
-    data.insert(QStringLiteral("personId"), personId);
-    data.insert(QStringLiteral("result"), result);
-    data.insert(QStringLiteral("msg"), message);
-    if (!result && !failedFaces.isEmpty()) {
-        QJsonArray responseFailedFaces;
-        for (const QJsonValue &value : failedFaces) {
-            const QJsonObject failed = value.toObject();
-            QJsonObject responseFace;
-            responseFace.insert(QStringLiteral("name"),
-                                failed.value(QStringLiteral("name")));
-            responseFace.insert(QStringLiteral("faceHash"),
-                                failed.value(QStringLiteral("faceHash")));
-            responseFailedFaces.append(responseFace);
-        }
-        data.insert(QStringLiteral("failed_faces"), responseFailedFaces);
+    QJsonArray responseFaces = responsePayload.value(QStringLiteral("data"))
+            .toObject().value(QStringLiteral("faces")).toArray();
+    if (responseFaces.isEmpty()) {
+        responseFaces = failedFaces;
+    }
+    if (responseFaces.isEmpty()) {
+        responseFaces.append(QJsonObject());
     }
 
-    QJsonObject payload;
-    payload.insert(QStringLiteral("method"), QStringLiteral("Imagesresult"));
-    payload.insert(QStringLiteral("id"), messageId);
-    payload.insert(QStringLiteral("deviceId"), deviceId);
-    payload.insert(QStringLiteral("data"), data);
-    payload.insert(QStringLiteral("time"),
-                   QDateTime::currentDateTime().toString(
-                       QStringLiteral("yyyy-MM-dd HH:mm:ss")));
+    bool submitted = true;
+    int submittedCount = 0;
+    for (const QJsonValue &value : responseFaces) {
+        const QJsonObject responseFaceSource = value.toObject();
+        const QString faceName = responseFaceSource.value(
+                    QStringLiteral("name")).toString().trimmed();
+        const QString faceHash = responseFaceSource.value(
+                    QStringLiteral("faceHash")).toString().trimmed();
 
-    QJsonObject packet;
-    packet.insert(QStringLiteral("cmd"), QStringLiteral("publish"));
-    packet.insert(QStringLiteral("topic"), eventTopic);
-    packet.insert(QStringLiteral("payload"), payload);
-    return publishJsonPacket(packet, QStringLiteral("Imagesresult"));
+        QJsonObject matchedFailure;
+        for (const QJsonValue &failedValue : failedFaces) {
+            const QJsonObject failed = failedValue.toObject();
+            const QString failedHash = failed.value(QStringLiteral("faceHash"))
+                    .toString().trimmed();
+            const QString failedName = failed.value(QStringLiteral("name"))
+                    .toString().trimmed();
+            const bool sameFace = !faceHash.isEmpty()
+                    ? failedHash == faceHash
+                    : (!faceName.isEmpty() && failedHash.isEmpty()
+                       && failedName == faceName);
+            if (sameFace) {
+                matchedFailure = failed;
+                break;
+            }
+        }
+
+        QJsonObject matchedNotice;
+        for (const QJsonValue &noticeValue : faceNotices) {
+            const QJsonObject notice = noticeValue.toObject();
+            const QString noticeHash = notice.value(QStringLiteral("faceHash"))
+                    .toString().trimmed();
+            const QString noticeName = notice.value(QStringLiteral("name"))
+                    .toString().trimmed();
+            const bool sameFace = !faceHash.isEmpty()
+                    ? noticeHash == faceHash
+                    : (!faceName.isEmpty() && noticeHash.isEmpty()
+                       && noticeName == faceName);
+            if (sameFace) {
+                matchedNotice = notice;
+                break;
+            }
+        }
+
+        const bool faceResult = matchedFailure.isEmpty()
+                ? (failedFaces.isEmpty() ? result : true)
+                : false;
+        QString faceMessage = matchedFailure.value(QStringLiteral("message"))
+                .toString().trimmed();
+        if (faceMessage.isEmpty()) {
+            faceMessage = matchedNotice.value(QStringLiteral("message"))
+                    .toString().trimmed();
+        }
+        if (faceMessage.isEmpty()) {
+            faceMessage = faceResult && !result
+                    ? QStringLiteral("人脸图像同步成功。")
+                    : message;
+        }
+
+        QJsonObject data;
+        data.insert(QStringLiteral("personId"), personId);
+        data.insert(QStringLiteral("name"), faceName);
+        data.insert(QStringLiteral("faceHash"), faceHash);
+        data.insert(QStringLiteral("result"), faceResult);
+        data.insert(QStringLiteral("msg"), faceMessage);
+        if (!faceResult && (!faceName.isEmpty() || !faceHash.isEmpty())) {
+            QJsonObject failedFace;
+            failedFace.insert(QStringLiteral("name"), faceName);
+            failedFace.insert(QStringLiteral("faceHash"), faceHash);
+            QJsonArray responseFailedFaces;
+            responseFailedFaces.append(failedFace);
+            data.insert(QStringLiteral("failed_faces"), responseFailedFaces);
+        }
+
+        QJsonObject payload;
+        payload.insert(QStringLiteral("method"), QStringLiteral("Imagesresult"));
+        payload.insert(QStringLiteral("id"), messageId);
+        payload.insert(QStringLiteral("deviceId"), deviceId);
+        payload.insert(QStringLiteral("data"), data);
+        payload.insert(QStringLiteral("time"),
+                       QDateTime::currentDateTime().toString(
+                           QStringLiteral("yyyy-MM-dd HH:mm:ss")));
+
+        QJsonObject packet;
+        packet.insert(QStringLiteral("cmd"), QStringLiteral("publish"));
+        packet.insert(QStringLiteral("topic"), eventTopic);
+        packet.insert(QStringLiteral("payload"), payload);
+        const bool faceSubmitted = publishJsonPacket(
+                    packet, QStringLiteral("Imagesresult"));
+        submitted = submitted && faceSubmitted;
+        if (faceSubmitted) {
+            ++submittedCount;
+        }
+    }
+
+    const QString normalizedPersonId = personId.trimmed();
+    if (submitted && !normalizedPersonId.isEmpty()) {
+        const bool wasPending =
+                pendingFaceImageRequests_.remove(normalizedPersonId) > 0;
+        faceImageReconnectRetryPersons_.remove(normalizedPersonId);
+        faceImageReconnectAwaitingPersons_.remove(normalizedPersonId);
+        if (faceImageReconnectAwaitingPersons_.isEmpty()
+                && faceImageReconnectResponseTimer_) {
+            faceImageReconnectResponseTimer_->stop();
+        }
+        if (wasPending) {
+            emit logMessage(QStringLiteral(
+                                "Imagesresult已提交，停止人脸图像断线补发：personId=%1")
+                            .arg(normalizedPersonId));
+        }
+    }
+    emit logMessage(QStringLiteral(
+                        "Imagesresult逐图提交完成: personId=%1 submitted=%2 total=%3")
+                    .arg(normalizedPersonId)
+                    .arg(submittedCount)
+                    .arg(responseFaces.size()));
+    return submitted;
 }
 
 
@@ -2323,6 +4253,14 @@ void MqttManager::setConfig(const MqttConfig &cfg)
     const bool onlineV1Active = cfg_.publishTopic.trimmed()
             .startsWith(QStringLiteral("device/ycLinux/"))
             && cfg_.publishTopic.trimmed().endsWith(QStringLiteral("/event"));
+    if (!onlineV1Active) {
+        if (faceImageReconnectResponseTimer_) {
+            faceImageReconnectResponseTimer_->stop();
+        }
+        pendingFaceImageRequests_.clear();
+        faceImageReconnectRetryPersons_.clear();
+        faceImageReconnectAwaitingPersons_.clear();
+    }
     if (!onlineV1Active && pendingOnlineQr_.active) {
         networkPersonnelStore_.finishQrAccessTransaction(
                     pendingOnlineQr_.scanId,
@@ -2442,7 +4380,7 @@ void MqttManager::testConnection()
  * 连接建立后会：
  * - 通知界面 IPC 已连接；
  * - 主动请求一次 mqttd status；
- * - 下发当前配置并立即应用。
+ * - 根据返回状态决定是否需要重新应用配置，避免IPC重连连带重建Broker连接。
  */
 void MqttManager::onIpcConnected()
 {
@@ -2454,9 +4392,27 @@ void MqttManager::onIpcConnected()
     emit mqttConnMarkChanged(0);
 
     // 主动请求一次 status
+    ipcConfigApplyPending_ = true;
+    const int configDecisionGeneration = ++ipcConfigDecisionGeneration_;
     ipc_->sendRawLine("{\"cmd\":\"status\"}\n");
-
-    sendConfigToMqttd(true);
+    const auto retryStatus = [this, configDecisionGeneration]() {
+        if (ipcConfigDecisionGeneration_ == configDecisionGeneration
+                && ipcConfigApplyPending_ && ipc_ && ipc_->isConnected()) {
+            ipc_->sendRawLine("{\"cmd\":\"status\"}\n");
+        }
+    };
+    QTimer::singleShot(3000, this, retryStatus);
+    QTimer::singleShot(10000, this, retryStatus);
+    QTimer::singleShot(30000, this, [this, configDecisionGeneration]() {
+        if (ipcConfigDecisionGeneration_ != configDecisionGeneration
+                || !ipcConfigApplyPending_ || !ipc_ || !ipc_->isConnected()) {
+            return;
+        }
+        ipcConfigApplyPending_ = false;
+        emit logMessage(QStringLiteral(
+                            "IPC连接30秒未取得mqttd状态，执行一次配置apply兜底"));
+        sendConfigToMqttd(true);
+    });
 }
 
 
@@ -2589,13 +4545,47 @@ bool MqttManager::dispatchPayloadMessage(const QString &topic, const QJsonObject
         return false;
     }
 
-    emit logMessage(QString("消息：topic=%1 payload=%2")
-                    .arg(topic,
-                         QString::fromUtf8(QJsonDocument(payloadObj).toJson(QJsonDocument::Compact))));
-
     const QString method = payloadObj.value("method").toString().trimmed().isEmpty()
             ? payloadObj.value("methon").toString().trimmed()
             : payloadObj.value("method").toString().trimmed();
+
+    if (method == QStringLiteral("face.responseImages")) {
+        const QJsonObject data = payloadObj.value(QStringLiteral("data")).toObject();
+        const QJsonArray faces = data.value(QStringLiteral("faces")).toArray();
+        QStringList faceHashes;
+        qint64 base64Chars = 0;
+        for (const QJsonValue &value : faces) {
+            const QJsonObject face = value.toObject();
+            const QString faceHash = face.value(QStringLiteral("faceHash"))
+                    .toString().trimmed();
+            if (!faceHash.isEmpty()) faceHashes.append(faceHash);
+
+            const QString encoded = face.value(QStringLiteral("faceBase64")).toString();
+            const int comma = encoded.indexOf(QLatin1Char(','));
+            base64Chars += comma >= 0 ? encoded.size() - comma - 1 : encoded.size();
+        }
+        emit logMessage(QStringLiteral(
+                            "消息摘要：topic=%1 method=%2 personId=%3 "
+                            "faceCount=%4 base64Chars=%5 faceHashes=%6")
+                        .arg(topic,
+                             method,
+                             data.value(QStringLiteral("personId")).toString().trimmed())
+                        .arg(faces.size())
+                        .arg(base64Chars)
+                        .arg(faceHashes.join(QLatin1Char(','))));
+    } else {
+        const QByteArray compactPayload = QJsonDocument(payloadObj)
+                .toJson(QJsonDocument::Compact);
+        if (compactPayload.size() > 16384) {
+            emit logMessage(QStringLiteral(
+                                "消息摘要：topic=%1 method=%2 payloadBytes=%3")
+                            .arg(topic, method)
+                            .arg(compactPayload.size()));
+        } else {
+            emit logMessage(QString("消息：topic=%1 payload=%2")
+                            .arg(topic, QString::fromUtf8(compactPayload)));
+        }
+    }
 
     return messageRouter_
             && messageRouter_->dispatch(topic, payloadObj, method);
@@ -3135,6 +5125,16 @@ void MqttManager::handleStatusLikeMessage(const QJsonObject &obj)
     const QString type = obj.value("type").toString();
     const bool connected = obj.value("connected").toBool(false);
     const int lastRc = obj.value("last_rc").toInt(-1);
+    mqttBrokerConnected_ = connected;
+    if (connected) {
+        if (IcEventBridge::instance()->networkAvailable()) {
+            mqttReconnectRequiredAfterNetworkLoss_ = false;
+        }
+        flushOfflineAccessResults();
+        resendPendingFaceImageRequestsAfterReconnect();
+    } else if (faceImageReconnectResponseTimer_) {
+        faceImageReconnectResponseTimer_->stop();
+    }
 
     emit mqttStateTextChanged(
         connected ? QString("已连接（rc=%1）").arg(lastRc)
@@ -3146,6 +5146,44 @@ void MqttManager::handleStatusLikeMessage(const QJsonObject &obj)
 
     const QJsonObject mqtt = obj.value("mqtt").toObject();
     emit mqttConfigFromStatus(mqtt);
+
+    if (ipcConfigApplyPending_
+            && (type == QStringLiteral("hello")
+                || type == QStringLiteral("status"))) {
+        ipcConfigApplyPending_ = false;
+        QStringList configuredTopics = cfg_.subTopics;
+        if (configuredTopics.isEmpty()) configuredTopics.append(QStringLiteral("test"));
+        configuredTopics.removeDuplicates();
+        configuredTopics.sort();
+
+        QString runningTopicsText = obj.value(QStringLiteral("sub_topics"))
+                .toString();
+        runningTopicsText.replace(QLatin1Char(';'), QLatin1Char(','));
+        QStringList runningTopics = runningTopicsText.split(QLatin1Char(','));
+        runningTopics.removeAll(QString());
+        for (QString &topic : runningTopics) topic = topic.trimmed();
+        runningTopics.removeAll(QString());
+        runningTopics.removeDuplicates();
+        runningTopics.sort();
+
+        const bool sameRunningConfig = connected
+                && mqtt.value(QStringLiteral("host")).toString().trimmed()
+                    == cfg_.host.trimmed()
+                && mqtt.value(QStringLiteral("port")).toInt() == cfg_.port
+                && mqtt.value(QStringLiteral("client_id")).toString().trimmed()
+                    == cfg_.clientId.trimmed()
+                && mqtt.value(QStringLiteral("qos")).toInt() == cfg_.qos
+                && mqtt.value(QStringLiteral("tls")).toBool() == cfg_.tls
+                && runningTopics == configuredTopics;
+        if (sameRunningConfig) {
+            emit logMessage(QStringLiteral(
+                                "IPC重连后mqttd配置和Broker连接仍有效，跳过apply"));
+        } else {
+            emit logMessage(QStringLiteral(
+                                "IPC连接后的mqttd状态或配置不一致，执行一次apply"));
+            sendConfigToMqttd(true);
+        }
+    }
 
     if (connected) {
         if (!mqttRoutePersisted_) {
@@ -3194,6 +5232,10 @@ void MqttManager::handleConnMessage(const QJsonObject &obj)
     const QString state = obj.value("state").toString();
 
     if (state == "connected") {
+        mqttBrokerConnected_ = true;
+        if (IcEventBridge::instance()->networkAvailable()) {
+            mqttReconnectRequiredAfterNetworkLoss_ = false;
+        }
         emit mqttStateTextChanged("已连接");
         emit mqttConnMarkChanged(2);
 
@@ -3206,10 +5248,33 @@ void MqttManager::handleConnMessage(const QJsonObject &obj)
                 emit logMessage(QString("MQTT broker 已连接，但写入 topic 路由失败：%1").arg(iniErr));
             }
         }
+        flushOfflineAccessResults();
+        resendPendingFaceImageRequestsAfterReconnect();
         return;
     }
 
     if (state == "disconnected") {
+        mqttBrokerConnected_ = false;
+        if (faceImageReconnectResponseTimer_) {
+            faceImageReconnectResponseTimer_->stop();
+        }
+        faceImageReconnectAwaitingPersons_.clear();
+        const int rc = obj.value(QStringLiteral("rc")).toInt(-1);
+        const QString desc = obj.value(QStringLiteral("desc"))
+                .toString().trimmed();
+        for (auto it = pendingFaceImageRequests_.cbegin();
+             it != pendingFaceImageRequests_.cend(); ++it) {
+            if (it.value().awaitingResponse) {
+                faceImageReconnectRetryPersons_.insert(it.key());
+            }
+        }
+        if (!faceImageReconnectRetryPersons_.isEmpty()) {
+            emit logMessage(QStringLiteral(
+                                "MQTT连接断开，已标记%1个尚未收到responseImages的请求，重连后补发一次：rc=%2 desc=%3")
+                            .arg(faceImageReconnectRetryPersons_.size())
+                            .arg(rc)
+                            .arg(desc.isEmpty() ? QStringLiteral("<empty>") : desc));
+        }
         mqttRoutePersisted_ = false;
         emit mqttStateTextChanged("已断开");
         emit mqttConnMarkChanged(3);
@@ -3217,6 +5282,11 @@ void MqttManager::handleConnMessage(const QJsonObject &obj)
     }
 
     if (state == "failed") {
+        mqttBrokerConnected_ = false;
+        if (faceImageReconnectResponseTimer_) {
+            faceImageReconnectResponseTimer_->stop();
+        }
+        faceImageReconnectAwaitingPersons_.clear();
         mqttRoutePersisted_ = false;
         const int rc = obj.value("rc").toInt(-1);
         emit mqttStateTextChanged(QString("连接失败（rc=%1）").arg(rc));

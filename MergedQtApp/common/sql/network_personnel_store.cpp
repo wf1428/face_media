@@ -7,6 +7,7 @@
 
 #include <QCryptographicHash>
 #include <QDateTime>
+#include <QDebug>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -27,6 +28,7 @@
 #include <cmath>
 
 #include "common/sql/dbstore.h"
+#include "common/storage_policy.h"
 #include "platform/rk3566_platform.h"
 
 namespace {
@@ -50,6 +52,30 @@ QString compactJson(const QJsonValue &value)
         return compactJson(value.toObject());
     }
     return {};
+}
+
+/** @return 与本地人员重复录入判断一致的 float 特征余弦相似度。 */
+float storedFeatureCosine(const QByteArray &left, const QByteArray &right)
+{
+    if (left.isEmpty() || left.size() != right.size()
+            || left.size() % static_cast<int>(sizeof(float)) != 0) {
+        return -1.0f;
+    }
+    const int count = left.size() / static_cast<int>(sizeof(float));
+    const float *l = reinterpret_cast<const float *>(left.constData());
+    const float *r = reinterpret_cast<const float *>(right.constData());
+    double dot = 0.0;
+    double leftNorm = 0.0;
+    double rightNorm = 0.0;
+    for (int index = 0; index < count; ++index) {
+        dot += static_cast<double>(l[index]) * static_cast<double>(r[index]);
+        leftNorm += static_cast<double>(l[index]) * static_cast<double>(l[index]);
+        rightNorm += static_cast<double>(r[index]) * static_cast<double>(r[index]);
+    }
+    if (leftNorm <= 0.0 || rightNorm <= 0.0) {
+        return -1.0f;
+    }
+    return static_cast<float>(dot / (std::sqrt(leftNorm) * std::sqrt(rightNorm)));
 }
 
 QJsonArray floorNumbers(const QJsonValue &value)
@@ -116,6 +142,104 @@ QStringList faceDeleteKeys(const QString &item)
     return keys;
 }
 
+void removeDeletedFaceImages(const QString &personId,
+                             const QStringList &storedImagePaths,
+                             const QStringList &faceHashes,
+                             bool removeWholePersonDirectory)
+{
+    QString safePersonId = personId.trimmed();
+    safePersonId.replace(
+                QRegularExpression(QStringLiteral("[^A-Za-z0-9_-]")),
+                QStringLiteral("_"));
+    const QString faceRootPath = QDir(
+                QFileInfo(Rk3566Platform::databasePath()).absolutePath())
+            .filePath(QStringLiteral("network_faces"));
+    const QString absoluteFaceRoot = QDir(faceRootPath).absolutePath();
+    const QString absolutePersonFaceDir = QDir(faceRootPath)
+            .absoluteFilePath(safePersonId);
+    const QString faceRootPrefix = absoluteFaceRoot + QDir::separator();
+    if (safePersonId.isEmpty()
+            || !absolutePersonFaceDir.startsWith(faceRootPrefix)) {
+        qWarning().noquote()
+                << "[PERSONNEL-SYNC] skip unsafe face image cleanup"
+                << "personId=" << personId
+                << "dir=" << absolutePersonFaceDir;
+        return;
+    }
+
+    QDir personFaceDir(absolutePersonFaceDir);
+    if (removeWholePersonDirectory) {
+        if (personFaceDir.exists() && !personFaceDir.removeRecursively()) {
+            qWarning().noquote()
+                    << "[PERSONNEL-SYNC] person face directory cleanup failed"
+                    << "personId=" << personId
+                    << "dir=" << absolutePersonFaceDir;
+        } else {
+            qInfo().noquote()
+                    << "[PERSONNEL-SYNC] person face directory cleaned"
+                    << "personId=" << personId
+                    << "dir=" << absolutePersonFaceDir;
+        }
+        return;
+    }
+
+    const QString personDirPrefix = absolutePersonFaceDir
+            + QDir::separator();
+    auto removeFile = [&](const QString &path) {
+        const QString absolutePath = QFileInfo(path).absoluteFilePath();
+        if (!absolutePath.startsWith(personDirPrefix)) {
+            qWarning().noquote()
+                    << "[PERSONNEL-SYNC] skip face image outside person directory"
+                    << "personId=" << personId
+                    << "path=" << absolutePath;
+            return;
+        }
+        if (QFileInfo::exists(absolutePath)) {
+            if (!QFile::remove(absolutePath)) {
+                qWarning().noquote()
+                        << "[PERSONNEL-SYNC] face image cleanup failed"
+                        << "personId=" << personId
+                        << "path=" << absolutePath;
+            } else {
+                qInfo().noquote()
+                        << "[PERSONNEL-SYNC] face image cleaned"
+                        << "personId=" << personId
+                        << "path=" << absolutePath;
+            }
+        }
+    };
+
+    for (const QString &path : storedImagePaths) {
+        if (!path.trimmed().isEmpty()) {
+            removeFile(path);
+        }
+    }
+
+    // image_path 可能已随先前的删除消失；图片落盘时文件名以 faceHash 开头，
+    // 因此再按 hash 扫描当前人员目录，保证幂等重放也能清理已成为孤儿的图片。
+    QSet<QString> safeFaceHashes;
+    const QRegularExpression safeHash(QStringLiteral("^[A-Za-z0-9_-]{1,128}$"));
+    for (const QString &hash : faceHashes) {
+        const QString normalizedHash = hash.trimmed();
+        if (safeHash.match(normalizedHash).hasMatch()) {
+            safeFaceHashes.insert(normalizedHash);
+        }
+    }
+    if (personFaceDir.exists() && !safeFaceHashes.isEmpty()) {
+        const QFileInfoList files = personFaceDir.entryInfoList(
+                    QDir::Files | QDir::NoDotAndDotDot);
+        for (const QFileInfo &file : files) {
+            for (const QString &hash : safeFaceHashes) {
+                if (file.fileName().startsWith(hash + QLatin1Char('.'))) {
+                    removeFile(file.absoluteFilePath());
+                    break;
+                }
+            }
+        }
+    }
+    QDir().rmdir(absolutePersonFaceDir);
+}
+
 } // namespace
 
 bool NetworkPersonnelStore::initialize()
@@ -157,7 +281,6 @@ bool NetworkPersonnelStore::initialize()
             "name TEXT,"
             "bind_time TEXT,"
             "image_path TEXT,"
-            "face_base64 TEXT,"
             "feature_blob BLOB,"
             "model_version TEXT,"
             "status TEXT NOT NULL DEFAULT 'METADATA',"
@@ -241,6 +364,8 @@ bool NetworkPersonnelStore::initialize()
             "person_id TEXT PRIMARY KEY,"
             "remaining_count INTEGER,"
             "access_count INTEGER NOT NULL DEFAULT 0,"
+            "remaining_amount REAL,"
+            "used_amount REAL NOT NULL DEFAULT 0,"
             "updated_at TEXT NOT NULL,"
             "FOREIGN KEY(person_id) REFERENCES network_person(person_id) ON DELETE CASCADE)"),
         QStringLiteral(
@@ -253,7 +378,18 @@ bool NetworkPersonnelStore::initialize()
             "message TEXT,"
             "remaining_count INTEGER,"
             "used_count INTEGER,"
+            "remaining_amount REAL,"
+            "used_amount REAL,"
             "processed_at TEXT NOT NULL)"),
+        QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS network_offline_access_result ("
+            "method TEXT NOT NULL,"
+            "person_id TEXT NOT NULL,"
+            "success INTEGER NOT NULL,"
+            "access_count INTEGER NOT NULL DEFAULT 0,"
+            "created_at TEXT NOT NULL,"
+            "updated_at TEXT NOT NULL,"
+            "PRIMARY KEY(method,person_id,success))"),
         QStringLiteral(
             "CREATE TABLE IF NOT EXISTS network_remote_call_transaction ("
             "request_id TEXT PRIMARY KEY,"
@@ -357,7 +493,6 @@ bool NetworkPersonnelStore::initialize()
     }
 
     const QList<QPair<QString, QString>> requiredFaceColumns = {
-        {QStringLiteral("face_base64"), QStringLiteral("TEXT")},
         {QStringLiteral("feature_blob"), QStringLiteral("BLOB")},
         {QStringLiteral("model_version"), QStringLiteral("TEXT")}
     };
@@ -368,6 +503,16 @@ bool NetworkPersonnelStore::initialize()
                                   .arg(column.first, column.second))) {
             return false;
         }
+    }
+
+    // 旧版本曾把服务器下发的完整 Base64 与本地图片重复保存。
+    // 保留旧列仅用于兼容既有 SQLite 表结构，初始化时清空存量数据；
+    // 新建数据库不再创建该列，后续流程也不再向其中写入内容。
+    if (faceColumnNames.contains(QStringLiteral("face_base64"))
+            && !DbStore::exec(QStringLiteral(
+                                  "UPDATE network_face SET face_base64=NULL "
+                                  "WHERE face_base64 IS NOT NULL"))) {
+        return false;
     }
 
     QSet<QString> accessRuleColumnNames;
@@ -392,7 +537,178 @@ bool NetworkPersonnelStore::initialize()
         }
     }
 
+    QSet<QString> accessUsageColumnNames;
+    const QList<QVariantMap> accessUsageColumns =
+            DbStore::query(QStringLiteral("PRAGMA table_info(network_access_usage)"));
+    for (const QVariantMap &column : accessUsageColumns) {
+        accessUsageColumnNames.insert(column.value(QStringLiteral("name"))
+                                      .toString().trimmed().toLower());
+    }
+    const QList<QPair<QString, QString>> requiredAccessUsageColumns = {
+        {QStringLiteral("remaining_amount"), QStringLiteral("REAL")},
+        {QStringLiteral("used_amount"), QStringLiteral("REAL NOT NULL DEFAULT 0")}
+    };
+    for (const auto &column : requiredAccessUsageColumns) {
+        if (!accessUsageColumnNames.contains(column.first)
+                && !DbStore::exec(QStringLiteral(
+                                      "ALTER TABLE network_access_usage ADD COLUMN %1 %2")
+                                  .arg(column.first, column.second))) {
+            return false;
+        }
+    }
+
+    QSet<QString> accessDeductColumnNames;
+    const QList<QVariantMap> accessDeductColumns =
+            DbStore::query(QStringLiteral("PRAGMA table_info(network_access_deduct_result)"));
+    for (const QVariantMap &column : accessDeductColumns) {
+        accessDeductColumnNames.insert(column.value(QStringLiteral("name"))
+                                       .toString().trimmed().toLower());
+    }
+    const QList<QPair<QString, QString>> requiredAccessDeductColumns = {
+        {QStringLiteral("remaining_amount"), QStringLiteral("REAL")},
+        {QStringLiteral("used_amount"), QStringLiteral("REAL")}
+    };
+    for (const auto &column : requiredAccessDeductColumns) {
+        if (!accessDeductColumnNames.contains(column.first)
+                && !DbStore::exec(QStringLiteral(
+                                      "ALTER TABLE network_access_deduct_result ADD COLUMN %1 %2")
+                                  .arg(column.first, column.second))) {
+            return false;
+        }
+    }
+
     initialized_ = true;
+    return true;
+}
+
+bool NetworkPersonnelStore::recordOfflineAccessResult(
+        const QString &method,
+        const QString &personId,
+        bool success,
+        QString *error)
+{
+    if (!initialized_ && !initialize()) {
+        if (error) *error = DbStore::lastError();
+        return false;
+    }
+
+    const QString normalizedMethod = method.trimmed();
+    const QString normalizedPersonId = personId.trimmed();
+    if (normalizedMethod.isEmpty() || normalizedPersonId.isEmpty()) {
+        if (error) *error = QStringLiteral("离线通行 method 或 personId 为空");
+        return false;
+    }
+
+    const QString now = QDateTime::currentDateTime().toString(
+                QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+    const bool ok = DbStore::execute(
+                QStringLiteral(
+                    "INSERT INTO network_offline_access_result("
+                    "method,person_id,success,access_count,created_at,updated_at) "
+                    "VALUES(?,?,?,1,?,?) "
+                    "ON CONFLICT(method,person_id,success) DO UPDATE SET "
+                    "access_count=access_count+1,updated_at=excluded.updated_at"),
+                {normalizedMethod, normalizedPersonId, success ? 1 : 0, now, now});
+    if (!ok && error) *error = DbStore::lastError();
+    return ok;
+}
+
+QJsonArray NetworkPersonnelStore::pendingOfflineAccessResults(
+        const QString &method,
+        QString *error)
+{
+    QJsonArray records;
+    if (!initialized_ && !initialize()) {
+        if (error) *error = DbStore::lastError();
+        return records;
+    }
+
+    const QString normalizedMethod = method.trimmed();
+    if (normalizedMethod.isEmpty()) {
+        if (error) *error = QStringLiteral("离线通行 method 为空");
+        return records;
+    }
+
+    const QList<QVariantMap> rows = DbStore::query(
+                QStringLiteral(
+                    "SELECT person_id,success,access_count "
+                    "FROM network_offline_access_result "
+                    "WHERE method=? AND access_count>0 "
+                    "ORDER BY person_id,success DESC"),
+                {normalizedMethod});
+
+    for (const QVariantMap &row : rows) {
+        QJsonObject record;
+        record.insert(QStringLiteral("personId"),
+                      row.value(QStringLiteral("person_id")).toString());
+        record.insert(QStringLiteral("success"),
+                      row.value(QStringLiteral("success")).toBool());
+        record.insert(QStringLiteral("count"),
+                      static_cast<double>(row.value(
+                          QStringLiteral("access_count")).toLongLong()));
+        records.append(record);
+    }
+    return records;
+}
+
+bool NetworkPersonnelStore::consumeOfflineAccessResults(
+        const QString &method,
+        const QJsonArray &records,
+        QString *error)
+{
+    if (!initialized_ && !initialize()) {
+        if (error) *error = DbStore::lastError();
+        return false;
+    }
+    const QString normalizedMethod = method.trimmed();
+    if (normalizedMethod.isEmpty()) {
+        if (error) *error = QStringLiteral("离线通行 method 为空");
+        return false;
+    }
+    if (records.isEmpty()) return true;
+    if (!DbStore::transactionBegin()) {
+        if (error) *error = DbStore::lastError();
+        return false;
+    }
+
+    for (const QJsonValue &value : records) {
+        const QJsonObject record = value.toObject();
+        const QString personId = record.value(QStringLiteral("personId"))
+                .toString().trimmed();
+        const bool success = record.value(QStringLiteral("success")).toBool(false);
+        const qlonglong count = record.value(QStringLiteral("count"))
+                .toVariant().toLongLong();
+        if (personId.isEmpty() || count <= 0
+                || !DbStore::execute(
+                    QStringLiteral(
+                        "UPDATE network_offline_access_result SET "
+                        "access_count=access_count-?,updated_at=? "
+                        "WHERE method=? AND person_id=? AND success=? "
+                        "AND access_count>=?"),
+                    {count,
+                     QDateTime::currentDateTime().toString(
+                         QStringLiteral("yyyy-MM-dd HH:mm:ss")),
+                     normalizedMethod, personId, success ? 1 : 0, count})) {
+            DbStore::transactionRollback();
+            if (error) {
+                *error = personId.isEmpty() || count <= 0
+                        ? QStringLiteral("离线通行批量快照记录无效")
+                        : DbStore::lastError();
+            }
+            return false;
+        }
+    }
+
+    if (!DbStore::execute(
+                QStringLiteral(
+                    "DELETE FROM network_offline_access_result "
+                    "WHERE method=? AND access_count<=0"),
+                {normalizedMethod})
+            || !DbStore::transactionCommit()) {
+        DbStore::transactionRollback();
+        if (error) *error = DbStore::lastError();
+        return false;
+    }
     return true;
 }
 
@@ -482,7 +798,8 @@ QJsonArray NetworkPersonnelStore::networkPersonnelList() const
                     "p.deleted,p.person_hash,p.updated_at,"
                     "COUNT(f.id) AS face_count,"
                     "COALESCE(SUM(CASE WHEN COALESCE(f.image_path,'')<>'' "
-                    "AND COALESCE(f.face_base64,'')<>'' THEN 1 ELSE 0 END),0) "
+                    "AND COALESCE(f.status,'')='IMAGE_READY' "
+                    "AND f.feature_blob IS NOT NULL THEN 1 ELSE 0 END),0) "
                     "AS image_count "
                     "FROM network_person p "
                     "LEFT JOIN network_face f ON f.person_id=p.person_id "
@@ -867,12 +1184,27 @@ NetworkPersonnelImportResult NetworkPersonnelStore::importSpreadsheetPersonnel(
                          range.size() > 1 ? range.at(1).toString() : QString()});
         }
         if (writeOk) {
-            if (rules.value(QStringLiteral("count")).toBool()) {
+            const bool countEnabled = rules.value(QStringLiteral("count")).toBool();
+            const bool amountEnabled = rules.value(QStringLiteral("amount")).toBool();
+            if (countEnabled || amountEnabled) {
+                const QVariant remainingCount = countEnabled
+                        ? (rules.value(QStringLiteral("countDataRemaining")).isDouble()
+                           ? rules.value(QStringLiteral("countDataRemaining")).toVariant()
+                           : rules.value(QStringLiteral("countDataTotal")).toVariant())
+                        : QVariant();
+                const QVariant remainingAmount = amountEnabled
+                        ? (rules.value(QStringLiteral("amountDataRemaining")).isDouble()
+                           ? rules.value(QStringLiteral("amountDataRemaining")).toVariant()
+                           : rules.value(QStringLiteral("amountDataTotal")).toVariant())
+                        : QVariant();
                 writeOk = DbStore::execute(
-                            QStringLiteral("INSERT INTO network_access_usage(person_id,remaining_count,access_count,updated_at) "
-                                           "VALUES(?,?,0,?) ON CONFLICT(person_id) DO UPDATE SET "
-                                           "remaining_count=excluded.remaining_count,updated_at=excluded.updated_at"),
-                            {personId, rules.value(QStringLiteral("countDataRemaining")).toVariant(), now});
+                            QStringLiteral("INSERT INTO network_access_usage("
+                                           "person_id,remaining_count,access_count,remaining_amount,used_amount,updated_at) "
+                                           "VALUES(?,?,0,?,0,?) ON CONFLICT(person_id) DO UPDATE SET "
+                                           "remaining_count=excluded.remaining_count,"
+                                           "remaining_amount=excluded.remaining_amount,"
+                                           "updated_at=excluded.updated_at"),
+                            {personId, remainingCount, remainingAmount, now});
             } else {
                 writeOk = DbStore::execute(QStringLiteral("DELETE FROM network_access_usage WHERE person_id=?"), {personId});
             }
@@ -919,7 +1251,8 @@ QJsonArray NetworkPersonnelStore::pendingFaceImageRequests() const
     QJsonArray requests;
     const QList<QVariantMap> rows = DbStore::query(
                 QStringLiteral(
-                    "SELECT p.person_id,f.face_hash,f.image_path,f.face_base64 "
+                    "SELECT p.person_id,f.face_hash,f.image_path,f.status,"
+                    "f.feature_blob,f.model_version "
                     "FROM network_person p "
                     "JOIN network_face f ON f.person_id=p.person_id "
                     "WHERE p.active=1 AND p.deleted=0 "
@@ -944,10 +1277,16 @@ QJsonArray NetworkPersonnelStore::pendingFaceImageRequests() const
                 row.value(QStringLiteral("face_hash")).toString().trimmed();
         const QString imagePath =
                 row.value(QStringLiteral("image_path")).toString().trimmed();
-        const bool imageMissing =
-                row.value(QStringLiteral("face_base64")).toString().isEmpty()
-                || imagePath.isEmpty()
-                || !QFileInfo::exists(imagePath);
+        // Base64 只作为 MQTT 传输数据使用。数据库完整性以本地图片是否存在为准；
+        // 特征提取和 IMAGE_READY 状态由后续校验流程负责。
+        const QFileInfo imageFile(imagePath);
+        const bool imageMissing = imagePath.isEmpty()
+                || !imageFile.isFile() || imageFile.size() <= 0
+                || row.value(QStringLiteral("status")).toString()
+                    != QStringLiteral("IMAGE_READY")
+                || row.value(QStringLiteral("feature_blob")).toByteArray().isEmpty()
+                || row.value(QStringLiteral("model_version"))
+                    .toString().trimmed().isEmpty();
         if (personId.isEmpty() || faceHash.isEmpty()) {
             continue;
         }
@@ -963,6 +1302,45 @@ QJsonArray NetworkPersonnelStore::pendingFaceImageRequests() const
     }
     appendCurrent();
     return requests;
+}
+
+QJsonObject NetworkPersonnelStore::pendingFaceImageRequest(
+        const QString &personId) const
+{
+    const QString normalizedPersonId = personId.trimmed();
+    if (normalizedPersonId.isEmpty()) return QJsonObject();
+
+    const QList<QVariantMap> rows = DbStore::query(
+                QStringLiteral(
+                    "SELECT f.face_hash,f.image_path,f.status,"
+                    "f.feature_blob,f.model_version "
+                    "FROM network_person p "
+                    "JOIN network_face f ON f.person_id=p.person_id "
+                    "WHERE p.person_id=? AND p.active=1 AND p.deleted=0 "
+                    "ORDER BY f.id"),
+                {normalizedPersonId});
+    QJsonArray hashes;
+    for (const QVariantMap &row : rows) {
+        const QString faceHash = row.value(QStringLiteral("face_hash"))
+                .toString().trimmed();
+        const QString imagePath = row.value(QStringLiteral("image_path"))
+                .toString().trimmed();
+        const QFileInfo imageFile(imagePath);
+        const bool incomplete = imagePath.isEmpty()
+                || !imageFile.isFile() || imageFile.size() <= 0
+                || row.value(QStringLiteral("status")).toString()
+                    != QStringLiteral("IMAGE_READY")
+                || row.value(QStringLiteral("feature_blob")).toByteArray().isEmpty()
+                || row.value(QStringLiteral("model_version"))
+                    .toString().trimmed().isEmpty();
+        if (!faceHash.isEmpty() && incomplete) hashes.append(faceHash);
+    }
+    if (hashes.isEmpty()) return QJsonObject();
+
+    QJsonObject request;
+    request.insert(QStringLiteral("personId"), normalizedPersonId);
+    request.insert(QStringLiteral("faceHashes"), hashes);
+    return request;
 }
 
 NetworkPersonnelSyncResult NetworkPersonnelStore::applyFaceImages(
@@ -1000,7 +1378,6 @@ NetworkPersonnelSyncResult NetworkPersonnelStore::applyFaceImages(
     struct DecodedFace {
         QString name;
         QString faceHash;
-        QString base64;
         QByteArray bytes;
         QString extension;
     };
@@ -1099,7 +1476,6 @@ NetworkPersonnelSyncResult NetworkPersonnelStore::applyFaceImages(
         DecodedFace decoded;
         decoded.name = faceName;
         decoded.faceHash = faceHash;
-        decoded.base64 = base64;
         decoded.bytes = bytes;
         decoded.extension = extension;
         decodedFaces.append(decoded);
@@ -1148,27 +1524,14 @@ NetworkPersonnelSyncResult NetworkPersonnelStore::applyFaceImages(
         const QString imagePath =
                 QDir(imageDirPath).filePath(
                     decoded.faceHash + QLatin1Char('.') + decoded.extension);
-        QSaveFile file(imagePath);
-        file.setDirectWriteFallback(true);
-        if (!file.open(QIODevice::WriteOnly)) {
+        QString storageError;
+        if (!StoragePolicy::writeRegistrationPhoto(
+                    imagePath, decoded.bytes, &storageError)) {
             appendFailedFace(
                         decoded.name, decoded.faceHash,
-                        QStringLiteral("人脸图像保存失败，请重新录入人脸。"),
-                        imagePath);
-            continue;
-        }
-        if (file.write(decoded.bytes) != decoded.bytes.size()) {
-            file.cancelWriting();
-            appendFailedFace(
-                        decoded.name, decoded.faceHash,
-                        QStringLiteral("人脸图像保存失败，请重新录入人脸。"),
-                        imagePath);
-            continue;
-        }
-        if (!file.commit()) {
-            appendFailedFace(
-                        decoded.name, decoded.faceHash,
-                        QStringLiteral("人脸图像保存失败，请重新录入人脸。"),
+                        storageError.isEmpty()
+                        ? QStringLiteral("人脸图像保存失败，请重新录入人脸。")
+                        : storageError,
                         imagePath);
             continue;
         }
@@ -1187,11 +1550,11 @@ NetworkPersonnelSyncResult NetworkPersonnelStore::applyFaceImages(
 
         if (!DbStore::execute(
                     QStringLiteral(
-                        "UPDATE network_face SET face_base64=?,image_path=?,"
+                        "UPDATE network_face SET image_path=?,"
                         "feature_blob=NULL,model_version=NULL,"
                         "status='IMAGE_PENDING_VALIDATION' "
                         "WHERE person_id=? AND face_hash=?"),
-                    {decoded.base64, imagePath, personId, decoded.faceHash})) {
+                    {imagePath, personId, decoded.faceHash})) {
             const QString error = DbStore::lastError();
             DbStore::transactionRollback();
             removeWrittenFiles();
@@ -1253,10 +1616,14 @@ bool NetworkPersonnelStore::finalizeFaceImageValidation(
         const QJsonArray &validatedFaces,
         const QJsonArray &failedFaces,
         bool *allFacesReady,
-        QString *error)
+        QString *error,
+        QJsonArray *commitFailedFaces,
+        QJsonArray *commitFaceNotices)
 {
     if (allFacesReady) *allFacesReady = false;
     if (error) error->clear();
+    if (commitFailedFaces) *commitFailedFaces = QJsonArray();
+    if (commitFaceNotices) *commitFaceNotices = QJsonArray();
     const QString normalizedPersonId = personId.trimmed();
     if (normalizedPersonId.isEmpty()
             || (validatedFaces.isEmpty() && failedFaces.isEmpty())) {
@@ -1279,6 +1646,20 @@ bool NetworkPersonnelStore::finalizeFaceImageValidation(
         return false;
     };
 
+    QStringList failedImagePaths;
+    QString duplicateConflictMessage;
+    QJsonArray transactionFailedFaces;
+    QJsonArray transactionFaceNotices;
+    const QList<QVariantMap> currentPersonRows = DbStore::query(
+                QStringLiteral(
+                    "SELECT name FROM network_person WHERE person_id=? LIMIT 1"),
+                {normalizedPersonId});
+    QString currentPersonName = currentPersonRows.isEmpty()
+            ? QString() : currentPersonRows.first().value(
+                QStringLiteral("name")).toString().trimmed();
+    if (currentPersonName.isEmpty()) {
+        currentPersonName = QStringLiteral("当前人员");
+    }
     for (const QJsonValue &value : validatedFaces) {
         const QJsonObject face = value.toObject();
         const QString faceHash = face.value(QStringLiteral("faceHash"))
@@ -1293,6 +1674,169 @@ bool NetworkPersonnelStore::finalizeFaceImageValidation(
             if (error) *error = QStringLiteral("通过的人脸校验结果缺少hash或特征");
             return false;
         }
+
+        const float duplicateThreshold = qBound(
+                    0.0f,
+                    static_cast<float>(face.value(
+                        QStringLiteral("duplicateThreshold")).toDouble(0.5)),
+                    1.0f);
+
+        QStringList replacedNetworkHashes;
+        const QJsonArray requestedReplacements = face.value(
+                    QStringLiteral("replaceNetworkFaceHashes")).toArray();
+        for (const QJsonValue &hashValue : requestedReplacements) {
+            const QString hash = hashValue.toString().trimmed();
+            if (!hash.isEmpty() && hash != faceHash
+                    && !replacedNetworkHashes.contains(hash)) {
+                replacedNetworkHashes.append(hash);
+            }
+        }
+
+        // 推理线程使用图库快照先行判断；事务提交前再次查询数据库，防止
+        // 不同 personId 并发同步时因图库刷新滞后而漏过重复人脸。
+        const QList<QVariantMap> storedNetworkFaces = DbStore::query(
+                    QStringLiteral(
+                        "SELECT nf.person_id,nf.face_hash,nf.image_path,nf.feature_blob,"
+                        "COALESCE(np.name,'') AS person_name "
+                        "FROM network_face nf "
+                        "LEFT JOIN network_person np ON np.person_id=nf.person_id "
+                        "WHERE nf.status='IMAGE_READY' "
+                        "AND nf.feature_blob IS NOT NULL "
+                        "AND NOT(nf.person_id=? AND nf.face_hash=?)"),
+                    {normalizedPersonId, faceHash});
+        QString conflictPersonId;
+        QString conflictPersonName;
+        float conflictCosine = -1.0f;
+        for (const QVariantMap &storedFace : storedNetworkFaces) {
+            const float cosine = storedFeatureCosine(
+                        storedFace.value(QStringLiteral("feature_blob")).toByteArray(),
+                        feature);
+            if (cosine < duplicateThreshold) continue;
+
+            const QString storedPersonId = storedFace.value(
+                        QStringLiteral("person_id")).toString().trimmed();
+            const QString storedHash = storedFace.value(
+                        QStringLiteral("face_hash")).toString().trimmed();
+            if (storedPersonId == normalizedPersonId) {
+                if (!storedHash.isEmpty() && storedHash != faceHash
+                        && !replacedNetworkHashes.contains(storedHash)) {
+                    replacedNetworkHashes.append(storedHash);
+                }
+            } else if (cosine > conflictCosine) {
+                conflictCosine = cosine;
+                conflictPersonId = storedPersonId;
+                conflictPersonName = storedFace.value(
+                            QStringLiteral("person_name")).toString().trimmed();
+            }
+        }
+
+        if (!conflictPersonId.isEmpty()) {
+            if (conflictPersonName.isEmpty()) {
+                conflictPersonName = QStringLiteral("其他网络人员");
+            }
+            const QString faceConflictMessage = QStringLiteral(
+                        "人脸与网络人员“%1”重复，相似度=%2。")
+                    .arg(conflictPersonName)
+                    .arg(conflictCosine, 0, 'f', 3);
+            const QString imagePath = face.value(
+                        QStringLiteral("imagePath")).toString().trimmed();
+            if (!imagePath.isEmpty() && !failedImagePaths.contains(imagePath)) {
+                failedImagePaths.append(imagePath);
+            }
+            if (!DbStore::execute(
+                        QStringLiteral(
+                            "UPDATE network_face SET image_path=NULL,"
+                            "feature_blob=NULL,model_version=NULL,status='IMAGE_FAILED' "
+                            "WHERE person_id=? AND face_hash=?"),
+                        {normalizedPersonId, faceHash})) {
+                return rollback();
+            }
+            if (duplicateConflictMessage.isEmpty()) {
+                duplicateConflictMessage = faceConflictMessage;
+            }
+            QJsonObject failedFace = face;
+            failedFace.insert(QStringLiteral("message"), faceConflictMessage);
+            transactionFailedFaces.append(failedFace);
+            continue;
+        }
+
+        // 同一网络 personId 下检测到相似人脸时，以本次响应中最新项为准，
+        // 删除被替换的旧记录；不同 personId 的冲突已在推理线程判为失败。
+        for (const QString &replacedHash : replacedNetworkHashes) {
+
+            const QList<QVariantMap> replacedRows = DbStore::query(
+                        QStringLiteral(
+                            "SELECT name,image_path FROM network_face "
+                            "WHERE person_id=? AND face_hash=? LIMIT 1"),
+                        {normalizedPersonId, replacedHash});
+            if (!replacedRows.isEmpty()) {
+                const QString replacedPath = replacedRows.first().value(
+                            QStringLiteral("image_path")).toString().trimmed();
+                if (!replacedPath.isEmpty()
+                        && !failedImagePaths.contains(replacedPath)) {
+                    failedImagePaths.append(replacedPath);
+                }
+                QJsonObject replacedNotice;
+                replacedNotice.insert(
+                            QStringLiteral("name"),
+                            replacedRows.first().value(
+                                QStringLiteral("name")).toString().trimmed());
+                replacedNotice.insert(QStringLiteral("faceHash"), replacedHash);
+                replacedNotice.insert(
+                            QStringLiteral("message"),
+                            QStringLiteral(
+                                "人员“%1”的该人脸已被本次最新下发的相似人脸替换。")
+                            .arg(currentPersonName));
+                transactionFaceNotices.append(replacedNotice);
+            }
+            if (!DbStore::execute(
+                        QStringLiteral(
+                            "DELETE FROM network_face "
+                            "WHERE person_id=? AND face_hash=?"),
+                        {normalizedPersonId, replacedHash})) {
+                return rollback();
+            }
+        }
+
+        // 提交时重新选择当前数据库中相似度最高的本地特征，避免本地图库
+        // 在校验期间发生更新。只替换特征数据，保留本地人员和录入原图。
+        const QList<QVariantMap> storedLocalFaces = DbStore::query(
+                    QStringLiteral(
+                        "SELECT f.id,f.person_id,f.feature_blob "
+                        "FROM face_feature f JOIN person p ON p.id=f.person_id "
+                        "WHERE COALESCE(p.deleted,0)=0"));
+        qint64 localFeatureId = 0;
+        qint64 localPersonId = 0;
+        float localBestCosine = -1.0f;
+        for (const QVariantMap &storedFace : storedLocalFaces) {
+            const float cosine = storedFeatureCosine(
+                        storedFace.value(QStringLiteral("feature_blob")).toByteArray(),
+                        feature);
+            if (cosine >= duplicateThreshold && cosine > localBestCosine) {
+                localFeatureId = storedFace.value(QStringLiteral("id")).toLongLong();
+                localPersonId = storedFace.value(
+                            QStringLiteral("person_id")).toLongLong();
+                localBestCosine = cosine;
+            }
+        }
+        if (localFeatureId > 0 && localPersonId > 0) {
+            if (!DbStore::execute(
+                        QStringLiteral(
+                            "UPDATE face_feature SET feature_blob=?,"
+                            "feature_size=?,model_version=?,quality=? "
+                            "WHERE id=?"),
+                        {feature, feature.size(), modelVersion,
+                         face.value(QStringLiteral("faceQuality")).toDouble(),
+                         localFeatureId})
+                    || !DbStore::execute(
+                        QStringLiteral(
+                            "UPDATE person SET updated_at=? WHERE id=?"),
+                        {QDateTime::currentDateTime().toString(
+                             QStringLiteral("yyyy-MM-dd HH:mm:ss")),
+                         localPersonId})) {
+                return rollback();
+            }
+        }
         if (!DbStore::execute(
                     QStringLiteral(
                         "UPDATE network_face SET feature_blob=?,model_version=?,"
@@ -1301,9 +1845,20 @@ bool NetworkPersonnelStore::finalizeFaceImageValidation(
                     {feature, modelVersion, normalizedPersonId, faceHash})) {
             return rollback();
         }
+        if (!replacedNetworkHashes.isEmpty()) {
+            QJsonObject latestNotice;
+            latestNotice.insert(QStringLiteral("name"),
+                                face.value(QStringLiteral("name")));
+            latestNotice.insert(QStringLiteral("faceHash"), faceHash);
+            latestNotice.insert(
+                        QStringLiteral("message"),
+                        QStringLiteral(
+                            "人员“%1”存在相似人脸，已以本次最新下发的人脸为准。")
+                        .arg(currentPersonName));
+            transactionFaceNotices.append(latestNotice);
+        }
     }
 
-    QStringList failedImagePaths;
     for (const QJsonValue &value : failedFaces) {
         const QJsonObject face = value.toObject();
         const QString faceHash = face.value(QStringLiteral("faceHash"))
@@ -1330,7 +1885,7 @@ bool NetworkPersonnelStore::finalizeFaceImageValidation(
             }
             if (!DbStore::execute(
                         QStringLiteral(
-                            "UPDATE network_face SET face_base64=NULL,image_path=NULL,"
+                            "UPDATE network_face SET image_path=NULL,"
                             "feature_blob=NULL,model_version=NULL,status='IMAGE_FAILED' "
                             "WHERE person_id=? AND face_hash=?"),
                         {normalizedPersonId, faceHash})) {
@@ -1339,17 +1894,34 @@ bool NetworkPersonnelStore::finalizeFaceImageValidation(
         }
     }
 
-    const QList<QVariantMap> incompleteRows = DbStore::query(
+    const QList<QVariantMap> committedFaceRows = DbStore::query(
                 QStringLiteral(
-                    "SELECT COUNT(*) AS incomplete_count FROM network_face "
-                    "WHERE person_id=? "
-                    "AND COALESCE(status,'')<>'IMAGE_READY'"),
+                    "SELECT image_path,feature_blob,model_version,status "
+                    "FROM network_face WHERE person_id=?"),
                 {normalizedPersonId});
-    if (incompleteRows.isEmpty()) {
-        return rollback();
+    if (committedFaceRows.isEmpty()) {
+        DbStore::transactionRollback();
+        if (error) {
+            *error = QStringLiteral("人员没有已落库的人脸记录");
+        }
+        return false;
     }
-    const bool ready = incompleteRows.first()
-            .value(QStringLiteral("incomplete_count")).toInt() == 0;
+    bool ready = true;
+    for (const QVariantMap &row : committedFaceRows) {
+        const QString imagePath = row.value(QStringLiteral("image_path"))
+                .toString().trimmed();
+        const QFileInfo imageFile(imagePath);
+        if (row.value(QStringLiteral("status")).toString()
+                    != QStringLiteral("IMAGE_READY")
+                || imagePath.isEmpty() || !imageFile.isFile()
+                || imageFile.size() <= 0
+                || row.value(QStringLiteral("feature_blob")).toByteArray().isEmpty()
+                || row.value(QStringLiteral("model_version"))
+                    .toString().trimmed().isEmpty()) {
+            ready = false;
+            break;
+        }
+    }
     const QString personState = ready
             ? QStringLiteral("READY")
             : QStringLiteral("FACE_PARTIAL_FAILED");
@@ -1368,6 +1940,15 @@ bool NetworkPersonnelStore::finalizeFaceImageValidation(
     }
 
     if (allFacesReady) *allFacesReady = ready;
+    if (!duplicateConflictMessage.isEmpty() && error) {
+        *error = duplicateConflictMessage;
+    }
+    if (commitFailedFaces) {
+        *commitFailedFaces = transactionFailedFaces;
+    }
+    if (commitFaceNotices) {
+        *commitFaceNotices = transactionFaceNotices;
+    }
 
     QString safePersonId = normalizedPersonId;
     safePersonId.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9_-]")),
@@ -1564,6 +2145,43 @@ NetworkPersonnelSyncResult NetworkPersonnelStore::applyFullPersonnel(
         }
     }
 
+    bool faceDataReady = faces.isEmpty();
+    if (!faces.isEmpty()) {
+        const QList<QVariantMap> readyRows = DbStore::query(
+                    QStringLiteral(
+                        "SELECT face_hash,image_path,feature_blob,model_version,status "
+                        "FROM network_face WHERE person_id=?"),
+                    {personId});
+        faceDataReady = !incomingFaceHashes.isEmpty()
+                && readyRows.size() == incomingFaceHashes.size();
+        for (const QVariantMap &row : readyRows) {
+            const QString faceHash = row.value(QStringLiteral("face_hash"))
+                    .toString().trimmed();
+            const QString imagePath = row.value(QStringLiteral("image_path"))
+                    .toString().trimmed();
+            const QFileInfo imageFile(imagePath);
+            if (!incomingFaceHashes.contains(faceHash)
+                    || row.value(QStringLiteral("status")).toString()
+                        != QStringLiteral("IMAGE_READY")
+                    || imagePath.isEmpty() || !imageFile.isFile()
+                    || imageFile.size() <= 0
+                    || row.value(QStringLiteral("feature_blob")).toByteArray().isEmpty()
+                    || row.value(QStringLiteral("model_version"))
+                        .toString().trimmed().isEmpty()) {
+                faceDataReady = false;
+                break;
+            }
+        }
+    }
+    if (!DbStore::execute(
+                QStringLiteral(
+                    "UPDATE network_person SET sync_state=? WHERE person_id=?"),
+                {faceDataReady ? QStringLiteral("READY")
+                               : QStringLiteral("FACE_PENDING"),
+                 personId})) {
+        return rollbackError(QStringLiteral("PERSON_FACE_STATE_FAILED"));
+    }
+
     // fullPersonnel 中的卡片、二维码、规则和楼层均按完整快照替换。
     if (!DbStore::execute(QStringLiteral("DELETE FROM network_ic_card WHERE person_id=?"), {personId})) {
         return rollbackError(QStringLiteral("CARD_DELETE_FAILED"));
@@ -1674,13 +2292,20 @@ NetworkPersonnelSyncResult NetworkPersonnelStore::applyFullPersonnel(
             return rollbackError(QStringLiteral("RULE_WRITE_FAILED"));
         }
 
-        if (rules.value(QStringLiteral("count")).toBool()
+        if ((rules.value(QStringLiteral("count")).toBool()
+             || rules.value(QStringLiteral("amount")).toBool())
                 && !DbStore::execute(
                     QStringLiteral("INSERT INTO network_access_usage("
-                                   "person_id,remaining_count,access_count,updated_at) "
-                                   "VALUES(?,?,0,?)"),
+                                   "person_id,remaining_count,access_count,"
+                                   "remaining_amount,used_amount,updated_at) "
+                                   "VALUES(?,?,0,?,0,?)"),
                     {personId,
-                     rules.value(QStringLiteral("countDataTotal")).toVariant(),
+                     rules.value(QStringLiteral("count")).toBool()
+                         ? rules.value(QStringLiteral("countDataTotal")).toVariant()
+                         : QVariant(),
+                     rules.value(QStringLiteral("amount")).toBool()
+                         ? rules.value(QStringLiteral("amountDataTotal")).toVariant()
+                         : QVariant(),
                      now})) {
             return rollbackError(QStringLiteral("USAGE_WRITE_FAILED"));
         }
@@ -2377,7 +3002,9 @@ NetworkAccessDeductApplyResult NetworkPersonnelStore::applyAccessDeductResult(
         bool deducted,
         const QString &message,
         const QVariant &remainingCount,
-        const QVariant &usedCount)
+        const QVariant &usedCount,
+        const QVariant &remainingAmount,
+        const QVariant &usedAmount)
 {
     NetworkAccessDeductApplyResult result;
     if (!initialized_ && !initialize()) {
@@ -2405,8 +3032,10 @@ NetworkAccessDeductApplyResult NetworkPersonnelStore::applyAccessDeductResult(
     }
 
     const QList<QVariantMap> personRows = DbStore::query(
-                QStringLiteral("SELECT person_id FROM network_person "
-                               "WHERE person_id=? LIMIT 1"),
+                QStringLiteral("SELECT p.person_id,r.count_enabled,r.amount_enabled "
+                               "FROM network_person p "
+                               "LEFT JOIN network_access_rule r ON r.person_id=p.person_id "
+                               "WHERE p.person_id=? LIMIT 1"),
                 {normalizedPersonId});
     if (personRows.isEmpty()) {
         result.error = QStringLiteral("deductResult 对应人员不存在");
@@ -2414,9 +3043,19 @@ NetworkAccessDeductApplyResult NetworkPersonnelStore::applyAccessDeductResult(
     }
 
     const bool shouldApply = code == 200 && deducted;
+    const bool countEnabled = personRows.first()
+            .value(QStringLiteral("count_enabled")).toInt() == 1;
+    const bool amountEnabled = personRows.first()
+            .value(QStringLiteral("amount_enabled")).toInt() == 1;
+    const bool amountFieldsPresent = remainingAmount.isValid()
+            && !remainingAmount.isNull() && usedAmount.isValid() && !usedAmount.isNull();
+    const bool countShouldApply = shouldApply && countEnabled;
+    const bool amountShouldApply = shouldApply && amountEnabled && amountFieldsPresent;
     qlonglong serverRemaining = -1;
     qlonglong serverUsed = -1;
-    if (shouldApply) {
+    double serverRemainingAmount = -1.0;
+    double serverUsedAmount = -1.0;
+    if (countShouldApply) {
         bool remainingOk = false;
         bool usedOk = false;
         serverRemaining = remainingCount.toLongLong(&remainingOk);
@@ -2427,6 +3066,27 @@ NetworkAccessDeductApplyResult NetworkPersonnelStore::applyAccessDeductResult(
                 || serverRemaining < 0 || serverUsed < 0) {
             result.error = QStringLiteral(
                         "扣次成功结果缺少有效 remainingCount 或 usedCount");
+            return result;
+        }
+    }
+    if (shouldApply && amountEnabled
+            && (remainingAmount.isValid() != usedAmount.isValid()
+                || remainingAmount.isNull() != usedAmount.isNull())) {
+        result.error = QStringLiteral(
+                    "扣减成功结果的 remainingAmount/usedAmount 必须同时提供");
+        return result;
+    }
+    if (amountShouldApply) {
+        bool remainingAmountOk = false;
+        bool usedAmountOk = false;
+        serverRemainingAmount = remainingAmount.toDouble(&remainingAmountOk);
+        serverUsedAmount = usedAmount.toDouble(&usedAmountOk);
+        if (!remainingAmountOk || !usedAmountOk
+                || !std::isfinite(serverRemainingAmount)
+                || !std::isfinite(serverUsedAmount)
+                || serverRemainingAmount < 0.0 || serverUsedAmount < 0.0) {
+            result.error = QStringLiteral(
+                        "扣减成功结果包含无效 remainingAmount 或 usedAmount");
             return result;
         }
     }
@@ -2443,32 +3103,64 @@ NetworkAccessDeductApplyResult NetworkPersonnelStore::applyAccessDeductResult(
 
     const QString now = QDateTime::currentDateTime().toString(
                 QStringLiteral("yyyy-MM-dd HH:mm:ss"));
-    if (shouldApply) {
+    if (shouldApply && (countShouldApply || amountShouldApply)) {
         const QList<QVariantMap> currentUsage = DbStore::query(
-                    QStringLiteral("SELECT remaining_count,access_count "
+                    QStringLiteral("SELECT remaining_count,access_count,"
+                                   "remaining_amount,used_amount "
                                    "FROM network_access_usage WHERE person_id=? LIMIT 1"),
                     {normalizedPersonId});
         const qlonglong currentUsed = currentUsage.isEmpty()
                 ? -1 : currentUsage.first().value(QStringLiteral("access_count")).toLongLong();
-        if (currentUsed > serverUsed) {
-            // 避免较晚到达的旧回执把本地权威计数倒退。
+        const double currentUsedAmount = currentUsage.isEmpty()
+                ? -1.0 : currentUsage.first().value(QStringLiteral("used_amount")).toDouble();
+        if ((countShouldApply && currentUsed > serverUsed)
+                || (amountShouldApply
+                    && currentUsedAmount > serverUsedAmount + 0.000001)) {
+            // 避免较晚到达的旧回执把本地权威次数或金额倒退。
             result.skipped = true;
         } else {
             if (!DbStore::execute(
                         QStringLiteral(
-                            "INSERT INTO network_access_usage("
-                            "person_id,remaining_count,access_count,updated_at) "
-                            "VALUES(?,?,?,?) "
-                            "ON CONFLICT(person_id) DO UPDATE SET "
-                            "remaining_count=excluded.remaining_count,"
-                            "access_count=excluded.access_count,"
-                            "updated_at=excluded.updated_at"),
-                        {normalizedPersonId, serverRemaining, serverUsed, now})) {
+                            "INSERT OR IGNORE INTO network_access_usage("
+                            "person_id,remaining_count,access_count,"
+                            "remaining_amount,used_amount,updated_at) "
+                            "VALUES(?,NULL,0,NULL,0,?)"),
+                        {normalizedPersonId, now})) {
                 return rollback(DbStore::lastError());
             }
-            result.countApplied = true;
-            result.remainingCount = serverRemaining;
-            result.usedCount = serverUsed;
+
+            QStringList assignments;
+            QList<QVariant> binds;
+            if (countShouldApply) {
+                assignments.append(QStringLiteral("remaining_count=?"));
+                binds.append(serverRemaining);
+                assignments.append(QStringLiteral("access_count=?"));
+                binds.append(serverUsed);
+            }
+            if (amountShouldApply) {
+                assignments.append(QStringLiteral("remaining_amount=?"));
+                binds.append(serverRemainingAmount);
+                assignments.append(QStringLiteral("used_amount=?"));
+                binds.append(serverUsedAmount);
+            }
+            assignments.append(QStringLiteral("updated_at=?"));
+            binds.append(now);
+            binds.append(normalizedPersonId);
+            if (!DbStore::execute(
+                        QStringLiteral("UPDATE network_access_usage SET %1 WHERE person_id=?")
+                        .arg(assignments.join(QLatin1Char(','))), binds)) {
+                return rollback(DbStore::lastError());
+            }
+            if (countShouldApply) {
+                result.countApplied = true;
+                result.remainingCount = serverRemaining;
+                result.usedCount = serverUsed;
+            }
+            if (amountShouldApply) {
+                result.amountApplied = true;
+                result.remainingAmount = serverRemainingAmount;
+                result.usedAmount = serverUsedAmount;
+            }
         }
     } else if (code == 200) {
         result.skipped = true;
@@ -2478,16 +3170,18 @@ NetworkAccessDeductApplyResult NetworkPersonnelStore::applyAccessDeductResult(
                 QStringLiteral(
                     "INSERT INTO network_access_deduct_result("
                     "result_id,method,person_id,code,deducted,message,"
-                    "remaining_count,used_count,processed_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?)"),
+                    "remaining_count,used_count,remaining_amount,used_amount,processed_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)"),
                 {normalizedId,
                  normalizedMethod,
                  normalizedPersonId,
                  code,
                  deducted ? 1 : 0,
                  message,
-                 shouldApply ? QVariant(serverRemaining) : QVariant(),
-                 shouldApply ? QVariant(serverUsed) : QVariant(),
+                 countShouldApply ? QVariant(serverRemaining) : QVariant(),
+                 countShouldApply ? QVariant(serverUsed) : QVariant(),
+                 amountShouldApply ? QVariant(serverRemainingAmount) : QVariant(),
+                 amountShouldApply ? QVariant(serverUsedAmount) : QVariant(),
                  now})) {
         return rollback(DbStore::lastError());
     }
@@ -2876,6 +3570,36 @@ NetworkPersonnelSyncResult NetworkPersonnelStore::deletePersonnel(
     const QString hash = payloadHash(envelope);
     NetworkPersonnelSyncResult cached;
     if (loadCachedResult(envelope, hash, &cached)) {
+        // 幂等删除也重试物理图片清理。旧版本可能已删除数据库记录，
+        // 但留下了图片文件，此时只能根据请求中的 faceHash 再次清理。
+        const QJsonObject cachedData = envelope.value(
+                    QStringLiteral("data")).toObject();
+        const QString cachedPersonId = cachedData.value(
+                    QStringLiteral("personId")).toString().trimmed();
+        const QString cachedDeleteType = cachedData.value(
+                    QStringLiteral("deleteType")).toString().trimmed().toUpper();
+        const bool cachedWholePerson = cachedDeleteType == QStringLiteral("ALL")
+                || cachedDeleteType == QStringLiteral("PERSON");
+        if (cached.ok && !cachedPersonId.isEmpty()
+                && (cachedWholePerson
+                    || cachedDeleteType == QStringLiteral("FACE"))) {
+            QStringList cachedFaceHashes;
+            if (!cachedWholePerson) {
+                const QJsonArray cachedItems = cachedData.value(
+                            QStringLiteral("items")).toArray();
+                for (const QJsonValue &item : cachedItems) {
+                    const QStringList keys = faceDeleteKeys(
+                                item.toString().trimmed());
+                    for (const QString &key : keys) {
+                        if (!cachedFaceHashes.contains(key)) {
+                            cachedFaceHashes.append(key);
+                        }
+                    }
+                }
+            }
+            removeDeletedFaceImages(cachedPersonId, QStringList(),
+                                    cachedFaceHashes, cachedWholePerson);
+        }
         return cached;
     }
 
@@ -2922,7 +3646,23 @@ NetworkPersonnelSyncResult NetworkPersonnelStore::deletePersonnel(
     };
 
     int removed = 0;
+    QStringList faceImagePaths;
+    QStringList deletedFaceHashes;
+    auto collectFaceImagePaths = [&faceImagePaths](
+            const QList<QVariantMap> &rows) {
+        for (const QVariantMap &row : rows) {
+            const QString path = row.value(QStringLiteral("image_path"))
+                    .toString().trimmed();
+            if (!path.isEmpty() && !faceImagePaths.contains(path)) {
+                faceImagePaths.append(path);
+            }
+        }
+    };
     if (deleteWholePerson) {
+        collectFaceImagePaths(DbStore::query(
+                    QStringLiteral(
+                        "SELECT image_path FROM network_face WHERE person_id=?"),
+                    {personId}));
         const QStringList childDeletes = {
             QStringLiteral("DELETE FROM network_face WHERE person_id=?"),
             QStringLiteral("DELETE FROM network_ic_card WHERE person_id=?"),
@@ -2972,6 +3712,16 @@ NetworkPersonnelSyncResult NetworkPersonnelStore::deletePersonnel(
                     ? faceDeleteKeys(value)
                     : QStringList{value};
             for (const QString &deleteKey : deleteKeys) {
+                if (deleteType == QStringLiteral("FACE")) {
+                    if (!deletedFaceHashes.contains(deleteKey)) {
+                        deletedFaceHashes.append(deleteKey);
+                    }
+                    collectFaceImagePaths(DbStore::query(
+                                QStringLiteral(
+                                    "SELECT image_path FROM network_face "
+                                    "WHERE person_id=? AND face_hash=?"),
+                                {personId, deleteKey}));
+                }
                 if (!DbStore::execute(sql, {personId, deleteKey})) {
                     return rollbackError(QStringLiteral("ITEM_DELETE_FAILED"));
                 }
@@ -3031,6 +3781,12 @@ NetworkPersonnelSyncResult NetworkPersonnelStore::deletePersonnel(
             || !DbStore::transactionCommit()) {
         DbStore::transactionRollback();
         return makeResult(false, QStringLiteral("DATABASE_COMMIT_FAILED"), DbStore::lastError(), personId);
+    }
+
+    // 数据库事务成功后再清理物理图片，避免数据库回滚时图片已不可恢复。
+    if (deleteWholePerson || deleteType == QStringLiteral("FACE")) {
+        removeDeletedFaceImages(personId, faceImagePaths,
+                                deletedFaceHashes, deleteWholePerson);
     }
     return result;
 }

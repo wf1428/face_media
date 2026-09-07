@@ -27,6 +27,7 @@
 #include <QTcpSocket>
 #include <QUdpSocket>
 #include <QDateTime>
+#include "ic_board/ic_event_bridge.h"
 #include "platform/rk3566_platform.h"
 
 /** @brief 创建网络检查、告警闪现和探测超时定时器。 */
@@ -53,8 +54,7 @@ NetworkStatusMonitor::NetworkStatusMonitor(QWidget *mainWindow,
     // 114.114.114.114 在部分网络会被屏蔽或丢包，因此不作为默认探测目标。
     pingTargets_ << QStringLiteral("223.5.5.5")
                  << QStringLiteral("8.8.8.8")
-                 << QStringLiteral("119.29.29.29")
-                 << QStringLiteral("1.1.1.1");
+                 << QStringLiteral("119.29.29.29");
 
     checkTimer_.setInterval(checkIntervalMs_);
     connect(&checkTimer_, &QTimer::timeout,
@@ -274,6 +274,8 @@ void NetworkStatusMonitor::checkNetworkStatus()
     }
 
     if (!isOnlineFeatureEnabled()) {
+        // offline_v1 不参与本次 online_v1 断线通行判定。
+        IcEventBridge::instance()->updateNetworkAvailability(true);
         clearWarning();
         return;
     }
@@ -281,6 +283,7 @@ void NetworkStatusMonitor::checkNetworkStatus()
     bool carrierValid = false;
     const bool linkUp = isWiredLinkUp(&carrierValid);
     if (carrierValid && !linkUp) {
+        IcEventBridge::instance()->updateNetworkAvailability(false);
         setWarning(WarningKind::LinkDown);
         return;
     }
@@ -373,9 +376,13 @@ void NetworkStatusMonitor::finishInternetProbe(bool internetOk)
     checkState_ = CheckState::Idle;
 
     if (!isOnlineFeatureEnabled()) {
+        IcEventBridge::instance()->updateNetworkAvailability(true);
         clearWarning();
         return;
     }
+
+    // 只用网络链路/外网探测结果更新通行离线状态；直播源无流不属于网络断开。
+    IcEventBridge::instance()->updateNetworkAvailability(internetOk);
 
     if (!internetOk) {
         if (lastDefaultRouteOk_) {

@@ -297,6 +297,23 @@ void FaceEnrollWidget::setStatusText(const QString &text)
     }
 }
 
+/** @brief 清除未锁定画面并在录入预览区域显示摄像头异常提示。 */
+void FaceEnrollWidget::setCameraUnavailableMessage(const QString &message)
+{
+    if (autoModeEnabled_ && autoCaptured_) {
+        return;
+    }
+
+    currentFrame_ = QImage();
+    currentPreviewFrame_ = QImage();
+    currentFaces_.clear();
+    detectionStatus_.clear();
+    livenessStatus_.clear();
+    if (preview_) {
+        preview_->setCameraUnavailableMessage(message);
+    }
+}
+
 /** @brief 预填人员编号和姓名。 */
 void FaceEnrollWidget::setPersonFields(const QString &personNo, const QString &name)
 {

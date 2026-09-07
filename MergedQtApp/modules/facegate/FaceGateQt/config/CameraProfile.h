@@ -13,6 +13,7 @@
 
 /** @brief 摄像头硬件来源。 */
 enum class CameraSourceType {
+    Auto,
     Mipi,
     Usb
 };
@@ -29,7 +30,7 @@ struct UsbCameraControlConfig {
 
 /** @brief 启动一次摄像头采集所需的完整参数。 */
 struct CameraProfile {
-    CameraSourceType source = CameraSourceType::Mipi; /**< MIPI 或 USB 后端。 */
+    CameraSourceType source = CameraSourceType::Auto; /**< 自动、MIPI 或 USB 后端。 */
     QString devicePath = QStringLiteral("/dev/video0"); /**< V4L2 设备节点。 */
     int width = 640;                         /**< 请求采集宽度，单位 px。 */
     int height = 480;                        /**< 请求采集高度，单位 px。 */

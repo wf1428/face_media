@@ -11,6 +11,7 @@
 #include <QObject>
 #include <QLocalSocket>
 #include <QJsonObject>
+#include <QQueue>
 
 /** @brief 与本机 mqttd 通过 QLocalSocket 交换换行分隔 JSON 帧的客户端。 */
 class MqttIpcClient : public QObject
@@ -60,15 +61,22 @@ private slots:
     void onSocketDisconnected();
     /** @brief 累积读取数据并逐行提取完整帧。 */
     void onSocketReadyRead();
+    /** @brief 分批向上层投递已组装帧，避免一次突发长期占用事件循环。 */
+    void processBufferedFrames();
     /** @brief 将 QLocalSocket 错误转换为业务错误文本。 */
     void onSocketError(QLocalSocket::LocalSocketError err);
 
 private:
-    /** @brief 从 buf 提取一个换行分隔帧并移除已消费数据。 */
-    static bool extractOneFrame(QByteArray &buf, QByteArray &outFrame);
+    /** @brief 从 buf 的 offset 位置提取一帧，只推进游标而不反复搬移缓冲区。 */
+    static bool extractOneFrame(const QByteArray &buf,
+                                int &offset,
+                                QByteArray &outFrame);
 
 private:
     QLocalSocket *socket = nullptr; /**< mqttd 本地套接字。 */
     QByteArray readBuffer;         /**< 跨 readyRead 保存的未完整行。 */
+    QQueue<QByteArray> readyFrames; /**< 已完整组装、等待分批投递的帧。 */
     QString serverPath;            /**< 当前连接路径。 */
+    bool frameDrainScheduled = false; /**< 是否已有下一轮分批投递任务。 */
+    int maxFramesPerDrain = 4;      /**< 每轮最多同步投递的帧数。 */
 };

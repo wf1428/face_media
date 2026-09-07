@@ -47,12 +47,18 @@ public:
     /** @return 模块已经激活且未关闭时返回 true。 */
     bool isActive() const override;
 
-    /** @return true only on the unattended face-recognition screen. */
+    /** @return 仅在无人值守的人脸识别主页允许外壳执行在场切换。 */
     bool allowsPresenceSwitch() const override;
 
 signals:
-    /** Forwarded when a successful recognition result becomes visible. */
+    /** @brief 当门禁界面显示识别成功结果时向应用外壳转发。 */
     void recognitionSucceeded();
+
+    /** @brief 当门禁界面显示最终人脸识别结果时向应用外壳转发。 */
+    void recognitionFinished();
+
+    /** @brief 转发主识别画面中的人脸检测状态。 */
+    void facePresenceChanged(bool present);
 
 private:
     QPointer<QWidget> widgetParent_;    /**< 门禁窗口的 QWidget 父对象。 */

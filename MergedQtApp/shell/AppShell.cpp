@@ -1,8 +1,8 @@
 #include "AppShell.h"
 
+#include "LedFillLight.h"
 #include "ModeController.h"
 #include "Sr505PresenceSensor.h"
-#include "components/cursoroverlay/CursorOverlay.h"
 #include "modules/facegate/FaceGateModuleAdapter.h"
 #include "modules/multimedia/MultimediaModuleAdapter.h"
 #include "platform/rk3566_platform.h"
@@ -11,7 +11,6 @@
 #include <QDebug>
 #include <QDir>
 #include <QFileInfo>
-#include <QResizeEvent>
 #include <QSettings>
 #include <QStackedWidget>
 #include <QTimer>
@@ -60,9 +59,9 @@ bool AppShell::initialize()
         settings.value(QStringLiteral("modeSwitch/sr505ReconnectMs"), 1000).toInt();
     const int recognitionReturnMs =
         settings.value(QStringLiteral("modeSwitch/recognitionReturnMs"), 5000).toInt();
-    const bool cursorEnabled =
-        settings.value(QStringLiteral("cursor/enabled"), true).toBool();
-
+    const QString fillLightDevice =
+        settings.value(QStringLiteral("fillLight/device"), QStringLiteral("/dev/led"))
+            .toString().trimmed();
     if (initialMode != QStringLiteral("multimedia")) {
         qWarning() << "[SHELL] unsupported initialMode; forcing multimedia" << initialMode;
     }
@@ -77,18 +76,16 @@ bool AppShell::initialize()
     stack_->addWidget(multimediaModule_->rootWidget());
     stack_->addWidget(faceGateModule_->rootWidget());
 
-    cursor_ = new CursorOverlay(this);
-    cursor_->setOverlayEnabled(cursorEnabled);
     modeController_ = new ModeController(stack_,
                                          multimediaModule_,
                                          faceGateModule_,
-                                         cursor_,
                                          recognitionReturnMs,
                                          this);
     presenceSensor_ = new Sr505PresenceSensor(sr505Device,
-                                              sr505ActiveHigh,
-                                              sr505ReconnectMs,
-                                              this);
+                                               sr505ActiveHigh,
+                                               sr505ReconnectMs,
+                                               this);
+    fillLight_ = new LedFillLight(fillLightDevice, this);
     presenceReconcileTimer_ = new QTimer(this);
     presenceReconcileTimer_->setInterval(200);
 
@@ -101,7 +98,15 @@ bool AppShell::initialize()
                 qWarning() << "[PRESENCE] fault" << message;
             });
     connect(faceGateModule_, &FaceGateModuleAdapter::recognitionSucceeded,
-            modeController_, &ModeController::handleRecognitionSucceeded);
+            this, [this]() {
+                if (fillLight_) {
+                    fillLight_->turnOff();
+                }
+            });
+    connect(faceGateModule_, &FaceGateModuleAdapter::recognitionFinished,
+            modeController_, &ModeController::handleRecognitionFinished);
+    connect(faceGateModule_, &FaceGateModuleAdapter::facePresenceChanged,
+            modeController_, &ModeController::handleFacePresenceChanged);
     connect(presenceReconcileTimer_, &QTimer::timeout, this, [this]() {
         if (presenceSensor_ && modeController_) {
             modeController_->reconcilePresenceLevel(
@@ -109,8 +114,20 @@ bool AppShell::initialize()
         }
     });
     connect(modeController_, &ModeController::stateChanged,
-            this, [this](ModeController::AppModeState) {
-                raiseCursorOverlay();
+            this, [this](ModeController::AppModeState state) {
+                if (state == ModeController::AppModeState::FaceGateActive
+                        && fillLight_) {
+                    fillLight_->turnOn();
+                } else if (state == ModeController::AppModeState::MultimediaActive
+                           && fillLight_) {
+                    fillLight_->turnOff();
+                }
+            });
+    connect(modeController_, &ModeController::recognitionResumed,
+            this, [this]() {
+                if (fillLight_) {
+                    fillLight_->turnOn();
+                }
             });
     connect(modeController_, &ModeController::switchFailed,
             this, [](const QString &message) {
@@ -131,10 +148,9 @@ bool AppShell::initialize()
             << "config=" << shellConfigPath()
             << "presenceDriver=sr505"
             << "sr505Device=" << sr505Device
+            << "fillLightDevice=" << fillLightDevice
             << "recognitionReturnMs=" << recognitionReturnMs
-            << "cursorEnabled=" << cursorEnabled
             << "facegateConfig=" << faceGateConfigPath();
-    raiseCursorOverlay();
     return true;
 }
 
@@ -149,6 +165,9 @@ void AppShell::shutdown()
     }
     if (presenceReconcileTimer_) {
         presenceReconcileTimer_->stop();
+    }
+    if (fillLight_) {
+        fillLight_->turnOff();
     }
     if (modeController_) {
         modeController_->shutdown();
@@ -165,23 +184,6 @@ QWidget *AppShell::multimediaRootWidget() const
 QWidget *AppShell::activeRootWidget() const
 {
     return stack_ ? stack_->currentWidget() : nullptr;
-}
-
-void AppShell::raiseCursorOverlay()
-{
-    QTimer::singleShot(0, this, [this]() {
-        if (cursor_) {
-            cursor_->raise();
-        }
-    });
-}
-
-void AppShell::resizeEvent(QResizeEvent *event)
-{
-    QWidget::resizeEvent(event);
-    if (cursor_) {
-        cursor_->raise();
-    }
 }
 
 QString AppShell::shellConfigPath() const

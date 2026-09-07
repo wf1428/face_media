@@ -149,6 +149,13 @@ bool CameraService::start(const CameraProfile &profile)
         return true;
     }
 
+    // 采集线程可能因设备不存在或初始化失败而自行退出。此时 running_ 已经
+    // 变为 false，但 std::thread 在 join() 前仍然是 joinable 的，直接向
+    // captureThread_ 赋予新线程会触发 std::terminate()。
+    if (captureThread_.joinable()) {
+        captureThread_.join();
+    }
+
     profile_ = profile;
     profile_.pixelFormat = profile_.pixelFormat.trimmed().toLower();
     {

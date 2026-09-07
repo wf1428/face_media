@@ -1,6 +1,9 @@
 /**
  * @file PersonXlsxExporter.cpp
  * @brief 人员数据库到固定31列 XLSX 模板的映射及无外部命令写入实现。
+ *
+ * @author Dulin
+ * @date 2026-08-28
  */
 
 #include "PersonXlsxExporter.h"
@@ -33,13 +36,15 @@
 
 namespace {
 
+/** @brief 一组待写入 XLSX 的人员行及其查询状态。 */
 struct ExportRows
 {
-    bool ok = false;
-    QVector<QStringList> rows;
-    QString error;
+    bool ok = false;                  /**< 查询和映射成功时为 true。 */
+    QVector<QStringList> rows;        /**< 每行固定包含 31 列人员数据。 */
+    QString error;                    /**< 查询或映射失败原因。 */
 };
 
+/** @return JSON 文本中的对象；格式无效时返回空对象。 */
 QJsonObject jsonObject(const QString &text)
 {
     QJsonParseError error;
@@ -48,6 +53,7 @@ QJsonObject jsonObject(const QString &text)
             ? document.object() : QJsonObject();
 }
 
+/** @return JSON 文本中的数组；格式无效时返回空数组。 */
 QJsonArray jsonArray(const QString &text)
 {
     QJsonParseError error;
@@ -56,6 +62,7 @@ QJsonArray jsonArray(const QString &text)
             ? document.array() : QJsonArray();
 }
 
+/** @return JSON 字符串、数值或布尔字段的文本表示。 */
 QString jsonText(const QJsonObject &object, const QString &key)
 {
     const QJsonValue value = object.value(key);
@@ -66,6 +73,7 @@ QString jsonText(const QJsonObject &object, const QString &key)
     return QString();
 }
 
+/** @return 最多保留两位小数并移除末尾零的紧凑数值文本。 */
 QString compactNumber(double value)
 {
     QString text = QString::number(value, 'f', 2);
@@ -74,6 +82,7 @@ QString compactNumber(double value)
     return text;
 }
 
+/** @brief 从 JSON 数值或可转数值字符串中读取 double。 */
 bool jsonNumber(const QJsonObject &object, const QString &key, double *value)
 {
     const QJsonValue item = object.value(key);
@@ -90,6 +99,7 @@ bool jsonNumber(const QJsonObject &object, const QString &key, double *value)
     return false;
 }
 
+/** @brief 从数据库行的指定字段读取 double。 */
 bool mapNumber(const QVariantMap &row, const QString &key, double *value)
 {
     const QVariant item = row.value(key);
@@ -100,6 +110,7 @@ bool mapNumber(const QVariantMap &row, const QString &key, double *value)
     return ok;
 }
 
+/** @return 固定 31 列模板中指定索引的表头。 */
 QString headersRow(int index)
 {
     static const QStringList headers = {
@@ -118,6 +129,7 @@ QString headersRow(int index)
     return headers.value(index);
 }
 
+/** @return 固定 31 列人员模板表头行。 */
 QStringList headerRow()
 {
     QStringList row;
@@ -125,6 +137,7 @@ QStringList headerRow()
     return row;
 }
 
+/** @return 与各模板列对应的填写说明行。 */
 QStringList instructionRow()
 {
     return QStringList{
@@ -148,6 +161,7 @@ QStringList instructionRow()
     };
 }
 
+/** @return 展示复合字段格式的模板示例行。 */
 QStringList exampleRow()
 {
     return QStringList{
@@ -166,6 +180,7 @@ QStringList exampleRow()
     };
 }
 
+/** @return 数据库存储值对应的中文人员类型。 */
 QString personTypeText(QString value)
 {
     value = value.trimmed();
@@ -178,6 +193,7 @@ QString personTypeText(QString value)
     return value;
 }
 
+/** @return 优先使用人员 JSON，否则由毫秒时间戳生成的入职日期文本。 */
 QString dateText(const QVariantMap &row, const QJsonObject &person)
 {
     QString text = jsonText(person, QStringLiteral("hireDateText")).trimmed();
@@ -199,6 +215,7 @@ QString dateText(const QVariantMap &row, const QJsonObject &person)
                    .toString(QStringLiteral("yyyy-MM-dd")) : QString();
 }
 
+/** @brief 查询指定列并把非空值连接为逗号分隔文本。 */
 QString joinedColumn(const QString &sql,
                      const QList<QVariant> &binds,
                      const QString &column)
@@ -212,6 +229,7 @@ QString joinedColumn(const QString &sql,
     return values.join(QLatin1Char(','));
 }
 
+/** @return 指定人员的人脸名称或图像文件名列表。 */
 QString faceFileList(const QString &personId)
 {
     QStringList values;
@@ -228,6 +246,7 @@ QString faceFileList(const QString &personId)
     return values.join(QLatin1Char(','));
 }
 
+/** @return 按“设备:楼层,楼层”格式分组的人员楼层权限。 */
 QString floorText(const QString &personId)
 {
     QMap<QString, QStringList> devices;
@@ -247,6 +266,7 @@ QString floorText(const QString &personId)
     return parts.join(QStringLiteral("; "));
 }
 
+/** @return 优先使用原始规则文本，否则由定时规则表重建的可读文本。 */
 QString timingText(const QString &personId, const QJsonObject &rules)
 {
     const QString stored = jsonText(rules, QStringLiteral("timingRuleText")).trimmed();
@@ -274,6 +294,7 @@ QString timingText(const QString &personId, const QJsonObject &rules)
     return result.join(QStringLiteral("; "));
 }
 
+/** @return 由规则 JSON 或兼容数据库列推导的已启用功能名称列表。 */
 QString enabledFeatures(const QJsonObject &person,
                         const QJsonObject &rules,
                         const QVariantMap &ruleRow)
@@ -310,6 +331,11 @@ QString enabledFeatures(const QJsonObject &person,
     return values.join(QLatin1Char(','));
 }
 
+/**
+ * @brief 将一名网络人员及其卡、二维码、权限和用量记录映射为 31 列。
+ *
+ * JSON 字段优先于兼容列，缺失时再回退到结构化表，保证新旧数据库均可导出。
+ */
 QStringList networkPersonRow(const QVariantMap &row, int sequence)
 {
     const QString personId = row.value(QStringLiteral("person_id")).toString();
@@ -320,7 +346,8 @@ QStringList networkPersonRow(const QVariantMap &row, int sequence)
     const QVariantMap ruleRow = ruleRows.value(0);
     const QJsonObject rules = jsonObject(ruleRow.value(QStringLiteral("raw_json")).toString());
     const QList<QVariantMap> usageRows = DbStore::query(
-                QStringLiteral("SELECT remaining_count FROM network_access_usage "
+                QStringLiteral("SELECT remaining_count,remaining_amount "
+                               "FROM network_access_usage "
                                "WHERE person_id=? LIMIT 1"), {personId});
 
     const QString cards = joinedColumn(
@@ -347,7 +374,11 @@ QStringList networkPersonRow(const QVariantMap &row, int sequence)
 
     double amountRemaining = 0;
     double amountTotal = 0;
-    const bool hasAmountRemaining = jsonNumber(rules, QStringLiteral("amountDataRemaining"), &amountRemaining);
+    const bool hasAmountRemaining = (!usageRows.isEmpty()
+                                     && mapNumber(usageRows.first(),
+                                                  QStringLiteral("remaining_amount"),
+                                                  &amountRemaining))
+            || jsonNumber(rules, QStringLiteral("amountDataRemaining"), &amountRemaining);
     const bool hasAmountTotal = jsonNumber(rules, QStringLiteral("amountDataTotal"), &amountTotal)
             || mapNumber(ruleRow, QStringLiteral("amount_total"), &amountTotal);
     const QString amounts = hasAmountRemaining || hasAmountTotal
@@ -439,6 +470,7 @@ QStringList networkPersonRow(const QVariantMap &row, int sequence)
     };
 }
 
+/** @brief 查询全部有效网络人员并映射为模板行。 */
 ExportRows loadNetworkRows()
 {
     ExportRows result;
@@ -462,6 +494,7 @@ ExportRows loadNetworkRows()
     return result;
 }
 
+/** @brief 查询 FaceGate 本地离线人员并映射到模板兼容列。 */
 ExportRows loadLocalRows()
 {
     ExportRows result;
@@ -491,6 +524,7 @@ ExportRows loadLocalRows()
     return result;
 }
 
+/** @brief 合并网络和本地人员行，并重新生成连续序号。 */
 ExportRows loadAllRows()
 {
     ExportRows result = loadNetworkRows();
@@ -506,6 +540,7 @@ ExportRows loadAllRows()
     return result;
 }
 
+/** @brief 移除 XML 1.0 非法控制字符并转义五种预定义实体。 */
 QString xmlEscape(QString value)
 {
     QString clean;
@@ -524,6 +559,7 @@ QString xmlEscape(QString value)
     return clean;
 }
 
+/** @return 零基列号对应的 Excel 列名，例如 0=A、26=AA。 */
 QString columnName(int zeroBased)
 {
     QString result;
@@ -536,6 +572,11 @@ QString columnName(int zeroBased)
     return result;
 }
 
+/**
+ * @brief 生成包含表头、说明、示例及人员数据的 worksheet XML。
+ *
+ * 所有单元格使用 inlineStr，避免维护 sharedStrings 关系；首行冻结并启用筛选。
+ */
 QByteArray worksheetXml(const QVector<QStringList> &personRows)
 {
     QVector<QStringList> rows;
@@ -583,6 +624,7 @@ QByteArray worksheetXml(const QVector<QStringList> &personRows)
     return xml.toUtf8();
 }
 
+/** @return 固定模板使用的字体、填充、边框和单元格样式 XML。 */
 QByteArray stylesXml()
 {
     return QByteArrayLiteral(
@@ -614,26 +656,34 @@ QByteArray stylesXml()
         "</styleSheet>");
 }
 
+/** @brief 以小端字节序追加 16 位整数。 */
 void append16(QByteArray *data, quint16 value)
 {
     data->append(char(value & 0xFFu));
     data->append(char((value >> 8) & 0xFFu));
 }
 
+/** @brief 以小端字节序追加 32 位整数。 */
 void append32(QByteArray *data, quint32 value)
 {
     append16(data, quint16(value & 0xFFFFu));
     append16(data, quint16((value >> 16) & 0xFFFFu));
 }
 
+/** @brief 待写入 ZIP 的未压缩文件及其中央目录元数据。 */
 struct ZipEntry
 {
-    QByteArray name;
-    QByteArray data;
-    quint32 crc = 0;
-    quint32 offset = 0;
+    QByteArray name;      /**< UTF-8 内部路径。 */
+    QByteArray data;      /**< 未压缩文件内容。 */
+    quint32 crc = 0;      /**< 内容 CRC32。 */
+    quint32 offset = 0;   /**< 本地文件头在归档中的偏移。 */
 };
 
+/**
+ * @brief 组装最小 XLSX ZIP 包并通过 QSaveFile 原子提交到目标路径。
+ *
+ * 设备端不依赖外部 zip 命令；所有条目采用 Store 方法，中央目录偏移在内存中计算。
+ */
 bool writeXlsx(const QString &filePath,
                const QVector<QStringList> &rows,
                QString *error)
@@ -761,6 +811,7 @@ bool writeXlsx(const QString &filePath,
 
 } // namespace
 
+/** @brief 按人员范围查询固定列数据，生成 XLSX 后关闭线程数据库连接。 */
 PersonXlsxExportResult PersonXlsxExporter::exportToFile(PersonExportKind kind,
                                                         const QString &filePath)
 {
@@ -801,6 +852,7 @@ PersonXlsxExportResult PersonXlsxExporter::exportToFile(PersonExportKind kind,
     return result;
 }
 
+/** @return 人员导出范围对应的中文名称。 */
 QString PersonXlsxExporter::kindName(PersonExportKind kind)
 {
     switch (kind) {

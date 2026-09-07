@@ -1,6 +1,9 @@
 /**
  * @file UsbPersonExportTarget.cpp
- * @brief 人员XLSX导出所需的U盘检测、可写挂载、目录创建和安全卸载。
+ * @brief 人员 XLSX 导出所需的 U 盘检测、可写挂载、目录创建和安全卸载。
+ *
+ * @author Dulin
+ * @date 2026-08-28
  */
 
 #include "UsbPersonExportTarget.h"
@@ -17,12 +20,14 @@
 
 namespace {
 
+/** @brief 从 /proc/mounts 识别出的已挂载 USB 卷。 */
 struct MountedVolume
 {
-    QString device;
-    QString mountPoint;
+    QString device;      /**< 块设备节点。 */
+    QString mountPoint;  /**< 已有挂载目录。 */
 };
 
+/** @brief 还原 /proc/mounts 对空格、制表符和反斜杠的八进制转义。 */
 QString decodeMountField(QString value)
 {
     value.replace(QStringLiteral("\\040"), QStringLiteral(" "));
@@ -31,6 +36,7 @@ QString decodeMountField(QString value)
     return value;
 }
 
+/** @return 当前已挂载的 /dev/sd* USB 卷。 */
 QList<MountedVolume> mountedUsbVolumes()
 {
     QList<MountedVolume> result;
@@ -50,6 +56,10 @@ QList<MountedVolume> mountedUsbVolumes()
     return result;
 }
 
+/**
+ * @brief 枚举尚未挂载的 USB 块设备。
+ * @return 优先返回分区节点；没有分区时才返回整盘节点。
+ */
 QStringList unmountedUsbDevices(const QList<MountedVolume> &mounted)
 {
     QSet<QString> mountedDevices;
@@ -73,6 +83,7 @@ QStringList unmountedUsbDevices(const QList<MountedVolume> &mounted)
     return partitions.isEmpty() ? wholeDevices : partitions;
 }
 
+/** @brief 执行有限时长的系统挂载命令，并保留标准错误作为失败原因。 */
 bool runProcess(const QString &program, const QStringList &arguments, QString *error)
 {
     QProcess process;
@@ -97,6 +108,7 @@ bool runProcess(const QString &program, const QStringList &arguments, QString *e
     return true;
 }
 
+/** @brief 创建 person 目录并通过临时探针文件验证介质确实可写。 */
 bool preparePersonDirectory(const QString &mountPoint,
                             QString *personDirectory,
                             QString *error)
@@ -124,6 +136,12 @@ bool preparePersonDirectory(const QString &mountPoint,
 
 } // namespace
 
+/**
+ * @brief 轮询已挂载和未挂载设备，直到取得可写的人员导出目录。
+ *
+ * 已挂载但只读的卷会尝试重新挂载为可写；应用自行挂载的设备使用固定挂载点，
+ * 失败时立即卸载并清理目录，避免把半完成挂载留给下一次任务。
+ */
 UsbPersonExportVolume UsbPersonExportTarget::waitForWritableVolume(
         int timeoutMs,
         const std::atomic_bool *cancelled)
@@ -209,6 +227,11 @@ UsbPersonExportVolume UsbPersonExportTarget::waitForWritableVolume(
     return result;
 }
 
+/**
+ * @brief 先执行 sync，再卸载卷并移除应用创建的挂载目录。
+ *
+ * 即使 sync 报错仍尝试卸载，以优先释放系统资源；最终把同步失败返回调用方。
+ */
 bool UsbPersonExportTarget::flushAndUnmount(const UsbPersonExportVolume &volume,
                                             QString *error)
 {

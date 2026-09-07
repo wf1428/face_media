@@ -594,6 +594,37 @@ RECORDED 下载示例：
 
 当 `code=200`、`deducted=true` 时，`remainingCount` 和 `usedCount` 必须是非负 JSON 数字；设备以平台值覆盖本地人员剩余次数和已用次数。顶层 `id` 用于幂等，重复回执不会重复应用；较晚到达且 `usedCount` 更小的旧回执不会把本地计数倒退。`deducted=false` 时记录为成功跳过，不修改本地次数。
 
+### 4.6.3 MQTT 断线通行的批量补报
+
+本节的“断线”是指设备仍运行在 `online_v1`，但网络链路/外网不可用，或者与 MQTT Broker 的连接已经断开；不是 `offline_v1` 运行模式。两种状态任意一个成立都按离线通行处理。网络和 MQTT 状态变化只更新统一离线标志，不直接写入通行次数；每次刷卡、二维码、人脸或密码实际完成 RS485 通行后只由对应完成事件记录一次，因此两个断线条件重复触发不会造成重复计数。二维码在该状态下使用本地人员、规则、有效期和楼层权限完成校验。
+
+网络恢复且 Broker 恢复连接后，设备按通行类型分别发送一条批量 `accessResult`。发生过网络断开后，即使设备内仍保留旧的 MQTT“已连接”状态，也不会在网络刚恢复时直接补报；设备会先向 mqttd 重新查询连接状态，收到断网后的 MQTT 已连接确认才发送。四种 method 为 `card.accessResult`、`qr.accessResult`、`face.accessResult` 和 `password.accessResult`；没有待报记录的类型不发送：
+
+```json
+{
+  "method": "password.accessResult",
+  "id": "设备生成的UUID",
+  "deviceId": "YCEEQZA10C1FFC62",
+  "data": {
+    "records": [
+      {
+        "personId": "P10001",
+        "success": true,
+        "count": 3
+      },
+      {
+        "personId": "P10002",
+        "success": true,
+        "count": 2
+      }
+    ]
+  },
+  "time": "2026-08-12 18:00:00"
+}
+```
+
+`count` 是该人员在本次断线待报期间通过相应方式实际成功通行的累计次数。消息成功提交给 mqttd 后，设备按本次快照消费本地待报数；补报过程中新增的通行次数继续保留，避免误删。本功能不新增对批量消息的 `deductResult` 关联或等待逻辑。
+
 ### 4.7 远程呼梯 `remoteCall`
 
 ```json
@@ -824,6 +855,7 @@ CREDENTIAL 示例：
 - [ ] 人员新增、hash 未变化、ID 幂等、ID 冲突、部分删除、全量 hash 对账均验证。
 - [ ] `face.requestImages → face.responseImages → Imagesresult` 成功与失败路径均验证。
 - [ ] `face.accessResult` 成功与 RS485 失败事件均验证。
+- [ ] MQTT Broker 断线期间四种通行成功次数能够持久化，重连后按 method 分批补报，补报期间新增次数不会丢失。
 - [ ] `remoteCall` 楼层边界（-8、-1、1、120、0、字符串）、RS485 成功/失败、`remoteCall.accessResult` 均验证。
 - [ ] `remoteCall.deductResult` 的成功同步、跳过、设备失败、失败不回退本地次数、重复回执和同人员同楼层并发保护均验证。
 - [ ] QR 完整链路、拒绝、超时、重复消息、VISITOR/CREDENTIAL、floorHex 不一致均验证。

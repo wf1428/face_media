@@ -16,9 +16,9 @@
 #include <unistd.h>
 
 #include <QDebug>
-#include <QFileInfo>
 
 #include "common/debug/probe_log.h"
+#include "ic_board/rs485_floor_frame_builder.h"
 
 /** @brief 初始化串口读取和接收空闲定时器的信号连接。 */
 Rs485DriverPort::Rs485DriverPort(QObject* parent) : QObject(parent)
@@ -32,10 +32,10 @@ Rs485DriverPort::Rs485DriverPort(QObject* parent) : QObject(parent)
 /**
  * @brief 打开 RS485 串口并配置收发方向控制。
  *
- * RK3566 优先使用内核 TIOCSRS485；仅当 dirDev 存在时沿用旧硬件的
- * 0/1 外部方向控制。内核 ioctl 不可用时继续依赖驱动或收发器自动方向。
+ * RK3566 使用内核 TIOCSRS485 配置 UART 自动方向；内核 ioctl 不可用时
+ * 继续依赖设备树中已经启用的驱动或收发器自动方向。
  */
-bool Rs485DriverPort::open(const QString& ttyDev, int baud, const QString& dirDev,
+bool Rs485DriverPort::open(const QString& ttyDev, int baud,
                            QSerialPort::DataBits db, QSerialPort::Parity par,
                            QSerialPort::StopBits sb)
 {
@@ -54,30 +54,11 @@ bool Rs485DriverPort::open(const QString& ttyDev, int baud, const QString& dirDe
         return false;
     }
 
-    // 兼容旧 T113 外部方向设备；RK3566 通常由 UART 驱动自动切换 DE/RE。
-    externalDirection_ = !dirDev.trimmed().isEmpty() && QFileInfo::exists(dirDev);
-    if (externalDirection_) {
-        dirDev_.setFileName(dirDev);
-        if (!dirDev_.open(QIODevice::WriteOnly)) {
-            emit errorOccured(QStringLiteral("打开 RS485 方向设备 %1 失败: %2")
-                              .arg(dirDev, dirDev_.errorString()));
-            serial_.close();
-            externalDirection_ = false;
-            return false;
-        }
-        if (!setDirRx()) {
-            emit errorOccured(QStringLiteral("RS485 方向设备切换到接收失败"));
-            close();
-            return false;
-        }
-    } else {
-        kernelDirection_ = configureKernelRs485();
-        if (!kernelDirection_) {
-            // 部分 RK3566 BSP 在设备树中已固定为自动方向，TIOCSRS485 可能返回
-            // ENOTTY/EINVAL。此时继续工作，由驱动或收发器硬件自行控制方向。
-            qWarning() << "[RS485] TIOCSRS485 unavailable; continue with hardware/driver auto direction"
-                       << ttyDev << strerror(errno);
-        }
+    if (!configureKernelRs485()) {
+        // 部分 RK3566 BSP 在设备树中已固定为自动方向，TIOCSRS485 可能返回
+        // ENOTTY/EINVAL。此时继续工作，由驱动或收发器硬件自行控制方向。
+        qWarning() << "[RS485] TIOCSRS485 unavailable; continue with hardware/driver auto direction"
+                   << ttyDev << strerror(errno);
     }
 
     rxBuf_.clear();
@@ -101,18 +82,12 @@ bool Rs485DriverPort::configureKernelRs485()
     return ::ioctl(static_cast<int>(handle), TIOCSRS485, &config) == 0;
 }
 
-/** @brief 停止接收定时器、恢复接收方向并关闭设备。 */
+/** @brief 停止接收定时器并关闭串口。 */
 void Rs485DriverPort::close()
 {
     rxIdleTimer_.stop();
-    if (dirDev_.isOpen()) {
-        setDirRx();
-        dirDev_.close();
-    }
     if (serial_.isOpen()) serial_.close();
 
-    externalDirection_ = false;
-    kernelDirection_ = false;
     rxBuf_.clear();
 }
 
@@ -122,33 +97,8 @@ void Rs485DriverPort::setInterByteTimeoutMs(int ms)
     interByteTimeoutMs_ = qMax(1, ms);
 }
 
-/** @brief 在外部方向设备上写入 1，切换为发送。 */
-bool Rs485DriverPort::setDirTx()
-{
-    if (!externalDirection_) return true;
-    if (!dirDev_.isOpen()) return false;
-
-    const char value = 1;
-    const qint64 written = dirDev_.write(&value, 1);
-    dirDev_.flush();
-    ::fsync(dirDev_.handle());
-    return written == 1;
-}
-
-/** @brief 在外部方向设备上写入 0，切换为接收。 */
-bool Rs485DriverPort::setDirRx()
-{
-    if (!externalDirection_) return true;
-    if (!dirDev_.isOpen()) return false;
-
-    const char value = 0;
-    const qint64 written = dirDev_.write(&value, 1);
-    dirDev_.flush();
-    return written == 1;
-}
-
 /**
- * @brief 完整发送一帧，并在外部方向模式下等待发送结束后切回接收。
+ * @brief 完整发送一帧，收发方向由内核 UART 驱动自动控制。
  * @param frame 待发送数据；空帧视为成功。
  * @param writeTimeoutMs 每次等待串口发送完成的超时，单位 ms。
  */
@@ -160,24 +110,23 @@ bool Rs485DriverPort::sendFrame(const QByteArray& frame, int writeTimeoutMs)
     }
     if (frame.isEmpty()) return true;
 
-    if (!setDirTx()) {
-        emit errorOccured(QStringLiteral("RS485 切换发送方向失败"));
-        return false;
-    }
+    // 所有业务最终都在串口出口执行一次模式位保护，覆盖事件桥直发、
+    // 人脸/密码/刷卡直发、访客二维码、呼梯和定时控梯等路径。
+    const QByteArray wireFrame =
+            Rs485FloorFrameBuilder::applyElevatorModeOverlay(frame);
 
     qint64 total = 0;
-    while (total < frame.size()) {
-        const qint64 written = serial_.write(frame.constData() + total, frame.size() - total);
+    while (total < wireFrame.size()) {
+        const qint64 written = serial_.write(wireFrame.constData() + total,
+                                             wireFrame.size() - total);
         if (written < 0) {
             emit errorOccured(QStringLiteral("RS485 写入失败: %1").arg(serial_.errorString()));
-            setDirRx();
             return false;
         }
         total += written;
         if (!serial_.waitForBytesWritten(writeTimeoutMs)) {
             emit errorOccured(QStringLiteral("RS485 等待发送完成超时: %1")
                               .arg(serial_.errorString()));
-            setDirRx();
             return false;
         }
     }
@@ -187,18 +136,9 @@ bool Rs485DriverPort::sendFrame(const QByteArray& frame, int writeTimeoutMs)
         ::tcdrain(static_cast<int>(handle));
     }
 
-    // 仅外部 GPIO/字符设备方向控制需要额外等待最后一个停止位。
-    if (externalDirection_) {
-        ::usleep(200);
-        if (!setDirRx()) {
-            emit errorOccured(QStringLiteral("RS485 切换接收方向失败"));
-            return false;
-        }
-    }
-
     PROBEQ(QStringLiteral("RS485 TX len=%1 hex=%2")
-           .arg(frame.size())
-           .arg(QString::fromLatin1(frame.toHex(' '))));
+           .arg(wireFrame.size())
+           .arg(QString::fromLatin1(wireFrame.toHex(' '))));
     return true;
 }
 

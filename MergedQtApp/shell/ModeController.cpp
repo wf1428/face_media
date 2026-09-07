@@ -1,7 +1,6 @@
 #include "ModeController.h"
 
 #include "IApplicationModule.h"
-#include "components/cursoroverlay/CursorOverlay.h"
 
 #include <QDebug>
 #include <QStackedWidget>
@@ -10,14 +9,12 @@
 ModeController::ModeController(QStackedWidget *stack,
                                IApplicationModule *multimediaModule,
                                IApplicationModule *faceGateModule,
-                               CursorOverlay *cursor,
                                int recognitionReturnDelayMs,
                                QObject *parent)
     : QObject(parent),
       stack_(stack),
       multimediaModule_(multimediaModule),
-      faceGateModule_(faceGateModule),
-      cursor_(cursor)
+      faceGateModule_(faceGateModule)
 {
     recognitionReturnTimer_ = new QTimer(this);
     recognitionReturnTimer_->setSingleShot(true);
@@ -31,7 +28,12 @@ ModeController::ModeController(QStackedWidget *stack,
             qInfo() << "[MODE] recognition return suppressed by password/admin UI";
             return;
         }
-        switchToMultimedia("recognition result timeout", true);
+        if (presenceLevelValid_ && presencePresent_) {
+            qInfo() << "[MODE] recognition result hold expired; presence remains high";
+            emit recognitionResumed();
+            return;
+        }
+        switchToMultimedia("recognition result timeout with no presence", false);
     });
 }
 
@@ -56,7 +58,6 @@ bool ModeController::start()
 
     started_ = true;
     setState(AppModeState::MultimediaActive);
-    raiseCursor();
     qInfo() << "[MODE] initial multimedia mode active";
     return true;
 }
@@ -70,6 +71,9 @@ void ModeController::shutdown()
     recognitionReturnTimer_->stop();
     recognitionResultPending_ = false;
     waitForPresenceReset_ = false;
+    presenceLevelValid_ = false;
+    presencePresent_ = false;
+    facePresent_ = false;
     if (multimediaModule_) {
         multimediaModule_->deactivate();
     }
@@ -93,6 +97,8 @@ ModeController::AppModeState ModeController::state() const
 
 void ModeController::handlePresenceDetected()
 {
+    presenceLevelValid_ = true;
+    presencePresent_ = true;
     if (waitForPresenceReset_) {
         qInfo() << "[MODE] presenceDetected ignored until SR505 returns low";
         return;
@@ -108,6 +114,9 @@ void ModeController::handlePresenceDetected()
     }
 
     qInfo() << "[MODE] switching multimedia -> facegate";
+    recognitionReturnTimer_->stop();
+    recognitionResultPending_ = false;
+    facePresent_ = false;
     setState(AppModeState::SwitchingToFaceGate);
     multimediaModule_->deactivate();
     stack_->setCurrentWidget(faceGateModule_->rootWidget());
@@ -119,20 +128,18 @@ void ModeController::handlePresenceDetected()
         stack_->setCurrentWidget(multimediaModule_->rootWidget());
         multimediaModule_->activate();
         setState(AppModeState::MultimediaActive);
-        raiseCursor();
         emit switchFailed(QStringLiteral("facegate activation failed; multimedia restored"));
         return;
     }
 
-    recognitionReturnTimer_->stop();
-    recognitionResultPending_ = false;
     setState(AppModeState::FaceGateActive);
-    raiseCursor();
     qInfo() << "[MODE] facegate mode active";
 }
 
 void ModeController::handlePresenceLost()
 {
+    presenceLevelValid_ = true;
+    presencePresent_ = false;
     if (waitForPresenceReset_ && state_ == AppModeState::MultimediaActive) {
         waitForPresenceReset_ = false;
         qInfo() << "[MODE] SR505 reset to low; next high level is armed";
@@ -147,6 +154,10 @@ void ModeController::handlePresenceLost()
         qInfo() << "[MODE] presenceLost ignored while recognition result is held";
         return;
     }
+    if (facePresent_) {
+        qInfo() << "[MODE] presenceLost ignored while a face is detected";
+        return;
+    }
     if (!faceGateModule_->allowsPresenceSwitch()) {
         qInfo() << "[MODE] presenceLost ignored during password/admin UI";
         return;
@@ -155,11 +166,11 @@ void ModeController::handlePresenceLost()
     switchToMultimedia("SR505 low level", false);
 }
 
-void ModeController::handleRecognitionSucceeded()
+void ModeController::handleRecognitionFinished()
 {
     if (!started_ || state_ != AppModeState::FaceGateActive ||
         !faceGateModule_->allowsPresenceSwitch()) {
-        qInfo() << "[MODE] recognition success return ignored in protected/non-face state";
+        qInfo() << "[MODE] recognition result return ignored in protected/non-face state";
         return;
     }
 
@@ -169,8 +180,24 @@ void ModeController::handleRecognitionSucceeded()
             << "durationMs=" << recognitionReturnTimer_->interval();
 }
 
+void ModeController::handleFacePresenceChanged(bool present)
+{
+    facePresent_ = present;
+    if (present || !started_ || state_ != AppModeState::FaceGateActive ||
+        recognitionResultPending_ || !presenceLevelValid_ || presencePresent_) {
+        return;
+    }
+    if (!faceGateModule_->allowsPresenceSwitch()) {
+        return;
+    }
+
+    switchToMultimedia("no face while presence is low", false);
+}
+
 void ModeController::reconcilePresenceLevel(bool valid, bool present)
 {
+    presenceLevelValid_ = valid;
+    presencePresent_ = valid && present;
     if (!valid || !started_) {
         return;
     }
@@ -186,7 +213,8 @@ void ModeController::reconcilePresenceLevel(bool valid, bool present)
             handlePresenceDetected();
         }
     } else if (state_ == AppModeState::FaceGateActive && !present) {
-        if (!recognitionResultPending_ && faceGateModule_->allowsPresenceSwitch()) {
+        if (!recognitionResultPending_ && !facePresent_ &&
+            faceGateModule_->allowsPresenceSwitch()) {
             handlePresenceLost();
         }
     }
@@ -211,16 +239,15 @@ void ModeController::switchToMultimedia(const char *reason, bool waitForPresence
         setState(faceGateModule_->isActive()
                  ? AppModeState::FaceGateActive
                  : AppModeState::SwitchingToMultimedia);
-        raiseCursor();
         emit switchFailed(QStringLiteral("multimedia activation failed"));
         return;
     }
 
     recognitionReturnTimer_->stop();
     recognitionResultPending_ = false;
+    facePresent_ = false;
     waitForPresenceReset_ = waitForPresenceReset;
     setState(AppModeState::MultimediaActive);
-    raiseCursor();
     qInfo() << "[MODE] multimedia mode active";
 }
 
@@ -231,13 +258,4 @@ void ModeController::setState(AppModeState state)
     }
     state_ = state;
     emit stateChanged(state_);
-}
-
-void ModeController::raiseCursor()
-{
-    QTimer::singleShot(0, this, [this]() {
-        if (cursor_) {
-            cursor_->raise();
-        }
-    });
 }

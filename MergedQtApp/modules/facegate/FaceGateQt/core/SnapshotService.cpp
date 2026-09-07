@@ -8,6 +8,10 @@
 
 #include "SnapshotService.h"
 
+#include "common/storage_policy.h"
+#include "platform/rk3566_platform.h"
+
+#include <QBuffer>
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
@@ -28,7 +32,13 @@ QString SnapshotService::snapshotRootPath() const
     if (info.isAbsolute()) {
         return info.absoluteFilePath();
     }
-    return QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(configured);
+    return QDir(Rk3566Platform::applicationRoot()).absoluteFilePath(configured);
+}
+
+/** @return 基于应用目录解析后的抓拍根路径。 */
+QString SnapshotService::rootPath() const
+{
+    return snapshotRootPath();
 }
 
 /** @return 移除路径非法字符后的安全文件名片段。 */
@@ -46,7 +56,7 @@ QString SnapshotService::safeFilePart(const QString &text) const
  * @return 成功时返回图片路径，失败时返回空字符串并填写 errorText。
  */
 QString SnapshotService::saveVerifySnapshot(const QImage &image,
-                                            const QString &personNo,
+                                             const QString &personName,
                                             const QString &result,
                                             QString *errorText) const
 {
@@ -69,12 +79,21 @@ QString SnapshotService::saveVerifySnapshot(const QImage &image,
 
     const QString fileName = QString("%1_%2_%3.jpg")
         .arg(now.toString("yyyyMMdd_HHmmss"))
-        .arg(safeFilePart(personNo))
+        .arg(safeFilePart(personName))
         .arg(safeFilePart(result));
     const QString path = root.absoluteFilePath(day + "/" + fileName);
-    if (!image.save(path, "JPG", 92)) {
+    QByteArray encodedImage;
+    QBuffer buffer(&encodedImage);
+    buffer.open(QIODevice::WriteOnly);
+    const bool encoded = image.save(&buffer, "JPG", 92);
+    buffer.close();
+    QString storageError;
+    if (!encoded || !StoragePolicy::writeAccessSnapshot(
+                root.absolutePath(), path, encodedImage, &storageError)) {
         if (errorText) {
-            *errorText = QStringLiteral("保存抓拍图片失败：") + path;
+            *errorText = storageError.isEmpty()
+                    ? QStringLiteral("保存抓拍图片失败：") + path
+                    : storageError;
         }
         return QString();
     }

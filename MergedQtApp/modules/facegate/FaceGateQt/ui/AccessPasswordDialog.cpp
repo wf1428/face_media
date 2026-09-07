@@ -1,3 +1,11 @@
+/**
+ * @file AccessPasswordDialog.cpp
+ * @brief 人脸识别主页的人员通行密码输入窗口实现。
+ *
+ * @author Dulin
+ * @date 2026-08-28
+ */
+
 #include "AccessPasswordDialog.h"
 
 #include "AppMessageDialog.h"
@@ -20,9 +28,10 @@
 #include <QVBoxLayout>
 
 namespace {
-constexpr int kAccessKeyboardHeight = 280;
+constexpr int kAccessKeyboardHeight = 280; /**< 内嵌虚拟键盘固定高度，单位 px。 */
 }
 
+/** @brief 初始化无边框模态窗口并创建密码输入界面。 */
 AccessPasswordDialog::AccessPasswordDialog(QWidget *parent)
     : QDialog(parent)
 {
@@ -35,16 +44,19 @@ AccessPasswordDialog::AccessPasswordDialog(QWidget *parent)
     buildUi();
 }
 
+/** @brief 销毁前主动隐藏输入法，避免其残留在门禁主页。 */
 AccessPasswordDialog::~AccessPasswordDialog()
 {
     hideKeyboard();
 }
 
+/** @return 当前密码输入框文本；控件尚未创建时返回空字符串。 */
 QString AccessPasswordDialog::password() const
 {
     return passwordEdit_ ? passwordEdit_->text() : QString();
 }
 
+/** @brief 以模态方式采集密码，仅在用户确认时写入输出参数。 */
 bool AccessPasswordDialog::getPassword(QWidget *parent, QString *password)
 {
     AccessPasswordDialog dialog(parent);
@@ -57,6 +69,7 @@ bool AccessPasswordDialog::getPassword(QWidget *parent, QString *password)
     return true;
 }
 
+/** @brief 首次显示后聚焦密码框，并等待窗口稳定再拉起键盘。 */
 void AccessPasswordDialog::showEvent(QShowEvent *event)
 {
     QDialog::showEvent(event);
@@ -66,6 +79,7 @@ void AccessPasswordDialog::showEvent(QShowEvent *event)
     QTimer::singleShot(80, this, &AccessPasswordDialog::showKeyboard);
 }
 
+/** @brief 创建密码卡片、操作按钮、样式和内嵌 QML 键盘。 */
 void AccessPasswordDialog::buildUi()
 {
     auto *root = new QVBoxLayout(this);
@@ -181,6 +195,7 @@ void AccessPasswordDialog::buildUi()
         "background:#2e405b;}"));
 }
 
+/** @brief 拒绝空密码；有效输入则先收起键盘再接受对话框。 */
 void AccessPasswordDialog::acceptInput()
 {
     if (!passwordEdit_ || passwordEdit_->text().trimmed().isEmpty()) {
@@ -192,6 +207,7 @@ void AccessPasswordDialog::acceptInput()
     accept();
 }
 
+/** @brief 显示内嵌键盘，同时通知 Qt 输入法进入可见状态。 */
 void AccessPasswordDialog::showKeyboard()
 {
     if (keyboardWidget_) {
@@ -203,6 +219,7 @@ void AccessPasswordDialog::showKeyboard()
     }
 }
 
+/** @brief 同时隐藏内嵌键盘和 Qt 输入法。 */
 void AccessPasswordDialog::hideKeyboard()
 {
     if (keyboardWidget_) {

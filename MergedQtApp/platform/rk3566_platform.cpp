@@ -361,14 +361,14 @@ QString heartbeatFile()
 QString signalBoardDevice()
 {
     return configuredDevice("QT_YCEST_SIGNAL_UART", QStringLiteral("hardware/signal_board_uart"),
-                            {QStringLiteral("/dev/ttyS9"), QStringLiteral("/dev/ttyAS9")}, QStringLiteral("/dev/ttyS9"));
+                            {QStringLiteral("/dev/ttyS5"), QStringLiteral("/dev/ttyAS5")}, QStringLiteral("/dev/ttyS5"));
 }
 
 /** @return 二维码扫描器串口节点。 */
 QString qrDevice()
 {
     return configuredDevice("QT_YCEST_QR_UART", QStringLiteral("hardware/qr_uart"),
-                            {QStringLiteral("/dev/ttyS4"), QStringLiteral("/dev/ttyAS4")}, QStringLiteral("/dev/ttyS4"));
+                            {QStringLiteral("/dev/ttyS6"), QStringLiteral("/dev/ttyAS6")}, QStringLiteral("/dev/ttyS6"));
 }
 
 /** @return IC 卡读取串口节点。 */
@@ -382,13 +382,7 @@ QString cardDevice()
 QString rs485Device()
 {
     return configuredDevice("QT_YCEST_RS485_UART", QStringLiteral("hardware/rs485_uart"),
-                            {QStringLiteral("/dev/ttyS0"), QStringLiteral("/dev/ttyAS0")}, QStringLiteral("/dev/ttyS0"));
-}
-
-/** @return RS485 收发方向控制节点；未配置且无兼容节点时返回空字符串。 */
-QString rs485DirectionDevice()
-{
-    return configuredDevice("QT_YCEST_RS485_DIR_DEVICE", QStringLiteral("hardware/rs485_dir_device"), {QStringLiteral("/dev/rs485_dir")}, QString());
+                            {QStringLiteral("/dev/ttyS8"), QStringLiteral("/dev/ttyAS8")}, QStringLiteral("/dev/ttyS8"));
 }
 
 /** @return RTC 设备节点。 */

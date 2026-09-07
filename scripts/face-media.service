@@ -1,0 +1,20 @@
+[Unit]
+Description=Face Media drivers, MQTT daemon and Qt application
+Wants=network-online.target
+After=network-online.target systemd-udev-settle.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/cat/face_media
+Environment=APP_START_DELAY_SECONDS=5
+ExecStart=/home/cat/face_media/start_face_media.sh
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

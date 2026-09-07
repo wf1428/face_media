@@ -41,12 +41,19 @@
 #include <sys/socket.h>
 #include <sys/stat.h>   // chmod
 #include <sys/un.h>
+#include <netinet/in.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <pthread.h>
 
-#define IPC_RX_CAP 262144
+#define IPC_RX_INITIAL_CAP 8192U
+#define IPC_RX_MAX_CAP (2U * 1024U * 1024U)
 #define IPC_TX_TIMEOUT_MS 10000
+#define IPC_TX_SOCKET_BUFFER (2 * 1024 * 1024)
+#define IPC_TX_MAX_FRAME_BYTES (16U * 1024U * 1024U)
+#define IPC_TX_MAX_QUEUE_BYTES (32U * 1024U * 1024U)
+#define IPC_TX_MAX_QUEUE_ITEMS 512U
+#define IPC_TX_MAX_RETRIES 3
 
 /*
  * g_running：程序是否继续运行的“开关”
@@ -54,6 +61,26 @@
  * - 当收到 SIGINT/SIGTERM 时，on_signal 会把它置为 0，让主循环退出
  */
 static volatile sig_atomic_t g_running = 1;
+
+typedef enum {
+    IPC_TX_ITEM_LINE = 0,
+    IPC_TX_ITEM_MQTT_MESSAGE = 1
+} ipc_tx_item_kind_t;
+
+typedef struct ipc_tx_item {
+    ipc_tx_item_kind_t kind;
+    char *line;
+    size_t line_len;
+    char *topic;
+    char *payload;
+    size_t payload_len;
+    int qos;
+    int retain;
+    size_t accounted_bytes;
+    unsigned long sequence;
+    int attempts;
+    struct ipc_tx_item *next;
+} ipc_tx_item_t;
 
 
 /*
@@ -105,7 +132,19 @@ typedef struct {
     char *ipc_path;      // Unix Socket 路径，/tmp/mqttd.sock
     int ipc_listen_fd;   // 监听 fd
     int ipc_client_fd;   // 当前已连接的 Qt 客户端 fd（简单起见：只保留 1 个）
-    pthread_mutex_t ipc_lock; // 保护 ipc_client_fd + write 的互斥锁
+    pthread_mutex_t ipc_lock; // 保护 ipc_client_fd 和连接代次
+    unsigned long ipc_client_generation;
+
+    pthread_t ipc_tx_thread;
+    pthread_mutex_t ipc_tx_lock;
+    pthread_cond_t ipc_tx_cond;
+    ipc_tx_item_t *ipc_tx_head;
+    ipc_tx_item_t *ipc_tx_tail;
+    size_t ipc_tx_queue_bytes;
+    size_t ipc_tx_queue_count;
+    unsigned long ipc_tx_next_sequence;
+    int ipc_tx_thread_started;
+    int ipc_tx_stop;
 
     /* ======== mosquitto 句柄（用于 apply 重建） ======== */
     struct mosquitto *mosq;
@@ -116,8 +155,9 @@ typedef struct {
     int mqtt_connected;      // 1=已连接；0=未连接
     int last_conn_rc;        // 最近一次 CONNACK rc 或错误码
 
-    char ipc_rx_buf[IPC_RX_CAP];
+    char *ipc_rx_buf;
     size_t ipc_rx_len;
+    size_t ipc_rx_cap;
 
     /* ======== apply 失败后的周期重试 ======== */
     int retry_apply_enabled;       // 1=需要重试，0=不需要
@@ -201,12 +241,27 @@ static void set_defaults(mqttd_cfg_t *cfg)
     cfg->tls_enable = false;
     cfg->tls_insecure = false;
 
+    cfg->ipc_rx_cap = IPC_RX_INITIAL_CAP;
+    cfg->ipc_rx_buf = (char *)malloc(cfg->ipc_rx_cap);
+    if (!cfg->ipc_rx_buf) {
+        fprintf(stderr, "[ipc] RX buffer allocation failed bytes=%zu\n", cfg->ipc_rx_cap);
+        exit(2);
+    }
     cfg->ipc_rx_len = 0;
     cfg->ipc_rx_buf[0] = '\0';
 
     cfg->ipc_path = strdup("/tmp/mqttd.sock");
     cfg->ipc_listen_fd = -1;
     cfg->ipc_client_fd = -1;
+    cfg->ipc_client_generation = 0;
+
+    cfg->ipc_tx_head = NULL;
+    cfg->ipc_tx_tail = NULL;
+    cfg->ipc_tx_queue_bytes = 0;
+    cfg->ipc_tx_queue_count = 0;
+    cfg->ipc_tx_next_sequence = 0;
+    cfg->ipc_tx_thread_started = 0;
+    cfg->ipc_tx_stop = 0;
 
     cfg->retry_apply_enabled = 0;
     cfg->retry_apply_interval_sec = 10;   //  10 秒重试apply
@@ -216,6 +271,8 @@ static void set_defaults(mqttd_cfg_t *cfg)
     pthread_mutex_init(&cfg->mosq_lock, NULL);
     
     pthread_mutex_init(&cfg->ipc_lock, NULL);
+    pthread_mutex_init(&cfg->ipc_tx_lock, NULL);
+    pthread_cond_init(&cfg->ipc_tx_cond, NULL);
     pthread_mutex_init(&cfg->state_lock, NULL);
 
     cfg->mqtt_connected = 0;
@@ -251,6 +308,17 @@ static void add_topic(mqttd_cfg_t *cfg, const char *topic)
 static void free_cfg(mqttd_cfg_t *cfg)
 {
     if (!cfg) return;
+    ipc_tx_item_t *item = cfg->ipc_tx_head;
+    while (item) {
+        ipc_tx_item_t *next = item->next;
+        free(item->line);
+        free(item->topic);
+        free(item->payload);
+        free(item);
+        item = next;
+    }
+    cfg->ipc_tx_head = NULL;
+    cfg->ipc_tx_tail = NULL;
     // 释放 topics 数组里的每个字符串
     for (int i = 0; i < cfg->topic_count; i++) {
         free(cfg->topics[i]);
@@ -272,9 +340,12 @@ static void free_cfg(mqttd_cfg_t *cfg)
     free(cfg->keyfile);
 
     free(cfg->ipc_path);
+    free(cfg->ipc_rx_buf);
 
     pthread_mutex_destroy(&cfg->mosq_lock);
     pthread_mutex_destroy(&cfg->ipc_lock);
+    pthread_mutex_destroy(&cfg->ipc_tx_lock);
+    pthread_cond_destroy(&cfg->ipc_tx_cond);
     pthread_mutex_destroy(&cfg->state_lock);
 }
 
@@ -346,16 +417,155 @@ static long long monotonic_millis(void)
     return (long long)ts.tv_sec * 1000LL + (long long)ts.tv_nsec / 1000000LL;
 }
 
+static void ipc_tx_item_free(ipc_tx_item_t *item)
+{
+    if (!item) return;
+    free(item->line);
+    free(item->topic);
+    free(item->payload);
+    free(item);
+}
+
+static const char *ipc_tx_kind_name(ipc_tx_item_kind_t kind)
+{
+    return kind == IPC_TX_ITEM_MQTT_MESSAGE ? "mqtt" : "line";
+}
+
+static int ipc_tx_is_stopping(mqttd_cfg_t *cfg)
+{
+    int stopping;
+    pthread_mutex_lock(&cfg->ipc_tx_lock);
+    stopping = cfg->ipc_tx_stop;
+    pthread_mutex_unlock(&cfg->ipc_tx_lock);
+    return stopping;
+}
+
+static void ipc_tx_wake(mqttd_cfg_t *cfg)
+{
+    pthread_mutex_lock(&cfg->ipc_tx_lock);
+    pthread_cond_broadcast(&cfg->ipc_tx_cond);
+    pthread_mutex_unlock(&cfg->ipc_tx_lock);
+}
+
+static int ipc_tx_enqueue_item(mqttd_cfg_t *cfg, ipc_tx_item_t *item)
+{
+    if (!cfg || !item) return -1;
+
+    pthread_mutex_lock(&cfg->ipc_tx_lock);
+    if (cfg->ipc_tx_stop ||
+        cfg->ipc_tx_queue_count >= IPC_TX_MAX_QUEUE_ITEMS ||
+        item->accounted_bytes > IPC_TX_MAX_QUEUE_BYTES ||
+        cfg->ipc_tx_queue_bytes > IPC_TX_MAX_QUEUE_BYTES - item->accounted_bytes) {
+        size_t count = cfg->ipc_tx_queue_count;
+        size_t bytes = cfg->ipc_tx_queue_bytes;
+        int stopping = cfg->ipc_tx_stop;
+        pthread_mutex_unlock(&cfg->ipc_tx_lock);
+        fprintf(stderr,
+                "[ipc-q] enqueue rejected kind=%s bytes=%zu count=%zu queuedBytes=%zu stopping=%d\n",
+                ipc_tx_kind_name(item->kind), item->accounted_bytes,
+                count, bytes, stopping);
+        ipc_tx_item_free(item);
+        return -1;
+    }
+
+    item->sequence = ++cfg->ipc_tx_next_sequence;
+    item->next = NULL;
+    if (cfg->ipc_tx_tail) {
+        cfg->ipc_tx_tail->next = item;
+    } else {
+        cfg->ipc_tx_head = item;
+    }
+    cfg->ipc_tx_tail = item;
+    cfg->ipc_tx_queue_count++;
+    cfg->ipc_tx_queue_bytes += item->accounted_bytes;
+
+    pthread_cond_signal(&cfg->ipc_tx_cond);
+    pthread_mutex_unlock(&cfg->ipc_tx_lock);
+    return 0;
+}
+
+static int ipc_tx_enqueue_line(mqttd_cfg_t *cfg, const char *line)
+{
+    if (!cfg || !line) return -1;
+
+    size_t line_len = strlen(line);
+    if (line_len + 1U > IPC_TX_MAX_FRAME_BYTES) {
+        fprintf(stderr, "[ipc-q] line too large bytes=%zu max=%u\n",
+                line_len + 1U, IPC_TX_MAX_FRAME_BYTES);
+        return -1;
+    }
+
+    ipc_tx_item_t *item = (ipc_tx_item_t *)calloc(1, sizeof(*item));
+    if (!item) return -1;
+
+    item->line = (char *)malloc(line_len + 1U);
+    if (!item->line) {
+        ipc_tx_item_free(item);
+        return -1;
+    }
+    memcpy(item->line, line, line_len + 1U);
+    item->kind = IPC_TX_ITEM_LINE;
+    item->line_len = line_len;
+    item->accounted_bytes = line_len + 1U;
+    return ipc_tx_enqueue_item(cfg, item);
+}
+
+static int ipc_tx_enqueue_mqtt_message(mqttd_cfg_t *cfg,
+                                       const struct mosquitto_message *msg)
+{
+    if (!cfg || !msg || !msg->topic || msg->payloadlen < 0) return -1;
+
+    size_t topic_len = strlen(msg->topic);
+    size_t payload_len = (size_t)msg->payloadlen;
+    if (payload_len > 0 && !msg->payload) return -1;
+    if (payload_len > IPC_TX_MAX_FRAME_BYTES ||
+        topic_len > IPC_TX_MAX_FRAME_BYTES - 512U ||
+        payload_len > IPC_TX_MAX_FRAME_BYTES - topic_len - 512U) {
+        fprintf(stderr,
+                "[ipc-q] MQTT message too large topic=%s payloadBytes=%zu maxFrame=%u\n",
+                msg->topic, payload_len, IPC_TX_MAX_FRAME_BYTES);
+        return -1;
+    }
+
+    ipc_tx_item_t *item = (ipc_tx_item_t *)calloc(1, sizeof(*item));
+    if (!item) return -1;
+
+    item->topic = strdup(msg->topic);
+    item->payload = (char *)malloc(payload_len + 1U);
+    if (!item->topic || !item->payload) {
+        ipc_tx_item_free(item);
+        return -1;
+    }
+
+    if (payload_len > 0 && msg->payload) {
+        memcpy(item->payload, msg->payload, payload_len);
+    }
+    item->payload[payload_len] = '\0';
+    item->kind = IPC_TX_ITEM_MQTT_MESSAGE;
+    item->payload_len = payload_len;
+    item->qos = msg->qos;
+    item->retain = msg->retain;
+    item->accounted_bytes = payload_len + topic_len + 512U;
+    return ipc_tx_enqueue_item(cfg, item);
+}
+
 /*
  * Send the complete frame through the non-blocking Unix socket. Large face
  * image messages may be written only partially, so retry the unsent tail.
  */
-static int ipc_write_all(int fd, const char *data, size_t len, size_t *sent_out)
+static int ipc_write_all(mqttd_cfg_t *cfg, int fd,
+                         const char *data, size_t len, size_t *sent_out,
+                         unsigned long sequence)
 {
     size_t sent = 0;
     const long long started_ms = monotonic_millis();
+    long long last_block_log_ms = 0;
 
     while (sent < len) {
+        if (ipc_tx_is_stopping(cfg)) {
+            errno = ECANCELED;
+            break;
+        }
 #ifdef MSG_NOSIGNAL
         ssize_t n = send(fd, data + sent, len - sent, MSG_NOSIGNAL);
 #else
@@ -375,6 +585,12 @@ static int ipc_write_all(int fd, const char *data, size_t len, size_t *sent_out)
 
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             long long elapsed_ms = monotonic_millis() - started_ms;
+            if (last_block_log_ms == 0 || elapsed_ms - last_block_log_ms >= 1000) {
+                fprintf(stderr,
+                        "[ipc-q] backpressure seq=%lu sent=%zu remaining=%zu elapsedMs=%lld\n",
+                        sequence, sent, len - sent, elapsed_ms);
+                last_block_log_ms = elapsed_ms;
+            }
             int wait_ms = IPC_TX_TIMEOUT_MS - (int)elapsed_ms;
             if (wait_ms <= 0) {
                 errno = ETIMEDOUT;
@@ -411,42 +627,215 @@ static int ipc_write_all(int fd, const char *data, size_t len, size_t *sent_out)
     return sent == len ? 0 : -1;
 }
 
-static void ipc_send_line(mqttd_cfg_t *cfg, const char *line)
+static int ipc_tx_build_frame(ipc_tx_item_t *item, char **frame_out, size_t *frame_len_out)
 {
-    if (!cfg || !line) return;
+    if (!item || !frame_out || !frame_len_out) return -1;
+    *frame_out = NULL;
+    *frame_len_out = 0;
 
-    const size_t line_len = strlen(line);
-    const size_t frame_len = line_len + 1;
-    char *frame = (char *)malloc(frame_len);
-    if (!frame) {
-        fprintf(stderr, "[ipc] TX allocation failed bytes=%zu\n", frame_len);
-        return;
+    char *text = NULL;
+    size_t text_len = 0;
+    if (item->kind == IPC_TX_ITEM_LINE) {
+        text = item->line;
+        text_len = item->line_len;
+    } else {
+        cJSON *root = cJSON_CreateObject();
+        if (!root) return -1;
+
+        cJSON_AddStringToObject(root, "type", "msg");
+        cJSON_AddStringToObject(root, "topic", item->topic ? item->topic : "");
+        cJSON_AddNumberToObject(root, "qos", item->qos);
+        cJSON_AddNumberToObject(root, "retain", item->retain);
+        cJSON_AddStringToObject(root, "payload", item->payload ? item->payload : "");
+        text = cJSON_PrintUnformatted(root);
+        cJSON_Delete(root);
+        if (!text) return -1;
+        text_len = strlen(text);
     }
-    memcpy(frame, line, line_len);
-    frame[line_len] = '\n';
 
+    if (text_len + 1U > IPC_TX_MAX_FRAME_BYTES) {
+        fprintf(stderr,
+                "[ipc-q] built frame too large seq=%lu bytes=%zu max=%u\n",
+                item->sequence, text_len + 1U, IPC_TX_MAX_FRAME_BYTES);
+        if (item->kind == IPC_TX_ITEM_MQTT_MESSAGE) free(text);
+        return -1;
+    }
+
+    char *frame = (char *)malloc(text_len + 1U);
+    if (!frame) {
+        if (item->kind == IPC_TX_ITEM_MQTT_MESSAGE) free(text);
+        return -1;
+    }
+    memcpy(frame, text, text_len);
+    frame[text_len] = '\n';
+    if (item->kind == IPC_TX_ITEM_MQTT_MESSAGE) free(text);
+
+    *frame_out = frame;
+    *frame_len_out = text_len + 1U;
+    return 0;
+}
+
+static int ipc_dup_client(mqttd_cfg_t *cfg, unsigned long *generation_out)
+{
+    int duplicate_fd = -1;
     pthread_mutex_lock(&cfg->ipc_lock);
-    int cfd = cfg->ipc_client_fd;
-    if (cfd >= 0) {
-        // 约定：每条消息以 '\n' 结束
-        size_t sent = 0;
-        if (ipc_write_all(cfd, frame, frame_len, &sent) != 0) {
-            int saved_errno = errno;
-            fprintf(stderr,
-                    "[ipc] TX failed expected=%zu sent=%zu error=%d (%s); closing Qt client\n",
-                    frame_len, sent, saved_errno, strerror(saved_errno));
-            if (cfg->ipc_client_fd == cfd) {
-                close(cfg->ipc_client_fd);
-                cfg->ipc_client_fd = -1;
-            }
-        } else if (cfg->verbose && frame_len >= 16384) {
-            fprintf(stderr, "[ipc] TX complete bytes=%zu\n", frame_len);
+    if (cfg->ipc_client_fd >= 0) {
+        duplicate_fd = dup(cfg->ipc_client_fd);
+        if (duplicate_fd >= 0 && generation_out) {
+            *generation_out = cfg->ipc_client_generation;
         }
-        // 再补一个换行
-        // 如果 write 出错（例如 EPIPE），下次读写会清理；这里保持简单
     }
     pthread_mutex_unlock(&cfg->ipc_lock);
-    free(frame);
+    return duplicate_fd;
+}
+
+static void ipc_close_client_if_generation(mqttd_cfg_t *cfg,
+                                           unsigned long generation)
+{
+    pthread_mutex_lock(&cfg->ipc_lock);
+    if (cfg->ipc_client_fd >= 0 && cfg->ipc_client_generation == generation) {
+        shutdown(cfg->ipc_client_fd, SHUT_RDWR);
+        close(cfg->ipc_client_fd);
+        cfg->ipc_client_fd = -1;
+        cfg->ipc_client_generation++;
+    }
+    pthread_mutex_unlock(&cfg->ipc_lock);
+}
+
+static void ipc_tx_wait_for_client(mqttd_cfg_t *cfg)
+{
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 1;
+
+    pthread_mutex_lock(&cfg->ipc_tx_lock);
+    if (!cfg->ipc_tx_stop) {
+        pthread_cond_timedwait(&cfg->ipc_tx_cond, &cfg->ipc_tx_lock, &deadline);
+    }
+    pthread_mutex_unlock(&cfg->ipc_tx_lock);
+}
+
+static void *ipc_tx_worker(void *arg)
+{
+    mqttd_cfg_t *cfg = (mqttd_cfg_t *)arg;
+
+    for (;;) {
+        pthread_mutex_lock(&cfg->ipc_tx_lock);
+        while (!cfg->ipc_tx_stop && cfg->ipc_tx_head == NULL) {
+            pthread_cond_wait(&cfg->ipc_tx_cond, &cfg->ipc_tx_lock);
+        }
+        if (cfg->ipc_tx_stop) {
+            pthread_mutex_unlock(&cfg->ipc_tx_lock);
+            break;
+        }
+
+        ipc_tx_item_t *item = cfg->ipc_tx_head;
+        cfg->ipc_tx_head = item->next;
+        if (!cfg->ipc_tx_head) cfg->ipc_tx_tail = NULL;
+        cfg->ipc_tx_queue_count--;
+        cfg->ipc_tx_queue_bytes -= item->accounted_bytes;
+        item->next = NULL;
+        pthread_mutex_unlock(&cfg->ipc_tx_lock);
+
+        char *frame = NULL;
+        size_t frame_len = 0;
+        if (ipc_tx_build_frame(item, &frame, &frame_len) != 0) {
+            fprintf(stderr, "[ipc-q] build failed seq=%lu kind=%s\n",
+                    item->sequence, ipc_tx_kind_name(item->kind));
+            ipc_tx_item_free(item);
+            continue;
+        }
+
+        int delivered = 0;
+        while (!ipc_tx_is_stopping(cfg) && item->attempts < IPC_TX_MAX_RETRIES) {
+            unsigned long generation = 0;
+            int cfd = ipc_dup_client(cfg, &generation);
+            if (cfd < 0) {
+                ipc_tx_wait_for_client(cfg);
+                continue;
+            }
+
+            item->attempts++;
+            size_t sent = 0;
+            int result = ipc_write_all(cfg, cfd, frame, frame_len, &sent,
+                                       item->sequence);
+            int saved_errno = errno;
+            close(cfd);
+
+            if (result == 0) {
+                delivered = 1;
+                break;
+            }
+
+            fprintf(stderr,
+                    "[ipc-q] send failed seq=%lu attempt=%d expected=%zu sent=%zu error=%d (%s)\n",
+                    item->sequence, item->attempts, frame_len, sent,
+                    saved_errno, strerror(saved_errno));
+            ipc_close_client_if_generation(cfg, generation);
+        }
+
+        if (!delivered && !ipc_tx_is_stopping(cfg)) {
+            fprintf(stderr,
+                    "[ipc-q] drop seq=%lu kind=%s after %d attempts bytes=%zu\n",
+                    item->sequence, ipc_tx_kind_name(item->kind),
+                    item->attempts, frame_len);
+        }
+        free(frame);
+        ipc_tx_item_free(item);
+    }
+    return NULL;
+}
+
+static int ipc_tx_start(mqttd_cfg_t *cfg)
+{
+    cfg->ipc_tx_stop = 0;
+    int rc = pthread_create(&cfg->ipc_tx_thread, NULL, ipc_tx_worker, cfg);
+    if (rc != 0) {
+        fprintf(stderr, "[ipc-q] worker start failed error=%d (%s)\n", rc, strerror(rc));
+        return -1;
+    }
+    cfg->ipc_tx_thread_started = 1;
+    return 0;
+}
+
+static void ipc_tx_stop(mqttd_cfg_t *cfg)
+{
+    pthread_mutex_lock(&cfg->ipc_tx_lock);
+    cfg->ipc_tx_stop = 1;
+    pthread_cond_broadcast(&cfg->ipc_tx_cond);
+    pthread_mutex_unlock(&cfg->ipc_tx_lock);
+
+    pthread_mutex_lock(&cfg->ipc_lock);
+    if (cfg->ipc_client_fd >= 0) {
+        shutdown(cfg->ipc_client_fd, SHUT_RDWR);
+    }
+    pthread_mutex_unlock(&cfg->ipc_lock);
+
+    if (cfg->ipc_tx_thread_started) {
+        pthread_join(cfg->ipc_tx_thread, NULL);
+        cfg->ipc_tx_thread_started = 0;
+    }
+
+    pthread_mutex_lock(&cfg->ipc_tx_lock);
+    ipc_tx_item_t *item = cfg->ipc_tx_head;
+    cfg->ipc_tx_head = NULL;
+    cfg->ipc_tx_tail = NULL;
+    cfg->ipc_tx_queue_bytes = 0;
+    cfg->ipc_tx_queue_count = 0;
+    pthread_mutex_unlock(&cfg->ipc_tx_lock);
+
+    while (item) {
+        ipc_tx_item_t *next = item->next;
+        ipc_tx_item_free(item);
+        item = next;
+    }
+}
+
+static void ipc_send_line(mqttd_cfg_t *cfg, const char *line)
+{
+    if (ipc_tx_enqueue_line(cfg, line) != 0) {
+        fprintf(stderr, "[ipc-q] failed to enqueue line\n");
+    }
 }
 
 /* ========== IPC：发送状态快照（Qt连接时用） ========== */
@@ -500,18 +889,39 @@ static void ipc_accept_if_needed(mqttd_cfg_t *cfg)
 
     set_nonblocking(cfd);
 
+    int requested_send_buffer = IPC_TX_SOCKET_BUFFER;
+    if (setsockopt(cfd, SOL_SOCKET, SO_SNDBUF,
+                   &requested_send_buffer, sizeof(requested_send_buffer)) != 0) {
+        fprintf(stderr, "[ipc] set SO_SNDBUF failed error=%d (%s)\n",
+                errno, strerror(errno));
+    }
+    int actual_send_buffer = 0;
+    socklen_t actual_send_buffer_len = sizeof(actual_send_buffer);
+    if (getsockopt(cfd, SOL_SOCKET, SO_SNDBUF,
+                   &actual_send_buffer, &actual_send_buffer_len) != 0) {
+        actual_send_buffer = -1;
+    }
+
     pthread_mutex_lock(&cfg->ipc_lock);
     if (cfg->ipc_client_fd >= 0) {
         // 已经有一个 Qt 客户端，替换掉旧的
+        shutdown(cfg->ipc_client_fd, SHUT_RDWR);
         close(cfg->ipc_client_fd);
     }
     cfg->ipc_client_fd = cfd;
+    cfg->ipc_client_generation++;
     pthread_mutex_unlock(&cfg->ipc_lock);
 
-    if (cfg->verbose) fprintf(stderr, "[ipc] Qt client connected\n");
+    cfg->ipc_rx_len = 0;
+    if (cfg->ipc_rx_buf && cfg->ipc_rx_cap > 0) cfg->ipc_rx_buf[0] = '\0';
+
+    if (cfg->verbose) {
+        fprintf(stderr, "[ipc] Qt client connected SO_SNDBUF=%d\n", actual_send_buffer);
+    }
 
     // Qt 连接上来先推送一份 hello（包含 host/port/topic/connected 等）
     ipc_send_status(cfg, "hello");
+    ipc_tx_wake(cfg);
 }
 
 /* ========== JSON 命令解析（cmd":"test/status） ========== */
@@ -870,45 +1280,65 @@ static void ipc_handle_command(mqttd_cfg_t *cfg, const char *line)
 //     }
 // }
 
+static int ipc_rx_ensure_capacity(mqttd_cfg_t *cfg, size_t required)
+{
+    if (required <= cfg->ipc_rx_cap) return 0;
+    if (required > IPC_RX_MAX_CAP) return -1;
+
+    size_t new_cap = cfg->ipc_rx_cap ? cfg->ipc_rx_cap : IPC_RX_INITIAL_CAP;
+    while (new_cap < required) {
+        if (new_cap >= IPC_RX_MAX_CAP / 2U) {
+            new_cap = IPC_RX_MAX_CAP;
+            break;
+        }
+        new_cap *= 2U;
+    }
+
+    char *new_buf = (char *)realloc(cfg->ipc_rx_buf, new_cap);
+    if (!new_buf) return -1;
+    cfg->ipc_rx_buf = new_buf;
+    cfg->ipc_rx_cap = new_cap;
+    if (cfg->verbose) fprintf(stderr, "[ipc] RX buffer grown bytes=%zu\n", new_cap);
+    return 0;
+}
+
 static void ipc_read_loop(mqttd_cfg_t *cfg)
 {
-    pthread_mutex_lock(&cfg->ipc_lock);
-    int cfd = cfg->ipc_client_fd;
-    pthread_mutex_unlock(&cfg->ipc_lock);
-
+    unsigned long generation = 0;
+    int cfd = ipc_dup_client(cfg, &generation);
     if (cfd < 0) return;
 
     char tmp[4096];
     ssize_t n = read(cfd, tmp, sizeof(tmp));
+    int saved_errno = errno;
+    close(cfd);
+
     if (n == 0) {
         if (cfg->verbose) fprintf(stderr, "[ipc] Qt client disconnected\n");
-        pthread_mutex_lock(&cfg->ipc_lock);
-        close(cfg->ipc_client_fd);
-        cfg->ipc_client_fd = -1;
-        pthread_mutex_unlock(&cfg->ipc_lock);
+        ipc_close_client_if_generation(cfg, generation);
         cfg->ipc_rx_len = 0;
-        cfg->ipc_rx_buf[0] = '\0';
+        if (cfg->ipc_rx_buf) cfg->ipc_rx_buf[0] = '\0';
         return;
     }
 
     if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+        if (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) return;
 
+        errno = saved_errno;
         if (cfg->verbose) perror("[ipc] read");
-        pthread_mutex_lock(&cfg->ipc_lock);
-        close(cfg->ipc_client_fd);
-        cfg->ipc_client_fd = -1;
-        pthread_mutex_unlock(&cfg->ipc_lock);
+        ipc_close_client_if_generation(cfg, generation);
         cfg->ipc_rx_len = 0;
-        cfg->ipc_rx_buf[0] = '\0';
+        if (cfg->ipc_rx_buf) cfg->ipc_rx_buf[0] = '\0';
         return;
     }
 
-    if ((size_t)n + cfg->ipc_rx_len >= sizeof(cfg->ipc_rx_buf)) {
-        fprintf(stderr, "[ipc] command too long, drop buffer len=%zu add=%zd\n",
-                cfg->ipc_rx_len, n);
+    size_t required = cfg->ipc_rx_len + (size_t)n + 1U;
+    if (ipc_rx_ensure_capacity(cfg, required) != 0) {
+        fprintf(stderr,
+                "[ipc] command too long or allocation failed, drop buffer len=%zu add=%zd max=%u\n",
+                cfg->ipc_rx_len, n, IPC_RX_MAX_CAP);
         cfg->ipc_rx_len = 0;
-        cfg->ipc_rx_buf[0] = '\0';
+        if (cfg->ipc_rx_buf) cfg->ipc_rx_buf[0] = '\0';
         ipc_send_ack(cfg, "publish", 0, "ipc line too long");
         return;
     }
@@ -1034,9 +1464,9 @@ static void on_disconnect(struct mosquitto *mosq, void *userdata, int rc)
     cfg->last_conn_rc = rc;                     //断开时同步更新最近错误码
     pthread_mutex_unlock(&cfg->state_lock);
 
-    if (cfg->verbose) {
-        fprintf(stderr, "[mqttd] disconnected rc=%d (%s)\n", rc, mosquitto_strerror(rc));
-    }
+    /* 断线原因属于运行错误信息，不能受 verbose 调试开关影响。 */
+    fprintf(stderr, "[mqttd] disconnected rc=%d (%s)\n",
+            rc, mosquitto_strerror(rc));
     
     // 推送给 Qt：断开事件 + 状态
     char msg[256];
@@ -1089,33 +1519,17 @@ static void on_message(struct mosquitto *mosq, void *userdata, const struct mosq
                 msg->topic, msg->qos, msg->retain, msg->payloadlen);
     }
 
-    // 调试打印原始 payload
-    // 先复制一份，补 '\0'
-    char *payload = (char *)malloc((size_t)msg->payloadlen + 1);
-    if (!payload) return;
-    memcpy(payload, msg->payload, (size_t)msg->payloadlen);
-    payload[msg->payloadlen] = '\0';
-
-    cJSON *root = cJSON_CreateObject();
-    if (!root) {
-        free(payload);
-        return;
+    /*
+     * Never write a potentially large MQTT payload to Qt from libmosquitto's
+     * network callback. Copy it into the IPC queue and return immediately so
+     * MQTT keepalive and subsequent PUBLISH packets are not blocked by Qt.
+     */
+    int enqueue_result = ipc_tx_enqueue_mqtt_message(cfg, msg);
+    if (enqueue_result != 0) {
+        fprintf(stderr,
+                "[mqttd] failed to queue RX topic=%s len=%d\n",
+                msg->topic, msg->payloadlen);
     }
-
-    cJSON_AddStringToObject(root, "type", "msg");
-    cJSON_AddStringToObject(root, "topic", msg->topic);
-    cJSON_AddNumberToObject(root, "qos", msg->qos);
-    cJSON_AddNumberToObject(root, "retain", msg->retain);
-    cJSON_AddStringToObject(root, "payload", payload);
-
-    char *out = cJSON_PrintUnformatted(root);
-    if (out) {
-        ipc_send_line(cfg, out);
-        free(out);
-    }
-
-    cJSON_Delete(root);
-    free(payload);
 }
 
 
@@ -1381,10 +1795,16 @@ int main(int argc, char **argv)
         fprintf(stderr, "[ipc] init failed, continue without IPC\n");
     }
 
+    if (ipc_tx_start(&cfg) != 0) {
+        if (cfg.ipc_client_fd >= 0) close(cfg.ipc_client_fd);
+        if (cfg.ipc_listen_fd >= 0) close(cfg.ipc_listen_fd);
+        if (cfg.ipc_path) unlink(cfg.ipc_path);
+        free_cfg(&cfg);
+        return 1;
+    }
+
     /* libmosquitto 全局初始化（进程级别） */
     mosquitto_lib_init();
-    
-
     // 启动 MQTT（按当前 cfg 建立连接）
     int r0 = mqtt_apply_reconnect(&cfg);
     if (r0 != MOSQ_ERR_SUCCESS) {
@@ -1464,6 +1884,8 @@ int main(int argc, char **argv)
         cfg.mosq = NULL;
     }
     pthread_mutex_unlock(&cfg.mosq_lock);
+
+    ipc_tx_stop(&cfg);
     
     // 关闭 IPC fd
     if (cfg.ipc_client_fd >= 0) close(cfg.ipc_client_fd);

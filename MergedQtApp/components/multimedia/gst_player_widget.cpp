@@ -17,7 +17,9 @@
 #include <QDateTime>
 #include <QElapsedTimer>
 #include <QDebug>
+#include <QDir>
 #include <QEvent>
+#include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
 #include <QHash>
@@ -30,8 +32,13 @@
 #include <QMutexLocker>
 #include <QUrl>
 
+#ifdef Q_OS_LINUX
+#include <unistd.h>
+#endif
+
 #include <gst/video/videooverlay.h>
 #include <gst/allocators/gstdmabuf.h>
+#include <gst/rtp/gstrtpbuffer.h>
 
 #include "RgaImageProcessor.h"
 #include "platform/rk3566_platform.h"
@@ -53,6 +60,10 @@
 #endif
 
 namespace {
+
+constexpr qint64 kLiveDecoderCreditLagNs = 800 * GST_MSECOND;
+constexpr qint64 kLiveDecoderMaximumInFlightAus = 12;
+constexpr int kLiveDecoderCreditConfirmAus = 3;
 
 /**
  * @brief 监听视频宿主控件几何和可见性变化的内部事件过滤器。
@@ -124,6 +135,30 @@ bool initGStreamer(QString *error)
                 gst_object_unref(feature);
             }
         }
+
+        auto pluginVersion = [registry](const char *name) -> QString {
+            GstPlugin *plugin = gst_registry_find_plugin(registry, name);
+            if (!plugin) return QStringLiteral("missing");
+            const gchar *version = gst_plugin_get_version(plugin);
+            const QString result = version
+                    ? QString::fromLatin1(version) : QStringLiteral("unknown");
+            gst_object_unref(plugin);
+            return result;
+        };
+        guint runtimeMajor = 0;
+        guint runtimeMinor = 0;
+        guint runtimeMicro = 0;
+        guint runtimeNano = 0;
+        gst_version(&runtimeMajor, &runtimeMinor, &runtimeMicro, &runtimeNano);
+        qInfo().noquote() << QStringLiteral(
+                "[GStreamer-DIAG] runtime=%1 rtpmanagerPlugin=%2 rtspPlugin=%3")
+                .arg(QStringLiteral("%1.%2.%3.%4")
+                     .arg(runtimeMajor)
+                     .arg(runtimeMinor)
+                     .arg(runtimeMicro)
+                     .arg(runtimeNano))
+                .arg(pluginVersion("rtpmanager"))
+                .arg(pluginVersion("rtsp"));
     });
 
     if (!ok && error) {
@@ -154,6 +189,19 @@ void setIntegerProperty(GObject *object, const char *name, gint value)
     }
 }
 
+/** @return GstRTSPSrcBufferMode 枚举值对应的稳定日志名称。 */
+QString rtspBufferModeName(gint value)
+{
+    switch (value) {
+    case 0: return QStringLiteral("none");
+    case 1: return QStringLiteral("slave");
+    case 2: return QStringLiteral("buffer");
+    case 3: return QStringLiteral("auto");
+    case 4: return QStringLiteral("synced");
+    default: return QStringLiteral("value-%1").arg(value);
+    }
+}
+
 /** @brief 读取 GStreamer 元素的工厂名称，供插件兼容判断和日志使用。 */
 const char *elementFactoryName(GstElement *element)
 {
@@ -162,6 +210,230 @@ const char *elementFactoryName(GstElement *element)
     return factory
             ? gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory))
             : nullptr;
+}
+
+/** @brief 返回元素所属插件及其版本，供板端确认 Rockchip BSP 组件归属。 */
+QString elementPluginVersion(GstElement *element)
+{
+    GstElementFactory *factory = element ? gst_element_get_factory(element) : nullptr;
+    if (!factory) return QStringLiteral("unknown");
+    const gchar *pluginName = gst_plugin_feature_get_plugin_name(
+                GST_PLUGIN_FEATURE(factory));
+    if (!pluginName || !*pluginName) return QStringLiteral("unknown");
+
+    GstPlugin *plugin = gst_registry_find_plugin(gst_registry_get(), pluginName);
+    if (!plugin) return QString::fromLatin1(pluginName) + QStringLiteral("/unknown");
+    const gchar *version = gst_plugin_get_version(plugin);
+    const QString result = QStringLiteral("%1/%2")
+            .arg(QString::fromLatin1(pluginName),
+                 version ? QString::fromLatin1(version) : QStringLiteral("unknown"));
+    gst_object_unref(plugin);
+    return result;
+}
+
+/** @brief 读取可选布尔属性并格式化；旧插件不公开属性时返回 unsupported。 */
+QString booleanPropertyText(GObject *object, const char *name)
+{
+    if (!hasProperty(object, name)) return QStringLiteral("unsupported");
+    gboolean value = FALSE;
+    g_object_get(object, name, &value, nullptr);
+    return value ? QStringLiteral("true") : QStringLiteral("false");
+}
+
+/** @return 当前进程常驻内存，单位 KiB；不可读时返回 -1。 */
+qint64 processResidentMemoryKiB()
+{
+    QFile status(QStringLiteral("/proc/self/status"));
+    if (status.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        while (!status.atEnd()) {
+            const QByteArray line = status.readLine();
+            if (!line.startsWith("VmRSS:")) continue;
+            const QList<QByteArray> fields = line.simplified().split(' ');
+            if (fields.size() < 2) break;
+            bool ok = false;
+            const qint64 value = fields.at(1).toLongLong(&ok);
+            if (ok) return value;
+            break;
+        }
+    }
+
+#ifdef Q_OS_LINUX
+    // 部分精简系统不公开 status 中的 VmRSS，改读 statm 的 resident 页数。
+    QFile statm(QStringLiteral("/proc/self/statm"));
+    if (statm.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        const QList<QByteArray> fields = statm.readAll().simplified().split(' ');
+        bool ok = false;
+        const qint64 residentPages = fields.size() > 1
+                ? fields.at(1).toLongLong(&ok) : -1;
+        const long pageSize = sysconf(_SC_PAGESIZE);
+        if (ok && residentPages >= 0 && pageSize > 0) {
+            return residentPages * static_cast<qint64>(pageSize) / 1024;
+        }
+    }
+#endif
+    return -1;
+}
+
+/** @return 当前进程打开的文件描述符数；/proc 不可读时返回 -1。 */
+int processOpenFileDescriptorCount()
+{
+    QDir fdDir(QStringLiteral("/proc/self/fd"));
+    if (!fdDir.exists()) return -1;
+    return fdDir.entryList(QDir::AllEntries | QDir::NoDotAndDotDot).size();
+}
+
+/** @return 系统 thermal zone 中的最高温度，单位摄氏度；不可读时返回 -1。 */
+double maximumThermalZoneCelsius()
+{
+    QDir thermalRoot(QStringLiteral("/sys/class/thermal"));
+    const QStringList zones = thermalRoot.entryList(
+                QStringList() << QStringLiteral("thermal_zone*"),
+                QDir::Dirs | QDir::NoDotAndDotDot,
+                QDir::Name);
+    double maximum = -1.0;
+    for (const QString &zone : zones) {
+        QFile temperature(thermalRoot.filePath(zone + QStringLiteral("/temp")));
+        if (!temperature.open(QIODevice::ReadOnly | QIODevice::Text)) continue;
+        bool ok = false;
+        double value = QString::fromLatin1(temperature.readAll()).trimmed().toDouble(&ok);
+        if (!ok) continue;
+        if (value > 1000.0) value /= 1000.0;
+        maximum = qMax(maximum, value);
+    }
+    return maximum;
+}
+
+/** @return 累计计数相对上次采样的增量，并兼容管线重建后计数归零。 */
+quint64 counterDelta(quint64 current, quint64 previous)
+{
+    return current >= previous ? current - previous : current;
+}
+
+/** @return 工厂名对应视频解码器时返回 true。 */
+bool isVideoDecoderFactory(const QString &factory)
+{
+    return factory == QStringLiteral("mppvideodec") ||
+           factory == QStringLiteral("mpph264dec") ||
+           factory == QStringLiteral("mpph265dec") ||
+           factory == QStringLiteral("rkvideodec") ||
+           factory == QStringLiteral("avdec_h264") ||
+           factory == QStringLiteral("avdec_h265") ||
+           (factory.contains(QStringLiteral("video")) &&
+            factory.endsWith(QStringLiteral("dec")));
+}
+
+/** @return RTP 元素 sink caps 中声明的 media；无法识别时返回 unknown。 */
+QString rtpMediaType(GstElement *element, QString *encodingName = nullptr)
+{
+    if (encodingName) encodingName->clear();
+    if (!element) return QStringLiteral("unknown");
+
+    GstPad *sinkPad = gst_element_get_static_pad(element, "sink");
+    if (!sinkPad) return QStringLiteral("unknown");
+    GstCaps *caps = gst_pad_get_current_caps(sinkPad);
+    if (!caps) caps = gst_pad_query_caps(sinkPad, nullptr);
+    gst_object_unref(sinkPad);
+
+    QString media = QStringLiteral("unknown");
+    if (caps && !gst_caps_is_empty(caps) && !gst_caps_is_any(caps)) {
+        const GstStructure *structure = gst_caps_get_structure(caps, 0);
+        if (structure) {
+            const gchar *mediaValue = gst_structure_get_string(structure, "media");
+            const gchar *encodingValue = gst_structure_get_string(structure, "encoding-name");
+            if (mediaValue && *mediaValue) {
+                media = QString::fromLatin1(mediaValue).toLower();
+            }
+            if (encodingName && encodingValue && *encodingValue) {
+                *encodingName = QString::fromLatin1(encodingValue);
+            }
+        }
+    }
+    if (caps) gst_caps_unref(caps);
+    return media;
+}
+
+/**
+ * @brief 计算 buffer PTS 对应运行时间相对当前管线运行时间的偏移。
+ * @return 可取得时间段、时钟和有效 PTS 时返回 true；正值表示该帧位于未来。
+ */
+bool bufferPtsClockOffsetNs(GstPad *pad, GstBuffer *buffer, qint64 *offsetNs)
+{
+    if (!pad || !buffer || !offsetNs ||
+        !GST_CLOCK_TIME_IS_VALID(GST_BUFFER_PTS(buffer))) {
+        return false;
+    }
+
+    GstClockTime bufferRunningTime = GST_CLOCK_TIME_NONE;
+    GstEvent *segmentEvent = gst_pad_get_sticky_event(pad, GST_EVENT_SEGMENT, 0);
+    if (segmentEvent) {
+        const GstSegment *segment = nullptr;
+        gst_event_parse_segment(segmentEvent, &segment);
+        if (segment && segment->format == GST_FORMAT_TIME) {
+            bufferRunningTime = gst_segment_to_running_time(
+                        segment, GST_FORMAT_TIME, GST_BUFFER_PTS(buffer));
+        }
+        gst_event_unref(segmentEvent);
+    }
+    if (!GST_CLOCK_TIME_IS_VALID(bufferRunningTime)) return false;
+
+    GstElement *element = gst_pad_get_parent_element(pad);
+    if (!element) return false;
+    GstClock *clock = gst_element_get_clock(element);
+    const GstClockTime baseTime = gst_element_get_base_time(element);
+    gst_object_unref(element);
+    if (!clock || !GST_CLOCK_TIME_IS_VALID(baseTime)) {
+        if (clock) gst_object_unref(clock);
+        return false;
+    }
+
+    const GstClockTime clockTime = gst_clock_get_time(clock);
+    gst_object_unref(clock);
+    if (!GST_CLOCK_TIME_IS_VALID(clockTime) || clockTime < baseTime) return false;
+    const GstClockTime pipelineRunningTime = clockTime - baseTime;
+
+    const quint64 maximum = static_cast<quint64>(std::numeric_limits<qint64>::max());
+    if (bufferRunningTime >= pipelineRunningTime) {
+        const quint64 difference = bufferRunningTime - pipelineRunningTime;
+        *offsetNs = difference > maximum
+                ? std::numeric_limits<qint64>::max()
+                : static_cast<qint64>(difference);
+    } else {
+        const quint64 difference = pipelineRunningTime - bufferRunningTime;
+        *offsetNs = difference > maximum
+                ? std::numeric_limits<qint64>::min()
+                : -static_cast<qint64>(difference);
+    }
+    return true;
+}
+
+/** @brief 以无锁方式更新诊断区间内的最大绝对值。 */
+void updateMaximumAbsolute(QAtomicInteger<qint64> *maximum, qint64 value)
+{
+    if (!maximum) return;
+    const qint64 absoluteValue = value == std::numeric_limits<qint64>::min()
+            ? std::numeric_limits<qint64>::max()
+            : qAbs(value);
+    qint64 oldMaximum = maximum->loadAcquire();
+    while (absoluteValue > oldMaximum &&
+           !maximum->testAndSetOrdered(oldMaximum, absoluteValue)) {
+        oldMaximum = maximum->loadAcquire();
+    }
+}
+
+/** @brief 更新相邻 buffer 的最大到达间隔。 */
+void updateMaximumBufferGap(QAtomicInteger<qint64> *lastBufferMs,
+                            QAtomicInteger<qint64> *maximumGapMs,
+                            qint64 nowMs)
+{
+    if (!lastBufferMs || !maximumGapMs) return;
+    const qint64 previousMs = lastBufferMs->fetchAndStoreOrdered(nowMs);
+    if (previousMs <= 0 || nowMs <= previousMs) return;
+    const qint64 gapMs = nowMs - previousMs;
+    qint64 oldMaximum = maximumGapMs->loadAcquire();
+    while (gapMs > oldMaximum &&
+           !maximumGapMs->testAndSetOrdered(oldMaximum, gapMs)) {
+        oldMaximum = maximumGapMs->loadAcquire();
+    }
 }
 
 /** @brief 构造 H.264 字节流且按访问单元对齐的媒体能力描述。 */
@@ -539,7 +811,6 @@ VideoHoleWidget::VideoHoleWidget(QWidget *parent)
     setAttribute(Qt::WA_TransparentForMouseEvents, true);
     setFocusPolicy(Qt::NoFocus);
     setUpdateBehavior(QOpenGLWidget::NoPartialUpdate);
-    setCursor(Qt::BlankCursor);
 
     connect(this, &QOpenGLWidget::frameSwapped, this, [this]() {
         const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
@@ -954,6 +1225,10 @@ GstPlayerWidget::GstPlayerWidget(QWidget *parent)
     positionTimer_.setInterval(200);
     connect(&positionTimer_, &QTimer::timeout, this, &GstPlayerWidget::pollPosition);
 
+    playbackDiagnosticTimer_.setInterval(30000);
+    connect(&playbackDiagnosticTimer_, &QTimer::timeout,
+            this, &GstPlayerWidget::pollPlaybackDiagnostics);
+
     QString error;
     if (!initGStreamer(&error)) {
         QTimer::singleShot(0, this, [this, error]() { emit errorOccured(error); });
@@ -1007,7 +1282,6 @@ void GstPlayerWidget::setVideoOutput(QWidget *widget)
         // EGLFS 只有一个 Qt 原生窗口。视频画布保持为普通 Qt 子控件，
         // 由 QOpenGLWidget 合成，不创建独立的 X11/KMS 视频窗口。
         videoWidget_->setAttribute(Qt::WA_TransparentForMouseEvents, true);
-        videoWidget_->setCursor(Qt::BlankCursor);
         videoWidget_->show();
     } else {
         // 仅保留桌面/X11调试兼容路径。
@@ -1023,9 +1297,16 @@ void GstPlayerWidget::setVideoOutput(QWidget *widget)
 /** @brief 设置本地路径或网络 URL，并使旧异步帧失效。 */
 void GstPlayerWidget::setMedia(const QString &path)
 {
+    playbackDiagnosticTimer_.stop();
+    invalidRtcpDestinationWarningLogged_ = false;
     mediaPath_ = path.trimmed();
-    hlsAuAlignmentEnabled_.storeRelease(
-                mediaPath_.toLower().contains(QStringLiteral(".m3u8")) ? 1 : 0);
+    const QString lowerMediaPath = mediaPath_.toLower();
+    const bool rtspMedia = lowerMediaPath.startsWith(QStringLiteral("rtsp://"));
+    const bool liveRtsp = rtspMedia && !preloadMode_;
+    const bool hlsMedia = lowerMediaPath.contains(QStringLiteral(".m3u8"));
+    liveRtspMode_.storeRelease(liveRtsp ? 1 : 0);
+    h264AuAlignmentEnabled_.storeRelease((rtspMedia || hlsMedia) ? 1 : 0);
+    playbackDiagnosticTimer_.setInterval(liveRtsp ? 5000 : 30000);
     mediaGeneration_.fetchAndAddOrdered(1);
     clearVideoCanvas();
     sourceWidth_ = 0;
@@ -1044,6 +1325,17 @@ void GstPlayerWidget::setMedia(const QString &path)
         emit errorOccured(QStringLiteral("GStreamer 切换到 NULL 失败，无法安全切换媒体"));
         return;
     }
+    resetPlaybackDiagnostics();
+
+    // RTSP 已由 rtpjitterbuffer 按直播时钟节奏输出，appsink 不再进行第二次
+    // 时钟等待，使 MPP 在发生短时落后后可以主动追赶。文件/HLS保持原同步逻辑。
+    if (appSink_) {
+        setBooleanProperty(G_OBJECT(appSink_), "sync", liveRtsp ? FALSE : TRUE);
+        qInfo() << "[GStreamer-LIVE] appsink clock sync"
+                << "liveRtsp=" << liveRtsp
+                << "sync=" << !liveRtsp;
+    }
+
     SharedAudioMixer::instance().removeSource(this);
     if (bus_) {
         // 丢弃上一媒体源残留的 EOS/ERROR/STATE_CHANGED，避免切源后误触发。
@@ -1090,12 +1382,18 @@ void GstPlayerWidget::play()
     }
     busTimer_.start();
     positionTimer_.start();
+    if (!preloadMode_ && mediaPath_.startsWith(QStringLiteral("rtsp://"),
+                                                Qt::CaseInsensitive)) {
+        playbackDiagnosticElapsed_.start();
+        playbackDiagnosticTimer_.start();
+    }
 }
 
 /** @brief 暂停当前管线。 */
 void GstPlayerWidget::pause()
 {
     if (!playbin_) return;
+    playbackDiagnosticTimer_.stop();
     playRequested_ = false;
     gst_element_set_state(playbin_, GST_STATE_PAUSED);
     playing_ = false;
@@ -1108,6 +1406,7 @@ void GstPlayerWidget::stop()
     prepared_ = false;
     playing_ = false;
     positionTimer_.stop();
+    playbackDiagnosticTimer_.stop();
     if (playbin_) {
         if (!setNullStateAndWait(playbin_)) {
             qWarning() << "[GStreamer] stop: switching playbin to NULL did not complete";
@@ -1121,6 +1420,14 @@ void GstPlayerWidget::stop()
     lastAudioFrameMs_.storeRelease(0);
     lastVideoSignalMs_.storeRelease(0);
     lastAudioSignalMs_.storeRelease(0);
+}
+
+/** @brief 完整释放并重建 playbin，确保 MPP 解码上下文随旧管线销毁。 */
+bool GstPlayerWidget::recreatePipeline()
+{
+    releasePipeline();
+    ensurePipeline();
+    return playbin_ != nullptr;
 }
 
 /** @brief 跳转到指定毫秒位置。 */
@@ -1294,6 +1601,7 @@ void GstPlayerWidget::releasePipeline()
 {
     busTimer_.stop();
     positionTimer_.stop();
+    playbackDiagnosticTimer_.stop();
 
     if (playbin_) {
         if (!setNullStateAndWait(playbin_)) {
@@ -1412,6 +1720,10 @@ GstElement *GstPlayerWidget::createQtCompositedVideoSink()
     g_object_set(sink,
                  "emit-signals", TRUE,
                  "sync", TRUE,
+                 // RK3566 的 mppvideodec 收到 sink 上游 QoS 后可能持续跳过
+                 // 已迟到的预测帧，最终退化为只在关键帧附近输出。关闭 QoS
+                 // 反馈，但保留 sync=true 和原有单帧反压策略。
+                 "qos", FALSE,
                  "max-buffers", 1,
                  "drop", TRUE,
                  "enable-last-sample", FALSE,
@@ -1740,14 +2052,112 @@ void GstPlayerWidget::pollBus()
             if (debug) g_free(debug);
             prepared_ = false;
             playing_ = false;
+            playbackDiagnosticTimer_.stop();
             SharedAudioMixer::instance().removeSource(this);
             emit errorOccured(detail.isEmpty() ? text : text + QStringLiteral(" | ") + detail);
+            break;
+        }
+        case GST_MESSAGE_WARNING: {
+            GError *warning = nullptr;
+            gchar *debug = nullptr;
+            gst_message_parse_warning(message, &warning, &debug);
+            const QString sourceName = QString::fromUtf8(
+                        GST_OBJECT_NAME(GST_MESSAGE_SRC(message)));
+            const QString warningText = warning
+                    ? QString::fromUtf8(warning->message)
+                    : QStringLiteral("unknown");
+            const QString detail = debug
+                    ? QString::fromUtf8(debug)
+                    : QStringLiteral("none");
+            const bool invalidRtcpDestination =
+                    sourceName.startsWith(QStringLiteral("udpsink")) &&
+                    warningText.contains(QStringLiteral("Error sending UDP packets")) &&
+                    detail.contains(QStringLiteral(":0"));
+            if (invalidRtcpDestination) {
+                if (!invalidRtcpDestinationWarningLogged_) {
+                    invalidRtcpDestinationWarningLogged_ = true;
+                    qWarning().noquote()
+                            << QStringLiteral(
+                                   "[GStreamer-RTCP] server supplied an invalid RTCP destination "
+                                   "(port 0); repeated warnings are suppressed for this media: %1")
+                               .arg(detail);
+                }
+            } else {
+                qWarning().noquote()
+                        << QStringLiteral("[GStreamer-WARNING] source=%1 message=%2 detail=%3")
+                           .arg(sourceName)
+                           .arg(warningText)
+                           .arg(detail);
+            }
+            if (warning) g_error_free(warning);
+            if (debug) g_free(debug);
+            break;
+        }
+        case GST_MESSAGE_QOS: {
+            GstFormat format = GST_FORMAT_UNDEFINED;
+            guint64 processed = 0;
+            guint64 dropped = 0;
+            gint64 jitter = 0;
+            gdouble proportion = 0.0;
+            gint quality = 0;
+            gst_message_parse_qos_stats(message, &format, &processed, &dropped);
+            gst_message_parse_qos_values(message, &jitter, &proportion, &quality);
+            Q_UNUSED(format);
+            Q_UNUSED(proportion);
+            Q_UNUSED(quality);
+            qosMessageCount_.fetchAndAddOrdered(1);
+            qosLastProcessed_.storeRelease(processed);
+            qosLastDropped_.storeRelease(dropped);
+            qosLastSource_ = GST_MESSAGE_SRC(message)
+                    ? QString::fromUtf8(GST_OBJECT_NAME(GST_MESSAGE_SRC(message)))
+                    : QStringLiteral("unknown");
+            qint64 oldMaximum = qosMaxLateNs_.loadAcquire();
+            while (jitter > oldMaximum &&
+                   !qosMaxLateNs_.testAndSetOrdered(oldMaximum, jitter)) {
+                oldMaximum = qosMaxLateNs_.loadAcquire();
+            }
+            break;
+        }
+        case GST_MESSAGE_ELEMENT: {
+            const GstStructure *structure = gst_message_get_structure(message);
+            if (structure && gst_structure_has_name(structure, "drop-msg")) {
+                guint tooLate = 0;
+                guint dropOnLatency = 0;
+                gst_structure_get_uint(structure, "num-too-late", &tooLate);
+                gst_structure_get_uint(structure, "num-drop-on-latency",
+                                       &dropOnLatency);
+
+                GstElement *sourceElement = GST_IS_ELEMENT(GST_MESSAGE_SRC(message))
+                        ? GST_ELEMENT(GST_MESSAGE_SRC(message))
+                        : nullptr;
+                const QString media = rtpMediaType(sourceElement);
+                if (media == QStringLiteral("video")) {
+                    jitterVideoTooLateDrops_.fetchAndAddOrdered(tooLate);
+                    jitterVideoLatencyDrops_.fetchAndAddOrdered(dropOnLatency);
+                } else if (media == QStringLiteral("audio")) {
+                    jitterAudioTooLateDrops_.fetchAndAddOrdered(tooLate);
+                    jitterAudioLatencyDrops_.fetchAndAddOrdered(dropOnLatency);
+                } else {
+                    jitterUnknownTooLateDrops_.fetchAndAddOrdered(tooLate);
+                    jitterUnknownLatencyDrops_.fetchAndAddOrdered(dropOnLatency);
+                }
+            } else if (structure &&
+                gst_structure_has_name(structure, "GstRTSPSrcTimeout")) {
+                gchar *detail = gst_structure_to_string(structure);
+                qWarning().noquote()
+                        << QStringLiteral("[GStreamer-RTSP] timeout source=%1 detail=%2")
+                           .arg(QString::fromUtf8(GST_OBJECT_NAME(GST_MESSAGE_SRC(message))))
+                           .arg(detail ? QString::fromUtf8(detail)
+                                       : QStringLiteral("unavailable"));
+                if (detail) g_free(detail);
+            }
             break;
         }
         case GST_MESSAGE_EOS:
             prepared_ = false;
             playing_ = false;
             positionTimer_.stop();
+            playbackDiagnosticTimer_.stop();
             SharedAudioMixer::instance().removeSource(this);
             emit videoFinished();
             break;
@@ -1785,6 +2195,622 @@ void GstPlayerWidget::pollPosition()
     gst_element_query_duration(playbin_, GST_FORMAT_TIME, &duration);
     emit positionChanged(static_cast<int>(position / GST_MSECOND),
                          static_cast<int>(duration / GST_MSECOND));
+}
+
+/** @brief 新媒体开始前清空长时运行诊断基线。 */
+void GstPlayerWidget::resetPlaybackDiagnostics()
+{
+    appSinkSamples_.storeRelease(0);
+    appSinkRgaFrames_.storeRelease(0);
+    appSinkRgaSkippedFrames_.storeRelease(0);
+    mailboxPublishedFrames_.storeRelease(0);
+    mailboxReadyOverwrites_.storeRelease(0);
+    mailboxNoSlotDrops_.storeRelease(0);
+    guiDeliveryCoalesced_.storeRelease(0);
+    guiDeliveredFrames_.storeRelease(0);
+    appSinkLastSampleMs_.storeRelease(0);
+    appSinkMaxGapMs_.storeRelease(0);
+    appSinkMaxRgaUs_.storeRelease(0);
+    guiMaxQueueLagMs_.storeRelease(0);
+    guiMaxEndToEndLagMs_.storeRelease(0);
+    firstRgaSuccessLogged_.storeRelease(0);
+    qosMessageCount_.storeRelease(0);
+    qosLastProcessed_.storeRelease(0);
+    qosLastDropped_.storeRelease(0);
+    qosMaxLateNs_.storeRelease(0);
+    qosLastSource_.clear();
+    jitterVideoTooLateDrops_.storeRelease(0);
+    jitterVideoLatencyDrops_.storeRelease(0);
+    jitterAudioTooLateDrops_.storeRelease(0);
+    jitterAudioLatencyDrops_.storeRelease(0);
+    jitterUnknownTooLateDrops_.storeRelease(0);
+    jitterUnknownLatencyDrops_.storeRelease(0);
+    decoderInputFrames_.storeRelease(0);
+    decoderInputKeyFrames_.storeRelease(0);
+    decoderInputCorruptedFrames_.storeRelease(0);
+    decoderOutputFrames_.storeRelease(0);
+    decoderOutputCorruptedFrames_.storeRelease(0);
+    decoderInputLastBufferMs_.storeRelease(0);
+    decoderInputMaxGapMs_.storeRelease(0);
+    decoderInputPtsOffsetNs_.storeRelease(0);
+    decoderInputMaxAbsPtsOffsetNs_.storeRelease(0);
+    decoderInputPtsOffsetValid_.storeRelease(0);
+    decoderOutputLastBufferMs_.storeRelease(0);
+    decoderOutputMaxGapMs_.storeRelease(0);
+    decoderOutputPtsOffsetNs_.storeRelease(0);
+    decoderOutputMaxAbsPtsOffsetNs_.storeRelease(0);
+    decoderOutputPtsOffsetValid_.storeRelease(0);
+    liveAuReceived_.storeRelease(0);
+    liveAuAccepted_.storeRelease(0);
+    liveAuDropped_.storeRelease(0);
+    liveInFlightAus_.storeRelease(0);
+    liveMaximumInFlightAus_.storeRelease(0);
+    liveLatestInputPtsNs_.storeRelease(0);
+    liveLatestOutputPtsNs_.storeRelease(0);
+    liveDecoderLagNs_.storeRelease(0);
+    liveMaximumDecoderLagNs_.storeRelease(0);
+    liveLatestInputPtsValid_.storeRelease(0);
+    liveLatestOutputPtsValid_.storeRelease(0);
+    liveDecoderAuAligned_.storeRelease(-1);
+    liveDecoderCapsLogged_.storeRelease(0);
+    liveWaitingForKeyframe_.storeRelease(liveRtspMode_.loadAcquire() != 0 ? 1 : 0);
+    liveCreditRecoveryPending_.storeRelease(0);
+    liveCreditOverLimitConsecutiveAus_.storeRelease(0);
+    appSinkPtsOffsetNs_.storeRelease(0);
+    appSinkMaxAbsPtsOffsetNs_.storeRelease(0);
+    appSinkPtsOffsetValid_.storeRelease(0);
+    rtpVideoRawPackets_.storeRelease(0);
+    rtpVideoTimestampChanges_.storeRelease(0);
+    rtpVideoTimestampAdvanceTicks_.storeRelease(0);
+    rtpVideoArrivalAdvanceUs_.storeRelease(0);
+    rtpVideoSequenceGaps_.storeRelease(0);
+    rtpVideoSequenceReorders_.storeRelease(0);
+    rtpVideoTimestampBackwards_.storeRelease(0);
+    rtpVideoTimestampJumps_.storeRelease(0);
+    rtpVideoSsrcChanges_.storeRelease(0);
+    rtpVideoLastTimestamp_.storeRelease(0);
+    rtpVideoLastSequence_.storeRelease(0);
+    rtpVideoLastSsrc_.storeRelease(0);
+    rtpVideoLastPayloadType_.storeRelease(0);
+    rtpVideoLastTimestampArrivalUs_.storeRelease(0);
+    rtpVideoClockRate_.storeRelease(0);
+    rtpVideoPreviousPacketValid_.storeRelease(0);
+    timelineFaultConsecutiveIntervals_ = 0;
+
+    diagnosticLastAppSinkSamples_ = 0;
+    diagnosticLastRgaFrames_ = 0;
+    diagnosticLastRgaSkippedFrames_ = 0;
+    diagnosticLastMailboxOverwrites_ = 0;
+    diagnosticLastMailboxNoSlotDrops_ = 0;
+    diagnosticLastGuiDeliveredFrames_ = 0;
+    diagnosticLastRtpPushed_ = 0;
+    diagnosticLastRtpLost_ = 0;
+    diagnosticLastRtpLate_ = 0;
+    diagnosticLastRtpDuplicates_ = 0;
+    diagnosticLastSinkRendered_ = 0;
+    diagnosticLastSinkDropped_ = 0;
+    playbackDiagnosticElapsed_.invalidate();
+}
+
+/** @brief 周期输出 RTSP/RTP、解码、RGA 和 GUI 端到端诊断数据。 */
+void GstPlayerWidget::pollPlaybackDiagnostics()
+{
+    if (!playbin_ || !playing_ ||
+        !mediaPath_.startsWith(QStringLiteral("rtsp://"), Qt::CaseInsensitive)) {
+        return;
+    }
+
+    const qint64 intervalMs = playbackDiagnosticElapsed_.isValid()
+            ? qMax<qint64>(1, playbackDiagnosticElapsed_.restart())
+            : 30000;
+
+    struct RtpCounterBaseline {
+        quint64 pushed = 0;
+        quint64 lost = 0;
+        quint64 late = 0;
+        quint64 duplicates = 0;
+    };
+    struct RtpIntervalStats {
+        quint64 pushed = 0;
+        quint64 lost = 0;
+        quint64 late = 0;
+        quint64 duplicates = 0;
+        quint64 averageJitterNs = 0;
+        int maximumFillPercent = 0;
+        int jitterBuffers = 0;
+        QStringList encodings;
+    };
+    RtpIntervalStats videoRtp;
+    RtpIntervalStats audioRtp;
+    RtpIntervalStats unknownRtp;
+
+    quint64 rtpPushed = 0;
+    quint64 rtpLost = 0;
+    quint64 rtpLate = 0;
+    quint64 rtpDuplicates = 0;
+    quint64 rtpAverageJitterNs = 0;
+    int jitterBufferCount = 0;
+    int udpSourceCount = 0;
+    bool rtspSourceFound = false;
+    guint rtspLatencyMs = 0;
+    guint rtspProtocols = 0;
+    gint rtspBufferMode = -1;
+    bool rtspBufferModeSupported = false;
+    gboolean rtspRetransmission = FALSE;
+    gboolean rtspDropOnLatency = FALSE;
+    gboolean rtspTcpTimestamp = FALSE;
+    bool rtspTcpTimestampSupported = false;
+    QStringList decoderFactories;
+
+    GstIterator *iterator = GST_IS_BIN(playbin_)
+            ? gst_bin_iterate_recurse(GST_BIN(playbin_))
+            : nullptr;
+    if (iterator) {
+        GValue item = G_VALUE_INIT;
+        bool finished = false;
+        while (!finished) {
+            switch (gst_iterator_next(iterator, &item)) {
+            case GST_ITERATOR_OK: {
+                GstElement *element = GST_ELEMENT(g_value_get_object(&item));
+                const char *factoryName = elementFactoryName(element);
+                const QString factory = factoryName
+                        ? QString::fromLatin1(factoryName)
+                        : QString();
+
+                if (factory == QStringLiteral("rtspsrc")) {
+                    rtspSourceFound = true;
+                    if (hasProperty(G_OBJECT(element), "latency")) {
+                        g_object_get(element, "latency", &rtspLatencyMs, nullptr);
+                    }
+                    if (hasProperty(G_OBJECT(element), "protocols")) {
+                        g_object_get(element, "protocols", &rtspProtocols, nullptr);
+                    }
+                    rtspBufferModeSupported = hasProperty(G_OBJECT(element), "buffer-mode");
+                    if (rtspBufferModeSupported) {
+                        g_object_get(element, "buffer-mode", &rtspBufferMode, nullptr);
+                    }
+                    if (hasProperty(G_OBJECT(element), "do-retransmission")) {
+                        g_object_get(element, "do-retransmission", &rtspRetransmission, nullptr);
+                    }
+                    if (hasProperty(G_OBJECT(element), "drop-on-latency")) {
+                        g_object_get(element, "drop-on-latency", &rtspDropOnLatency, nullptr);
+                    }
+                    rtspTcpTimestampSupported = hasProperty(G_OBJECT(element), "tcp-timestamp");
+                    if (rtspTcpTimestampSupported) {
+                        g_object_get(element, "tcp-timestamp", &rtspTcpTimestamp, nullptr);
+                    }
+                } else if (factory == QStringLiteral("rtpjitterbuffer")) {
+                    ++jitterBufferCount;
+                    QString encodingName;
+                    const QString media = rtpMediaType(element, &encodingName);
+                    RtpIntervalStats *mediaStats = media == QStringLiteral("video")
+                            ? &videoRtp
+                            : (media == QStringLiteral("audio")
+                               ? &audioRtp : &unknownRtp);
+                    ++mediaStats->jitterBuffers;
+                    if (!encodingName.isEmpty() &&
+                        !mediaStats->encodings.contains(encodingName)) {
+                        mediaStats->encodings.append(encodingName);
+                    }
+                    if (hasProperty(G_OBJECT(element), "percent")) {
+                        gint fillPercent = 0;
+                        g_object_get(element, "percent", &fillPercent, nullptr);
+                        mediaStats->maximumFillPercent = qMax(
+                                    mediaStats->maximumFillPercent, fillPercent);
+                    }
+                    GstStructure *stats = nullptr;
+                    if (hasProperty(G_OBJECT(element), "stats")) {
+                        g_object_get(element, "stats", &stats, nullptr);
+                    }
+                    if (stats) {
+                        guint64 pushed = 0;
+                        guint64 lost = 0;
+                        guint64 late = 0;
+                        guint64 duplicates = 0;
+                        guint64 value = 0;
+                        gst_structure_get_uint64(stats, "num-pushed", &pushed);
+                        gst_structure_get_uint64(stats, "num-lost", &lost);
+                        gst_structure_get_uint64(stats, "num-late", &late);
+                        gst_structure_get_uint64(stats, "num-duplicates", &duplicates);
+                        rtpPushed += pushed;
+                        rtpLost += lost;
+                        rtpLate += late;
+                        rtpDuplicates += duplicates;
+
+                        auto *baseline = static_cast<RtpCounterBaseline *>(
+                                    g_object_get_data(G_OBJECT(element),
+                                                      "ycest-rtp-diag-baseline"));
+                        if (!baseline) {
+                            baseline = new RtpCounterBaseline;
+                            g_object_set_data_full(
+                                        G_OBJECT(element),
+                                        "ycest-rtp-diag-baseline",
+                                        baseline,
+                                        [](gpointer data) {
+                                            delete static_cast<RtpCounterBaseline *>(data);
+                                        });
+                        }
+                        mediaStats->pushed += counterDelta(pushed, baseline->pushed);
+                        mediaStats->lost += counterDelta(lost, baseline->lost);
+                        mediaStats->late += counterDelta(late, baseline->late);
+                        mediaStats->duplicates += counterDelta(
+                                    duplicates, baseline->duplicates);
+                        baseline->pushed = pushed;
+                        baseline->lost = lost;
+                        baseline->late = late;
+                        baseline->duplicates = duplicates;
+
+                        if (gst_structure_get_uint64(stats, "avg-jitter", &value)) {
+                            rtpAverageJitterNs = qMax(rtpAverageJitterNs,
+                                                     static_cast<quint64>(value));
+                            mediaStats->averageJitterNs = qMax(
+                                        mediaStats->averageJitterNs,
+                                        static_cast<quint64>(value));
+                        }
+                        gst_structure_free(stats);
+                    }
+                } else if (factory == QStringLiteral("udpsrc")) {
+                    ++udpSourceCount;
+                }
+
+                if (isVideoDecoderFactory(factory) &&
+                    !decoderFactories.contains(factory)) {
+                    decoderFactories.append(factory);
+                }
+                g_value_reset(&item);
+                break;
+            }
+            case GST_ITERATOR_RESYNC:
+                gst_iterator_resync(iterator);
+                break;
+            case GST_ITERATOR_ERROR:
+            case GST_ITERATOR_DONE:
+                finished = true;
+                break;
+            }
+        }
+        if (G_VALUE_TYPE(&item) != G_TYPE_INVALID) {
+            g_value_unset(&item);
+        }
+        gst_iterator_free(iterator);
+    }
+
+    guint64 sinkRendered = 0;
+    guint64 sinkDropped = 0;
+    double sinkAverageRate = 0.0;
+    if (appSink_ && hasProperty(G_OBJECT(appSink_), "stats")) {
+        GstStructure *sinkStats = nullptr;
+        g_object_get(appSink_, "stats", &sinkStats, nullptr);
+        if (sinkStats) {
+            gst_structure_get_uint64(sinkStats, "rendered", &sinkRendered);
+            gst_structure_get_uint64(sinkStats, "dropped", &sinkDropped);
+            gst_structure_get_double(sinkStats, "average-rate", &sinkAverageRate);
+            gst_structure_free(sinkStats);
+        }
+    }
+
+    const quint64 appSinkSamples = appSinkSamples_.loadAcquire();
+    const quint64 rgaFrames = appSinkRgaFrames_.loadAcquire();
+    const quint64 rgaSkipped = appSinkRgaSkippedFrames_.loadAcquire();
+    const quint64 mailboxOverwrites = mailboxReadyOverwrites_.loadAcquire();
+    const quint64 mailboxNoSlotDrops = mailboxNoSlotDrops_.loadAcquire();
+    const quint64 guiFrames = guiDeliveredFrames_.loadAcquire();
+
+    const quint64 appSinkDelta = counterDelta(appSinkSamples,
+                                              diagnosticLastAppSinkSamples_);
+    const quint64 rgaDelta = counterDelta(rgaFrames, diagnosticLastRgaFrames_);
+    const quint64 rgaSkippedDelta = counterDelta(
+                rgaSkipped, diagnosticLastRgaSkippedFrames_);
+    const quint64 mailboxOverwriteDelta = counterDelta(
+                mailboxOverwrites, diagnosticLastMailboxOverwrites_);
+    const quint64 mailboxNoSlotDelta = counterDelta(
+                mailboxNoSlotDrops, diagnosticLastMailboxNoSlotDrops_);
+    const quint64 guiDelta = counterDelta(guiFrames,
+                                          diagnosticLastGuiDeliveredFrames_);
+    const quint64 rtpPushedDelta = counterDelta(rtpPushed,
+                                                diagnosticLastRtpPushed_);
+    const quint64 rtpLostDelta = counterDelta(rtpLost,
+                                              diagnosticLastRtpLost_);
+    const quint64 rtpLateDelta = counterDelta(rtpLate,
+                                              diagnosticLastRtpLate_);
+    const quint64 rtpDuplicateDelta = counterDelta(
+                rtpDuplicates, diagnosticLastRtpDuplicates_);
+    const quint64 sinkRenderedDelta = counterDelta(
+                sinkRendered, diagnosticLastSinkRendered_);
+    const quint64 sinkDroppedDelta = counterDelta(
+                sinkDropped, diagnosticLastSinkDropped_);
+
+    diagnosticLastAppSinkSamples_ = appSinkSamples;
+    diagnosticLastRgaFrames_ = rgaFrames;
+    diagnosticLastRgaSkippedFrames_ = rgaSkipped;
+    diagnosticLastMailboxOverwrites_ = mailboxOverwrites;
+    diagnosticLastMailboxNoSlotDrops_ = mailboxNoSlotDrops;
+    diagnosticLastGuiDeliveredFrames_ = guiFrames;
+    diagnosticLastRtpPushed_ = rtpPushed;
+    diagnosticLastRtpLost_ = rtpLost;
+    diagnosticLastRtpLate_ = rtpLate;
+    diagnosticLastRtpDuplicates_ = rtpDuplicates;
+    diagnosticLastSinkRendered_ = sinkRendered;
+    diagnosticLastSinkDropped_ = sinkDropped;
+
+    const double seconds = static_cast<double>(intervalMs) / 1000.0;
+    const QString transportHint = udpSourceCount > 0
+            ? QStringLiteral("udp")
+            : (rtspSourceFound ? QStringLiteral("tcp-or-undetermined")
+                               : QStringLiteral("unknown"));
+    const QString tcpTimestampText = rtspTcpTimestampSupported
+            ? QString::number(rtspTcpTimestamp != FALSE)
+            : QStringLiteral("unsupported");
+    const QString decoderText = decoderFactories.isEmpty()
+            ? QStringLiteral("unknown")
+            : decoderFactories.join(QLatin1Char(','));
+
+    const quint64 decoderInputFrames = decoderInputFrames_.fetchAndStoreOrdered(0);
+    const quint64 decoderInputKeyFrames =
+            decoderInputKeyFrames_.fetchAndStoreOrdered(0);
+    const quint64 decoderInputCorrupted =
+            decoderInputCorruptedFrames_.fetchAndStoreOrdered(0);
+    const quint64 decoderOutputFrames = decoderOutputFrames_.fetchAndStoreOrdered(0);
+    const quint64 decoderOutputCorrupted =
+            decoderOutputCorruptedFrames_.fetchAndStoreOrdered(0);
+    const bool decoderInputPtsValid =
+            decoderInputPtsOffsetValid_.fetchAndStoreOrdered(0) != 0;
+    const bool decoderPtsValid = decoderOutputPtsOffsetValid_.fetchAndStoreOrdered(0) != 0;
+    const bool appSinkPtsValid = appSinkPtsOffsetValid_.fetchAndStoreOrdered(0) != 0;
+    const qint64 decoderPtsOffsetNs = decoderOutputPtsOffsetNs_.loadAcquire();
+    const qint64 decoderMaxAbsPtsOffsetNs =
+            decoderOutputMaxAbsPtsOffsetNs_.fetchAndStoreOrdered(0);
+    const qint64 appSinkPtsOffsetNs = appSinkPtsOffsetNs_.loadAcquire();
+    const qint64 appSinkMaxAbsPtsOffsetNs =
+            appSinkMaxAbsPtsOffsetNs_.fetchAndStoreOrdered(0);
+    const qint64 decoderInputPtsOffsetNs = decoderInputPtsOffsetNs_.loadAcquire();
+    const qint64 decoderInputMaxAbsPtsOffsetNs =
+            decoderInputMaxAbsPtsOffsetNs_.fetchAndStoreOrdered(0);
+    const quint64 liveAuReceived = liveAuReceived_.fetchAndStoreOrdered(0);
+    const quint64 liveAuAccepted = liveAuAccepted_.fetchAndStoreOrdered(0);
+    const quint64 liveAuDropped = liveAuDropped_.fetchAndStoreOrdered(0);
+    const qint64 liveInFlightAus = liveInFlightAus_.loadAcquire();
+    const qint64 liveMaximumInFlightAus =
+            liveMaximumInFlightAus_.fetchAndStoreOrdered(0);
+    const qint64 liveDecoderLagNs = liveDecoderLagNs_.loadAcquire();
+    const qint64 liveMaximumDecoderLagNs =
+            liveMaximumDecoderLagNs_.fetchAndStoreOrdered(0);
+    const int liveAuAlignment = liveDecoderAuAligned_.loadAcquire();
+    const QString liveAuAlignmentText = liveAuAlignment < 0
+            ? QStringLiteral("unknown")
+            : (liveAuAlignment != 0 ? QStringLiteral("au")
+                                    : QStringLiteral("not-au"));
+
+    const quint64 rawRtpPackets = rtpVideoRawPackets_.fetchAndStoreOrdered(0);
+    const quint64 rawTimestampChanges =
+            rtpVideoTimestampChanges_.fetchAndStoreOrdered(0);
+    const quint64 rawTimestampTicks =
+            rtpVideoTimestampAdvanceTicks_.fetchAndStoreOrdered(0);
+    const quint64 rawArrivalUs =
+            rtpVideoArrivalAdvanceUs_.fetchAndStoreOrdered(0);
+    const quint64 rawSequenceGaps =
+            rtpVideoSequenceGaps_.fetchAndStoreOrdered(0);
+    const quint64 rawSequenceReorders =
+            rtpVideoSequenceReorders_.fetchAndStoreOrdered(0);
+    const quint64 rawTimestampBackwards =
+            rtpVideoTimestampBackwards_.fetchAndStoreOrdered(0);
+    const quint64 rawTimestampJumps =
+            rtpVideoTimestampJumps_.fetchAndStoreOrdered(0);
+    const quint64 rawSsrcChanges =
+            rtpVideoSsrcChanges_.fetchAndStoreOrdered(0);
+    const qint64 rawClockRate = rtpVideoClockRate_.loadAcquire();
+    const double rawMediaAdvanceMs = rawClockRate > 0
+            ? static_cast<double>(rawTimestampTicks) * 1000.0 /
+              static_cast<double>(rawClockRate)
+            : 0.0;
+    const double rawArrivalAdvanceMs = static_cast<double>(rawArrivalUs) / 1000.0;
+    const double rawClockRateRatioValue = rawClockRate > 0 && rawArrivalUs > 0
+            ? rawMediaAdvanceMs / rawArrivalAdvanceMs : 0.0;
+    const QString rawClockRateRatio = rawClockRateRatioValue > 0.0
+            ? QString::number(rawClockRateRatioValue, 'f', 6)
+            : QStringLiteral("unavailable");
+
+    auto formatRtpStats = [](const QString &name,
+                             const RtpIntervalStats &stats) -> QString {
+        const QString encoding = stats.encodings.isEmpty()
+                ? QStringLiteral("unknown")
+                : stats.encodings.join(QLatin1Char(','));
+        return QStringLiteral(
+                    "%1[encoding=%2 buffers=%3 pushed=%4 lost=%5 late=%6 dup=%7 "
+                    "jitterMs=%8 fillPct=%9]")
+                .arg(name)
+                .arg(encoding)
+                .arg(stats.jitterBuffers)
+                .arg(stats.pushed)
+                .arg(stats.lost)
+                .arg(stats.late)
+                .arg(stats.duplicates)
+                .arg(static_cast<double>(stats.averageJitterNs) /
+                     1000000.0, 0, 'f', 3)
+                .arg(stats.maximumFillPercent);
+    };
+    const QString decoderInputPtsText = decoderInputPtsValid
+            ? QStringLiteral("latestMs=%1 maxAbsMs=%2")
+              .arg(static_cast<double>(decoderInputPtsOffsetNs) / 1000000.0,
+                   0, 'f', 3)
+              .arg(static_cast<double>(decoderInputMaxAbsPtsOffsetNs) / 1000000.0,
+                   0, 'f', 3)
+            : QStringLiteral("unavailable");
+    const QString decoderOutputPtsText = decoderPtsValid
+            ? QStringLiteral("latestMs=%1 maxAbsMs=%2")
+              .arg(static_cast<double>(decoderPtsOffsetNs) / 1000000.0,
+                   0, 'f', 3)
+              .arg(static_cast<double>(decoderMaxAbsPtsOffsetNs) / 1000000.0,
+                   0, 'f', 3)
+            : QStringLiteral("unavailable");
+    const QString appSinkPtsText = appSinkPtsValid
+            ? QStringLiteral("latestMs=%1 maxAbsMs=%2")
+              .arg(static_cast<double>(appSinkPtsOffsetNs) / 1000000.0,
+                   0, 'f', 3)
+              .arg(static_cast<double>(appSinkMaxAbsPtsOffsetNs) / 1000000.0,
+                   0, 'f', 3)
+            : QStringLiteral("unavailable");
+    const QString rtspBufferModeText = !rtspBufferModeSupported
+            ? QStringLiteral("unsupported")
+            : rtspBufferModeName(rtspBufferMode);
+
+    QStringList diagnosticParts;
+    diagnosticParts
+            << QStringLiteral(
+                   "[GStreamer-DIAG] intervalMs=%1 transport=%2 protocols=0x%3 "
+                   "rtspLatencyMs=%4 bufferMode=%5 retransmission=%6 dropOnLatency=%7 "
+                   "tcpTimestamp=%8 decoder=%9 jitterBuffers=%10")
+               .arg(intervalMs)
+               .arg(transportHint)
+               .arg(QString::number(rtspProtocols, 16))
+               .arg(rtspLatencyMs)
+               .arg(rtspBufferModeText)
+               .arg(rtspRetransmission != FALSE)
+               .arg(rtspDropOnLatency != FALSE)
+               .arg(tcpTimestampText)
+               .arg(decoderText)
+               .arg(jitterBufferCount)
+            << QStringLiteral(
+                   "rtpTotal[pushed=%1 lost=%2 late=%3 dup=%4 avgJitterMs=%5]")
+               .arg(rtpPushedDelta)
+               .arg(rtpLostDelta)
+               .arg(rtpLateDelta)
+               .arg(rtpDuplicateDelta)
+               .arg(static_cast<double>(rtpAverageJitterNs) /
+                    1000000.0, 0, 'f', 3)
+            << formatRtpStats(QStringLiteral("rtpVideo"), videoRtp)
+            << formatRtpStats(QStringLiteral("rtpAudio"), audioRtp)
+            << formatRtpStats(QStringLiteral("rtpUnknown"), unknownRtp)
+            << QStringLiteral(
+                   "jitterDrops[videoLate=%1 videoLatency=%2 audioLate=%3 "
+                   "audioLatency=%4 unknownLate=%5 unknownLatency=%6]")
+               .arg(jitterVideoTooLateDrops_.fetchAndStoreOrdered(0))
+               .arg(jitterVideoLatencyDrops_.fetchAndStoreOrdered(0))
+               .arg(jitterAudioTooLateDrops_.fetchAndStoreOrdered(0))
+               .arg(jitterAudioLatencyDrops_.fetchAndStoreOrdered(0))
+               .arg(jitterUnknownTooLateDrops_.fetchAndStoreOrdered(0))
+               .arg(jitterUnknownLatencyDrops_.fetchAndStoreOrdered(0))
+            << QStringLiteral(
+                   "decoderIO[inFps=%1 outFps=%2 key=%3 inCorrupt=%4 "
+                   "outCorrupt=%5 inGapMs=%6 outGapMs=%7]")
+               .arg(static_cast<double>(decoderInputFrames) / seconds, 0, 'f', 2)
+               .arg(static_cast<double>(decoderOutputFrames) / seconds, 0, 'f', 2)
+               .arg(decoderInputKeyFrames)
+               .arg(decoderInputCorrupted)
+               .arg(decoderOutputCorrupted)
+               .arg(decoderInputMaxGapMs_.fetchAndStoreOrdered(0))
+               .arg(decoderOutputMaxGapMs_.fetchAndStoreOrdered(0))
+            << QStringLiteral(
+                   "liveCredit[enabled=%1 alignment=%2 received=%3 accepted=%4 "
+                   "dropped=%5 inFlight=%6 maxInFlight=%7 lagMs=%8 maxLagMs=%9 "
+                   "recoveryPending=%10]")
+               .arg(liveRtspMode_.loadAcquire() != 0)
+               .arg(liveAuAlignmentText)
+               .arg(liveAuReceived)
+               .arg(liveAuAccepted)
+               .arg(liveAuDropped)
+               .arg(liveInFlightAus)
+               .arg(liveMaximumInFlightAus)
+               .arg(static_cast<double>(liveDecoderLagNs) / 1000000.0,
+                    0, 'f', 3)
+               .arg(static_cast<double>(liveMaximumDecoderLagNs) / 1000000.0,
+                    0, 'f', 3)
+               .arg(liveCreditRecoveryPending_.loadAcquire() != 0)
+            << QStringLiteral(
+                   "pts[decoderInput={%1} decoderOutput={%2} appsink={%3}]")
+               .arg(decoderInputPtsText)
+               .arg(decoderOutputPtsText)
+               .arg(appSinkPtsText)
+            << QStringLiteral("fps[appsink=%1 rga=%2 gui=%3]")
+               .arg(static_cast<double>(appSinkDelta) / seconds, 0, 'f', 2)
+               .arg(static_cast<double>(rgaDelta) / seconds, 0, 'f', 2)
+               .arg(static_cast<double>(guiDelta) / seconds, 0, 'f', 2)
+            << QStringLiteral("drops[rga=%1 overwrite=%2 noSlot=%3]")
+               .arg(rgaSkippedDelta)
+               .arg(mailboxOverwriteDelta)
+               .arg(mailboxNoSlotDelta)
+            << QStringLiteral(
+                   "max[appGapMs=%1 rgaUs=%2 guiQueueMs=%3 endToEndMs=%4 qosLateMs=%5]")
+               .arg(appSinkMaxGapMs_.fetchAndStoreOrdered(0))
+               .arg(appSinkMaxRgaUs_.fetchAndStoreOrdered(0))
+               .arg(guiMaxQueueLagMs_.fetchAndStoreOrdered(0))
+               .arg(guiMaxEndToEndLagMs_.fetchAndStoreOrdered(0))
+               .arg(static_cast<double>(qosMaxLateNs_.fetchAndStoreOrdered(0)) /
+                    1000000.0, 0, 'f', 3)
+            << QStringLiteral(
+                   "sinkStats[rendered=%1 dropped=%2 averageRate=%3] "
+                   "qos[source=%4 messages=%5 processed=%6 dropped=%7]")
+               .arg(sinkRenderedDelta)
+               .arg(sinkDroppedDelta)
+               .arg(sinkAverageRate, 0, 'f', 3)
+               .arg(qosLastSource_.isEmpty() ? QStringLiteral("none")
+                                             : qosLastSource_)
+               .arg(qosMessageCount_.loadAcquire())
+               .arg(qosLastProcessed_.loadAcquire())
+               .arg(qosLastDropped_.loadAcquire())
+            << QStringLiteral("process[rssKiB=%1 fds=%2 tempC=%3]")
+               .arg(processResidentMemoryKiB())
+               .arg(processOpenFileDescriptorCount())
+               .arg(maximumThermalZoneCelsius(), 0, 'f', 1);
+    qInfo().noquote() << diagnosticParts.join(QLatin1Char(' '));
+    qInfo().noquote() << QStringLiteral(
+            "[GStreamer-RTP-CLOCK] ssrc=0x%1 pt=%2 clockRate=%3 packets=%4 "
+            "tsChanges=%5 seqGap=%6 reorder=%7 tsBack=%8 tsJump=%9 "
+            "ssrcChange=%10 mediaAdvanceMs=%11 arrivalAdvanceMs=%12 rate=%13 "
+            "lastSeq=%14 lastTs=%15")
+            .arg(QString::number(rtpVideoLastSsrc_.loadAcquire(), 16))
+            .arg(rtpVideoLastPayloadType_.loadAcquire())
+            .arg(rawClockRate)
+            .arg(rawRtpPackets)
+            .arg(rawTimestampChanges)
+            .arg(rawSequenceGaps)
+            .arg(rawSequenceReorders)
+            .arg(rawTimestampBackwards)
+            .arg(rawTimestampJumps)
+            .arg(rawSsrcChanges)
+            .arg(rawMediaAdvanceMs, 0, 'f', 3)
+            .arg(rawArrivalAdvanceMs, 0, 'f', 3)
+            .arg(rawClockRateRatio)
+            .arg(rtpVideoLastSequence_.loadAcquire())
+            .arg(rtpVideoLastTimestamp_.loadAcquire());
+    const double rawFrameFps = static_cast<double>(rawTimestampChanges) / seconds;
+    const double decoderInputFps =
+            static_cast<double>(decoderInputFrames) / seconds;
+    const double decoderOutputFps =
+            static_cast<double>(decoderOutputFrames) / seconds;
+    const bool rawVideoHealthy = rawClockRate > 0 && rawFrameFps >= 4.0 &&
+            rawClockRateRatioValue >= 0.98 && rawClockRateRatioValue <= 1.02 &&
+            rawSequenceGaps == 0 && rawTimestampBackwards == 0 &&
+            rawTimestampJumps == 0 && rawSsrcChanges == 0;
+    const bool decoderInputActive = decoderInputFps >= 1.0;
+    const bool decoderOutputSlow =
+            decoderOutputFps < rawFrameFps * 0.65;
+    const bool decoderOutputPtsLagged = decoderPtsValid &&
+            decoderPtsOffsetNs <= -static_cast<qint64>(10 * GST_SECOND);
+    const bool jitterBackpressure = videoRtp.maximumFillPercent >= 90;
+    const bool timelineFault =
+            rawVideoHealthy && decoderInputActive &&
+            (decoderOutputPtsLagged ||
+             (decoderOutputSlow && jitterBackpressure));
+    timelineFaultConsecutiveIntervals_ = timelineFault
+            ? timelineFaultConsecutiveIntervals_ + 1 : 0;
+    if (timelineFaultConsecutiveIntervals_ >= 2) {
+        const QString reason = QStringLiteral(
+                "live MPP output stall: rawFps=%1 decoderInFps=%2 decoderOutFps=%3 "
+                "decoderOutputPtsLagMs=%4 fillPct=%5 rawClockRate=%6 rawRate=%7")
+                .arg(rawFrameFps, 0, 'f', 2)
+                .arg(decoderInputFps, 0, 'f', 2)
+                .arg(decoderOutputFps, 0, 'f', 2)
+                .arg(decoderPtsValid
+                     ? static_cast<double>(decoderPtsOffsetNs) / 1000000.0
+                     : 0.0, 0, 'f', 3)
+                .arg(videoRtp.maximumFillPercent)
+                .arg(rawClockRate)
+                .arg(rawClockRateRatio);
+        timelineFaultConsecutiveIntervals_ = 0;
+        qWarning().noquote() << "[GStreamer-WATCHDOG]" << reason;
+        emit liveTimelineFaultDetected(reason);
+    }
 }
 
 /** @brief 在同步总线回调中绑定硬件视频窗口句柄。 */
@@ -1881,6 +2907,301 @@ GstPadProbeReturn GstPlayerWidget::audioPadProbe(GstPad *, GstPadProbeInfo *info
         QMetaObject::invokeMethod(self, [self, now]() {
             if (!self->shuttingDown_.load()) emit self->audioFrameArrived(now);
         }, Qt::QueuedConnection);
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+/** @brief 统计送入视频解码器的压缩帧、关键帧和损坏标志。 */
+GstPadProbeReturn GstPlayerWidget::decoderInputPadProbe(
+        GstPad *pad, GstPadProbeInfo *info, gpointer userData)
+{
+    auto *self = static_cast<GstPlayerWidget *>(userData);
+    if (!self || self->shuttingDown_.load() ||
+        !(GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER)) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buffer) return GST_PAD_PROBE_OK;
+
+    const bool liveRtsp = self->liveRtspMode_.loadAcquire() != 0;
+    const bool deltaUnit = GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT);
+    if (liveRtsp) {
+        self->liveAuReceived_.fetchAndAddOrdered(1);
+
+        GstCaps *caps = gst_pad_get_current_caps(pad);
+        if (caps && !gst_caps_is_empty(caps) && !gst_caps_is_any(caps)) {
+            const GstStructure *structure = gst_caps_get_structure(caps, 0);
+            const gchar *alignment = structure
+                    ? gst_structure_get_string(structure, "alignment") : nullptr;
+            const bool auAligned = alignment && std::strcmp(alignment, "au") == 0;
+            self->liveDecoderAuAligned_.storeRelease(auAligned ? 1 : 0);
+            if (self->liveDecoderCapsLogged_.testAndSetOrdered(0, 1)) {
+                gchar *capsText = gst_caps_to_string(caps);
+                qInfo().noquote() << "[GStreamer-LIVE-CAPS] decoderSink="
+                                  << (capsText ? QString::fromUtf8(capsText)
+                                               : QStringLiteral("unknown"))
+                                  << "auAligned=" << auAligned;
+                if (capsText) g_free(capsText);
+            }
+        }
+        if (caps) gst_caps_unref(caps);
+
+        const bool auAligned = self->liveDecoderAuAligned_.loadAcquire() == 1;
+        if (auAligned && self->liveWaitingForKeyframe_.loadAcquire() != 0) {
+            if (deltaUnit) {
+                self->liveAuDropped_.fetchAndAddOrdered(1);
+                return GST_PAD_PROBE_DROP;
+            }
+            self->liveWaitingForKeyframe_.storeRelease(0);
+            qInfo() << "[GStreamer-LIVE-CREDIT] first IDR accepted; live decoder input opened";
+        }
+
+        if (auAligned && self->liveCreditRecoveryPending_.loadAcquire() != 0) {
+            self->liveAuDropped_.fetchAndAddOrdered(1);
+            return GST_PAD_PROBE_DROP;
+        }
+
+        if (auAligned && GST_CLOCK_TIME_IS_VALID(GST_BUFFER_PTS(buffer)) &&
+            GST_BUFFER_PTS(buffer) <=
+                    static_cast<GstClockTime>(std::numeric_limits<qint64>::max())) {
+            const qint64 inputPtsNs = static_cast<qint64>(GST_BUFFER_PTS(buffer));
+            self->liveLatestInputPtsNs_.storeRelease(inputPtsNs);
+            self->liveLatestInputPtsValid_.storeRelease(1);
+
+            if (self->liveLatestOutputPtsValid_.loadAcquire() != 0) {
+                const qint64 outputPtsNs = self->liveLatestOutputPtsNs_.loadAcquire();
+                const qint64 lagNs = inputPtsNs >= outputPtsNs
+                        ? inputPtsNs - outputPtsNs : 0;
+                self->liveDecoderLagNs_.storeRelease(lagNs);
+                updateMaximumAbsolute(&self->liveMaximumDecoderLagNs_, lagNs);
+
+                const qint64 inFlight = self->liveInFlightAus_.loadAcquire();
+                const bool creditOverLimit =
+                        lagNs >= kLiveDecoderCreditLagNs &&
+                        inFlight >= kLiveDecoderMaximumInFlightAus;
+                const int consecutive = creditOverLimit
+                        ? self->liveCreditOverLimitConsecutiveAus_.fetchAndAddOrdered(1) + 1
+                        : 0;
+                if (!creditOverLimit) {
+                    self->liveCreditOverLimitConsecutiveAus_.storeRelease(0);
+                }
+
+                if (consecutive >= kLiveDecoderCreditConfirmAus &&
+                    self->liveCreditRecoveryPending_.testAndSetOrdered(0, 1)) {
+                    self->liveAuDropped_.fetchAndAddOrdered(1);
+                    const QString reason = QStringLiteral(
+                            "live MPP credit overflow: lagMs=%1 inFlightAu=%2 "
+                            "limitAu=%3 alignment=au")
+                            .arg(static_cast<double>(lagNs) / 1000000.0, 0, 'f', 3)
+                            .arg(inFlight)
+                            .arg(kLiveDecoderMaximumInFlightAus);
+                    QPointer<GstPlayerWidget> safeSelf(self);
+                    const bool queued = QMetaObject::invokeMethod(self,
+                            [safeSelf, reason]() {
+                        if (!safeSelf || safeSelf->shuttingDown_.load() ||
+                            safeSelf->liveRtspMode_.loadAcquire() == 0) {
+                            return;
+                        }
+                        qWarning().noquote() << "[GStreamer-LIVE-CREDIT]" << reason;
+                        emit safeSelf->liveTimelineFaultDetected(reason);
+                    }, Qt::QueuedConnection);
+                    if (!queued) {
+                        self->liveCreditRecoveryPending_.storeRelease(0);
+                    }
+                    return GST_PAD_PROBE_DROP;
+                }
+            }
+        }
+
+        if (auAligned) {
+            self->liveAuAccepted_.fetchAndAddOrdered(1);
+            const qint64 inFlight = self->liveInFlightAus_.fetchAndAddOrdered(1) + 1;
+            updateMaximumAbsolute(&self->liveMaximumInFlightAus_, inFlight);
+        }
+    }
+
+    self->decoderInputFrames_.fetchAndAddOrdered(1);
+    if (!deltaUnit) {
+        self->decoderInputKeyFrames_.fetchAndAddOrdered(1);
+    }
+    if (GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_CORRUPTED)) {
+        self->decoderInputCorruptedFrames_.fetchAndAddOrdered(1);
+    }
+    updateMaximumBufferGap(&self->decoderInputLastBufferMs_,
+                           &self->decoderInputMaxGapMs_,
+                           QDateTime::currentMSecsSinceEpoch());
+
+    qint64 inputOffsetNs = 0;
+    if (bufferPtsClockOffsetNs(pad, buffer, &inputOffsetNs)) {
+        self->decoderInputPtsOffsetNs_.storeRelease(inputOffsetNs);
+        updateMaximumAbsolute(&self->decoderInputMaxAbsPtsOffsetNs_,
+                              inputOffsetNs);
+        self->decoderInputPtsOffsetValid_.storeRelease(1);
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+/** @brief 统计视频解码器输出帧及其相对管线时钟的 PTS 偏移。 */
+GstPadProbeReturn GstPlayerWidget::decoderOutputPadProbe(
+        GstPad *pad, GstPadProbeInfo *info, gpointer userData)
+{
+    auto *self = static_cast<GstPlayerWidget *>(userData);
+    if (!self || self->shuttingDown_.load() ||
+        !(GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER)) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buffer) return GST_PAD_PROBE_OK;
+    if (self->liveRtspMode_.loadAcquire() != 0 &&
+        self->liveDecoderAuAligned_.loadAcquire() == 1) {
+        qint64 inFlight = self->liveInFlightAus_.loadAcquire();
+        while (inFlight > 0 &&
+               !self->liveInFlightAus_.testAndSetOrdered(inFlight, inFlight - 1)) {
+            inFlight = self->liveInFlightAus_.loadAcquire();
+        }
+        if (GST_CLOCK_TIME_IS_VALID(GST_BUFFER_PTS(buffer)) &&
+            GST_BUFFER_PTS(buffer) <=
+                    static_cast<GstClockTime>(std::numeric_limits<qint64>::max())) {
+            const qint64 outputPtsNs = static_cast<qint64>(GST_BUFFER_PTS(buffer));
+            self->liveLatestOutputPtsNs_.storeRelease(outputPtsNs);
+            self->liveLatestOutputPtsValid_.storeRelease(1);
+            if (self->liveLatestInputPtsValid_.loadAcquire() != 0) {
+                const qint64 inputPtsNs = self->liveLatestInputPtsNs_.loadAcquire();
+                const qint64 lagNs = inputPtsNs >= outputPtsNs
+                        ? inputPtsNs - outputPtsNs : 0;
+                self->liveDecoderLagNs_.storeRelease(lagNs);
+                updateMaximumAbsolute(&self->liveMaximumDecoderLagNs_, lagNs);
+            }
+        }
+    }
+    self->decoderOutputFrames_.fetchAndAddOrdered(1);
+    if (GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_CORRUPTED)) {
+        self->decoderOutputCorruptedFrames_.fetchAndAddOrdered(1);
+    }
+    updateMaximumBufferGap(&self->decoderOutputLastBufferMs_,
+                           &self->decoderOutputMaxGapMs_,
+                           QDateTime::currentMSecsSinceEpoch());
+
+    qint64 offsetNs = 0;
+    if (bufferPtsClockOffsetNs(pad, buffer, &offsetNs)) {
+        self->decoderOutputPtsOffsetNs_.storeRelease(offsetNs);
+        updateMaximumAbsolute(&self->decoderOutputMaxAbsPtsOffsetNs_, offsetNs);
+        self->decoderOutputPtsOffsetValid_.storeRelease(1);
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+/** @brief 统计进入 jitterbuffer 前的原始视频 RTP 时钟推进和本地到达推进。 */
+GstPadProbeReturn GstPlayerWidget::rtpInputPadProbe(
+        GstPad *pad, GstPadProbeInfo *info, gpointer userData)
+{
+    auto *self = static_cast<GstPlayerWidget *>(userData);
+    if (!self || self->shuttingDown_.load() || !pad ||
+        !(GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER)) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    int mediaTag = GPOINTER_TO_INT(
+                g_object_get_data(G_OBJECT(pad), "ycest-rtp-media-tag"));
+    if (mediaTag == 0) {
+        GstCaps *caps = gst_pad_get_current_caps(pad);
+        if (!caps) caps = gst_pad_query_caps(pad, nullptr);
+        if (caps && !gst_caps_is_empty(caps) && !gst_caps_is_any(caps)) {
+            const GstStructure *structure = gst_caps_get_structure(caps, 0);
+            const gchar *media = structure
+                    ? gst_structure_get_string(structure, "media") : nullptr;
+            if (media && g_ascii_strcasecmp(media, "video") == 0) {
+                mediaTag = 1;
+                gint clockRate = 0;
+                if (gst_structure_get_int(structure, "clock-rate", &clockRate) &&
+                    clockRate > 0) {
+                    self->rtpVideoClockRate_.storeRelease(clockRate);
+                }
+            } else if (media && *media) {
+                mediaTag = 2;
+            }
+            if (mediaTag != 0) {
+                g_object_set_data(G_OBJECT(pad), "ycest-rtp-media-tag",
+                                  GINT_TO_POINTER(mediaTag));
+            }
+        }
+        if (caps) gst_caps_unref(caps);
+    }
+    if (mediaTag != 1) return GST_PAD_PROBE_OK;
+
+    GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    GstRTPBuffer rtp = GST_RTP_BUFFER_INIT;
+    if (!buffer || !gst_rtp_buffer_map(buffer, GST_MAP_READ, &rtp)) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    const quint32 timestamp = gst_rtp_buffer_get_timestamp(&rtp);
+    const quint32 ssrc = gst_rtp_buffer_get_ssrc(&rtp);
+    const quint32 sequence = gst_rtp_buffer_get_seq(&rtp);
+    const quint32 payloadType = gst_rtp_buffer_get_payload_type(&rtp);
+    gst_rtp_buffer_unmap(&rtp);
+
+    const qint64 arrivalUs = g_get_monotonic_time();
+    self->rtpVideoRawPackets_.fetchAndAddOrdered(1);
+    self->rtpVideoLastPayloadType_.storeRelease(payloadType);
+
+    if (self->rtpVideoPreviousPacketValid_.testAndSetOrdered(0, 1)) {
+        self->rtpVideoLastSsrc_.storeRelease(ssrc);
+        self->rtpVideoLastSequence_.storeRelease(sequence);
+        self->rtpVideoLastTimestamp_.storeRelease(timestamp);
+        self->rtpVideoLastTimestampArrivalUs_.storeRelease(arrivalUs);
+        return GST_PAD_PROBE_OK;
+    }
+
+    const quint32 previousSsrc = self->rtpVideoLastSsrc_.fetchAndStoreOrdered(ssrc);
+    const quint32 previousSequence =
+            self->rtpVideoLastSequence_.fetchAndStoreOrdered(sequence);
+    const quint32 previousTimestamp =
+            self->rtpVideoLastTimestamp_.fetchAndStoreOrdered(timestamp);
+
+    if (previousSsrc != ssrc) {
+        self->rtpVideoSsrcChanges_.fetchAndAddOrdered(1);
+        self->rtpVideoLastTimestampArrivalUs_.storeRelease(arrivalUs);
+        return GST_PAD_PROBE_OK;
+    }
+
+    const quint16 sequenceDelta = static_cast<quint16>(
+                static_cast<quint16>(sequence) -
+                static_cast<quint16>(previousSequence));
+    if (sequenceDelta > 1 && sequenceDelta < 0x8000u) {
+        self->rtpVideoSequenceGaps_.fetchAndAddOrdered(sequenceDelta - 1);
+    } else if (sequenceDelta == 0 || sequenceDelta >= 0x8000u) {
+        self->rtpVideoSequenceReorders_.fetchAndAddOrdered(1);
+    }
+
+    if (timestamp != previousTimestamp) {
+        const quint32 modularDelta = timestamp - previousTimestamp;
+        const qint64 timestampDelta = modularDelta <= 0x7fffffffu
+                ? static_cast<qint64>(modularDelta)
+                : -static_cast<qint64>(0x100000000ULL - modularDelta);
+        const qint64 previousArrivalUs =
+                self->rtpVideoLastTimestampArrivalUs_.fetchAndStoreOrdered(arrivalUs);
+        const qint64 clockRate = self->rtpVideoClockRate_.loadAcquire();
+        const qint64 maximumExpectedStep = clockRate > 0
+                ? clockRate * 10 : 900000;
+
+        if (timestampDelta > 0 && timestampDelta <= maximumExpectedStep) {
+            self->rtpVideoTimestampChanges_.fetchAndAddOrdered(1);
+            self->rtpVideoTimestampAdvanceTicks_.fetchAndAddOrdered(
+                        static_cast<quint64>(timestampDelta));
+            const qint64 arrivalDeltaUs = arrivalUs - previousArrivalUs;
+            if (previousArrivalUs > 0 && arrivalDeltaUs > 0 &&
+                arrivalDeltaUs <= 10000000) {
+                self->rtpVideoArrivalAdvanceUs_.fetchAndAddOrdered(
+                            static_cast<quint64>(arrivalDeltaUs));
+            }
+        } else if (timestampDelta < 0) {
+            self->rtpVideoTimestampBackwards_.fetchAndAddOrdered(1);
+        } else if (timestampDelta > maximumExpectedStep) {
+            self->rtpVideoTimestampJumps_.fetchAndAddOrdered(1);
+        }
     }
     return GST_PAD_PROBE_OK;
 }
@@ -2213,6 +3534,17 @@ GstFlowReturn GstPlayerWidget::appSinkNewSample(GstElement *sink, gpointer userD
     GstVideoInfo info;
     gst_video_info_init(&info);
 
+    if (buffer) {
+        GstPad *sinkPad = gst_element_get_static_pad(sink, "sink");
+        qint64 offsetNs = 0;
+        if (sinkPad && bufferPtsClockOffsetNs(sinkPad, buffer, &offsetNs)) {
+            self->appSinkPtsOffsetNs_.storeRelease(offsetNs);
+            updateMaximumAbsolute(&self->appSinkMaxAbsPtsOffsetNs_, offsetNs);
+            self->appSinkPtsOffsetValid_.storeRelease(1);
+        }
+        if (sinkPad) gst_object_unref(sinkPad);
+    }
+
     if (!caps || !buffer || !gst_video_info_from_caps(&info, caps) ||
         GST_VIDEO_INFO_FORMAT(&info) != GST_VIDEO_FORMAT_NV12) {
         return rejectFrame(QStringLiteral("appsink未收到有效NV12 caps/buffer"),
@@ -2416,40 +3748,136 @@ void GstPlayerWidget::sourceSetup(GstElement *, GstElement *source, gpointer)
 {
     if (!source) return;
 
+    const char *factoryName = elementFactoryName(source);
+    if (!factoryName || std::strcmp(factoryName, "rtspsrc") != 0) return;
+
     // rtspsrc 的属性在 source-setup 阶段配置。延迟可通过环境变量覆盖，
-    // 默认 300 ms 在 RK3566 局域网直播和抗抖动之间较平衡。
+    // 默认 1000 ms 为长时间播放吸收网络抖动，同时用 drop-on-latency 限制延迟上界。
     bool ok = false;
     const int envLatency = QString::fromLocal8Bit(qgetenv("QT_YCEST_RTSP_LATENCY_MS")).toInt(&ok);
-    const int latency = ok ? std::max(0, envLatency) : 300;
+    const int latency = ok ? std::max(0, envLatency) : 1000;
     setIntegerProperty(G_OBJECT(source), "latency", latency);
     setBooleanProperty(G_OBJECT(source), "drop-on-latency", TRUE);
+    // 对照测试结束后恢复 auto；解码器输入探针只观测原始时间戳，不再改写 PTS/DTS。
+    // GstRTSPSrcBufferMode 的 auto 枚举值为 3。
+    const bool bufferModeSupported = hasProperty(G_OBJECT(source), "buffer-mode");
+    setIntegerProperty(G_OBJECT(source), "buffer-mode", 3);
+    gint configuredBufferMode = -1;
+    if (bufferModeSupported) {
+        g_object_get(source, "buffer-mode", &configuredBufferMode, nullptr);
+    }
+    const QString configuredBufferModeText = !bufferModeSupported
+            ? QStringLiteral("unsupported")
+            : rtspBufferModeName(configuredBufferMode);
+    // 当前组播服务端把 RTCP 回传端口发布为 0，无法接收 NACK/重传请求。
+    // 保留普通 RTCP 支持以接收发送端时钟报告，仅关闭无效的重传请求。
     setBooleanProperty(G_OBJECT(source), "do-retransmission", FALSE);
+    // 新版 GStreamer 在 RTSP/TCP 模式下可用接收时间戳抑制长时发送端时钟漂移；
+    // 老版本没有该属性时保持原行为。
+    setBooleanProperty(G_OBJECT(source), "tcp-timestamp", TRUE);
+
+    qInfo() << "[GStreamer-RTSP] source configured"
+            << "latencyMs=" << latency
+            << "bufferMode=" << configuredBufferModeText
+            << "dropOnLatency=true"
+            << "retransmission=false"
+            << "tcpTimestampSupported=" << hasProperty(G_OBJECT(source), "tcp-timestamp");
 }
 
 /** @brief 在 element 创建时调整解码器和解析器属性。 */
 void GstPlayerWidget::elementSetup(GstElement *, GstElement *element, gpointer userData)
 {
     auto *self = static_cast<GstPlayerWidget *>(userData);
-    if (!self || !element || self->shuttingDown_.load() ||
-        self->hlsAuAlignmentEnabled_.loadAcquire() == 0) {
-        return;
-    }
+    if (!self || !element || self->shuttingDown_.load()) return;
 
     const char *factoryName = elementFactoryName(element);
     if (!factoryName) return;
 
+    if (std::strcmp(factoryName, "rtpjitterbuffer") == 0) {
+        // 只开启丢包消息统计，不改变 jitterbuffer 的排队或丢帧策略。
+        setBooleanProperty(G_OBJECT(element), "post-drop-messages", TRUE);
+        setIntegerProperty(G_OBJECT(element), "drop-messages-interval", 1000);
+        if (!g_object_get_data(G_OBJECT(element), "ycest-raw-rtp-diag-hooked")) {
+            g_object_set_data(G_OBJECT(element),
+                              "ycest-raw-rtp-diag-hooked",
+                              GINT_TO_POINTER(1));
+            GstPad *sinkPad = gst_element_get_static_pad(element, "sink");
+            if (sinkPad) {
+                gst_pad_add_probe(sinkPad,
+                                  GST_PAD_PROBE_TYPE_BUFFER,
+                                  &GstPlayerWidget::rtpInputPadProbe,
+                                  self,
+                                  nullptr);
+                gst_object_unref(sinkPad);
+            }
+        }
+    }
+
+    const QString factory = QString::fromLatin1(factoryName);
+    if (isVideoDecoderFactory(factory) &&
+        !g_object_get_data(G_OBJECT(element), "ycest-decoder-diag-hooked")) {
+        g_object_set_data(G_OBJECT(element),
+                          "ycest-decoder-diag-hooked",
+                          GINT_TO_POINTER(1));
+        GstPad *sinkPad = gst_element_get_static_pad(element, "sink");
+        GstPad *srcPad = gst_element_get_static_pad(element, "src");
+        const bool sinkPadAttached = sinkPad != nullptr;
+        const bool srcPadAttached = srcPad != nullptr;
+        if (sinkPad) {
+            gst_pad_add_probe(sinkPad,
+                              GST_PAD_PROBE_TYPE_BUFFER,
+                              &GstPlayerWidget::decoderInputPadProbe,
+                              self,
+                              nullptr);
+            gst_object_unref(sinkPad);
+        }
+        if (srcPad) {
+            gst_pad_add_probe(srcPad,
+                              GST_PAD_PROBE_TYPE_BUFFER,
+                              &GstPlayerWidget::decoderOutputPadProbe,
+                              self,
+                              nullptr);
+            gst_object_unref(srcPad);
+        }
+        qInfo() << "[GStreamer-DIAG] decoder probes attached"
+                << "factory=" << factory
+                << "sinkPad=" << sinkPadAttached
+                << "srcPad=" << srcPadAttached;
+        if (self->liveRtspMode_.loadAcquire() != 0) {
+            qInfo().noquote() << QStringLiteral(
+                    "[GStreamer-DECODER] factory=%1 plugin=%2 fastMode=%3 ignoreError=%4")
+                    .arg(factory,
+                         elementPluginVersion(element),
+                         booleanPropertyText(G_OBJECT(element), "fast-mode"),
+                         booleanPropertyText(G_OBJECT(element), "ignore-error"));
+        }
+    }
+
+    if (self->liveRtspMode_.loadAcquire() != 0 &&
+        std::strcmp(factoryName, "rtph264depay") == 0) {
+        const bool waitSupported = hasProperty(G_OBJECT(element), "wait-for-keyframe");
+        const bool requestSupported = hasProperty(G_OBJECT(element), "request-keyframe");
+        setBooleanProperty(G_OBJECT(element), "wait-for-keyframe", TRUE);
+        setBooleanProperty(G_OBJECT(element), "request-keyframe", TRUE);
+        qInfo() << "[GStreamer-LIVE] H.264 depay keyframe recovery"
+                << "waitForKeyframe=" << waitSupported
+                << "requestKeyframe=" << requestSupported;
+    }
+
+    if (self->h264AuAlignmentEnabled_.loadAcquire() == 0) return;
+
     if (std::strcmp(factoryName, "h264parse") != 0 ||
-        g_object_get_data(G_OBJECT(element), "ycest-hls-au-query-hooked")) {
+        g_object_get_data(G_OBJECT(element), "ycest-h264-au-query-hooked")) {
         return;
     }
 
-    // 不修改 decodebin 已经创建的内部 capsfilter。HLS 开始推流后再改
+    // 不修改 decodebin 已经创建的内部 capsfilter。开始推流后再改
     // capsfilter 会触发重新协商，并可能让 hlsdemux 报 not-negotiated。
     // 在 h264parse 首次协商输出格式时限制为完整 AU，使解析器先完成
     // NAL -> AU 组装，再把 byte-stream/AU 数据交给 Rockchip MPP。
     setIntegerProperty(G_OBJECT(element), "config-interval", -1);
     g_object_set_data(G_OBJECT(element),
-                      "ycest-hls-au-query-hooked",
+                      "ycest-h264-au-query-hooked",
                       GINT_TO_POINTER(1));
     GstPad *srcPad = gst_element_get_static_pad(element, "src");
     if (!srcPad) return;
@@ -2457,24 +3885,25 @@ void GstPlayerWidget::elementSetup(GstElement *, GstElement *element, gpointer u
                       static_cast<GstPadProbeType>(
                               GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM |
                               GST_PAD_PROBE_TYPE_PUSH),
-                      &GstPlayerWidget::hlsH264ParserQueryProbe,
+                      &GstPlayerWidget::h264ParserQueryProbe,
                       self,
                       nullptr);
     gst_object_unref(srcPad);
 
-    qInfo() << "[GStreamer-HLS] H.264 parser negotiation restricted to"
+    qInfo() << "[GStreamer-H264] parser negotiation restricted"
+            << "liveRtsp=" << (self->liveRtspMode_.loadAcquire() != 0)
             << "stream-format=byte-stream alignment=au";
 }
 
-/** @brief 为 HLS H.264 caps 查询补充 AU 对齐要求。 */
-GstPadProbeReturn GstPlayerWidget::hlsH264ParserQueryProbe(
+/** @brief 为 HLS/RTSP H.264 caps 查询补充 AU 对齐要求。 */
+GstPadProbeReturn GstPlayerWidget::h264ParserQueryProbe(
         GstPad *pad,
         GstPadProbeInfo *info,
         gpointer userData)
 {
     auto *self = static_cast<GstPlayerWidget *>(userData);
     if (!self || !pad || !info || self->shuttingDown_.load() ||
-        self->hlsAuAlignmentEnabled_.loadAcquire() == 0) {
+        self->h264AuAlignmentEnabled_.loadAcquire() == 0) {
         return GST_PAD_PROBE_OK;
     }
 

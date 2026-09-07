@@ -169,8 +169,8 @@ void IcWorker::start()
         IcEventBridge::instance()->emitRs485SendFinished(sourceTag, true, QString());
     }, Qt::QueuedConnection);
 
-    if (!rs485_->open(io_.rs485Dev, io_.rs485Baud, io_.rs485DirDev)) {
-        qWarning() << "[IoBootstrap] RS485 open failed:" << io_.rs485Dev << io_.rs485DirDev;
+    if (!rs485_->open(io_.rs485Dev, io_.rs485Baud)) {
+        qWarning() << "[IoBootstrap] RS485 open failed:" << io_.rs485Dev;
     } else {
         rs485_->setInterByteTimeoutMs(10);
 
@@ -188,8 +188,7 @@ void IcWorker::start()
         });
 
         qInfo() << "[IoBootstrap] RS485 started:" << io_.rs485Dev
-                << "baud=" << io_.rs485Baud
-                << "dirDev=" << io_.rs485DirDev;
+                << "baud=" << io_.rs485Baud;
     }
 
     QObject::connect(IcEventBridge::instance(), &IcEventBridge::faceRecognized,
@@ -222,6 +221,7 @@ void IcWorker::start()
                     ? QStringLiteral("人脸楼层权限校验失败") : result.reason;
             qInfo().noquote() << "[FACE-ACCESS] DENY"
                               << "personId=" << normalizedId
+                              << "code=" << result.code
                               << "reason=" << reason;
             IcEventBridge::instance()->emitFaceAccessFinished(
                         normalizedId, faceHash, floors,
@@ -236,6 +236,16 @@ void IcWorker::start()
                                  << "personId=" << normalizedId
                                  << "floors=" << floors
                                  << "frame=" << result.rs485Frame.toHex(' ');
+            IcEventBridge::instance()->emitFaceAccessFinished(
+                        normalizedId, faceHash, floors,
+                        result.rs485Frame, false, reason);
+            return;
+        }
+
+        if (!networkAccess_ || !networkAccess_->recordSuccessfulAccess(result)) {
+            const QString reason = QStringLiteral("人脸通行次数/金额扣减失败");
+            qWarning().noquote() << "[FACE-ACCESS] DEDUCT_FAIL"
+                                 << "personId=" << normalizedId;
             IcEventBridge::instance()->emitFaceAccessFinished(
                         normalizedId, faceHash, floors,
                         result.rs485Frame, false, reason);
@@ -277,6 +287,7 @@ void IcWorker::start()
                     ? QStringLiteral("密码通行权限校验失败") : result.reason;
             qInfo().noquote() << "[PASSWORD-ACCESS] DENY"
                               << "personId=" << result.personId
+                              << "code=" << result.code
                               << "reason=" << reason;
             IcEventBridge::instance()->emitPasswordAccessFinished(
                         result.personId, floors, result.rs485Frame, false, reason);
@@ -299,6 +310,18 @@ void IcWorker::start()
                           << "personId=" << result.personId
                           << "floors=" << floors
                           << "frame=" << result.rs485Frame.toHex(' ');
+
+        // 485 已成功下发后，先按启用的次数/金额规则原子扣减本地状态，
+        // 再发出完成信号；MQTT 侧收到该信号后才会上报 password.accessResult。
+        if (!networkAccess_ || !networkAccess_->recordSuccessfulAccess(result)) {
+            const QString reason = QStringLiteral("密码通行次数/金额扣减失败");
+            qWarning().noquote() << "[PASSWORD-ACCESS] DEDUCT_FAIL"
+                                 << "personId=" << result.personId;
+            IcEventBridge::instance()->emitPasswordAccessFinished(
+                        result.personId, floors, result.rs485Frame, false, reason);
+            return;
+        }
+
         IcEventBridge::instance()->emitPasswordAccessFinished(
                     result.personId, floors, result.rs485Frame, true, QString());
     }, Qt::QueuedConnection);
@@ -358,7 +381,8 @@ void IcWorker::start()
             }
             const QString floors = floorTexts.join(QLatin1Char(','));
             if (!result.pass) {
-                qInfo() << "[ONLINE-V1][IC] DENY" << result.reason;
+                qInfo() << "[ONLINE-V1][IC] DENY"
+                        << "code=" << result.code << result.reason;
                 IcEventBridge::instance()->emitToastFailRequested(result.reason);
                 IcEventBridge::instance()->emitCardAccessFinished(
                             result.personId, result.credential, floors,
@@ -378,6 +402,17 @@ void IcWorker::start()
                 IcEventBridge::instance()->emitCardAccessFinished(
                             result.personId, result.credential, floors,
                             result.rs485Frame, false, QStringLiteral("RS485发送失败"));
+                return;
+            }
+            if (!networkAccess_ || !networkAccess_->recordSuccessfulAccess(result)) {
+                const QString reason = QStringLiteral("刷卡通行次数/金额扣减失败");
+                qWarning().noquote() << "[ONLINE-V1][IC] DEDUCT_FAIL"
+                                     << "personId=" << result.personId
+                                     << "cardId=" << result.credential;
+                IcEventBridge::instance()->emitToastFailRequested(reason);
+                IcEventBridge::instance()->emitCardAccessFinished(
+                            result.personId, result.credential, floors,
+                            result.rs485Frame, false, reason);
                 return;
             }
             IcEventBridge::instance()->emitToastPassRequested();

@@ -15,6 +15,7 @@
 struct NetworkAccessResult
 {
     bool pass = false;
+    int code = 0;
     QString reason;
     QString personId;
     QString credential;

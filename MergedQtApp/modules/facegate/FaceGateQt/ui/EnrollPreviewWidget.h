@@ -11,13 +11,14 @@
 
 #include <QImage>
 #include <QSize>
+#include <QString>
 #include <QVector>
-#include <QWidget>
 
+#include "OpenGlImageWidget.h"
 #include "VerificationTypes.h"
 
 /** @brief 人脸录入页面的等比预览和检测框绘制控件。 */
-class EnrollPreviewWidget : public QWidget {
+class EnrollPreviewWidget : public OpenGlImageWidget {
     Q_OBJECT
 
 public:
@@ -35,14 +36,18 @@ public:
     /** @brief 清除预览和检测框。 */
     void clearFrame();
 
+    /** @brief 清除旧画面并显示摄像头不可用提示。 */
+    void setCameraUnavailableMessage(const QString &message);
+
 protected:
-    /** @brief 绘制等比图像，并将原始人脸坐标映射到预览区域。 */
-    void paintEvent(QPaintEvent *event) override;
+    /** @brief 用 OpenGL 纹理绘制等比图像，并叠加检测框。 */
+    void paintGL() override;
 
 private:
     QImage previewImage_;            /**< 当前录入预览图。 */
     QSize sourceSize_;               /**< 人脸坐标所基于的原始图像尺寸。 */
     QVector<DetectedFace> faces_;    /**< 当前检测框和状态。 */
+    QString cameraUnavailableMessage_; /**< 无画面时显示的摄像头异常提示。 */
 };
 
 #endif

@@ -75,9 +75,6 @@ QString cardDevice();
 /** @return RS485 数据串口节点。 */
 QString rs485Device();
 
-/** @return RS485 收发方向控制节点；未配置且无兼容节点时返回空字符串。 */
-QString rs485DirectionDevice();
-
 /** @return RTC 设备节点。 */
 QString rtcDevice();
 

@@ -16,15 +16,39 @@
 #include <QTime>
 #include <QVariantMap>
 #include <algorithm>
+#include <cmath>
 
 namespace {
+
+constexpr int kAccessCountExhaustedCode = 4200;
+constexpr int kAccessBalanceInsufficientCode = 4201;
+constexpr double kAmountEpsilon = 0.000001;
+
+QString accessRuleFailureReason(int code)
+{
+    switch (code) {
+    case kAccessCountExhaustedCode:
+        return QStringLiteral("通行次数已用完，请联系管理员充值");
+    case kAccessBalanceInsufficientCode:
+        return QStringLiteral("通行余额不足，请联系管理员充值");
+    default:
+        return QStringLiteral("通行权限校验失败");
+    }
+}
+
+double normalizedAmount(double value)
+{
+    return std::round(value * 1000000.0) / 1000000.0;
+}
 
 NetworkAccessResult denied(const QString &reason,
                            const QString &personId = QString(),
                            const QString &credential = QString(),
-                           const QString &credentialType = QString())
+                           const QString &credentialType = QString(),
+                           int code = 0)
 {
     NetworkAccessResult result;
+    result.code = code;
     result.reason = reason;
     result.personId = personId;
     result.credential = credential;
@@ -130,6 +154,8 @@ bool NetworkAccessService::initialize()
         "person_id TEXT PRIMARY KEY,"
         "remaining_count INTEGER,"
         "access_count INTEGER NOT NULL DEFAULT 0,"
+        "remaining_amount REAL,"
+        "used_amount REAL NOT NULL DEFAULT 0,"
         "updated_at TEXT NOT NULL,"
         "FOREIGN KEY(person_id) REFERENCES network_person(person_id) ON DELETE CASCADE)"));
 }
@@ -284,9 +310,9 @@ NetworkAccessResult NetworkAccessService::evaluatePerson(const QString &personId
         return denied(QStringLiteral("人员未启用控梯权限"), personId, credential, credentialType);
     }
 
-    // rules.time controls the overall permission validity period. It is
-    // independent from rules.timingRules, which controls recurring time slots.
-    if (rule.value(QStringLiteral("time_enabled")).toInt() == 1) {
+    // rules.duration controls the overall permission validity period. It is
+    // independent from rules.time, which controls recurring timingRules slots.
+    if (rule.value(QStringLiteral("duration_enabled")).toInt() == 1) {
         const QDateTime start = parseServerDateTime(
                     rule.value(QStringLiteral("duration_start")).toString());
         const QDateTime end = parseServerDateTime(
@@ -309,7 +335,8 @@ NetworkAccessResult NetworkAccessService::evaluatePerson(const QString &personId
                 QStringLiteral("SELECT days_json,start_time,end_time "
                                "FROM network_timing_rule WHERE person_id=? ORDER BY rule_order"),
                 {personId});
-    if (!timingRules.isEmpty()) {
+    if (rule.value(QStringLiteral("time_enabled")).toInt() == 1
+            && !timingRules.isEmpty()) {
         bool matched = false;
         for (const QVariantMap &timing : timingRules) {
             if (timeWindowMatches(timing, now)) {
@@ -323,27 +350,92 @@ NetworkAccessResult NetworkAccessService::evaluatePerson(const QString &personId
         }
     }
 
-    if (rule.value(QStringLiteral("count_enabled")).toInt() == 1) {
+    const bool countEnabled = rule.value(QStringLiteral("count_enabled")).toInt() == 1;
+    const bool amountEnabled = rule.value(QStringLiteral("amount_enabled")).toInt() == 1;
+    if (countEnabled || amountEnabled) {
         QList<QVariantMap> usage = DbStore::query(
-                    QStringLiteral("SELECT remaining_count FROM network_access_usage WHERE person_id=?"),
+                    QStringLiteral("SELECT remaining_count,access_count,"
+                                   "remaining_amount,used_amount "
+                                   "FROM network_access_usage WHERE person_id=?"),
                     {personId});
         if (usage.isEmpty()) {
-            const int initial = rule.value(QStringLiteral("count_total")).toInt();
+            const QVariant initialCount = countEnabled
+                    ? rule.value(QStringLiteral("count_total")) : QVariant();
+            const QVariant initialAmount = amountEnabled
+                    ? rule.value(QStringLiteral("amount_total")) : QVariant();
             if (!DbStore::execute(
                         QStringLiteral("INSERT INTO network_access_usage("
-                                       "person_id,remaining_count,access_count,updated_at) "
-                                       "VALUES(?,?,0,?)"),
-                        {personId, initial, now.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"))})) {
+                                       "person_id,remaining_count,access_count,"
+                                       "remaining_amount,used_amount,updated_at) "
+                                       "VALUES(?,?,0,?,0,?)"),
+                        {personId, initialCount, initialAmount,
+                         now.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"))})) {
+                return denied(QStringLiteral("通行次数/金额状态初始化失败"), personId,
+                              credential, credentialType);
+            }
+            QVariantMap initialUsage;
+            initialUsage.insert(QStringLiteral("remaining_count"), initialCount);
+            initialUsage.insert(QStringLiteral("access_count"), 0);
+            initialUsage.insert(QStringLiteral("remaining_amount"), initialAmount);
+            initialUsage.insert(QStringLiteral("used_amount"), 0.0);
+            usage.append(initialUsage);
+        }
+
+        QVariantMap usageState = usage.first();
+        if (countEnabled
+                && usageState.value(QStringLiteral("remaining_count")).isNull()) {
+            const QVariant initialCount = rule.value(QStringLiteral("count_total"));
+            if (!DbStore::execute(
+                        QStringLiteral("UPDATE network_access_usage SET "
+                                       "remaining_count=?,updated_at=? WHERE person_id=?"),
+                        {initialCount,
+                         now.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")),
+                         personId})) {
                 return denied(QStringLiteral("权限次数状态初始化失败"), personId,
                               credential, credentialType);
             }
-            if (initial <= 0) {
-                return denied(QStringLiteral("人员可用次数已用完"), personId,
+            usageState.insert(QStringLiteral("remaining_count"), initialCount);
+        }
+        if (amountEnabled
+                && usageState.value(QStringLiteral("remaining_amount")).isNull()) {
+            const QVariant initialAmount = rule.value(QStringLiteral("amount_total"));
+            if (!DbStore::execute(
+                        QStringLiteral("UPDATE network_access_usage SET "
+                                       "remaining_amount=?,updated_at=? WHERE person_id=?"),
+                        {initialAmount,
+                         now.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")),
+                         personId})) {
+                return denied(QStringLiteral("权限金额状态初始化失败"), personId,
                               credential, credentialType);
             }
-        } else if (usage.first().value(QStringLiteral("remaining_count")).toInt() <= 0) {
-            return denied(QStringLiteral("人员可用次数已用完"), personId,
-                          credential, credentialType);
+            usageState.insert(QStringLiteral("remaining_amount"), initialAmount);
+        }
+
+        if (countEnabled
+                && usageState.value(QStringLiteral("remaining_count")).toLongLong() <= 0) {
+            return denied(accessRuleFailureReason(kAccessCountExhaustedCode), personId,
+                          credential, credentialType, kAccessCountExhaustedCode);
+        }
+
+        if (amountEnabled) {
+            bool unitPriceOk = false;
+            bool remainingAmountOk = false;
+            const double unitPrice = rule.value(QStringLiteral("amount_unit_price"))
+                    .toDouble(&unitPriceOk);
+            const double remainingAmount = usageState
+                    .value(QStringLiteral("remaining_amount"))
+                    .toDouble(&remainingAmountOk);
+            if (!unitPriceOk || !std::isfinite(unitPrice) || unitPrice <= 0.0) {
+                return denied(QStringLiteral("通行金额单价配置无效"), personId,
+                              credential, credentialType);
+            }
+            if (!remainingAmountOk || !std::isfinite(remainingAmount)
+                    || remainingAmount <= 0.0
+                    || remainingAmount + kAmountEpsilon < unitPrice) {
+                return denied(accessRuleFailureReason(kAccessBalanceInsufficientCode),
+                              personId, credential, credentialType,
+                              kAccessBalanceInsufficientCode);
+            }
         }
     }
 
@@ -370,6 +462,11 @@ NetworkAccessResult NetworkAccessService::evaluatePerson(const QString &personId
     }
     std::sort(floors.begin(), floors.end());
 
+    if (Rs485FloorFrameBuilder::shouldRejectModeOccupiedFloors(floors)) {
+        return denied(QStringLiteral("楼层已被电梯模式占用"), personId,
+                      credential, credentialType);
+    }
+
     QString frameError;
     const QByteArray frame = Rs485FloorFrameBuilder::buildFloors(floors, &frameError);
     if (frame.isEmpty()) {
@@ -394,16 +491,88 @@ bool NetworkAccessService::recordSuccessfulAccess(const NetworkAccessResult &res
     const QString now = QDateTime::currentDateTime().toString(
                 QStringLiteral("yyyy-MM-dd HH:mm:ss"));
     const QList<QVariantMap> rules = DbStore::query(
-                QStringLiteral("SELECT count_enabled FROM network_access_rule WHERE person_id=?"),
+                QStringLiteral("SELECT count_enabled,amount_enabled,count_total,"
+                               "amount_total,amount_unit_price "
+                               "FROM network_access_rule WHERE person_id=?"),
                 {result.personId});
-    if (!rules.isEmpty() && rules.first().value(QStringLiteral("count_enabled")).toInt() == 1) {
-        if (!DbStore::execute(
-                    QStringLiteral("UPDATE network_access_usage SET "
-                                   "remaining_count=MAX(remaining_count-1,0),"
-                                   "access_count=access_count+1,updated_at=? WHERE person_id=?"),
-                    {now, result.personId})) {
-            DbStore::transactionRollback();
-            return false;
+    if (!rules.isEmpty()) {
+        const QVariantMap rule = rules.first();
+        const bool countEnabled = rule.value(QStringLiteral("count_enabled")).toInt() == 1;
+        const bool amountEnabled = rule.value(QStringLiteral("amount_enabled")).toInt() == 1;
+        if (countEnabled || amountEnabled) {
+            QList<QVariantMap> usages = DbStore::query(
+                        QStringLiteral("SELECT remaining_count,access_count,"
+                                       "remaining_amount,used_amount "
+                                       "FROM network_access_usage WHERE person_id=? LIMIT 1"),
+                        {result.personId});
+            if (usages.isEmpty()) {
+                const QVariant initialCount = countEnabled
+                        ? rule.value(QStringLiteral("count_total")) : QVariant();
+                const QVariant initialAmount = amountEnabled
+                        ? rule.value(QStringLiteral("amount_total")) : QVariant();
+                if (!DbStore::execute(
+                            QStringLiteral("INSERT INTO network_access_usage("
+                                           "person_id,remaining_count,access_count,"
+                                           "remaining_amount,used_amount,updated_at) "
+                                           "VALUES(?,?,0,?,0,?)"),
+                            {result.personId, initialCount, initialAmount, now})) {
+                    DbStore::transactionRollback();
+                    return false;
+                }
+                QVariantMap initialUsage;
+                initialUsage.insert(QStringLiteral("remaining_count"), initialCount);
+                initialUsage.insert(QStringLiteral("access_count"), 0);
+                initialUsage.insert(QStringLiteral("remaining_amount"), initialAmount);
+                initialUsage.insert(QStringLiteral("used_amount"), 0.0);
+                usages.append(initialUsage);
+            }
+
+            const QVariantMap usage = usages.first();
+            QStringList assignments;
+            QList<QVariant> binds;
+            if (countEnabled) {
+                const qlonglong remainingCount = usage
+                        .value(QStringLiteral("remaining_count")).toLongLong();
+                if (remainingCount <= 0) {
+                    DbStore::transactionRollback();
+                    return false;
+                }
+                assignments.append(QStringLiteral("remaining_count=?"));
+                binds.append(remainingCount - 1);
+                assignments.append(QStringLiteral("access_count=?"));
+                binds.append(usage.value(QStringLiteral("access_count")).toLongLong() + 1);
+            }
+            if (amountEnabled) {
+                bool unitPriceOk = false;
+                bool remainingAmountOk = false;
+                const double unitPrice = rule.value(QStringLiteral("amount_unit_price"))
+                        .toDouble(&unitPriceOk);
+                const double remainingAmount = usage
+                        .value(QStringLiteral("remaining_amount"))
+                        .toDouble(&remainingAmountOk);
+                if (!unitPriceOk || !remainingAmountOk
+                        || !std::isfinite(unitPrice) || !std::isfinite(remainingAmount)
+                        || unitPrice <= 0.0 || remainingAmount <= 0.0
+                        || remainingAmount + kAmountEpsilon < unitPrice) {
+                    DbStore::transactionRollback();
+                    return false;
+                }
+                assignments.append(QStringLiteral("remaining_amount=?"));
+                binds.append(normalizedAmount(std::max(0.0, remainingAmount - unitPrice)));
+                assignments.append(QStringLiteral("used_amount=?"));
+                binds.append(normalizedAmount(
+                                 usage.value(QStringLiteral("used_amount")).toDouble()
+                                 + unitPrice));
+            }
+            assignments.append(QStringLiteral("updated_at=?"));
+            binds.append(now);
+            binds.append(result.personId);
+            if (!DbStore::execute(
+                        QStringLiteral("UPDATE network_access_usage SET %1 WHERE person_id=?")
+                        .arg(assignments.join(QLatin1Char(','))), binds)) {
+                DbStore::transactionRollback();
+                return false;
+            }
         }
     }
 
