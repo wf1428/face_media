@@ -214,9 +214,9 @@ QT_QPA_PLATFORM=xcb ./MergedQtApp
 
 ## 相关文档
 
-- [技术文档](docs/technical_doc.md)
-- [接口文档](docs/interface_doc.md)
-- [RK3566 移植说明](docs/rk3566_porting.md)
-- [性能文档](docs/performance_doc.md)
-- [FaceGate 设计说明](modules/facegate/FaceGateQt/docs/face_gate_design.md)
+- [技术文档](MergedQtApp/docs/technical_doc.md)
+- [接口文档](MergedQtApp/docs/interface_doc.md)
+- [RK3566 移植说明](MergedQtApp/docs/rk3566_porting.md)
+- [性能文档](MergedQtApp/docs/performance_doc.md)
+- [FaceGate 设计说明](MergedQtApp/modules/facegate/FaceGateQt/docs/face_gate_design.md)
 
