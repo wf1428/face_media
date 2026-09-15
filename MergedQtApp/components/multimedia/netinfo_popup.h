@@ -12,13 +12,15 @@
 #include <QWidget>
 #include <QLabel>
 #include <QVBoxLayout>
-#include <QPropertyAnimation>
 #include <QDir>
 #include <QFile>
 #include <QMouseEvent>
 #include <QSettings>
 #include <QEasingCurve>
 #include <QProcess>
+
+class QGraphicsOpacityEffect;
+class QPropertyAnimation;
 
 
 /** @brief MQTT/IPC 连接状态图标。 */
@@ -31,7 +33,7 @@ enum class MqttConnMark
 };
 
 
-/** @brief 从屏幕侧边滑入的网络、MQTT 和主机可达性信息面板。 */
+/** @brief 固定在屏幕左上角淡入淡出的网络、MQTT 和主机可达性信息面板。 */
 class NetInfoPanel : public QWidget
 {
     Q_OBJECT
@@ -50,10 +52,10 @@ public:
     /** @brief 更新 MQTT/IPC 状态标记并重绘文本。 */
     void setMqttConnMark(MqttConnMark mark);
 
-    /** @brief 从屏幕外滑入面板并发起主机可达性检查。 */
+    /** @brief 在固定位置淡入面板。 */
     void showSlideIn();
 
-    /** @brief 将面板滑出屏幕并隐藏。 */
+    /** @brief 在固定位置淡出并隐藏面板。 */
     void hideSlideOut();
 
     /** @return 面板逻辑上处于显示状态时返回 true。 */
@@ -64,7 +66,10 @@ protected:
     void mousePressEvent(QMouseEvent *e) override;
 
 private:
-    /** @brief 根据 1024x768 布局参数计算显示和隐藏位置。 */
+    /** @brief 启动一次非阻塞的主机可达性检查。 */
+    void startHostReachabilityCheck(const QString &host);
+
+    /** @brief 启动构造时读取一次布局参数并缓存面板位置。 */
     void applyGeometry();
 
     /** @brief 按当前字段、状态标记和可达性刷新富文本。 */
@@ -97,6 +102,11 @@ private:
     bool m_hostReachableKnown = false;
 
     QProcess *m_pingProcess = nullptr;
+    QString m_pingHostInFlight;
+    QString m_pendingPingHost;
+
+    QGraphicsOpacityEffect *m_opacityEffect = nullptr;
+    QPropertyAnimation *m_opacityAnimation = nullptr;
 
     bool m_shown = false;
 };

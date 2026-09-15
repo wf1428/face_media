@@ -9,6 +9,14 @@
 #include "netinfo_popup.h"
 #include "platform/rk3566_platform.h"
 
+#include <QGraphicsOpacityEffect>
+#include <QPropertyAnimation>
+#include <QTimer>
+
+namespace {
+constexpr int kFadeDurationMs = 1800;
+}
+
 /** @brief 创建信息标签、动画和异步 ping 进程。 */
 NetInfoPanel::NetInfoPanel(QWidget *parent)
     : QWidget(parent)
@@ -33,15 +41,47 @@ NetInfoPanel::NetInfoPanel(QWidget *parent)
 
     connect(m_pingProcess, static_cast<void(QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
             this, [this](int exitCode, QProcess::ExitStatus exitStatus) {
-        m_hostReachableKnown = true;
-        m_hostReachable = (exitStatus == QProcess::NormalExit && exitCode == 0);
-        refreshText();
+        const QString completedHost = m_pingHostInFlight;
+        m_pingHostInFlight.clear();
+
+        // 只把结果应用给当前正在展示的主机，避免旧请求覆盖新配置。
+        if (completedHost == m_host.trimmed()) {
+            m_hostReachableKnown = true;
+            m_hostReachable = (exitStatus == QProcess::NormalExit && exitCode == 0);
+            refreshText();
+        }
+
+        if (!m_pendingPingHost.isEmpty()) {
+            const QString nextHost = m_pendingPingHost;
+            m_pendingPingHost.clear();
+            QTimer::singleShot(0, this, [this, nextHost]() {
+                startHostReachabilityCheck(nextHost);
+            });
+        }
     });
 
-    connect(m_pingProcess, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
-        m_hostReachableKnown = true;
-        m_hostReachable = false;
-        refreshText();
+    connect(m_pingProcess, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
+        // FailedToStart 不一定伴随 finished 信号，需要在这里收口；其余错误
+        // 仍交给 finished 处理，避免一次请求被重复结算。
+        if (error != QProcess::FailedToStart) {
+            return;
+        }
+
+        const QString failedHost = m_pingHostInFlight;
+        m_pingHostInFlight.clear();
+        if (failedHost == m_host.trimmed()) {
+            m_hostReachableKnown = true;
+            m_hostReachable = false;
+            refreshText();
+        }
+
+        if (!m_pendingPingHost.isEmpty()) {
+            const QString nextHost = m_pendingPingHost;
+            m_pendingPingHost.clear();
+            QTimer::singleShot(0, this, [this, nextHost]() {
+                startHostReachabilityCheck(nextHost);
+            });
+        }
     });
 
 
@@ -61,8 +101,21 @@ NetInfoPanel::NetInfoPanel(QWidget *parent)
 
     applyGeometry();
 
-    // 初始隐藏在屏幕左侧外
-    move(-m_panelW, m_panelY);
+    // 面板位置和尺寸只在构造时从配置读取一次，显示时不再访问磁盘。
+    move(m_panelX, m_panelY);
+
+    m_opacityEffect = new QGraphicsOpacityEffect(this);
+    m_opacityEffect->setOpacity(0.0);
+    setGraphicsEffect(m_opacityEffect);
+
+    m_opacityAnimation = new QPropertyAnimation(m_opacityEffect, "opacity", this);
+    m_opacityAnimation->setDuration(kFadeDurationMs);
+    m_opacityAnimation->setEasingCurve(QEasingCurve::InOutCubic);
+    connect(m_opacityAnimation, &QPropertyAnimation::finished, this, [this]() {
+        if (!m_shown) {
+            hide();
+        }
+    });
     hide();
 }
 
@@ -172,39 +225,32 @@ void NetInfoPanel::refreshText()
     m_infoLabel->setText(text);
 }
 
-/** @brief 从屏幕外滑入面板并发起主机可达性检查。 */
+/** @brief 在固定位置淡入面板。 */
 void NetInfoPanel::showSlideIn()
 {
     if (m_shown) return;
     m_shown = true;
 
-    applyGeometry();
+    move(m_panelX, m_panelY);
     show();
     raise();
 
-    auto *anim = new QPropertyAnimation(this, "pos");
-    anim->setDuration(180);
-    anim->setStartValue(QPoint(-width(), m_panelY));
-    anim->setEndValue(QPoint(m_panelX, m_panelY));
-    anim->setEasingCurve(QEasingCurve::OutCubic);
-    anim->start(QAbstractAnimation::DeleteWhenStopped);
+    m_opacityAnimation->stop();
+    m_opacityAnimation->setStartValue(m_opacityEffect->opacity());
+    m_opacityAnimation->setEndValue(1.0);
+    m_opacityAnimation->start();
 }
 
-/** @brief 将面板滑出屏幕并隐藏。 */
+/** @brief 在固定位置淡出并隐藏面板。 */
 void NetInfoPanel::hideSlideOut()
 {
     if (!m_shown) return;
     m_shown = false;
 
-    auto *anim = new QPropertyAnimation(this, "pos");
-    anim->setDuration(160);
-    anim->setStartValue(pos());
-    anim->setEndValue(QPoint(-width(), m_panelY));
-    anim->setEasingCurve(QEasingCurve::InCubic);
-    connect(anim, &QPropertyAnimation::finished, this, [this](){
-        hide();
-    });
-    anim->start(QAbstractAnimation::DeleteWhenStopped);
+    m_opacityAnimation->stop();
+    m_opacityAnimation->setStartValue(m_opacityEffect->opacity());
+    m_opacityAnimation->setEndValue(0.0);
+    m_opacityAnimation->start();
 }
 
 /** @brief 点击面板时阻止事件穿透到下层业务控件。 */
@@ -228,6 +274,7 @@ void NetInfoPanel::checkHostReachableAsync()
     const QString host = m_host.trimmed();
 
     if (host.isEmpty() || host == "N/A") {
+        m_pendingPingHost.clear();
         m_hostReachableKnown = false;
         m_hostReachable = false;
         refreshText();
@@ -239,10 +286,32 @@ void NetInfoPanel::checkHostReachableAsync()
     }
 
     if (m_pingProcess->state() != QProcess::NotRunning) {
-        m_pingProcess->kill();
-        m_pingProcess->waitForFinished(200);
+        // 不在 GUI 线程等待旧进程退出。同一主机沿用当前请求；主机发生
+        // 变化时只缓存最新请求，待当前进程异步结束后再启动。
+        if (m_pingHostInFlight == host) {
+            m_pendingPingHost.clear();
+        } else {
+            m_pendingPingHost = host;
+        }
+        return;
     }
 
+    m_pendingPingHost.clear();
+    startHostReachabilityCheck(host);
+}
+
+/** @brief 启动一次非阻塞的主机可达性检查。 */
+void NetInfoPanel::startHostReachabilityCheck(const QString &host)
+{
+    if (!m_pingProcess || host.isEmpty()) {
+        return;
+    }
+    if (m_pingProcess->state() != QProcess::NotRunning) {
+        m_pendingPingHost = host;
+        return;
+    }
+
+    m_pingHostInFlight = host;
     // -c 1 发一个包，-W 1 等待1秒
     m_pingProcess->start("ping", QStringList() << "-c" << "1" << "-W" << "1" << host);
 }

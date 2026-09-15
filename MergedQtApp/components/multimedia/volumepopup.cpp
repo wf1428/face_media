@@ -12,9 +12,14 @@
 #include <QLabel>
 #include <QVBoxLayout>
 #include <QPropertyAnimation>
+#include <QGraphicsOpacityEffect>
 #include <QMouseEvent>
 #include <QDebug>
 #include "platform/rk3566_platform.h"
+
+namespace {
+constexpr int kFadeDurationMs = 1800;
+}
 
 /** @brief 绑定音量控制器并创建滑块、标签和动画。 */
 VolumePanel::VolumePanel(AmpVolumeController *ctrl, QWidget *parent)
@@ -109,8 +114,21 @@ VolumePanel::VolumePanel(AmpVolumeController *ctrl, QWidget *parent)
 
     applyGeometry();
 
-    // 初始隐藏在屏幕外（最右边），y 用面板的目标 y
-    move(m_screenW, m_panelY);
+    // 面板位置和尺寸只在构造时从配置读取一次，显示时不再访问磁盘。
+    move(m_screenW - width(), m_panelY);
+
+    m_opacityEffect = new QGraphicsOpacityEffect(this);
+    m_opacityEffect->setOpacity(0.0);
+    setGraphicsEffect(m_opacityEffect);
+
+    m_opacityAnimation = new QPropertyAnimation(m_opacityEffect, "opacity", this);
+    m_opacityAnimation->setDuration(kFadeDurationMs);
+    m_opacityAnimation->setEasingCurve(QEasingCurve::InOutCubic);
+    connect(m_opacityAnimation, &QPropertyAnimation::finished, this, [this]() {
+        if (!m_shown) {
+            hide();
+        }
+    });
     hide();
 }
 
@@ -173,40 +191,32 @@ void VolumePanel::setCurrentVolume(int v)
     m_slider->blockSignals(false);
 }
 
-/** @brief 从右侧屏幕外滑入。 */
+/** @brief 在固定位置淡入。 */
 void VolumePanel::showSlideIn()
 {
     if (m_shown) return;
     m_shown = true;
 
-    applyGeometry();
+    move(m_screenW - width(), m_panelY);
     show();
     raise();
 
-    // 从 x=800（屏幕外）滑到 x=800-panelW，y 保持 m_panelY
-    auto *anim = new QPropertyAnimation(this, "pos");
-    anim->setDuration(180);
-    anim->setStartValue(QPoint(m_screenW, m_panelY));
-    anim->setEndValue(QPoint(m_screenW - width(), m_panelY));
-    anim->setEasingCurve(QEasingCurve::OutCubic);
-    anim->start(QAbstractAnimation::DeleteWhenStopped);
+    m_opacityAnimation->stop();
+    m_opacityAnimation->setStartValue(m_opacityEffect->opacity());
+    m_opacityAnimation->setEndValue(1.0);
+    m_opacityAnimation->start();
 }
 
-/** @brief 滑出到右侧后隐藏。 */
+/** @brief 在固定位置淡出并隐藏。 */
 void VolumePanel::hideSlideOut()
 {
     if (!m_shown) return;
     m_shown = false;
 
-    auto *anim = new QPropertyAnimation(this, "pos");
-    anim->setDuration(160);
-    anim->setStartValue(pos());
-    anim->setEndValue(QPoint(m_screenW, m_panelY));
-    anim->setEasingCurve(QEasingCurve::InCubic);
-    connect(anim, &QPropertyAnimation::finished, this, [this](){
-        hide();
-    });
-    anim->start(QAbstractAnimation::DeleteWhenStopped);
+    m_opacityAnimation->stop();
+    m_opacityAnimation->setStartValue(m_opacityEffect->opacity());
+    m_opacityAnimation->setEndValue(0.0);
+    m_opacityAnimation->start();
 }
 
 /** @brief 消费面板内点击，避免事件穿透到底层播放器。 */

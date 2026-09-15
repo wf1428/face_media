@@ -15,6 +15,7 @@
 
 class QLabel;
 class QPushButton;
+class QEvent;
 
 /**
  * @brief 项目统一消息弹窗，替代系统 QMessageBox。
@@ -45,6 +46,9 @@ public:
                               const QString &cancelText = QString(),
                               const QStringList &choiceTexts = QStringList());
 
+    /** @brief 销毁前移除 Wayland 宿主尺寸监听。 */
+    ~AppMessageDialog() override;
+
     /** @brief 显示阻塞式信息提示。 */
     static void information(QWidget *parent, const QString &title, const QString &message);
 
@@ -72,6 +76,9 @@ public:
                       const QString &cancelText = QStringLiteral("取消"));
 
 protected:
+    /** @brief 跟随 Wayland 父控件尺寸更新应用内覆盖层。 */
+    bool eventFilter(QObject *watched, QEvent *event) override;
+
     /** @brief 显示时稳定文本布局并居中到父窗口。 */
     void showEvent(QShowEvent *event) override;
 
@@ -104,6 +111,7 @@ private:
     QString cancelText_;       /**< 自定义取消文本。 */
     QStringList choiceTexts_;  /**< 选择模式下直接显示的选项按钮。 */
     int selectedChoice_ = -1;  /**< 选择模式下用户选择的选项序号。 */
+    bool embeddedForWayland_ = false; /**< 是否作为父控件内的 Wayland 覆盖层显示。 */
 };
 
 #endif // APPMESSAGEDIALOG_H

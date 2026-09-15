@@ -1,6 +1,6 @@
 /**
  * @file AdminLoginDialog.h
- * @brief 带内嵌 Qt 虚拟键盘的管理员登录对话框。
+ * @brief 使用人脸模块共享 Qt Virtual Keyboard 的管理员登录对话框。
  *
  * @author Dulin
  * @date 2026-07-25
@@ -15,47 +15,39 @@
 
 class QEvent;
 class QLineEdit;
-class QQuickWidget;
+class QShowEvent;
 
-/** @brief 带内嵌 Qt 虚拟键盘的管理员登录对话框。 */
+/** @brief 使用人脸模块共享 Qt Virtual Keyboard 的管理员登录对话框。 */
 class AdminLoginDialog : public QDialog {
     Q_OBJECT
 
 public:
-    /** @brief 按配置创建用户名、密码输入和虚拟键盘界面。 */
+    /** @brief 按配置创建用户名、密码输入和登录界面。 */
     explicit AdminLoginDialog(const AppConfig &config, QWidget *parent = nullptr);
 
-    /** @brief 销毁前释放键盘焦点和资源。 */
+    /** @brief 销毁前移除宿主尺寸监听。 */
     ~AdminLoginDialog() override;
 
     /** @return 当前密码输入框内容。 */
     QString password() const;
 
 protected:
-    /** @brief 根据文本编辑器焦点和点击位置显示或隐藏内嵌键盘。 */
+    /** @brief Wayland 宿主尺寸变化时同步覆盖层几何。 */
     bool eventFilter(QObject *watched, QEvent *event) override;
+
+    /** @brief Wayland 内嵌模式显示时覆盖父界面。 */
+    void showEvent(QShowEvent *event) override;
 
 private:
     /** @brief 使用 AppConfig 校验管理员凭据并接受或提示失败。 */
     void verify();
 
-    /** @brief 显示并定位内嵌虚拟键盘。 */
-    void showKeyboard();
-
-    /** @brief 隐藏内嵌虚拟键盘。 */
-    void hideKeyboard();
-
-    /** @brief 根据对话框可用区域更新键盘几何位置。 */
-    void positionKeyboard();
-
-    /** @return widget 是可编辑文本输入控件时返回 true。 */
-    bool isTextEditor(QWidget *widget) const;
-
 private:
     AppConfig config_;                 /**< 管理员用户名和密码散列配置。 */
     QLineEdit *userEdit_ = nullptr;    /**< 用户名输入框。 */
     QLineEdit *passwordEdit_ = nullptr; /**< 密码输入框。 */
-    QQuickWidget *keyboardWidget_ = nullptr; /**< 内嵌 Qt 虚拟键盘。 */
+    QWidget *keyboardClearance_ = nullptr; /**< 为底部共享键盘预留的布局空间。 */
+    bool embeddedForWayland_ = false;  /**< 是否复用人脸主界面的 Wayland surface。 */
 };
 
 #endif

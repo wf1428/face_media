@@ -62,8 +62,8 @@ void IcIoBootstrap::startAll(QObject* parent, const IcSerialConfig& io)
     }, static_cast<Qt::ConnectionType>(Qt::QueuedConnection | Qt::UniqueConnection));
 
     QObject::connect(IcEventBridge::instance(), &IcEventBridge::toastFailRequested,
-                     parent, [toast](const QString &reason) {
-        toast->showFail(reason);
+                     parent, [toast](const QString &reason, int resultCode) {
+        toast->showFail(reason, 5000, resultCode);
     }, static_cast<Qt::ConnectionType>(Qt::QueuedConnection | Qt::UniqueConnection));
 
     auto *thread = new QThread(parent);

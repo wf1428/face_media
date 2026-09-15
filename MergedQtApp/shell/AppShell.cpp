@@ -107,6 +107,30 @@ bool AppShell::initialize()
             modeController_, &ModeController::handleRecognitionFinished);
     connect(faceGateModule_, &FaceGateModuleAdapter::facePresenceChanged,
             modeController_, &ModeController::handleFacePresenceChanged);
+#ifndef FACEGATE_LEGACY_PAGE_MODE
+    connect(faceGateModule_, &FaceGateModuleAdapter::previewFrameChanged,
+            multimediaModule_, &MultimediaModuleAdapter::setEmbeddedFaceFrame);
+    connect(faceGateModule_, &FaceGateModuleAdapter::previewUnavailable,
+            multimediaModule_, &MultimediaModuleAdapter::setEmbeddedFaceUnavailable);
+    connect(faceGateModule_, &FaceGateModuleAdapter::previewFacesChanged,
+            multimediaModule_, &MultimediaModuleAdapter::setEmbeddedFaceFaces);
+    connect(faceGateModule_, &FaceGateModuleAdapter::previewStateChanged,
+            multimediaModule_, &MultimediaModuleAdapter::setEmbeddedFaceState);
+    connect(faceGateModule_, &FaceGateModuleAdapter::recognitionImageReady,
+            this, [this, recognitionReturnMs](const QImage &image,
+                                               const QString &name) {
+                if (multimediaModule_) {
+                    multimediaModule_->showRecognitionImage(
+                                image, name, recognitionReturnMs);
+                }
+            });
+    connect(multimediaModule_, &MultimediaModuleAdapter::adminLongPressRequested,
+            modeController_, &ModeController::handleAdminRequested);
+    connect(multimediaModule_, &MultimediaModuleAdapter::recognitionResultDisplayStarted,
+            modeController_, &ModeController::handleRecognitionDisplayStarted);
+    connect(faceGateModule_, &FaceGateModuleAdapter::adminSessionFinished,
+            modeController_, &ModeController::handleAdminSessionFinished);
+#endif
     connect(presenceReconcileTimer_, &QTimer::timeout, this, [this]() {
         if (presenceSensor_ && modeController_) {
             modeController_->reconcilePresenceLevel(
@@ -116,8 +140,10 @@ bool AppShell::initialize()
     connect(modeController_, &ModeController::stateChanged,
             this, [this](ModeController::AppModeState state) {
                 if (state == ModeController::AppModeState::FaceGateActive
-                        && fillLight_) {
-                    fillLight_->turnOn();
+                        || state == ModeController::AppModeState::AdminActive) {
+                    if (fillLight_) {
+                        fillLight_->turnOn();
+                    }
                 } else if (state == ModeController::AppModeState::MultimediaActive
                            && fillLight_) {
                     fillLight_->turnOff();

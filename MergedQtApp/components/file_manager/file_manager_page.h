@@ -16,6 +16,8 @@
 #include <QPushButton>
 #include <QMenu>
 
+class QResizeEvent;
+
 /**
  * @brief 基于 QFileSystemModel 的本地文件浏览和删除页面。
  *
@@ -34,6 +36,10 @@ public:
 signals:
     /** @brief 用户请求退出文件管理页面。 */
     void backToMenuRequested();
+
+protected:
+    /** @brief 按视口宽度重新分配文件列表列宽。 */
+    void resizeEvent(QResizeEvent *event) override;
 
 private slots:
     /** @brief 双击目录时进入目录，双击文件时交给系统打开。 */
@@ -57,6 +63,9 @@ private:
 
     /** @brief 应用文件管理页面样式。 */
     void applyStyle();
+
+    /** @brief 根据当前可用宽度设置名称、大小、类型和时间列。 */
+    void updateColumnWidths();
 
 private:
     QFileSystemModel *model = nullptr; /**< 文件系统数据模型。 */

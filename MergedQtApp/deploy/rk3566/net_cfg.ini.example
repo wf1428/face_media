@@ -6,11 +6,9 @@ database=/var/lib/qt_ycest/demo.db
 
 [hardware]
 signal_board_uart=/dev/ttyS5
-qr_uart=/dev/ttyS1
+qr_uart=/dev/ttyS6
 card_uart=/dev/ttyS2
-rs485_uart=/dev/ttyS4
-# RK3566 使用内核自动方向时保持为空
-rs485_dir_device=
+rs485_uart=/dev/ttyS8
 rtc_device=/dev/rtc0
 # 必须根据 /proc/bus/input/devices 或 /dev/input/by-path 配置
 key_device=
@@ -22,8 +20,8 @@ audio_sink=alsasink
 
 [audio]
 card=0
-device=default
-# 留空时程序从 amixer scontrols 自动选择
-mixer_control=
+device=plughw:CARD=rockchiprk809co,DEV=0
+# RK809 原始播放音量控制项；应用内部使用 cset numid=3
+mixer_control=numid=3
 # 仅在板级驱动提供功放控制字符设备时填写
 amp_device=

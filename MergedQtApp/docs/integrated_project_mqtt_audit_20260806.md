@@ -397,11 +397,10 @@ IC 成功响应使用请求原 ID；无请求上下文的事件 ID 来自统一 
 
 1. `deletePlayFile` 没有 MQTT 业务回执。
 2. online_v1 `remoteCall` 没有 MQTT 业务回执，只以 RS485 日志判定结果。
-3. FaceGate 的 `GateOutputService` 只发状态，不直接驱动继电器/GPIO。
-4. MQTT 网络人员不会自动进入 FaceGate 识别图库。
-5. FaceGate 当前配置加载强制 QSQLITE，MySQL 参数不会改变实际驱动。
-6. mqttd 不在本工程源码内；Qt 侧只能验证 IPC 合约，无法静态证明 mqttd 对 broker 的 QoS、重连和订阅行为。
-7. 编译、模型加载、硬件节点、RS485 电气方向、串口波特率和目标板时序必须由目标板测试确认。
+3. MQTT 网络人员不会自动进入 FaceGate 识别图库。
+4. FaceGate 当前配置加载强制 QSQLITE，MySQL 参数不会改变实际驱动。
+5. mqttd 不在本工程源码内；Qt 侧只能验证 IPC 合约，无法静态证明 mqttd 对 broker 的 QoS、重连和订阅行为。
+6. 编译、模型加载、硬件节点、RS485 电气方向、串口波特率和目标板时序必须由目标板测试确认。
 
 ## 16. 建议的端到端手工测试矩阵
 

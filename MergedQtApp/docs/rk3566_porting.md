@@ -54,16 +54,15 @@ make -j$(nproc)
 | `QT_YCEST_QR_UART` | 二维码串口 |
 | `QT_YCEST_CARD_UART` | 读卡器串口 |
 | `QT_YCEST_RS485_UART` | RS485 串口 |
-| `QT_YCEST_RS485_DIR_DEVICE` | 旧式外部方向设备；RK3566 通常留空 |
 | `QT_YCEST_RTC_DEVICE` | RTC 设备，默认 `/dev/rtc0` |
 | `QT_YCEST_KEY_DEVICE` | 独立按键输入节点，不再默认占用 `/dev/input/event0` |
-| `QT_YCEST_RTSP_LATENCY_MS` | RTSP jitterbuffer 延迟，默认 300 ms |
+| `QT_YCEST_RTSP_LATENCY_MS` | RTSP jitterbuffer 延迟，默认 1000 ms；仍可按现场网络覆盖 |
 
 同样的配置也可写入 `net_cfg.ini` 的 `[paths]`、`[hardware]`、`[gstreamer]` 和 `[audio]` 分组，参见 `deploy/rk3566/net_cfg.ini.example`。
 
 ## RS485
 
-RK3566 分支优先通过 Linux `TIOCSRS485` 启用 UART 内核自动方向控制。若 BSP 设备树已经完成自动方向配置而 ioctl 返回 `ENOTTY/EINVAL`，程序会记录告警后继续使用硬件/驱动自动方向。只有显式配置 `hardware/rs485_dir_device` 时，才使用旧 T113 风格的 0/1 方向字符设备。
+RK3566 分支使用 `/dev/ttyS8`，并通过 Linux `TIOCSRS485` 启用 UART 内核自动方向控制。若 BSP 设备树已经完成自动方向配置而 ioctl 返回 `ENOTTY/EINVAL`，程序会记录告警后继续使用驱动或收发器的自动方向。应用不直接控制 RS485 DE GPIO。
 
 ## 无桌面 EGLFS + Qt OpenGL ES 显示
 

@@ -13,7 +13,7 @@
 #include <QString>
 
 class QLineEdit;
-class QQuickWidget;
+class QEvent;
 class QShowEvent;
 
 /** @brief 人脸识别主页使用的人员通行密码输入窗口。 */
@@ -21,10 +21,10 @@ class AccessPasswordDialog : public QDialog
 {
     Q_OBJECT
 public:
-    /** @brief 创建带内嵌虚拟键盘的模态密码输入窗口。 */
+    /** @brief 创建使用共享虚拟键盘的模态密码输入窗口。 */
     explicit AccessPasswordDialog(QWidget *parent = nullptr);
 
-    /** @brief 隐藏系统输入法并销毁窗口资源。 */
+    /** @brief 移除宿主尺寸监听并释放输入焦点。 */
     ~AccessPasswordDialog() override;
 
     /** @return 当前输入的原始密码文本。 */
@@ -39,24 +39,21 @@ public:
     static bool getPassword(QWidget *parent, QString *password);
 
 protected:
+    /** @brief Wayland 宿主尺寸变化时同步覆盖层几何。 */
+    bool eventFilter(QObject *watched, QEvent *event) override;
+
     /** @brief 显示后聚焦密码框并延迟拉起虚拟键盘。 */
     void showEvent(QShowEvent *event) override;
 
 private:
-    /** @brief 创建密码表单、操作按钮和内嵌 QML 键盘。 */
+    /** @brief 创建密码表单和操作按钮。 */
     void buildUi();
 
-    /** @brief 校验非空输入，隐藏键盘后接受对话框。 */
+    /** @brief 校验非空输入，释放焦点后接受对话框。 */
     void acceptInput();
 
-    /** @brief 同时显示内嵌键盘和 Qt 输入法。 */
-    void showKeyboard();
-
-    /** @brief 同时隐藏内嵌键盘和 Qt 输入法。 */
-    void hideKeyboard();
-
     QLineEdit *passwordEdit_ = nullptr;       /**< 密码输入控件。 */
-    QQuickWidget *keyboardWidget_ = nullptr;  /**< 内嵌 QML 虚拟键盘。 */
+    bool embeddedForWayland_ = false;         /**< 是否复用人脸主页的 Wayland surface。 */
 };
 
 #endif // ACCESS_PASSWORD_DIALOG_H

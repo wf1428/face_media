@@ -1,14 +1,15 @@
 #include "ModeController.h"
 
-#include "IApplicationModule.h"
+#include "modules/facegate/FaceGateModuleAdapter.h"
+#include "modules/multimedia/MultimediaModuleAdapter.h"
 
 #include <QDebug>
 #include <QStackedWidget>
 #include <QTimer>
 
 ModeController::ModeController(QStackedWidget *stack,
-                               IApplicationModule *multimediaModule,
-                               IApplicationModule *faceGateModule,
+                               MultimediaModuleAdapter *multimediaModule,
+                               FaceGateModuleAdapter *faceGateModule,
                                int recognitionReturnDelayMs,
                                QObject *parent)
     : QObject(parent),
@@ -28,12 +29,18 @@ ModeController::ModeController(QStackedWidget *stack,
             qInfo() << "[MODE] recognition return suppressed by password/admin UI";
             return;
         }
+#ifdef FACEGATE_LEGACY_PAGE_MODE
         if (presenceLevelValid_ && presencePresent_) {
             qInfo() << "[MODE] recognition result hold expired; presence remains high";
             emit recognitionResumed();
             return;
         }
         switchToMultimedia("recognition result timeout with no presence", false);
+#else
+        // 新模式必须回到播放列表，且在 SR505 先回低之前不重新触发，避免
+        // 200ms 电平校准在人体仍停留时立即再次打开摄像头。
+        switchToMultimedia("recognition result hold expired", true);
+#endif
     });
 }
 
@@ -118,15 +125,24 @@ void ModeController::handlePresenceDetected()
     recognitionResultPending_ = false;
     facePresent_ = false;
     setState(AppModeState::SwitchingToFaceGate);
+#ifdef FACEGATE_LEGACY_PAGE_MODE
     multimediaModule_->deactivate();
     stack_->setCurrentWidget(faceGateModule_->rootWidget());
+#else
+    // 顺序不可反转：先让 GStreamer/MPP 和图片混播完整停止，再启动摄像头。
+    multimediaModule_->beginEmbeddedFaceRecognition();
+#endif
     faceGateModule_->activate();
 
     if (!faceGateModule_->isActive()) {
         qWarning() << "[MODE] facegate activation failed; rolling back";
         faceGateModule_->deactivate();
+#ifdef FACEGATE_LEGACY_PAGE_MODE
         stack_->setCurrentWidget(multimediaModule_->rootWidget());
         multimediaModule_->activate();
+#else
+        multimediaModule_->endEmbeddedFaceRecognition();
+#endif
         setState(AppModeState::MultimediaActive);
         emit switchFailed(QStringLiteral("facegate activation failed; multimedia restored"));
         return;
@@ -180,6 +196,18 @@ void ModeController::handleRecognitionFinished()
             << "durationMs=" << recognitionReturnTimer_->interval();
 }
 
+/** @brief 等待图片开始新一批显示时重新计算完整的结果保持时间。 */
+void ModeController::handleRecognitionDisplayStarted()
+{
+#ifndef FACEGATE_LEGACY_PAGE_MODE
+    if (!started_ || state_ != AppModeState::FaceGateActive) {
+        return;
+    }
+    recognitionResultPending_ = true;
+    recognitionReturnTimer_->start();
+#endif
+}
+
 void ModeController::handleFacePresenceChanged(bool present)
 {
     facePresent_ = present;
@@ -229,6 +257,7 @@ void ModeController::switchToMultimedia(const char *reason, bool waitForPresence
     qInfo() << "[MODE] switching facegate -> multimedia" << "reason=" << reason;
     setState(AppModeState::SwitchingToMultimedia);
     faceGateModule_->deactivate();
+#ifdef FACEGATE_LEGACY_PAGE_MODE
     stack_->setCurrentWidget(multimediaModule_->rootWidget());
     multimediaModule_->activate();
 
@@ -242,6 +271,10 @@ void ModeController::switchToMultimedia(const char *reason, bool waitForPresence
         emit switchFailed(QStringLiteral("multimedia activation failed"));
         return;
     }
+#else
+    stack_->setCurrentWidget(multimediaModule_->rootWidget());
+    multimediaModule_->endEmbeddedFaceRecognition();
+#endif
 
     recognitionReturnTimer_->stop();
     recognitionResultPending_ = false;
@@ -249,6 +282,57 @@ void ModeController::switchToMultimedia(const char *reason, bool waitForPresence
     waitForPresenceReset_ = waitForPresenceReset;
     setState(AppModeState::MultimediaActive);
     qInfo() << "[MODE] multimedia mode active";
+}
+
+/** @brief 多媒体页长按后切到原 FaceGate 根窗口并打开原管理认证流程。 */
+void ModeController::handleAdminRequested()
+{
+#ifdef FACEGATE_LEGACY_PAGE_MODE
+    // 旧模式保留原人脸主页五击入口，不改变现有交互。
+    return;
+#else
+    if (!started_ || state_ == AppModeState::ShuttingDown
+            || state_ == AppModeState::AdminActive) {
+        return;
+    }
+    if (state_ != AppModeState::MultimediaActive
+            && state_ != AppModeState::FaceGateActive) {
+        return;
+    }
+
+    recognitionReturnTimer_->stop();
+    recognitionResultPending_ = false;
+    if (state_ == AppModeState::MultimediaActive) {
+        multimediaModule_->beginEmbeddedFaceRecognition();
+        faceGateModule_->activate();
+        if (!faceGateModule_->isActive()) {
+            multimediaModule_->endEmbeddedFaceRecognition();
+            emit switchFailed(QStringLiteral("facegate activation failed; multimedia restored"));
+            return;
+        }
+    }
+
+    stack_->setCurrentWidget(faceGateModule_->rootWidget());
+    setState(AppModeState::AdminActive);
+    faceGateModule_->requestOpenAdminManagement();
+#endif
+}
+
+/** @brief 管理登录取消或后台关闭后回到多媒体并等待人体传感器复位。 */
+void ModeController::handleAdminSessionFinished()
+{
+#ifndef FACEGATE_LEGACY_PAGE_MODE
+    if (!started_ || state_ != AppModeState::AdminActive) {
+        return;
+    }
+    faceGateModule_->deactivate();
+    stack_->setCurrentWidget(multimediaModule_->rootWidget());
+    multimediaModule_->endEmbeddedFaceRecognition();
+    recognitionResultPending_ = false;
+    facePresent_ = false;
+    waitForPresenceReset_ = presenceLevelValid_ && presencePresent_;
+    setState(AppModeState::MultimediaActive);
+#endif
 }
 
 void ModeController::setState(AppModeState state)

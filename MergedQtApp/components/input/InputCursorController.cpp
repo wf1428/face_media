@@ -25,7 +25,7 @@ InputCursorController::InputCursorController(QObject *parent)
         qApp->installEventFilter(this);
     }
 
-    // EGLFS 输入设备通常已在 QApplication 构造期间注册；再延迟检查一次，
+    // 平台输入设备通常已在 QApplication 构造期间注册；再延迟检查一次，
     // 兼容平台插件在首轮事件循环中才完成触摸设备注册的情况。
     applyInitialDeviceState();
     QTimer::singleShot(0, this, [this]() {

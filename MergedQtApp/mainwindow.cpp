@@ -10,9 +10,9 @@
 #include "ui_mainwindow.h"
 #include <QKeyEvent>
 #include <QDebug>
-#include <QMessageBox>
 #include <QTimer>
 #include <QFileInfo>
+#include "components/dialogs/ui_message_box.h"
 #include "platform/rk3566_platform.h"
 
 namespace {
@@ -118,8 +118,8 @@ MainWindow::MainWindow(QWidget *parent)
     // 启动默认显示 app3Page
     stack->setCurrentWidget(app3Page);
 
-    // 无桌面 EGLFS 下顶层窗口由 main.cpp 中唯一的根窗口统一管理。
-    // 这里不再单独 showFullScreen()，避免创建第二个 DRM/EGL 顶层窗口。
+    // 嵌入式全屏模式由 main.cpp 中唯一的根窗口统一管理。
+    // 这里不再单独 showFullScreen()，避免创建第二个原生顶层窗口。
 
     // 开启鼠标跟踪
     this->setMouseTracking(true);
@@ -147,11 +147,13 @@ MainWindow::MainWindow(QWidget *parent)
 
         if (stack->currentWidget() == app3Page) {
             QTimer::singleShot(0, mm, [mm]() {
-                mm->resumeLocalPlaylistFromStart();     // 回到 app3
+                // 回到多媒体主页：恢复本地首项，并在仍有 LIVE 目标时继续验证和重试。
+                mm->resumePlaybackAfterModuleSwitch();
             });
         } else {
             QTimer::singleShot(0, mm, [mm]() {
-                mm->leaveAndStopVideo();                // 离开 app3
+                // 进入多媒体管理员或文件页面只暂停播放器，不能清除 LIVE 目标。
+                mm->suspendPlaybackForModuleSwitch();
             });
         }
 
@@ -295,7 +297,11 @@ MainWindow::MainWindow(QWidget *parent)
 
         settingsDialog->show();
         settingsDialog->raise();
-        settingsDialog->activateWindow();
+        // Wayland 不允许客户端主动请求全局窗口激活；show/raise 已足够。
+        if (!QGuiApplication::platformName().startsWith(
+                    QStringLiteral("wayland"), Qt::CaseInsensitive)) {
+            settingsDialog->activateWindow();
+        }
 
     });
 
@@ -400,7 +406,10 @@ MainWindow::MainWindow(QWidget *parent)
 
         cmdDialog->show();
         cmdDialog->raise();
-        cmdDialog->activateWindow();
+        if (!QGuiApplication::platformName().startsWith(
+                    QStringLiteral("wayland"), Qt::CaseInsensitive)) {
+            cmdDialog->activateWindow();
+        }
     });
 
 
@@ -442,7 +451,7 @@ MainWindow::MainWindow(QWidget *parent)
     // 连接退出按钮点击信号，执行重启
     connect(ui->exitButton, &QPushButton::clicked, this, [=]() {
 
-        auto ret = QMessageBox::question(
+        auto ret = UiMessageBox::question(
             this,
             "确认重启",
             "确认要重启设备吗？",
@@ -456,7 +465,7 @@ MainWindow::MainWindow(QWidget *parent)
 
         QString rebootError;
         if (!Rk3566Platform::reboot(&rebootError)) {
-            QMessageBox::warning(this, "重启失败", rebootError);
+            UiMessageBox::warning(this, "重启失败", rebootError);
         }
     });
 

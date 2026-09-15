@@ -36,6 +36,10 @@ struct FeatureSettings
 namespace Ui {
 class FeaturesDialog;
 }
+class QEvent;
+class QHideEvent;
+class QShowEvent;
+class QWidget;
 
 /** @brief 编辑并约束设备功能开关的设置对话框。 */
 class FeaturesDialog : public QDialog
@@ -55,6 +59,12 @@ public:
     /** @brief 将功能设置回显到复选框。 */
     void setFeatureSettings(const FeatureSettings &settings);
 
+protected:
+    /** @brief Wayland 宿主变化时保持遮罩和功能卡片居中。 */
+    bool eventFilter(QObject *watched, QEvent *event) override;
+    void showEvent(QShowEvent *event) override;
+    void hideEvent(QHideEvent *event) override;
+
 private slots:
     /** @brief 保证 offline_v1、online_v1、online_v2 最多选中一个。 */
     void onFeatureChecked(int state);
@@ -63,8 +73,13 @@ private:
     /** @brief 建立复选框和对话框按钮信号连接。 */
     void setupConnections();
 
+    /** @brief 使用宿主局部坐标把功能窗口放在正中央。 */
+    void centerInHost();
+
 private:
     Ui::FeaturesDialog *ui;
+    QWidget *waylandBlocker_ = nullptr;
+    bool embeddedForWayland_ = false;
 };
 
 

@@ -94,8 +94,8 @@ private:
     /** @brief 按数据库字段规则归一化输入值，失败时填写 err。 */
     QString normalizeValue(const QString& dbKey, const QString& v, QString* err) const;
 
-    /** @brief 从配置读取对话框尺寸并限制在当前屏幕可用范围内。 */
-    QSize loadWindowSizeFromConfig() const;
+    /** @return 当前宿主/屏幕实际可用尺寸。 */
+    QSize availableWindowSize() const;
     /** @brief 创建带标题的配置分区卡片。 */
     QWidget* makeSectionCard(const QString& title, const QList<QWidget*>& rows);
     /** @brief 创建设备动作按钮卡片。 */
@@ -112,7 +112,7 @@ private:
     /** 配置数据库路径。 */
     QString m_dbPath = Rk3566Platform::databasePath();
 
-    /** 小屏幕下使用紧凑间距和字号。 */
+    /** 使用可滚动紧凑结构，保证运行中横竖屏切换无需重建编辑器。 */
     bool m_compactLayout = false;
 
 

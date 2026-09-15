@@ -66,9 +66,11 @@ void IcEventBridge::emitPasswordAccessFinished(const QString &personId,
                                                 const QString &floors,
                                                 const QByteArray &rs485Frame,
                                                 bool success,
-                                                const QString &reason)
+                                                const QString &reason,
+                                                int resultCode)
 {
-    emit passwordAccessFinished(personId, floors, rs485Frame, success, reason);
+    emit passwordAccessFinished(personId, floors, rs485Frame,
+                                success, reason, resultCode);
 }
 
 /** @brief 发布人脸楼层权限判定及 RS485 实际发送结果。 */
@@ -77,10 +79,11 @@ void IcEventBridge::emitFaceAccessFinished(const QString &personId,
                                            const QString &floors,
                                            const QByteArray &rs485Frame,
                                            bool success,
-                                           const QString &reason)
+                                           const QString &reason,
+                                           int resultCode)
 {
     emit faceAccessFinished(personId, faceHash, floors, rs485Frame,
-                            success, reason);
+                            success, reason, resultCode);
 }
 
 /** @brief 把人脸通行抓拍上传任务投递给 MQTT 协调器。 */
@@ -132,9 +135,9 @@ void IcEventBridge::emitToastPassRequested()
 }
 
 /** @brief 请求主线程显示带原因的验证失败提示。 */
-void IcEventBridge::emitToastFailRequested(const QString &reason)
+void IcEventBridge::emitToastFailRequested(const QString &reason, int resultCode)
 {
-    emit toastFailRequested(reason);
+    emit toastFailRequested(reason, resultCode);
 }
 
 

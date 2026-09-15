@@ -445,7 +445,7 @@ MQTT 通信通过 mqttd 守护进程中转，应用通过 Unix Domain Socket IPC
 
 | 参数 | 值 |
 |------|-----|
-| 设备路径 | `/dev/ttyAS2` |
+| 设备路径 | `/dev/ttyS7` |
 | 波特率 | 9600 (默认) |
 | 数据位 | 8 |
 | 校验位 | 无 |
@@ -459,7 +459,7 @@ MQTT 通信通过 mqttd 守护进程中转，应用通过 Unix Domain Socket IPC
 
 | 参数 | 值 |
 |------|-----|
-| 设备路径 | `/dev/ttyAS1` |
+| 设备路径 | `/dev/ttyS6` |
 | 波特率 | 9600 |
 | 模式 | 只读 |
 
@@ -469,9 +469,9 @@ MQTT 通信通过 mqttd 守护进程中转，应用通过 Unix Domain Socket IPC
 
 | 参数 | 值 |
 |------|-----|
-| 设备路径 | `/dev/ttyAS4` |
+| 设备路径 | `/dev/ttyS8` |
 | 波特率 | 9600 |
-| 方向控制 | `/dev/rs485_dir` GPIO |
+| 方向控制 | UART 内核驱动自动控制 RTS/DE |
 | 模式 | 读写 |
 
 ---

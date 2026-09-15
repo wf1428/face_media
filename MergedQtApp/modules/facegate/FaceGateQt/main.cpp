@@ -65,10 +65,15 @@ int main(int argc, char *argv[])
     /*
      * 使用 Qt Virtual Keyboard 作为输入法。目标系统需要
      * 在 Qt 插件路径中安装 qtvirtualkeyboard inputcontext 插件。
-     * 下面的焦点过滤器会为 Qt Widgets 输入框主动弹出键盘。键盘内嵌在 AdminPanel 中，因此禁用桌面顶层键盘窗口。
+     * 下面的焦点过滤器会为 Qt Widgets 输入框主动弹出键盘。人脸根窗口
+     * 长期维护唯一的内嵌 InputPanel，因此禁用桌面顶层键盘窗口。
      */
     qputenv("QT_IM_MODULE", QByteArray("qtvirtualkeyboard"));
     qputenv("QT_VIRTUALKEYBOARD_DESKTOP_DISABLE", QByteArray("1"));
+
+    // QQuickWidget 共享键盘和 OpenGL 预览必须在 QApplication 创建前开启
+    // 上下文共享；融合程序入口也使用同一设置。
+    QCoreApplication::setAttribute(Qt::AA_ShareOpenGLContexts);
 
     // 创建 QApplication 后安装输入法焦点过滤器。
     QApplication app(argc, argv);

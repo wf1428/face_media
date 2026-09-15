@@ -7,7 +7,7 @@
  */
 
 #include "bluetoothpage.h"
-#include <QMessageBox>
+#include "components/dialogs/ui_message_box.h"
 #include <QGroupBox>
 #include <QAbstractItemView>
 
@@ -108,7 +108,7 @@ void BluetoothPage::setupUI()
 void BluetoothPage::onScanButtonClicked()
 {
     // 模拟扫描过程
-    QMessageBox::information(this, "扫描", "正在扫描蓝牙设备...");
+    UiMessageBox::information(this, "扫描", "正在扫描蓝牙设备...");
     // 实际应用中这里应该调用蓝牙API进行扫描
 }
 
@@ -117,12 +117,12 @@ void BluetoothPage::onConnectButtonClicked()
 {
     QListWidgetItem *item = deviceListWidget->currentItem();
     if (!item) {
-        QMessageBox::warning(this, "警告", "请先选择一个设备");
+        UiMessageBox::warning(this, "警告", "请先选择一个设备");
         return;
     }
     
     QString deviceName = item->text();
-    QMessageBox::information(this, "连接", QString("正在连接设备: %1").arg(deviceName));
+    UiMessageBox::information(this, "连接", QString("正在连接设备: %1").arg(deviceName));
     // 实际应用中这里应该调用蓝牙API进行连接
 }
 
@@ -131,11 +131,11 @@ void BluetoothPage::onDisconnectButtonClicked()
 {
     QListWidgetItem *item = deviceListWidget->currentItem();
     if (!item) {
-        QMessageBox::warning(this, "警告", "请先选择一个设备");
+        UiMessageBox::warning(this, "警告", "请先选择一个设备");
         return;
     }
     
     QString deviceName = item->text();
-    QMessageBox::information(this, "断开连接", QString("正在断开设备: %1").arg(deviceName));
+    UiMessageBox::information(this, "断开连接", QString("正在断开设备: %1").arg(deviceName));
     // 实际应用中这里应该调用蓝牙API进行断开连接
 }

@@ -13,6 +13,7 @@
 3. 人脸检测置信度达到 `faceDetectThreshold`；
 4. 人脸质量达到 `faceQualityThreshold`；
 5. 人脸特征提取成功。
+6. 使用本地配置的 `duplicateFaceCosineThreshold` 执行重复人脸处理。
 
 此同步校验链路不执行活体检测。只有该人员的全部图片都通过，才确认人员图片同步成功。
 
@@ -20,7 +21,17 @@
 
 `face.responseImages` → Base64 解码和图片落盘 → `IMAGE_PENDING_VALIDATION` / `FACE_VALIDATING` → FaceGate 推理线程离线校验 → 全部通过后保存特征 → `IMAGE_READY` / `READY` → 发布 `Imagesresult`。
 
+Base64 只在 MQTT 响应解析和图片落盘期间临时存在，不写入 `network_face`。数据库仅保存本地图片路径、`faceHash`、人脸特征、模型版本和同步状态；旧数据库中遗留的 `face_base64` 数据会在初始化时清空，新建数据库不再创建该列。
+
 图片质量校验运行在 FaceGate 推理线程中，不改变摄像头实时识别、活体状态机、MQTT topic 选择和二维码/IC 卡逻辑。
+
+重复人脸规则如下：
+
+- 同一个网络 `personId` 可以保存多张不同人脸；达到重复阈值的相似人脸只保留本次最新下发项，并删除被替换的旧记录和旧图片；
+- 不同网络 `personId` 之间禁止保存相似人脸，冲突项校验失败且不进入识别图库；
+- 网络人脸与本地人员特征相似时，用最新网络特征更新相似度最高的本地特征，本地人员主键和本地录入图片路径保持不变；
+- 同一响应内按照图片数组顺序判断新旧，后出现的相似项视为最新项。
+- 推理阶段使用内存图库预判，数据库提交事务内再次复核网络和本地特征，避免不同人员并发同步时因图库刷新滞后漏过重复人脸。
 
 ## 3. 成功条件
 
@@ -31,13 +42,14 @@
 - 每张图片的检测置信度和人脸质量均达到当前配置阈值；
 - 每张图片均成功提取非空特征及模型版本；
 - 数据库中该人员不存在未达到 `IMAGE_READY` 的人脸记录；
+- 不存在与其他网络 `personId` 达到去重阈值的人脸；
 - 特征和人员最终状态事务提交成功。
 
 成功后 `network_face` 保存图片路径、特征、模型版本及 `IMAGE_READY` 状态，`network_person.sync_state` 更新为 `READY`。
 
 ## 4. `Imagesresult` 回执
 
-回执发布到配置的 `device/ycLinux/.../event` 主题。基本信封字段沿用现有 online_v1 格式：`method`、`id`、`deviceId`、`data`、`time`。
+回执发布到配置的 `device/ycLinux/.../event` 主题。基本信封字段沿用现有 online_v1 格式：`method`、`id`、`deviceId`、`data`、`time`。每张下发人脸单独发布一条 `Imagesresult`；同一批次继续沿用下行消息 ID，通过 `faceHash` 区分图片。
 
 ```json
 {
@@ -46,6 +58,8 @@
   "deviceId": "device-id",
   "data": {
     "personId": "person-id",
+    "name": "front",
+    "faceHash": "face-hash-001",
     "result": true,
     "msg": "人脸图像同步成功。"
   },
@@ -53,7 +67,7 @@
 }
 ```
 
-失败时 `result` 为 `false`，`msg` 返回具体失败原因。主要可见提示包括：
+失败时只在对应图片的回执中设置 `result=false`，`msg` 返回该图片自己的失败原因，兼容字段 `failed_faces` 也只包含这一张图片；同批其他校验通过的图片单独返回成功，不再共用最后一条错误消息。不同人员重复时提示冲突人员姓名；同一 `personId` 下发现相似人脸时，最新图片和被替换图片的回执分别说明“以最新下发人脸为准”和“已被最新相似人脸替换”，文案使用 `network_person.name`，不向用户显示内部 `personId`。主要可见提示包括：
 
 | 失败类型 | `msg` 示例 |
 |---|---|

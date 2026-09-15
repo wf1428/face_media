@@ -303,12 +303,17 @@ AppConfig AppConfig::load(const QString &iniPath)
     cfg.livenessPassRequired = s.value("verify/liveness_pass_required", cfg.livenessPassRequired).toInt();
     cfg.resultHoldMs = s.value("verify/result_hold_ms", cfg.resultHoldMs).toInt();
     cfg.sameFaceSuppressMs = s.value("verify/same_face_suppress_ms", cfg.sameFaceSuppressMs).toInt();
+    cfg.accessDecisionTimeoutMs = qMax(
+                1000,
+                s.value("verify/access_decision_timeout_ms",
+                        cfg.accessDecisionTimeoutMs).toInt());
     cfg.livenessEnabled = s.value("verify/liveness_enabled", cfg.livenessEnabled).toBool();
 
     cfg.snapshotDir = s.value("log/snapshot_dir", cfg.snapshotDir).toString();
     cfg.saveFailedSnapshot = s.value("log/save_failed_snapshot", cfg.saveFailedSnapshot).toBool();
 
     cfg.privacyMode = s.value("ui/privacy_mode", cfg.privacyMode).toBool();
+    cfg.showAccessPhoto = s.value("ui/show_access_photo", cfg.showAccessPhoto).toBool();
     cfg.strangerPromptCooldownMs = s.value("ui/stranger_prompt_cooldown_ms", cfg.strangerPromptCooldownMs).toInt();
 
     cfg.audioEnabled = s.value("audio/enabled", cfg.audioEnabled).toBool();
@@ -446,12 +451,15 @@ bool AppConfig::save(const QString &iniPath, QString *errorText) const
     s.setValue("verify/liveness_pass_required", QString::number(livenessPassRequired));
     s.setValue("verify/result_hold_ms", QString::number(resultHoldMs));
     s.setValue("verify/same_face_suppress_ms", QString::number(sameFaceSuppressMs));
+    s.setValue("verify/access_decision_timeout_ms",
+               QString::number(accessDecisionTimeoutMs));
     s.setValue("verify/liveness_enabled", boolText(livenessEnabled));
 
     s.setValue("log/snapshot_dir", snapshotDir);
     s.setValue("log/save_failed_snapshot", boolText(saveFailedSnapshot));
 
     s.setValue("ui/privacy_mode", boolText(privacyMode));
+    s.setValue("ui/show_access_photo", boolText(showAccessPhoto));
     s.setValue("ui/stranger_prompt_cooldown_ms", QString::number(strangerPromptCooldownMs));
 
     s.setValue("audio/enabled", boolText(audioEnabled));

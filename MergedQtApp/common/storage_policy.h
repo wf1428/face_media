@@ -22,11 +22,13 @@ qint64 mediaLimitBytes();
 qint64 registrationLimitBytes();
 qint64 accessSoftLimitBytes();
 qint64 accessHardLimitBytes();
+/** @return 当前容量档位在界面展示的注册照参考数量。 */
+int registrationPhotoCapacity();
 
 Usage mediaUsage();
 Usage registrationUsage();
 
-/** @brief 下载前检查目标媒体文件写入后是否仍在 2 GiB 配额内。 */
+/** @brief 下载前检查目标媒体文件写入后是否仍在当前设备的媒体配额内。 */
 bool canStoreMediaFile(const QString &targetPath,
                        qint64 incomingBytes,
                        QString *error = nullptr);
@@ -39,7 +41,7 @@ bool canCommitMediaFile(const QString &targetPath,
                         const QString &partPath,
                         QString *error = nullptr);
 
-/** @brief 在 1 GiB 注册照配额内原子保存本地或网络注册照片。 */
+/** @brief 在当前设备的注册照配额内原子保存本地或网络注册照片。 */
 bool writeRegistrationPhoto(const QString &targetPath,
                             const QByteArray &encodedImage,
                             QString *error = nullptr);
@@ -54,7 +56,7 @@ bool writeAccessSnapshot(const QString &snapshotRoot,
  * @brief 向 data/access_logs/yyyyMMdd.log 追加一条 JSON Lines 通行记录。
  *
  * record 可包含 type/name/credential/success/reason/snapshotPath/faceHash；
- * 本函数统一补充毫秒级准确时间并执行 15 天、400 MiB/500 MiB 清理策略。
+ * 本函数统一补充毫秒级准确时间，并执行 15 天及当前设备容量档位的清理策略。
  */
 bool appendAccessRecord(const QString &snapshotRoot,
                         QJsonObject record,

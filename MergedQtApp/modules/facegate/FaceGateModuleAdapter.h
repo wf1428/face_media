@@ -10,7 +10,9 @@
 #define FACEGATEMODULEADAPTER_H
 
 #include "shell/IApplicationModule.h"
+#include "modules/facegate/FaceGateQt/core/VerificationTypes.h"
 
+#include <QImage>
 #include <QObject>
 #include <QPointer>
 #include <QString>
@@ -50,6 +52,9 @@ public:
     /** @return 仅在无人值守的人脸识别主页允许外壳执行在场切换。 */
     bool allowsPresenceSwitch() const override;
 
+    /** @brief 打开原有管理员认证和管理面板。 */
+    void requestOpenAdminManagement();
+
 signals:
     /** @brief 当门禁界面显示识别成功结果时向应用外壳转发。 */
     void recognitionSucceeded();
@@ -59,6 +64,13 @@ signals:
 
     /** @brief 转发主识别画面中的人脸检测状态。 */
     void facePresenceChanged(bool present);
+
+    void previewFrameChanged(const QImage &image);
+    void previewUnavailable(const QString &message);
+    void previewFacesChanged(const QVector<DetectedFace> &faces);
+    void previewStateChanged(VerifyState state, const QString &message);
+    void recognitionImageReady(const QImage &image, const QString &name);
+    void adminSessionFinished();
 
 private:
     QPointer<QWidget> widgetParent_;    /**< 门禁窗口的 QWidget 父对象。 */

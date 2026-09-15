@@ -1,12 +1,13 @@
 /**
  * @file appstyle.cpp
- * @brief 1024x768 设置页面的统一缩放、QSS 和滚动区域工厂的实现。
+ * @brief 横竖屏设置页面的统一缩放、QSS 和滚动区域工厂的实现。
  *
  * @author Dulin
  * @date 2026-07-25
  */
 
 #include "appstyle.h"
+#include "common/responsive_ui.h"
 
 #include <QGuiApplication>
 #include <QScreen>
@@ -17,19 +18,10 @@
 
 static double g_scale = 1.0;
 
-/** @return 相对设计分辨率计算的统一 UI 缩放系数。 */
+/** @return 按配置优先的参考分辨率计算的统一 UI 缩放系数。 */
 double AppStyle::uiScaleForScreen()
 {
-    QScreen* s = QGuiApplication::primaryScreen();
-    if (!s) return 1.0;
-
-    const QRect g = s->availableGeometry();
-    const double sx = double(g.width())  / 1024.0;
-    const double sy = double(g.height()) / 768.0;
-
-    double f = qMin(sx, sy);
-    f = qBound(0.78, f, 1.20);
-    return f;
+    return ResponsiveUi::scaleForSize(ResponsiveUi::layoutReferenceSize());
 }
 
 

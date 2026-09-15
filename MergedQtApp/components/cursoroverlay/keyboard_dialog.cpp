@@ -16,6 +16,7 @@
 // 依赖：keyboard_dialog.h 为通用版（titleLabel/edit/keysHost/... 成员与接口）
 
 #include "keyboard_dialog.h"
+#include "common/responsive_ui.h"
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -23,6 +24,7 @@
 #include <QPushButton>
 #include <QLineEdit>
 #include <QLabel>
+#include <QEvent>
 #include <QShowEvent>
 #include <QPropertyAnimation>
 #include <QGuiApplication>
@@ -51,13 +53,26 @@ static QPushButton* makeKeyBtn(const QString &label, QWidget *parent)
 
 /** @brief 创建键盘布局和文本编辑框。 */
 KeyboardDialog::KeyboardDialog(QWidget *parent)
-    : QDialog(parent)
+    : QDialog(ResponsiveUi::dialogParent(parent))
 {
+    embeddedForWayland = ResponsiveUi::isWaylandPlatform() && parentWidget();
     setModal(true);
-    setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
+    if (embeddedForWayland) {
+        setWindowFlags(Qt::Widget);
+    } else {
+        setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
+    }
     setAttribute(Qt::WA_TranslucentBackground, true);
 
-    setFixedHeight(kDialogHeight);
+    if (embeddedForWayland) {
+        // 覆盖整个既有 Wayland surface，由内部面板贴住宿主底部；不再创建
+        // 位置受 Weston 管理的独立 xdg/wl-shell 顶层窗口。
+        setMinimumSize(0, 0);
+        setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+        parentWidget()->installEventFilter(this);
+    } else {
+        setFixedHeight(kDialogHeight);
+    }
 
     setUpdatesEnabled(false);
     buildUi();
@@ -122,8 +137,23 @@ QString KeyboardDialog::text() const
 /** @brief 显示时从屏幕底部弹出。 */
 void KeyboardDialog::showEvent(QShowEvent *e)
 {
+    if (embeddedForWayland) {
+        popupFromBottom();
+    }
     QDialog::showEvent(e);
-    popupFromBottom();
+    if (!embeddedForWayland) {
+        popupFromBottom();
+    }
+    raise();
+}
+
+bool KeyboardDialog::eventFilter(QObject *watched, QEvent *event)
+{
+    if (embeddedForWayland && watched == parentWidget() && event &&
+            event->type() == QEvent::Resize) {
+        popupFromBottom();
+    }
+    return QDialog::eventFilter(watched, event);
 }
 
 /** @brief 创建标题、编辑器和功能按键。 */
@@ -137,10 +167,10 @@ void KeyboardDialog::buildUi()
     // 顶部留空，把面板压到底部
     root->addStretch(1);
 
-    auto *panel = new QWidget(this);
+    panel = new QWidget(this);
     panel->setObjectName("kbdPanel");
     panel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    panel->setFixedHeight(height());
+    panel->setFixedHeight(kDialogHeight);
     root->addWidget(panel);
 
     auto *lay = new QVBoxLayout(panel);
@@ -453,11 +483,24 @@ void KeyboardDialog::onToggleMode()
 /** @brief 计算屏幕几何并执行底部弹出动画。 */
 void KeyboardDialog::popupFromBottom()
 {
-    QRect base;
-    if (parentWidget()) base = parentWidget()->frameGeometry();
-    else base = QGuiApplication::primaryScreen()->availableGeometry();
+    const QRect base = ResponsiveUi::hostRect(parentWidget());
 
-    const int h = height();
+    // 该键盘包含四排至少 44px 的按键及标题、输入框和操作区，340px 是
+    // 保证所有键帽完整可见的实际最小高度。支持屏幕下限为 600px，因此无需
+    // 再压缩键盘本身，只在异常更小的宿主中限制为宿主高度。
+    const int h = qMin(kDialogHeight, qMax(1, base.height()));
+    if (panel) {
+        panel->setFixedHeight(h);
+    }
+
+    if (embeddedForWayland) {
+        // 对话框本身覆盖宿主，根布局把 panel 固定在最底部。这里全部使用
+        // 宿主局部坐标，横竖屏切换时也不会受点击位置影响。
+        setGeometry(base);
+        return;
+    }
+
+    setFixedHeight(h);
     const QRect target(base.x(), base.y() + base.height() - h, base.width(), h);
 
     setFixedWidth(target.width());

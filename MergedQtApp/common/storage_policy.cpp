@@ -19,6 +19,7 @@
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QSet>
+#include <QStorageInfo>
 
 #include <algorithm>
 
@@ -26,13 +27,65 @@ namespace {
 
 const qint64 kGiB = 1024LL * 1024LL * 1024LL;
 const qint64 kMiB = 1024LL * 1024LL;
-const qint64 kMediaLimit = 2LL * kGiB;
-const qint64 kRegistrationLimit = 1LL * kGiB;
-const qint64 kAccessSoftLimit = 400LL * kMiB;
-const qint64 kAccessHardLimit = 500LL * kMiB;
+const qint64 kLargeEmmcFilesystemThreshold = 24LL * kGiB;
 const int kAccessRetentionDays = 15;
 
+/** @brief 一档设备存储容量对应的各业务配额。 */
+struct StorageLimits {
+    qint64 mediaBytes;
+    qint64 registrationBytes;
+    qint64 accessSoftBytes;
+    qint64 accessHardBytes;
+    int registrationPhotoCapacity;
+};
+
+const StorageLimits kLegacyStorageLimits = {
+    2LL * kGiB,
+    1LL * kGiB,
+    400LL * kMiB,
+    500LL * kMiB,
+    3000
+};
+
+const StorageLimits kLargeEmmcStorageLimits = {
+    8LL * kGiB,
+    15LL * kGiB,
+    2LL * kGiB * 4LL / 5LL,
+    2LL * kGiB,
+    52000
+};
+
 QMutex g_storageMutex;
+
+/**
+ * @brief 按应用数据所在文件系统选择 8GB 或 32GB eMMC 配额档位。
+ *
+ * 标称 32GB eMMC 格式化后的根文件系统通常约为 29 GiB，因此使用
+ * 24 GiB 作为两档之间的安全分界；容量读取失败时保守沿用原 8GB 策略。
+ */
+const StorageLimits &currentStorageLimits()
+{
+    QStorageInfo storage(Rk3566Platform::applicationRoot());
+    storage.refresh();
+    if (!storage.isValid() || !storage.isReady() || storage.bytesTotal() <= 0) {
+        storage = QStorageInfo::root();
+        storage.refresh();
+    }
+    if (storage.isValid()
+            && storage.isReady()
+            && storage.bytesTotal() >= kLargeEmmcFilesystemThreshold) {
+        return kLargeEmmcStorageLimits;
+    }
+    return kLegacyStorageLimits;
+}
+
+QString capacityText(qint64 bytes)
+{
+    if (bytes % kGiB == 0) {
+        return QStringLiteral("%1 GiB").arg(bytes / kGiB);
+    }
+    return QStringLiteral("%1 MiB").arg(bytes / kMiB);
+}
 
 QString absoluteCleanPath(const QString &path)
 {
@@ -183,9 +236,11 @@ bool prepareAccessWriteUnlocked(const QString &snapshotRoot,
                                 qint64 incomingBytes,
                                 QString *error)
 {
-    if (incomingBytes < 0 || incomingBytes > kAccessHardLimit) {
+    const StorageLimits &limits = currentStorageLimits();
+    if (incomingBytes < 0 || incomingBytes > limits.accessHardBytes) {
         if (error) {
-            *error = QStringLiteral("单条通行数据超过 500 MiB 限制");
+            *error = QStringLiteral("单条通行数据超过 %1 限制")
+                    .arg(capacityText(limits.accessHardBytes));
         }
         return false;
     }
@@ -210,9 +265,9 @@ bool prepareAccessWriteUnlocked(const QString &snapshotRoot,
     qint64 projected = accessUsageBytes(snapshotRoot) + incomingBytes;
     QStringList days = accessDays(snapshotRoot);
 
-    // 到达 400 MiB 时，本次只主动清理最早的一天；后续写入会继续逐日处理。
+    // 到达当前档位软上限时，本次只主动清理最早的一天；后续写入继续逐日处理。
     if (!cleanedOneDay
-            && projected >= kAccessSoftLimit
+            && projected >= limits.accessSoftBytes
             && !days.isEmpty()
             && days.first() != today) {
         if (!removeAccessDay(snapshotRoot, days.first(), error)) {
@@ -222,8 +277,8 @@ bool prepareAccessWriteUnlocked(const QString &snapshotRoot,
         days = accessDays(snapshotRoot);
     }
 
-    // 500 MiB 是硬上限；仍超限时继续逐日清理，但绝不删除当天记录。
-    while (projected > kAccessHardLimit
+    // 当前档位硬上限不可突破；仍超限时继续逐日清理，但绝不删除当天记录。
+    while (projected > limits.accessHardBytes
            && !days.isEmpty()
            && days.first() != today) {
         if (!removeAccessDay(snapshotRoot, days.first(), error)) {
@@ -233,10 +288,11 @@ bool prepareAccessWriteUnlocked(const QString &snapshotRoot,
         days = accessDays(snapshotRoot);
     }
 
-    if (projected > kAccessHardLimit) {
+    if (projected > limits.accessHardBytes) {
         if (error) {
             *error = QStringLiteral(
-                        "通行抓拍和日志已达到 500 MiB，且只剩当天记录，无法继续保存");
+                        "通行抓拍和日志已达到 %1，且只剩当天记录，无法继续保存")
+                    .arg(capacityText(limits.accessHardBytes));
         }
         return false;
     }
@@ -247,10 +303,14 @@ bool prepareAccessWriteUnlocked(const QString &snapshotRoot,
 
 namespace StoragePolicy {
 
-qint64 mediaLimitBytes() { return kMediaLimit; }
-qint64 registrationLimitBytes() { return kRegistrationLimit; }
-qint64 accessSoftLimitBytes() { return kAccessSoftLimit; }
-qint64 accessHardLimitBytes() { return kAccessHardLimit; }
+qint64 mediaLimitBytes() { return currentStorageLimits().mediaBytes; }
+qint64 registrationLimitBytes() { return currentStorageLimits().registrationBytes; }
+qint64 accessSoftLimitBytes() { return currentStorageLimits().accessSoftBytes; }
+qint64 accessHardLimitBytes() { return currentStorageLimits().accessHardBytes; }
+int registrationPhotoCapacity()
+{
+    return currentStorageLimits().registrationPhotoCapacity;
+}
 
 Usage mediaUsage()
 {
@@ -269,6 +329,7 @@ bool canStoreMediaFile(const QString &targetPath,
                        QString *error)
 {
     QMutexLocker locker(&g_storageMutex);
+    const qint64 mediaLimit = currentStorageLimits().mediaBytes;
     if (!isInside(targetPath, mediaRoot())) {
         return true;
     }
@@ -279,10 +340,11 @@ bool canStoreMediaFile(const QString &targetPath,
             ? QFileInfo(partPath).size() : 0;
     const qint64 projected = directoryUsage(mediaRoot()).bytes
             - oldSize - oldPartSize + qMax<qint64>(0, incomingBytes);
-    if (incomingBytes < 0 || projected > kMediaLimit) {
+    if (incomingBytes < 0 || projected > mediaLimit) {
         if (error) {
             *error = QStringLiteral(
-                        "媒体目录容量不足：视频和图片总量限制为 2 GiB，当前文件无法写入");
+                        "媒体目录容量不足：视频和图片总量限制为 %1，当前文件无法写入")
+                    .arg(capacityText(mediaLimit));
         }
         return false;
     }
@@ -292,6 +354,7 @@ bool canStoreMediaFile(const QString &targetPath,
 qint64 mediaWritableBytes(const QString &targetPath)
 {
     QMutexLocker locker(&g_storageMutex);
+    const qint64 mediaLimit = currentStorageLimits().mediaBytes;
     if (!isInside(targetPath, mediaRoot())) {
         return -1;
     }
@@ -300,7 +363,7 @@ qint64 mediaWritableBytes(const QString &targetPath)
     const QString partPath = targetPath + QStringLiteral(".part");
     const qint64 oldPartSize = QFileInfo(partPath).isFile()
             ? QFileInfo(partPath).size() : 0;
-    return qMax<qint64>(0, kMediaLimit - directoryUsage(mediaRoot()).bytes
+    return qMax<qint64>(0, mediaLimit - directoryUsage(mediaRoot()).bytes
                         + oldSize + oldPartSize);
 }
 
@@ -309,6 +372,7 @@ bool canCommitMediaFile(const QString &targetPath,
                         QString *error)
 {
     QMutexLocker locker(&g_storageMutex);
+    const qint64 mediaLimit = currentStorageLimits().mediaBytes;
     if (!isInside(targetPath, mediaRoot())) {
         return true;
     }
@@ -319,10 +383,11 @@ bool canCommitMediaFile(const QString &targetPath,
     const qint64 oldSize = QFileInfo(targetPath).isFile()
             ? QFileInfo(targetPath).size() : 0;
     const qint64 projected = directoryUsage(mediaRoot()).bytes - oldSize;
-    if (projected > kMediaLimit) {
+    if (projected > mediaLimit) {
         if (error) {
             *error = QStringLiteral(
-                        "媒体目录容量不足：下载完成后视频和图片总量将超过 2 GiB");
+                        "媒体目录容量不足：下载完成后视频和图片总量将超过 %1")
+                    .arg(capacityText(mediaLimit));
         }
         return false;
     }
@@ -334,6 +399,7 @@ bool writeRegistrationPhoto(const QString &targetPath,
                             QString *error)
 {
     QMutexLocker locker(&g_storageMutex);
+    const qint64 registrationLimit = currentStorageLimits().registrationBytes;
     bool recognizedRoot = false;
     for (const QString &root : registrationRoots()) {
         if (isInside(targetPath, root)) {
@@ -350,13 +416,15 @@ bool writeRegistrationPhoto(const QString &targetPath,
             ? QFileInfo(targetPath).size() : 0;
     const qint64 projected = registrationUsageUnlocked().bytes
             - oldSize + encodedImage.size();
-    if (encodedImage.isEmpty() || projected > kRegistrationLimit) {
+    if (encodedImage.isEmpty() || projected > registrationLimit) {
         if (error) {
             const qint64 remaining = qMax<qint64>(
-                        0, kRegistrationLimit - registrationUsageUnlocked().bytes + oldSize);
+                        0, registrationLimit - registrationUsageUnlocked().bytes + oldSize);
             *error = QStringLiteral(
-                        "注册照存储空间不足：总量限制为 1 GiB，本张需要 %1 字节，剩余 %2 字节")
-                    .arg(encodedImage.size()).arg(remaining);
+                        "注册照存储空间不足：总量限制为 %1，本张需要 %2 字节，剩余 %3 字节")
+                    .arg(capacityText(registrationLimit))
+                    .arg(encodedImage.size())
+                    .arg(remaining);
         }
         return false;
     }

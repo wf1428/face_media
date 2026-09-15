@@ -11,7 +11,6 @@
 #include <QApplication>
 #include <QPainter>
 #include <QFontMetrics>
-#include <QScreen>
 #include <QEvent>
 #include <QLinearGradient>
 #include <QtMath>
@@ -269,17 +268,10 @@ void DiskUsageMonitor::moveBoxToScreenCenter()
         return;
     }
 
-    QScreen *s = QApplication::primaryScreen();
-    if (!s) {
-        return;
-    }
-
-    QPoint screenCenter = s->geometry().center();
-    QPoint mainTopLeftGlobal = main_->mapToGlobal(QPoint(0, 0));
-    QPoint centerInMain = screenCenter - mainTopLeftGlobal;
-
     QRect r = boxRect_;
-    r.moveCenter(centerInMain);
+    // 告警本身就是 main_ 的子覆盖层，直接使用宿主局部中心即可。
+    // Wayland 下不再把不可控的屏幕全局坐标换算回窗口坐标。
+    r.moveCenter(main_->rect().center());
     boxRect_ = r;
 }
 

@@ -7,10 +7,12 @@
  */
 
 #include "AppMessageDialog.h"
+#include "common/responsive_ui.h"
 
 #include <QApplication>
 #include <QColor>
 #include <QDesktopWidget>
+#include <QEvent>
 #include <QFile>
 #include <QFrame>
 #include <QFontMetrics>
@@ -42,14 +44,35 @@ AppMessageDialog::AppMessageDialog(Type type,
       cancelText_(cancelText),
       choiceTexts_(choiceTexts)
 {
+    embeddedForWayland_ = ResponsiveUi::isWaylandPlatform() && parentWidget();
     setModal(true);
-    setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
+    if (embeddedForWayland_) {
+        // Wayland 不允许客户端控制顶层弹窗的全局坐标。提示框改为父控件
+        // 内部覆盖层，由布局把卡片固定在本地坐标中心。
+        setWindowFlags(Qt::Widget);
+        setMinimumSize(0, 0);
+        setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+        setGeometry(parentWidget()->rect());
+        parentWidget()->installEventFilter(this);
+    } else {
+        setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
+    }
     setAttribute(Qt::WA_TranslucentBackground, true);
+    setAttribute(Qt::WA_StyledBackground, true);
     setObjectName("AppMessageDialog");
-    setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    setSizePolicy(embeddedForWayland_ ? QSizePolicy::Expanding : QSizePolicy::Fixed,
+                  embeddedForWayland_ ? QSizePolicy::Expanding : QSizePolicy::Fixed);
 
     buildUi(title, message);
     loadStyleSheet();
+}
+
+/** @brief 销毁前移除 Wayland 宿主尺寸监听。 */
+AppMessageDialog::~AppMessageDialog()
+{
+    if (embeddedForWayland_ && parentWidget()) {
+        parentWidget()->removeEventFilter(this);
+    }
 }
 
 /** @brief 显示阻塞式信息提示。 */
@@ -108,18 +131,43 @@ int AppMessageDialog::choose(QWidget *parent,
 /** @brief 显示时稳定文本布局并居中到父窗口。 */
 void AppMessageDialog::showEvent(QShowEvent *event)
 {
+    if (embeddedForWayland_ && parentWidget()) {
+        setGeometry(parentWidget()->rect());
+    }
     QDialog::showEvent(event);
 
     // Qt 5.12 在无边框弹窗首次显示时，QSS 字体和 word-wrap 标签高度偶发没有立即生效。
     // 先主动重算一次，再在事件循环下一拍重算并重绘，避免文字初次弹出时上下重叠。
     stabilizeTextLayout();
-    centerOnParent();
+    if (embeddedForWayland_) {
+        raise();
+    } else {
+        centerOnParent();
+    }
     QTimer::singleShot(0, this, [this]() {
         stabilizeTextLayout();
-        centerOnParent();
+        if (embeddedForWayland_) {
+            if (parentWidget()) {
+                setGeometry(parentWidget()->rect());
+            }
+            raise();
+        } else {
+            centerOnParent();
+        }
         update();
         repaint();
     });
+}
+
+/** @brief 跟随 Wayland 父控件尺寸更新应用内覆盖层。 */
+bool AppMessageDialog::eventFilter(QObject *watched, QEvent *event)
+{
+    if (embeddedForWayland_ && watched == parentWidget() && event &&
+            event->type() == QEvent::Resize) {
+        setGeometry(parentWidget()->rect());
+        raise();
+    }
+    return QDialog::eventFilter(watched, event);
 }
 
 /** @return 指定类型对应的资源图标路径。 */
@@ -271,9 +319,15 @@ void AppMessageDialog::buildUi(const QString &title, const QString &message)
     cardLayout->addWidget(messageLabel);
     cardLayout->addLayout(buttonRow);
 
-    rootLayout->addWidget(card);
+    if (embeddedForWayland_) {
+        rootLayout->addWidget(card, 0, Qt::AlignCenter);
+    } else {
+        rootLayout->addWidget(card);
+    }
     setLayout(rootLayout);
-    adjustSize();
+    if (!embeddedForWayland_) {
+        adjustSize();
+    }
 }
 
 /** @brief 加载项目统一弹窗样式表。 */
@@ -288,6 +342,9 @@ void AppMessageDialog::loadStyleSheet()
 /** @brief 将弹窗移动到父窗口或屏幕中心。 */
 void AppMessageDialog::centerOnParent()
 {
+    if (embeddedForWayland_) {
+        return;
+    }
     QRect targetRect;
     if (parentWidget()) {
         targetRect = parentWidget()->window()->frameGeometry();
@@ -327,5 +384,7 @@ void AppMessageDialog::stabilizeTextLayout()
     if (layout()) {
         layout()->activate();
     }
-    adjustSize();
+    if (!embeddedForWayland_) {
+        adjustSize();
+    }
 }

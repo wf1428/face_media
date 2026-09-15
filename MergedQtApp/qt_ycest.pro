@@ -4,7 +4,7 @@ QT += core gui widgets opengl serialport network sql virtualkeyboard qml quick q
 CONFIG += c++17 thread link_pkgconfig
 PKGCONFIG += gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0 gstreamer-rtp-1.0
 
-# EGLFS 视频链路强制使用 Rockchip RGA。只兼容不同 BSP 使用的
+# RK3566 Qt 合成视频链路强制使用 Rockchip RGA。只兼容不同 BSP 使用的
 # pkg-config 包名；如果开发文件不存在则直接中止构建，不启用 CPU 回退。
 packagesExist(librga) {
     PKGCONFIG += librga
@@ -12,7 +12,7 @@ packagesExist(librga) {
     packagesExist(rockchip_rga) {
         PKGCONFIG += rockchip_rga
     } else {
-        error("RK3566 EGLFS video requires Rockchip librga development files (librga.pc or rockchip_rga.pc)")
+        error("RK3566 Qt video requires Rockchip librga development files (librga.pc or rockchip_rga.pc)")
     }
 }
 
@@ -25,6 +25,12 @@ DEFINES += QT_DEPRECATED_WARNINGS PNG_SKIP_iCCP_CHECK=1
 # RK3566 使用 GStreamer 1.0。交叉编译时请让 PKG_CONFIG_SYSROOT_DIR 和
 # PKG_CONFIG_LIBDIR 指向 RK3566 sysroot，qmake 会通过 pkg-config 注入头文件与库。
 DEFINES += QT_YCEST_RK3566
+
+# 回退开关：qmake "CONFIG+=facegate_legacy_page_mode" 后恢复原有
+# SR505 触发整页 FaceGate 主界面的切换逻辑；默认使用多媒体页内嵌识别。
+contains(CONFIG, facegate_legacy_page_mode) {
+    DEFINES += FACEGATE_LEGACY_PAGE_MODE
+}
 
 # FaceGate SDK settings are kept separate from multimedia configuration.
 INSPIREFACE_ROOT = /home/lubancat/rk3566_inspireface/inspireface-sdk/inspireface-linux-aarch64-rk356x-rk3588-1.2.3/InspireFace
@@ -73,6 +79,8 @@ SOURCES += \
     common/workers/signalboard_worker.cpp \
     components/rga/RgaImageProcessor.cpp \
     components/input/InputCursorController.cpp \
+    components/dialogs/ui_file_dialog.cpp \
+    components/dialogs/ui_message_box.cpp \
     components/cursoroverlay/keyboard_dialog.cpp \
     components/features/command_dialog.cpp \
     components/features/key_service.cpp \
@@ -87,6 +95,7 @@ SOURCES += \
     components/multimedia/volumepopup.cpp \
     components/settings/appstyle.cpp \
     components/settings/auto_connect_manager.cpp \
+    components/settings/displayrotationpage.cpp \
     components/settings/ftppage.cpp \
     components/settings/mqtt/ic_mqtt_gateway.cpp \
     components/settings/mqtt/mqttmessagerouter.cpp \
@@ -144,6 +153,7 @@ SOURCES += \
     modules/facegate/FaceGateQt/ui/CameraPreviewWidget.cpp \
     modules/facegate/FaceGateQt/ui/EnrollPreviewWidget.cpp \
     modules/facegate/FaceGateQt/ui/FaceEnrollWidget.cpp \
+    modules/facegate/FaceGateQt/ui/SharedVirtualKeyboard.cpp \
     modules/facegate/FaceGateQt/ui/MainWindow.cpp \
     main.cpp \
     mainwindow.cpp \
@@ -159,6 +169,7 @@ SOURCES += \
 
 HEADERS += \
     common/face_image_sync_bridge.h \
+    common/responsive_ui.h \
     common/storage_policy.h \
     common/clients/icboard_client.h \
     common/clients/signalboard_client.h \
@@ -173,6 +184,8 @@ HEADERS += \
     common/workers/signalboard_worker.h \
     components/rga/RgaImageProcessor.h \
     components/input/InputCursorController.h \
+    components/dialogs/ui_file_dialog.h \
+    components/dialogs/ui_message_box.h \
     components/cursoroverlay/keyboard_dialog.h \
     components/features/command_dialog.h \
     components/features/key_service.h \
@@ -187,6 +200,7 @@ HEADERS += \
     components/multimedia/volumepopup.h \
     components/settings/appstyle.h \
     components/settings/auto_connect_manager.h \
+    components/settings/displayrotationpage.h \
     components/settings/ftppage.h \
     components/settings/mqtt/ic_mqtt_gateway.h \
     components/settings/mqtt/mqttmessagerouter.h \
@@ -252,6 +266,7 @@ HEADERS += \
     modules/facegate/FaceGateQt/ui/CameraPreviewWidget.h \
     modules/facegate/FaceGateQt/ui/EnrollPreviewWidget.h \
     modules/facegate/FaceGateQt/ui/FaceEnrollWidget.h \
+    modules/facegate/FaceGateQt/ui/SharedVirtualKeyboard.h \
     modules/facegate/FaceGateQt/ui/MainWindow.h \
     mainwindow.h \
     components/splash/splashscreen.h \
@@ -273,6 +288,7 @@ FORMS += \
 # 资源文件
 RESOURCES += \
     resources.qrc \
+    common/audio_resources.qrc \
     modules/facegate/FaceGateQt/facegate_resources.qrc
 
 # .pro.user files are user-specific and should be excluded from version control

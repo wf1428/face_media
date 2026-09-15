@@ -17,8 +17,10 @@
 class QSlider;
 class QLabel;
 class AmpVolumeController;
+class QGraphicsOpacityEffect;
+class QPropertyAnimation;
 
-/** @brief 从右侧滑入的触摸音量调节面板。 */
+/** @brief 固定在屏幕右侧淡入淡出的触摸音量调节面板。 */
 class VolumePanel : public QWidget
 {
     Q_OBJECT
@@ -29,10 +31,10 @@ public:
     /** @brief 将外部音量同步到滑块和标签。 */
     void setCurrentVolume(int v);
 
-    /** @brief 从右侧屏幕外滑入。 */
+    /** @brief 在固定位置淡入。 */
     void showSlideIn();
 
-    /** @brief 滑出到右侧后隐藏。 */
+    /** @brief 在固定位置淡出并隐藏。 */
     void hideSlideOut();
 
     /** @return 面板逻辑上已显示时返回 true。 */
@@ -58,7 +60,10 @@ private:
     int m_screenW ;
     int m_screenH ;
 
-    /** @brief 根据屏幕尺寸计算显示和隐藏几何位置。 */
+    QGraphicsOpacityEffect *m_opacityEffect = nullptr;
+    QPropertyAnimation *m_opacityAnimation = nullptr;
+
+    /** @brief 构造时读取一次屏幕尺寸并缓存面板几何位置。 */
     void applyGeometry();
 };
 

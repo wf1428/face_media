@@ -7,9 +7,13 @@
  */
 
 #include "ftppage.h"
+#include <QResizeEvent>
 
 #include <QRegularExpression>
+#include "common/responsive_ui.h"
 #include "common/storage_policy.h"
+#include "components/dialogs/ui_file_dialog.h"
+#include "components/dialogs/ui_message_box.h"
 #include "platform/rk3566_platform.h"
 
 
@@ -484,7 +488,7 @@ void FtpPage::buildUi()
     header->addWidget(title);
     header->addStretch(1);
     header->addWidget(statusLabel);
-    root->addLayout(header);
+    layout->addLayout(header);
 
     // 上半部分：左侧 FTP + 右侧 拉流控制
     topRow = new QHBoxLayout();
@@ -586,7 +590,7 @@ void FtpPage::buildUi()
 
     topRow->addWidget(ftpBox, 1);
     topRow->addWidget(streamBox, 1);
-    root->addLayout(topRow);
+    layout->addLayout(topRow);
 
     // ---------- Toast 提示条（默认隐藏） ----------
     toastLabel = new QLabel(this);
@@ -596,19 +600,19 @@ void FtpPage::buildUi()
     toastLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     toastLabel->setMinimumHeight(px(36));
 
-    root->addWidget(toastLabel);
+    layout->addWidget(toastLabel);
 
     // 显示日志
     showLogCheckBox = new QCheckBox(QStringLiteral("日志"),this);
     showLogCheckBox->setChecked(true);              // 默认显示，也可以 false
-    root->addWidget(showLogCheckBox);
-    root->addSpacing(px(6));
+    layout->addWidget(showLogCheckBox);
+    layout->addSpacing(px(6));
 
     // 占位块：用于日志隐藏时保持布局不塌
     logPlaceholder_ = new QWidget(this);
     logPlaceholder_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     logPlaceholder_->setVisible(false); // 默认不显示
-    root->addWidget(logPlaceholder_, 1);
+    layout->addWidget(logPlaceholder_, 1);
 
     // 底部：日志
     logBox = new QGroupBox(QStringLiteral("日志"), this);
@@ -619,11 +623,11 @@ void FtpPage::buildUi()
     logEdit->setMaximumBlockCount(500);
 
     logLayout->addWidget(logEdit);
-    root->addWidget(logBox, 1);
+    layout->addWidget(logBox, 1);
 
     // 连接 UI 信号
     connect(btnBrowseLocal, &QPushButton::clicked, this, [this]{
-        const QString file = QFileDialog::getExistingDirectory(this, QStringLiteral("选择本地保存路径"));
+        const QString file = UiFileDialog::getExistingDirectory(this, QStringLiteral("选择本地保存路径"));
         if (!file.isEmpty()) localPathEdit->setText(file);
     });
 
@@ -693,6 +697,34 @@ void FtpPage::applyStyles()
     .arg(px(34)).arg(px(6)).arg(px(14)).arg(px(13))
     .arg(px(13))
     );
+}
+
+void FtpPage::resizeEvent(QResizeEvent *event)
+{
+    QWidget::resizeEvent(event);
+    applyResponsiveLayout();
+}
+
+void FtpPage::applyResponsiveLayout()
+{
+    const QSize referenceSize = ResponsiveUi::layoutReferenceSize(this);
+    const bool compact = ResponsiveUi::usesTopNavigation(referenceSize)
+            || width() < 720;
+    if (topRow) {
+        topRow->setDirection(compact ? QBoxLayout::TopToBottom
+                                     : QBoxLayout::LeftToRight);
+    }
+    if (header) {
+        header->setDirection(compact ? QBoxLayout::TopToBottom
+                                     : QBoxLayout::LeftToRight);
+    }
+    if (statusLabel) {
+        statusLabel->setMinimumWidth(compact ? 0 : 220);
+        statusLabel->setAlignment(compact
+                ? (Qt::AlignLeft | Qt::AlignVCenter)
+                : (Qt::AlignRight | Qt::AlignVCenter));
+        statusLabel->setWordWrap(compact);
+    }
 }
 
 // ------------------------------
@@ -1026,7 +1058,7 @@ void FtpPage::onDownloadClicked()
     }
 
     if (localDir.isEmpty()) {
-        const QString dir = QFileDialog::getExistingDirectory(this, QStringLiteral("选择本地保存目录"));
+        const QString dir = UiFileDialog::getExistingDirectory(this, QStringLiteral("选择本地保存目录"));
         if (dir.isEmpty()) {
             appendLog(QStringLiteral("取消下载：未选择本地保存目录"));
             return;
@@ -1348,7 +1380,7 @@ void FtpPage::handleLiveUrl(const UrlInfo& info)
         default:                    kindStr = "live"; break;
     }
 
-    const auto ret = QMessageBox::question(
+    const auto ret = UiMessageBox::question(
         this,
         QStringLiteral("提示"),
         QStringLiteral("检测到直播流地址：\n%1\n\n是否跳转到播放页？")
@@ -1639,13 +1671,15 @@ void FtpPage::onWorkerStatus(const QString &text)
 // ------------------------------
 void FtpPage::installKeyboardFilters()
 {
-    hostEdit->installEventFilter(this);
-    portEdit->installEventFilter(this);
-    userEdit->installEventFilter(this);
-    passEdit->installEventFilter(this);
-    remotePathEdit->installEventFilter(this);
-    localPathEdit->installEventFilter(this);
-    streamUrlEdit->installEventFilter(this);
+    const QList<QLineEdit *> edits = {
+        hostEdit, portEdit, userEdit, passEdit,
+        remotePathEdit, localPathEdit, streamUrlEdit
+    };
+    for (QLineEdit *edit : edits) {
+        if (!edit) continue;
+        edit->setProperty("ycestCustomKeyboard", true);
+        edit->installEventFilter(this);
+    }
 }
 
 /// @brief 统一拦截输入框点击，弹出软键盘。
@@ -1683,8 +1717,7 @@ bool FtpPage::eventFilter(QObject *watched, QEvent *event)
             }
             if (edit == streamUrlEdit) {
                 // 先弹出历史列表；没有历史也会给“手动输入...”
-                auto* me = static_cast<QMouseEvent*>(event);
-                showStreamUrlHistoryPopup(me->globalPos());
+                showStreamUrlHistoryPopup();
                 return true;
             }
 
@@ -1750,11 +1783,11 @@ void FtpPage::openKeyboardForPort(QLineEdit *edit, const QString &title,
     bool okNum = false;
     int v = text.trimmed().toInt(&okNum);
     if (!okNum) {
-        QMessageBox::warning(this, "提示", "端口必须是数字");
+        UiMessageBox::warning(this, "提示", "端口必须是数字");
         return;
     }
     if (v < minV || v > maxV) {
-        QMessageBox::warning(this, "提示", QString("端口范围 %1-%2").arg(minV).arg(maxV));
+        UiMessageBox::warning(this, "提示", QString("端口范围 %1-%2").arg(minV).arg(maxV));
         return;
     }
 
@@ -1782,7 +1815,7 @@ QString FtpPage::pickHttpSaveFilePath(const QString& urlStr)
 
     // 如果没填，就弹窗选目录
     if (base.isEmpty()) {
-        const QString dir = QFileDialog::getExistingDirectory(this, QStringLiteral("选择HTTP视频保存目录"));
+        const QString dir = UiFileDialog::getExistingDirectory(this, QStringLiteral("选择HTTP视频保存目录"));
         if (dir.isEmpty()) return QString();
         base = dir;
         if (localPathEdit) localPathEdit->setText(base);
@@ -1862,8 +1895,10 @@ void FtpPage::startHttpMp4DownloadByProcess(const QString& urlStr, const QString
 
     const qint64 mediaWritable = StoragePolicy::mediaWritableBytes(localFile);
     if (mediaWritable == 0) {
+        const qint64 gibibyte = 1024LL * 1024LL * 1024LL;
         const QString reason = QStringLiteral(
-                    "媒体目录容量不足：视频和图片总量限制为 2 GiB");
+                    "媒体目录容量不足：视频和图片总量限制为 %1 GiB")
+                .arg(StoragePolicy::mediaLimitBytes() / gibibyte);
         setStatusText(QStringLiteral("媒体目录容量不足"));
         showToast(reason, 3500);
         appendLog(reason);
@@ -1950,8 +1985,8 @@ void FtpPage::addStreamUrlHistory(const QString& url)
 }
 
 
-/** @brief 在指定全局位置显示流地址历史菜单。 */
-void FtpPage::showStreamUrlHistoryPopup(const QPoint& globalPos)
+/** @brief 在流地址输入框下方显示历史菜单。 */
+void FtpPage::showStreamUrlHistoryPopup()
 {
     if (!streamUrlMenu_) streamUrlMenu_ = new QMenu(this);
     streamUrlMenu_->clear();
@@ -1974,7 +2009,12 @@ void FtpPage::showStreamUrlHistoryPopup(const QPoint& globalPos)
         openKeyboardFor(streamUrlEdit, "请输入 Stream URL（rtsp/http...）", QLineEdit::Normal, 512);
     });
 
-    streamUrlMenu_->popup(globalPos);
+    // QMenu 在 Wayland 下使用专用 popup surface；以输入框作为稳定锚点，
+    // 不再让同一菜单随输入框内的点击位置漂移。
+    const QPoint anchor = streamUrlEdit
+            ? streamUrlEdit->mapToGlobal(QPoint(0, streamUrlEdit->height()))
+            : QPoint();
+    streamUrlMenu_->popup(anchor);
 }
 
 // 输入配置文件

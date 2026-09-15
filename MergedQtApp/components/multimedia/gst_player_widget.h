@@ -33,7 +33,7 @@
 #include <gst/video/video.h>
 
 /**
- * @brief EGLFS 下由 Qt 完成最终合成的 NV12 视频画布。
+ * @brief 由 Qt/OpenGL 完成最终合成的 NV12 视频画布。
  *
  * GStreamer/MPP 只负责解码，NV12 帧由本控件通过 OpenGL ES 完成颜色转换和缩放，
  * 使视频、弹窗、提示条和软件光标处于同一个 Qt 场景。

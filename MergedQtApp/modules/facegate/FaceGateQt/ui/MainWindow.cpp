@@ -18,6 +18,7 @@
 #include "PersonExportWorker.h"
 #include "PersonImportWorker.h"
 #include "SnapshotService.h"
+#include "SharedVirtualKeyboard.h"
 #include "common/face_image_sync_bridge.h"
 #include "common/storage_policy.h"
 #include "ic_board/ic_event_bridge.h"
@@ -36,6 +37,7 @@
 #include <QHBoxLayout>
 #include <QHostAddress>
 #include <QIcon>
+#include <QImageReader>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QMetaObject>
@@ -145,12 +147,22 @@ bool FaceGateMainWindow::activateModule()
 /** @brief 暂停摄像头和验证，但保留后台服务以便恢复。 */
 void FaceGateMainWindow::deactivateModule()
 {
+    if (virtualKeyboard_) {
+        virtualKeyboard_->hideKeyboard();
+    }
     if (!moduleActive_ && !camera_.isRunning() && !liveness_.isReady()) {
         return;
     }
 
     moduleActive_ = false;
+    // 新模式下，管理面板自己的 closeEvent 会先清除 adminModeActive_，
+    // 再同步通知外壳返回多媒体。此时不重复 close()，避免递归进入关闭流程。
+    // 旧页面模式维持原来的面板关闭行为。
+#ifdef FACEGATE_LEGACY_PAGE_MODE
     if (adminPanel_) {
+#else
+    if (adminPanel_ && adminModeActive_) {
+#endif
         adminPanel_->close();
     }
     camera_.stop();
@@ -164,6 +176,7 @@ void FaceGateMainWindow::deactivateModule()
             Qt::BlockingQueuedConnection);
     }
     faceFramePending_ = false;
+    faceAccessTimeoutTimer_.stop();
     faceAccessPending_ = false;
     if (facePresent_) {
         facePresent_ = false;
@@ -254,10 +267,10 @@ bool FaceGateMainWindow::allowsPresenceSwitch() const
     return !modal || (modal != this && !isAncestorOf(modal));
 }
 
-/** @brief 创建预览、状态栏和覆盖信息面板。 */
+/** @brief 创建预览和右侧综合信息面板。 */
 void FaceGateMainWindow::buildUi()
 {
-    // 主界面采用中央预览区叠加左右信息面板的布局。
+    // 主界面采用全屏预览叠加右侧综合信息面板的布局。
     auto *central = new QWidget(this);
     central->setObjectName("gateRoot");
     setCentralWidget(central);
@@ -266,48 +279,31 @@ void FaceGateMainWindow::buildUi()
     preview_->setGeometry(central->rect());
     preview_->lower();
 
-    leftOverlay_ = new QWidget(central);
-    leftOverlay_->setObjectName("leftOverlay");
-    leftOverlay_->setAttribute(Qt::WA_TransparentForMouseEvents);
-    auto *leftLayout = new QVBoxLayout(leftOverlay_);
-    leftLayout->setContentsMargins(22, 22, 22, 22);
-    leftLayout->setSpacing(10);
-
-    auto *brandLabel = new QLabel("人脸闸机", leftOverlay_);
-    brandLabel->setObjectName("brandLabel");
-    timeLabel_ = new QLabel("--:--", leftOverlay_);
-    timeLabel_->setObjectName("timeLabel");
-    dateLabel_ = new QLabel("--", leftOverlay_);
-    dateLabel_->setObjectName("dateLabel");
-    networkLabel_ = new QLabel("网络 检查中", leftOverlay_);
-    networkLabel_->setObjectName("infoChip");
-    networkLabel_->setMinimumHeight(44);
-    networkLabel_->setWordWrap(true);
-    cameraLabel_ = new QLabel("摄像头 启动中", leftOverlay_);
-    cameraLabel_->setObjectName("infoChip");
-    cameraLabel_->setMinimumHeight(44);
-    cameraLabel_->setWordWrap(true);
-    databaseLabel_ = new QLabel("数据库 打开中", leftOverlay_);
-    databaseLabel_->setObjectName("infoChip");
-    databaseLabel_->setMinimumHeight(44);
-    databaseLabel_->setWordWrap(true);
-
-    leftLayout->addWidget(brandLabel);
-    leftLayout->addSpacing(16);
-    leftLayout->addWidget(timeLabel_);
-    leftLayout->addWidget(dateLabel_);
-    leftLayout->addSpacing(18);
-    leftLayout->addWidget(networkLabel_);
-    leftLayout->addWidget(cameraLabel_);
-    leftLayout->addWidget(databaseLabel_);
-    leftLayout->addStretch();
-
     rightOverlay_ = new QWidget(central);
     rightOverlay_->setObjectName("rightOverlay");
     rightOverlay_->setAttribute(Qt::WA_TransparentForMouseEvents, false);
     auto *rightLayout = new QVBoxLayout(rightOverlay_);
     rightLayout->setContentsMargins(22, 22, 22, 22);
     rightLayout->setSpacing(10);
+
+    auto *brandLabel = new QLabel("人脸闸机", rightOverlay_);
+    brandLabel->setObjectName("brandLabel");
+    timeLabel_ = new QLabel("--:--", rightOverlay_);
+    timeLabel_->setObjectName("timeLabel");
+    dateLabel_ = new QLabel("--", rightOverlay_);
+    dateLabel_->setObjectName("dateLabel");
+    networkLabel_ = new QLabel("网络 检查中", rightOverlay_);
+    networkLabel_->setObjectName("infoChip");
+    networkLabel_->setMinimumHeight(44);
+    networkLabel_->setWordWrap(true);
+    cameraLabel_ = new QLabel("摄像头 启动中", rightOverlay_);
+    cameraLabel_->setObjectName("infoChip");
+    cameraLabel_->setMinimumHeight(44);
+    cameraLabel_->setWordWrap(true);
+    databaseLabel_ = new QLabel("数据库 打开中", rightOverlay_);
+    databaseLabel_->setObjectName("infoChip");
+    databaseLabel_->setMinimumHeight(44);
+    databaseLabel_->setWordWrap(true);
 
     recognitionLabel_ = new QLabel("就绪", rightOverlay_);
     recognitionLabel_->setObjectName("primaryStatus");
@@ -361,6 +357,17 @@ void FaceGateMainWindow::buildUi()
     successfulAccessLayout->addWidget(successfulAccessNameLabel_);
     successfulAccessCard_->hide();
 
+    // 竖屏下取消左侧占位。原左侧信息按既有优先级迁入右侧顶部，
+    // 右侧再接续门禁状态和操作项，业务控件与信号保持原样。
+    rightLayout->addWidget(brandLabel);
+    rightLayout->addSpacing(10);
+    rightLayout->addWidget(timeLabel_);
+    rightLayout->addWidget(dateLabel_);
+    rightLayout->addSpacing(12);
+    rightLayout->addWidget(networkLabel_);
+    rightLayout->addWidget(cameraLabel_);
+    rightLayout->addWidget(databaseLabel_);
+    rightLayout->addSpacing(10);
     rightLayout->addWidget(gateLabel_);
     rightLayout->addWidget(livenessLabel_);
     rightLayout->addWidget(galleryLabel_);
@@ -369,13 +376,12 @@ void FaceGateMainWindow::buildUi()
     rightLayout->addStretch();
     rightLayout->addWidget(hintLabel_);
 
-    leftOverlay_->raise();
     rightOverlay_->raise();
 
     setStyleSheet(
         "QMainWindow,#gateRoot{background:#05070a;}"
         "QLabel{color:#f5f7fb;font-family:Arial;font-size:16px;}"
-        "#leftOverlay,#rightOverlay{background:rgba(5,10,14,168);}"
+        "#rightOverlay{background:rgba(5,10,14,168);}"
         "#brandLabel{color:#49d1ff;font-size:20px;font-weight:700;}"
         "#timeLabel{font-size:42px;font-weight:700;color:#ffffff;}"
         "#dateLabel{font-size:16px;color:#9fb3bf;}"
@@ -413,10 +419,65 @@ void FaceGateMainWindow::buildUi()
     successfulAccessTimer_.setInterval(5000);
     connect(&successfulAccessTimer_, &QTimer::timeout,
             this, &FaceGateMainWindow::hideSuccessfulAccess);
+
+#ifndef FACEGATE_LEGACY_PAGE_MODE
+    faceAccessTimeoutTimer_.setSingleShot(true);
+    faceAccessTimeoutTimer_.setInterval(qMax(1000, config_.accessDecisionTimeoutMs));
+    connect(&faceAccessTimeoutTimer_, &QTimer::timeout, this, [this]() {
+        if (!faceAccessPending_) {
+            return;
+        }
+
+        VerifyLog completedLog = pendingFaceAccessLog_;
+        completedLog.result = QStringLiteral("failed");
+        completedLog.failReason = QStringLiteral("人脸通行权限校验超时");
+        faceAccessPending_ = false;
+        pendingFaceAccessLog_ = VerifyLog();
+
+        audio_.playPrompt(AudioService::Prompt::FaceAccessTimeout);
+        recognitionLabel_->setText(completedLog.failReason);
+        gateLabel_->setText(QStringLiteral("权限校验超时"));
+        preview_->setState(VerifyState::Failed);
+        preview_->setStateText(completedLog.failReason);
+        emit previewStateChanged(VerifyState::Failed, completedLog.failReason);
+
+        if (databaseWorker_) {
+            QMetaObject::invokeMethod(databaseWorker_, "addVerifyLog",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(VerifyLog, completedLog));
+        }
+        QJsonObject accessRecord;
+        accessRecord.insert(QStringLiteral("type"), QStringLiteral("face"));
+        accessRecord.insert(QStringLiteral("name"),
+                            completedLog.nameSnapshot.trimmed().isEmpty()
+                            ? QStringLiteral("已授权人员")
+                            : completedLog.nameSnapshot.trimmed());
+        accessRecord.insert(QStringLiteral("success"), false);
+        accessRecord.insert(QStringLiteral("reason"), completedLog.failReason);
+        if (!completedLog.snapshotPath.trimmed().isEmpty()) {
+            accessRecord.insert(QStringLiteral("snapshotPath"),
+                                completedLog.snapshotPath.trimmed());
+        }
+        QString accessLogError;
+        if (!StoragePolicy::appendAccessRecord(
+                    SnapshotService(config_).rootPath(), accessRecord,
+                    &accessLogError)) {
+            qWarning().noquote() << accessLogError;
+        }
+        writeSystemEvent(QStringLiteral("face_elevator"),
+                         QStringLiteral("warning"),
+                         completedLog.failReason);
+        emit recognitionFinished();
+    });
+#endif
+    // Qt Virtual Keyboard 的 InputPanel 在人脸模块生命周期内只创建一次。
+    // 登录、后台和密码弹窗切换时仅改变可见性，避免 Qt 5.12 Wayland
+    // 连续销毁/创建 QQuickWidget 导致输入法上下文悬空。
+    virtualKeyboard_ = new SharedVirtualKeyboard(this);
     layoutOverlayPanels();
 }
 
-/** @brief 窗口尺寸变化后重新布局左右覆盖面板。 */
+/** @brief 窗口尺寸变化后重新布局右侧覆盖面板。 */
 void FaceGateMainWindow::resizeEvent(QResizeEvent *event)
 {
     QMainWindow::resizeEvent(event);
@@ -429,25 +490,26 @@ void FaceGateMainWindow::resizeEvent(QResizeEvent *event)
         adminPanel_->setGeometry(rect());
         adminPanel_->raise();
     }
+    if (virtualKeyboard_) {
+        virtualKeyboard_->updateGeometry();
+    }
 }
 
 /**
- * @brief 将侧边信息面板固定在 1024x768 闸机边缘。
+ * @brief 将综合信息面板固定在右侧，并释放左侧预览空间。
  */
 void FaceGateMainWindow::layoutOverlayPanels()
 {
     QWidget *root = centralWidget();
-    if (!root || !leftOverlay_ || !rightOverlay_) {
+    if (!root || !rightOverlay_) {
         return;
     }
 
-    const int panelWidth = qBound(190, root->width() / 5, 228);
-    leftOverlay_->setGeometry(0, 0, panelWidth, root->height());
+    const int panelWidth = qBound(220, root->width() / 4, 260);
     rightOverlay_->setGeometry(root->width() - panelWidth, 0, panelWidth, root->height());
     if (preview_) {
-        preview_->setSideOverlayWidth(panelWidth);
+        preview_->setOverlayWidths(0, panelWidth);
     }
-    leftOverlay_->raise();
     rightOverlay_->raise();
 }
 
@@ -510,6 +572,55 @@ void FaceGateMainWindow::hideSuccessfulAccess()
     if (successfulAccessCard_) {
         successfulAccessCard_->hide();
     }
+}
+
+/** @return 与本次实际匹配人脸对应的录入图；不可用时使用本次验证抓拍。 */
+QImage FaceGateMainWindow::recognitionImageForLog(const VerifyLog &log) const
+{
+    QString imagePath;
+
+    // faceHash 能精确定位多照片人员本次实际匹配的那一张。
+    if (!log.faceHash.trimmed().isEmpty()) {
+        for (const FaceRecord &record : latestGallery_) {
+            if (record.faceHash == log.faceHash && !record.imagePath.trimmed().isEmpty()) {
+                imagePath = record.imagePath.trimmed();
+                break;
+            }
+        }
+    }
+
+    if (imagePath.isEmpty()) {
+        for (const FaceRecord &record : latestGallery_) {
+            if ((log.personId > 0 && record.person.id == log.personId)
+                    || (!log.personNo.isEmpty()
+                        && record.person.personNo == log.personNo)) {
+                if (!record.imagePath.trimmed().isEmpty()) {
+                    imagePath = record.imagePath.trimmed();
+                    break;
+                }
+            }
+        }
+    }
+
+    auto loadImage = [](const QString &path) {
+        if (path.trimmed().isEmpty()) {
+            return QImage();
+        }
+        QImageReader reader(path);
+        reader.setDecideFormatFromContent(true);
+        reader.setAutoTransform(true);
+        return reader.read();
+    };
+
+    QImage image = loadImage(imagePath);
+    if (image.isNull()) {
+        image = loadImage(log.snapshotPath);
+    }
+    if (image.isNull()) {
+        qWarning().noquote() << "识别通过图片加载失败："
+                             << imagePath << log.snapshotPath;
+    }
+    return image;
 }
 
 /**
@@ -664,6 +775,9 @@ void FaceGateMainWindow::startServices()
         writeSystemEvent("audio", "warning", "音频播报错误", message);
     });
     audio_.configure(config_);
+    // 全部模块共用 /home/cat/face_media/volume.dat；首次缺失时为 50%。
+    // 人脸配置中的旧 audio/volume 仅保留兼容读取，不覆盖统一持久化音量。
+    config_.audioVolume = audio_.volume();
     livenessEnabled_ = config_.livenessEnabled;
     if (livenessLabel_) {
         livenessLabel_->setText(livenessEnabled_ ? "活体开启" : "活体关闭");
@@ -693,6 +807,7 @@ void FaceGateMainWindow::startServices()
         }
         latestFrame_ = frame.image;
         latestEnrollmentPreview_ = frame.enrollmentPreview;
+        emit previewFrameChanged(frame.image);
         if (adminModeActive_) {
             if (adminPanel_ && adminPanel_->cameraRequired()) {
                 processAdminFrame(frame);
@@ -728,6 +843,7 @@ void FaceGateMainWindow::startServices()
         if (preview_) {
             preview_->setCameraUnavailableMessage(userMessage);
         }
+        emit previewUnavailable(userMessage);
         if (adminPanel_ && adminPanel_->cameraRequired()) {
             adminPanel_->setCameraUnavailableMessage(userMessage);
         }
@@ -800,8 +916,10 @@ void FaceGateMainWindow::startServices()
                 return;
             }
             preview_->setState(state);
-            preview_->setStateText(message.isEmpty() ? stateName(state) : message);
+            const QString displayMessage = message.isEmpty() ? stateName(state) : message;
+            preview_->setStateText(displayMessage);
             recognitionLabel_->setText(stateName(state).toUpper());
+            emit previewStateChanged(state, displayMessage);
         });
 
     connect(faceInferenceWorker_, &FaceInferenceWorker::facesUpdated, this,
@@ -815,6 +933,7 @@ void FaceGateMainWindow::startServices()
                 emit facePresenceChanged(present);
             }
             preview_->setFaces(faces);
+            emit previewFacesChanged(faces);
         });
 
     connect(faceInferenceWorker_, &FaceInferenceWorker::verificationPassed, this,
@@ -866,6 +985,9 @@ void FaceGateMainWindow::startServices()
 
             faceAccessPending_ = true;
             pendingFaceAccessLog_ = enriched;
+#ifndef FACEGATE_LEGACY_PAGE_MODE
+            faceAccessTimeoutTimer_.start();
+#endif
             recognitionLabel_->setText(QStringLiteral("正在识别"));
             preview_->setStateText(QStringLiteral("正在识别"));
             qInfo().noquote() << "人脸匹配成功，等待权限校验："
@@ -911,7 +1033,11 @@ void FaceGateMainWindow::startServices()
             if (enriched.result == QStringLiteral("stranger")) {
                 audio_.playPrompt(AudioService::Prompt::Stranger);
             } else if (enriched.result == QStringLiteral("liveness_failed")) {
-                audio_.playPrompt(AudioService::Prompt::LivenessFailed);
+                const AudioService::Prompt prompt =
+                        enriched.failReason == QStringLiteral("活体工作线程未就绪")
+                        ? AudioService::Prompt::FaceLivenessUnavailable
+                        : AudioService::Prompt::LivenessFailed;
+                audio_.playPrompt(prompt);
             } else if (enriched.result == QStringLiteral("failed")) {
                 audio_.playPrompt(AudioService::Prompt::VerifyFailed);
             }
@@ -951,10 +1077,11 @@ void FaceGateMainWindow::startServices()
             [this](const QString &personId, const QString &faceHash,
                    const QString &floors,
                    const QByteArray &rs485Frame, bool success,
-                   const QString &reason) {
+                   const QString &reason, int resultCode) {
         Q_UNUSED(faceHash)
         if (!moduleActive_ || adminModeActive_) {
             if (faceAccessPending_ && pendingFaceAccessLog_.personNo == personId) {
+                faceAccessTimeoutTimer_.stop();
                 faceAccessPending_ = false;
                 pendingFaceAccessLog_ = VerifyLog();
             }
@@ -969,6 +1096,14 @@ void FaceGateMainWindow::startServices()
                      reason);
         const bool matchesPending = faceAccessPending_
                 && pendingFaceAccessLog_.personNo == personId;
+#ifndef FACEGATE_LEGACY_PAGE_MODE
+        if (!matchesPending) {
+            qInfo().noquote() << "[FACE-ACCESS] ignored stale permission result"
+                              << personId;
+            return;
+        }
+#endif
+        faceAccessTimeoutTimer_.stop();
         VerifyLog completedLog;
         if (matchesPending) {
             completedLog = pendingFaceAccessLog_;
@@ -990,8 +1125,17 @@ void FaceGateMainWindow::startServices()
                               completedLog.nameSnapshot.isEmpty()
                               ? completedLog.personNo : completedLog.nameSnapshot);
                 recognitionLabel_->setText(successText);
+                preview_->setState(VerifyState::Passed);
                 preview_->setStateText(successText);
-                showSuccessfulAccess(completedLog);
+                emit previewStateChanged(VerifyState::Passed, successText);
+                if (config_.showAccessPhoto) {
+                    showSuccessfulAccess(completedLog);
+                    emit recognitionImageReady(
+                                recognitionImageForLog(completedLog),
+                                completedLog.nameSnapshot.trimmed().isEmpty()
+                                ? completedLog.personNo
+                                : completedLog.nameSnapshot.trimmed());
+                }
                 emit recognitionSucceeded();
             }
             gateLabel_->setText(QStringLiteral("楼层权限 已下发"));
@@ -1005,9 +1149,11 @@ void FaceGateMainWindow::startServices()
                                 ? QStringLiteral("权限校验失败")
                                 : QStringLiteral("楼层权限 下发失败"));
             recognitionLabel_->setText(failureText);
+            preview_->setState(VerifyState::Failed);
             preview_->setStateText(failureText);
+            emit previewStateChanged(VerifyState::Failed, failureText);
             if (matchesPending) {
-                audio_.playPrompt(AudioService::Prompt::VerifyFailed);
+                audio_.playAccessFailure(resultCode);
             }
             writeSystemEvent(QStringLiteral("face_elevator"),
                              QStringLiteral("warning"),
@@ -1053,7 +1199,7 @@ void FaceGateMainWindow::startServices()
             this,
             [this](const QString &personId, const QString &floors,
                    const QByteArray &rs485Frame, bool success,
-                   const QString &reason) {
+                   const QString &reason, int resultCode) {
         if (!passwordAccessActive_) {
             return;
         }
@@ -1104,7 +1250,7 @@ void FaceGateMainWindow::startServices()
                                  QStringLiteral("info"),
                                  QStringLiteral("密码通行楼层权限下发成功"), detail);
             } else {
-                audio_.playPrompt(AudioService::Prompt::VerifyFailed);
+                audio_.playAccessFailure(resultCode);
                 preview_->setState(VerifyState::Failed);
                 preview_->setStateText(failureText);
                 recognitionLabel_->setText(failureText);
@@ -1259,12 +1405,6 @@ void FaceGateMainWindow::startDatabaseThread()
         }
     });
 
-    connect(databaseWorker_, &DatabaseWorker::syncTasksLoaded, this, [this](const QVector<SyncTaskRecord> &records) {
-        if (adminPanel_) {
-            adminPanel_->setSyncTasks(records);
-        }
-    });
-
     connect(databaseWorker_, &DatabaseWorker::systemEventsLoaded, this, [this](const QVector<SystemEventLog> &records) {
         if (adminPanel_) {
             adminPanel_->setSystemEvents(records);
@@ -1354,20 +1494,40 @@ void FaceGateMainWindow::handleAdminTap()
     if (adminTapCount_ >= 5) {
         adminTapCount_ = 0;
         qInfo().noquote() << "管理员点击快捷入口已触发";
-        if (config_.adminLoginRequired) {
-            AdminLoginDialog dialog(config_, this);
-            adminLoginActive_ = true;
-            const int loginResult = dialog.exec();
-            adminLoginActive_ = false;
-            if (loginResult != QDialog::Accepted) {
-                qInfo().noquote() << "管理员登录已取消或失败";
-                writeOperatorAudit("管理员登录", "admin", config_.adminUsername, "失败", "登录取消或密码错误");
-                return;
-            }
-            writeOperatorAudit("管理员登录", "admin", config_.adminUsername, "成功", "进入管理后台");
-        }
-        openAdminPanel();
+        requestOpenAdminManagement();
     }
+}
+
+/** @brief 复用原有认证流程进入管理后台，外壳长按入口不会绕过密码。 */
+void FaceGateMainWindow::requestOpenAdminManagement()
+{
+    if (!moduleActive_ || adminModeActive_ || adminLoginActive_) {
+        return;
+    }
+
+    if (config_.adminLoginRequired) {
+        adminLoginActive_ = true;
+        int loginResult = QDialog::Rejected;
+        {
+            // 登录框只包含 QWidget 输入控件；QML InputPanel 由人脸根窗口
+            // 长期持有，因此返回后销毁登录框不会释放键盘的 EGL/QML 资源。
+            AdminLoginDialog dialog(config_, this);
+            loginResult = dialog.exec();
+        }
+        qInfo() << "[ADMIN] login dialog finished"
+                << "accepted=" << (loginResult == QDialog::Accepted);
+        adminLoginActive_ = false;
+        if (loginResult != QDialog::Accepted) {
+            qInfo().noquote() << "管理员登录已取消或失败";
+            writeOperatorAudit("管理员登录", "admin", config_.adminUsername,
+                               "失败", "登录取消或密码错误");
+            emit adminSessionFinished();
+            return;
+        }
+        writeOperatorAudit("管理员登录", "admin", config_.adminUsername,
+                           "成功", "进入管理后台");
+    }
+    openAdminPanel();
 }
 
 /**
@@ -1487,9 +1647,10 @@ void FaceGateMainWindow::handleAdminPasswordChange(const QString &oldPassword, c
 /** @brief 完成管理员认证后打开综合管理面板。 */
 void FaceGateMainWindow::openAdminPanel()
 {
+    qInfo() << "[ADMIN] preparing embedded admin panel";
     if (!adminPanel_) {
         adminPanel_ = new AdminPanel(config_, this);
-        adminPanel_->setWindowFlags(Qt::Widget);
+        qInfo() << "[ADMIN] embedded admin panel constructed";
         adminPanel_->setAttribute(Qt::WA_DeleteOnClose);
         connect(adminPanel_, &AdminPanel::enrollRequested, this, &FaceGateMainWindow::handleEnrollRequest);
         connect(adminPanel_, &AdminPanel::livenessEnabledChanged, this, &FaceGateMainWindow::setLivenessEnabled);
@@ -1510,17 +1671,14 @@ void FaceGateMainWindow::openAdminPanel()
         connect(adminPanel_, &AdminPanel::peopleExportRequested,
                 this, &FaceGateMainWindow::handlePeopleExport);
         connect(adminPanel_, &AdminPanel::passedLogsRefreshRequested, this, &FaceGateMainWindow::refreshAdminPassedLogs);
-        connect(adminPanel_, &AdminPanel::syncTasksRefreshRequested, this, [this]() {
-            if (databaseWorker_) {
-                QMetaObject::invokeMethod(databaseWorker_, "loadSyncTasks", Qt::QueuedConnection);
-            }
-        });
         connect(adminPanel_, &AdminPanel::maintenanceBackupRequested, this, &FaceGateMainWindow::handleMaintenanceBackup);
         connect(adminPanel_, &AdminPanel::maintenanceCleanupRequested, this, &FaceGateMainWindow::handleMaintenanceCleanup);
         connect(adminPanel_, &AdminPanel::deviceInfoRefreshRequested, this, &FaceGateMainWindow::refreshAdminStorageStats);
         connect(adminPanel_, &AdminPanel::thresholdConfigSaveRequested, this, &FaceGateMainWindow::handleThresholdConfigSave);
         connect(adminPanel_, &AdminPanel::networkConfigSaveRequested, this, &FaceGateMainWindow::handleNetworkConfigSave);
         connect(adminPanel_, &AdminPanel::audioConfigSaveRequested, this, &FaceGateMainWindow::handleAudioConfigSave);
+        connect(adminPanel_, &AdminPanel::accessPhotoDisplayChanged,
+                this, &FaceGateMainWindow::handleAccessPhotoDisplayChanged);
         connect(adminPanel_, &AdminPanel::audioTestPlayRequested, this, &FaceGateMainWindow::handleAudioTestPlay);
         connect(adminPanel_, &AdminPanel::adminPasswordChangeRequested, this, &FaceGateMainWindow::handleAdminPasswordChange);
         connect(adminPanel_, &AdminPanel::personNoChangeRequested, this, &FaceGateMainWindow::handlePersonNoChange);
@@ -1533,7 +1691,18 @@ void FaceGateMainWindow::openAdminPanel()
             adminModeActive_ = false;
             adminLivenessPending_ = false;
             resetFaceVerification(QStringLiteral("等待人脸"));
+#ifndef FACEGATE_LEGACY_PAGE_MODE
+            // 必须在 AdminPanel 真正隐藏前同步通知外壳切回多媒体，否则
+            // closeEvent 与下一轮事件循环之间会短暂露出底层人脸识别主页。
+            // adminModeActive_ 已先清除，deactivateModule() 不会再次 close()。
+            emit adminSessionFinished();
+#else
+            // 旧页面模式保持原来的延迟通知和返回行为。
             updateCameraPowerState();
+            QTimer::singleShot(0, this, [this]() {
+                emit adminSessionFinished();
+            });
+#endif
         });
         connect(adminPanel_, &QObject::destroyed, this, [this]() {
             adminPanel_ = nullptr;
@@ -1556,8 +1725,8 @@ void FaceGateMainWindow::openAdminPanel()
     refreshAdminStorageStats();
     FaceImageSyncBridge::instance()->requestPersonnelList();
 
-    // EGLFS 融合模式下管理面板保持为统一 AppShell 内的普通子控件，
-    // 不创建第二个全屏顶层窗口。
+    // 管理面板保持为统一 AppShell 内的普通子控件，不创建第二个 Wayland
+    // 顶层 surface。
     adminPanel_->setGeometry(rect());
     adminPanel_->show();
     adminPanel_->raise();
@@ -2077,6 +2246,7 @@ void FaceGateMainWindow::handleAudioConfigSave(const AppConfig &audioConfig)
     QString errorText;
     const bool saved = config_.save(config_.configPath, &errorText);
     audio_.configure(config_);
+    audio_.setVolume(config_.audioVolume);
 
     const QString message = saved ? "音频设置已保存" : ("音频设置已应用，保存失败：" + errorText);
     writeOperatorAudit("修改音频设置", "audio", config_.audioEnabled ? "enabled" : "disabled", saved ? "成功" : "失败", message);
@@ -2085,6 +2255,33 @@ void FaceGateMainWindow::handleAudioConfigSave(const AppConfig &audioConfig)
     }
     if (!saved) {
         AppMessageDialog::warning(this, "音频设置", message);
+    }
+}
+
+/** @brief 保存并立即应用通行照片及姓名显示开关。 */
+void FaceGateMainWindow::handleAccessPhotoDisplayChanged(bool enabled)
+{
+    config_.showAccessPhoto = enabled;
+    if (!enabled) {
+        hideSuccessfulAccess();
+    }
+
+    QString errorText;
+    const bool saved = config_.save(config_.configPath, &errorText);
+    const QString message = saved
+            ? QStringLiteral("通行照片显示已%1").arg(enabled ? QStringLiteral("开启")
+                                                          : QStringLiteral("关闭"))
+            : QStringLiteral("通行照片显示已应用，保存失败：%1").arg(errorText);
+    writeOperatorAudit(QStringLiteral("修改通行照片显示"),
+                       QStringLiteral("display"),
+                       enabled ? QStringLiteral("enabled") : QStringLiteral("disabled"),
+                       saved ? QStringLiteral("成功") : QStringLiteral("失败"),
+                       message);
+    if (adminPanel_) {
+        adminPanel_->setStatusText(message);
+    }
+    if (!saved) {
+        AppMessageDialog::warning(this, QStringLiteral("显示设置"), message);
     }
 }
 

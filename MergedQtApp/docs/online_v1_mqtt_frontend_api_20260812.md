@@ -1,8 +1,8 @@
 # online_v1 MQTT 前端对接接口说明
 
 > 工程：MergedQtApp（RK3566 / Qt 5.12.8）  
-> 文档日期：2026-08-12  
-> 分析方式：基于当前源码静态分析，未修改任何业务代码，未连接真实 Broker 或目标板验证  
+> 文档日期：2026-08-27  
+> 文档状态：与当前源码实现同步；尚未连接真实 Broker 或目标板验证  
 > 适用范围：`feature/online_v1=true` 的 ycLinux V1 MQTT 路由
 
 ## 1. 对接结论
@@ -56,6 +56,14 @@ online_v1 使用“一条下行主题 + 一条上行主题”，以 JSON `method
 | `deletePlayFile` | 下行 | **否** | 删除本地视频 |
 | `videoControl` | 下行/上行 | 是：同 method | 控制直播、录播、停止、音量；也用于本地音量主动同步 |
 | `linuxReboot` | 下行 | 是：同 method | 回执后约 1 秒重启设备 |
+| `floorLimit` | 下行 | 是：同 method | 设置一个或多个楼层开放/限行状态并下发分层板 |
+| `floorLimit.query` | 下行 | 是：`floorLimit` | 查询设备持久化的楼层开放/限行状态 |
+| `floorSchedule` | 下行 | 是：同 method | 全量覆盖设备本地执行的楼层定时开放/限行规则 |
+| `floorSchedule.query` | 下行 | 是：`floorSchedule` | 查询设备当前定时规则，`data=null` 不参与解析 |
+| `floorSchedule.delete` | 下行 | 是：`floorSchedule` | 根据规则 hash 批量删除设备定时规则 |
+| `elevatorMode` | 下行 | 是：同 method | 设置分层板最高8位的自定义电梯模式并立即下发 |
+| `elevatorMode.query` | 下行 | 是：`elevatorMode` | 查询设备持久化的电梯模式状态 |
+| `heartbeat` | 下行 | 是：同 method | 平台主动探测设备，响应严格回显请求 ID |
 | `sync.fullPersonnel` | 下行 | 是：同 method | 全量新增/更新一个人员 |
 | `sync.checkAllPersonHash` | 下行 | 是：同 method | 平台全量人员 hash 对账 |
 | `sync.deletePersonnel` | 下行 | 是：同 method | 删除人员或指定凭证 |
@@ -282,6 +290,280 @@ RECORDED 下载示例：
 
 重复重启请求在设备已进入等待重启状态后会被忽略且无第二次回执。
 
+### 3.6 楼层开放/限行 `floorLimit`
+
+平台设置一个或多个楼层，`action=1` 表示开放，`action=0` 表示限行：
+
+```json
+{
+  "method": "floorLimit",
+  "id": "a7b8c9d0-e1f2-3456-abcd-567890123456",
+  "deviceId": "YCEEQZA10C1FFC62",
+  "data": {
+    "floors": [
+      { "floor": 1, "action": 1 },
+      { "floor": 2, "action": 0 }
+    ],
+    "time": "2026-08-26 17:30:00"
+  }
+}
+```
+
+设备保存状态、逐层提交 RS485 后，在 event Topic 回报；`id` 原样回显：
+
+```json
+{
+  "method": "floorLimit",
+  "id": "a7b8c9d0-e1f2-3456-abcd-567890123456",
+  "deviceId": "YCEEQZA10C1FFC62",
+  "data": {
+    "code": 0,
+    "floors": [
+      { "floor": 1, "status": 1 },
+      { "floor": 2, "status": 0 }
+    ],
+    "floorHex": "0x00000000000000000000000000000001"
+  },
+  "time": "2026-08-26 17:30:01"
+}
+```
+
+处理约定：
+
+- 楼层范围与 online_v2 相同：`-8..-1、1..120`，不接受 0、小数或字符串。
+- 同一请求内重复的同楼层同 action 只执行一次；同楼层出现冲突 action 时整笔拒绝。
+- 无论本次设置一个还是多个楼层，设备都先更新本地完整楼层状态，再发送一次 `OPEN` 加128个状态字符，共132字节。分层板位序为 `-8..-1、1..120`，帧内状态字符为 `0=开放、1=限行`，其余未操作楼层保持数据库中的当前状态。
+- 状态保存到 online_v1 独立配置项 `online_v1_floor_limit_bits`，不调用也不修改 online_v2 的接收入口和楼层状态。存储位与上行 `status` 均使用 `1=开放、0=限行`。
+- `floorHex` 是 128 位“开放状态”十六进制数，带 `0x` 前缀。1～120 楼对应 bit0～bit119，所以仅 1 楼开放时末位为 `1`；`-8..-1` 依次使用 bit120～bit127。
+- `code=0` 表示状态已保存且 RS485 请求已提交；参数或保存错误时返回 `code=-1`。该回执不等待串口驱动的最终异步发送结果。
+
+查询请求：
+
+```json
+{
+  "method": "floorLimit.query",
+  "id": "b8c9d0e1-f2a3-4567-bcde-678901234567",
+  "deviceId": "YCEEQZA10C1FFC62"
+}
+```
+
+`floorLimit.query` 请求本身没有 `data` 字段，设备不会读取或解析 `data`。查询响应使用 `method=floorLimit` 并回显查询 ID；`data.code=0`，`floors` 返回 1～120、-8～-1 共128个当前状态，`floorHex` 与设置回执采用同一编码。查询只读本地持久化状态，不下发 RS485。
+
+### 3.7 定时楼层开放/限行 `floorSchedule`
+
+平台全量覆盖设备原有全部定时规则；`schedules=[]` 表示清空：
+
+```json
+{
+  "method": "floorSchedule",
+  "id": "a3b4c5d6-e7f8-9012-3456-789abcdef012",
+  "deviceId": "YCEEQZA10C1FFC62",
+  "data": {
+    "schedules": [
+      { "action": 1, "time": "07:00", "weekDays": [1, 2, 3, 4, 5], "floors": [3, 5], "hash": "2ce839d19e99f591" },
+      { "action": 0, "time": "22:30", "weekDays": [1, 2, 3, 4, 5], "floors": [3, 5], "hash": "8c329fcea568ee41" }
+    ],
+    "time": "2026-08-27 12:00:00"
+  },
+  "time": "2026-08-27 12:00:00"
+}
+```
+
+保存成功后回显原请求 ID，并返回设备数据库当前生效的完整规则：
+
+```json
+{
+  "method": "floorSchedule",
+  "id": "a3b4c5d6-e7f8-9012-3456-789abcdef012",
+  "deviceId": "YCEEQZA10C1FFC62",
+  "data": {
+    "code": 200,
+    "schedules": [
+      { "action": 1, "time": "07:00", "weekDays": [1, 2, 3, 4, 5], "floors": [3, 5], "hash": "2ce839d19e99f591" },
+      { "action": 0, "time": "22:30", "weekDays": [1, 2, 3, 4, 5], "floors": [3, 5], "hash": "8c329fcea568ee41" }
+    ]
+  },
+  "time": "2026-08-27 12:00:01"
+}
+```
+
+规则约定：
+
+- `action=1` 开放，`action=0` 限行；`time` 必须为严格的 `HH:mm`。
+- `weekDays` 使用 Qt/ISO 星期：`1=星期一`，`7=星期日`；必须是非空数组。
+- `floors` 必须是非空数组，范围为 `-8..-1、1..120`。
+- `hash` 必须是非空字符串，并且在本次全量列表中唯一；设备原样保存，用作删除规则的稳定标识。
+- 同一楼层在相同时间且星期范围重叠时，不允许配置不同 action；整笔规则会返回 `code=400` 且不覆盖旧数据。
+- 规则、定时楼层当前状态和最后执行分钟分别保存到 SQLite 配置项 `online_v1_floor_schedules`、`online_v1_floor_schedule_bits`、`online_v1_floor_schedule_last_minute`。
+- `floorLimit` 与 `floorSchedule` 不互斥。`floorLimit` 享有即时控制权限，即使楼层存在定时规则，也能随时开放或限行；到达后续定时时间时，再由对应定时规则覆盖该楼层状态。
+- 新加入定时管理的楼层以设备当前开放/限行状态初始化；保存规则本身不改变当前状态，也不下发485。
+- 设备每5秒按本地日期、星期和 `HH:mm` 检查一次。同一分钟命中的全部规则只执行一次，执行分钟持久化，进程在该分钟内重启也不会重复下发。
+- 无论本次命中一个还是多个楼层，都以设备当前全部楼层状态为基础更新命中楼层，并发送一次 `OPEN + 128位状态` 的132字节全量帧，避免7字节单层协议的高楼层板号兼容问题，同时保持其他楼层最近一次控制结果。
+- 定时执行属于设备本地任务；即使 MQTT 暂时断开，只要设备仍处于 online_v1 配置，规则仍会按设备时间执行。
+
+查询请求中的 `data` 为 `null`，设备不读取其内容：
+
+```json
+{
+  "method": "floorSchedule.query",
+  "id": "b4c5d6e7-f890-1234-5678-9abcdef01234",
+  "deviceId": "YCEEQZA10C1FFC62",
+  "data": null,
+  "time": "2026-08-27 12:00:00"
+}
+```
+
+查询响应统一使用 `method=floorSchedule`、`code=200`，回显查询 ID，并在 `schedules` 返回数据库中完整规则列表。参数错误返回 `code=400`，数据库保存失败返回 `code=500`，失败响应会保留当前旧规则并增加 `message`。
+
+按 hash 删除一个或多个定时规则：
+
+```json
+{
+  "method": "floorSchedule.delete",
+  "id": "548aaf559bd549f58abf1f1772defded",
+  "deviceId": "YCEEQZA10C1FFC62",
+  "data": {
+    "hashList": ["2ce839d19e99f591"],
+    "schedules": [],
+    "time": "2026-08-27 16:45:32"
+  },
+  "time": "2026-08-27 16:45:32"
+}
+```
+
+设备只解析 `hashList`，请求中的 `schedules` 不参与删除判断。删除不会立即下发485，也不会改变楼层当前开放/限行状态；后续只执行剩余规则。不存在的 hash 按幂等成功处理。
+
+删除回执统一使用 `method=floorSchedule` 并回显删除请求 ID；`data` 只返回 `code` 和删除后的完整 `schedules`：
+
+```json
+{
+  "method": "floorSchedule",
+  "id": "548aaf559bd549f58abf1f1772defded",
+  "deviceId": "YCEEQZA10C1FFC62",
+  "data": {
+    "code": 200,
+    "schedules": [
+      { "action": 0, "time": "22:30", "weekDays": [1, 2, 3, 4, 5], "floors": [3, 5], "hash": "8c329fcea568ee41" }
+    ]
+  },
+  "time": "2026-08-27 16:45:33"
+}
+```
+
+### 3.8 自定义电梯模式 `elevatorMode`
+
+平台设置总开关和8个模式位：
+
+```json
+{
+  "method": "elevatorMode",
+  "id": "0bff6f034719479b80ae04fa83318631",
+  "deviceId": "YCEEQZA10C1FFC62",
+  "data": {
+    "masterSwitch": 1,
+    "delay": 0,
+    "parking": 0,
+    "driver": 0,
+    "independent": 0,
+    "ext1": 0,
+    "ext2": 0,
+    "ext3": 0,
+    "ext4": 0,
+    "time": "2026-08-31 10:05:06"
+  },
+  "time": "2026-08-31 10:05:06"
+}
+```
+
+`masterSwitch`及8个模式字段都必须是整数0或1。设置成功后保存到SQLite配置项 `online_v1_elevator_mode`，并立即把当前楼层权限与模式状态组合后下发485。
+
+模式位使用板端128位的最高8位：
+
+| 板端位索引 | 字段 | 总开关开启时的值 |
+|---:|---|---|
+| 120 | `delay` | 1=启用，0=关闭 |
+| 121 | `parking` | 1=启用，0=关闭 |
+| 122 | `driver` | 1=启用，0=关闭 |
+| 123 | `independent` | 1=启用，0=关闭 |
+| 124 | `ext1` | 1=启用，0=关闭 |
+| 125 | `ext2` | 1=启用，0=关闭 |
+| 126 | `ext3` | 1=启用，0=关闭 |
+| 127 | `ext4` | 1=启用，0=关闭 |
+
+- `masterSwitch=1`：132字节持续状态帧保留0～119位业务数据，并把120～127位替换为数据库模式状态；36字节一次性呼梯/通行帧保留0～119位并把120～127位清零，避免误触发模式通道。
+- `masterSwitch=0`：模式覆盖完全停用，所有帧保持原有楼层权限逻辑，113～120层恢复使用原始楼层权限。
+- 原始128位楼层权限始终独立保存；模式开启期间不会删除113～120层原有权限。
+- `OPEN + 128字符`帧使用数据库模式值覆盖最后8个字符；`#@ + 32HEX + #!`帧把最后两个HEX字符固定为 `00`。模式开启期间113～120不再作为普通呼梯/通行楼层使用。
+- `floorLimit` 和 `floorSchedule` 无论单层、多层均直接发送132字节全量帧；模式开启时，最终串口出口继续用数据库模式状态覆盖最高8位，楼层操作不能直接修改模式位。
+- 保护在RS485驱动最终发送入口统一执行，覆盖 `floorLimit`、`floorSchedule`、`remoteCall`、人员/访客同步后的刷卡、人脸、密码、二维码通行以及其他36字节楼层帧。通行类帧不会携带数据库模式值；继电器、时间同步等非楼层帧不修改。
+- `masterSwitch=1` 时，如果 `remoteCall` 的目标楼层，或刷卡、人脸、密码、人员二维码、访客二维码的一次授权楼层全部位于113～120，设备会在RS485发送前拒绝，并以 `success=false, reason="楼层已被电梯模式占用"` 上报。授权中只要同时包含任一113楼以下楼层或地下楼层，就保持原有逻辑继续执行，不因同时包含113～120楼而整笔拒绝。
+
+查询请求：
+
+```json
+{
+  "method": "elevatorMode.query",
+  "id": "af266479a7fa48e88e97a143728742e2",
+  "deviceId": "YCEEQZA10C1FFC62",
+  "data": {},
+  "time": "2026-08-31 10:07:29"
+}
+```
+
+设置和查询均回复 `method=elevatorMode` 并回显请求ID：
+
+```json
+{
+  "method": "elevatorMode",
+  "id": "af266479a7fa48e88e97a143728742e2",
+  "deviceId": "YCEEQZA10C1FFC62",
+  "data": {
+    "code": 200,
+    "masterSwitch": 1,
+    "delay": 1,
+    "parking": 0,
+    "driver": 0,
+    "independent": 0,
+    "ext1": 0,
+    "ext2": 0,
+    "ext3": 0,
+    "ext4": 0
+  },
+  "time": "2026-08-31 10:07:30"
+}
+```
+
+### 3.9 平台探活 `heartbeat`
+
+平台发送空 `data` 对象：
+
+```json
+{
+  "method": "heartbeat",
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef0123456789",
+  "deviceId": "YCEEQZA10C1FFC62",
+  "data": {},
+  "time": "2026-08-26 12:00:00"
+}
+```
+
+设备立即返回同 method，并严格回显请求 `id`：
+
+```json
+{
+  "method": "heartbeat",
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef0123456789",
+  "deviceId": "YCEEQZA10C1FFC62",
+  "data": {
+    "code": 200,
+    "time": "2026-08-26 12:00:01"
+  },
+  "time": "2026-08-26 12:00:01"
+}
+```
+
+`data.time` 与报文顶层 `time` 由设备在同一时刻生成，格式均为 `yyyy-MM-dd HH:mm:ss`。探活只确认当前设备进程能够接收并发布 MQTT 业务消息，不触发 RS485 或其他硬件动作。
+
 ## 4. 人员、人脸与呼梯接口
 
 ### 4.1 人员同步统一回执
@@ -393,7 +675,11 @@ RECORDED 下载示例：
 
 `icCards/qrCodes/rules/floors` 按完整快照替换；`faces` 按 `faceHash` 差量保留已有图片和特征。成功回执还可能包含 `personHash`、`changed`、`faceCount`、`icCardCount`、`qrCodeCount`。若人员聚合 hash、人脸 hash 集合及本地 READY 状态均未变化，返回 `code=HASH_UNCHANGED, changed=false`。
 
-`rules.cardPasswordDataPassword` 是当前人员唯一的通行密码，一个人员不支持配置多个密码。`rules.cardPassword=true` 时，人脸主界面的“密码通行”会用该密码查找人员，并执行与人脸/刷卡一致的通行期限、定时规则、次数和楼层权限校验。校验通过后才发送 36 字节 RS485 楼层帧；密码错误、密码重复对应多人或其他权限校验失败时不发送 RS485。设备日志不记录密码明文。该本地密码通行当前不新增 MQTT method。
+`rules.cardPasswordDataPassword` 是当前人员唯一的通行密码，一个人员不支持配置多个密码。`rules.cardPassword=true` 时，人脸主界面的“密码通行”会用该密码查找人员，并执行与人脸/刷卡一致的通行期限、定时规则、次数、金额和楼层权限校验。校验通过后才发送 36 字节 RS485 楼层帧；密码错误、密码重复对应多人或其他权限校验失败时不发送 RS485。设备日志不记录密码明文。
+
+`rules.count` 与 `rules.amount` 独立生效：仅 `count=true` 时只判断并扣减一次 `countDataTotal` 对应的剩余次数，不读取金额；`amount=true` 时要求 `amountDataUnitPrice>0`，每次实际完成 RS485 通行后从剩余金额扣减一个单价。两者同时开启时必须同时满足“剩余次数大于 0”和“剩余金额不少于一个单价”，成功后在同一笔本地事务内扣次数 1、扣金额一个单价。剩余金额为 0 或不足一个单价时按 `code=4201` 显示“通行余额不足，请联系管理员充值”，拒绝通行且不发送 RS485。
+
+`rules.duration` 与 `rules.time` 是两套互相独立的开关：`duration=true` 时校验 `durationDataStartTime/durationDataEndTime` 总有效期限；`time=true` 时校验 `timingRules` 中的星期和每日时间段。两者同时启用时必须同时通过，任一校验失败都不会发送 RS485 楼层帧。期限和定时数据只在主设备本地参与判断，不会编码进下发分层板的 36 字节楼层帧。
 
 同步成功后，设备检查缺失图片；有缺图时立即主动上行 `face.requestImages`：
 
@@ -498,7 +784,7 @@ RECORDED 下载示例：
 - 同一人员一次只能有一个图片校验任务；设备校验超时为 30 秒。
 - 设备进行单人脸、检测置信度、图像质量和特征提取校验；此链路不做活体检测。
 
-最终上行 `Imagesresult`，正常沿用下行 ID：
+最终按下发图片逐张上行 `Imagesresult`。同一批图片正常沿用同一个下行 ID，通过 `faceHash` 区分每张图片：
 
 ```json
 {
@@ -507,6 +793,8 @@ RECORDED 下载示例：
   "deviceId": "YCEEQZA10C1FFC62",
   "data": {
     "personId": "P10001",
+    "name": "front",
+    "faceHash": "face_hash_001",
     "result": false,
     "msg": "人脸质量过低，请重新录入人脸。",
     "failed_faces": [
@@ -517,7 +805,7 @@ RECORDED 下载示例：
 }
 ```
 
-成功时 `result=true` 且通常不含 `failed_faces`。失败消息可能包括无脸、多脸、置信度/质量不足、特征提取失败、服务未就绪、图片保存失败或校验超时。前端应以 `result` 为判断依据，不要对中文 `msg` 做业务分支。
+每张图片都有独立的 `result` 和 `msg`；成功图片 `result=true` 且不含 `failed_faces`，失败图片的 `failed_faces` 最多包含当前这一张。失败消息可能包括无脸、多脸、置信度/质量不足、特征提取失败、服务未就绪、图片保存失败、重复人脸或校验超时。不同人员重复时消息显示冲突人员姓名；同一 `personId` 下存在相似人脸时仍按原规则保留最新下发图片，但最新图片及本批被替换图片的 `msg` 会使用人员姓名说明替换结果，不暴露内部 `personId`。前端应使用 `faceHash + result` 判断单图结果，不要对中文 `msg` 做业务分支。
 
 ### 4.6 人脸识别控梯结果 `face.accessResult`
 
@@ -543,7 +831,7 @@ RECORDED 下载示例：
 
 `floorHex` 仅在 RS485 帧恰好为 36 字节时存在；`reason` 为空时省略。
 
-人脸 `success=true` 后设备不再立即扣减本地次数，而是等待平台返回 `face.deductResult`。
+人脸实际完成 RS485 后，设备先按已启用规则原子扣减本地次数/金额，再发送 `success=true`。平台后续返回的 `face.deductResult` 作为权威值校准，不会再次按增量重复扣减。
 
 ### 4.6.1 刷卡控梯结果 `card.accessResult`
 
@@ -568,7 +856,7 @@ RECORDED 下载示例：
 }
 ```
 
-刷卡 `success=true` 后同样等待平台返回 `card.deductResult`，不在上报前提前扣减本地次数。
+刷卡实际完成 RS485 后同样先原子扣减本地次数/金额，再上报 `success=true`；断网分支只累计批量补报记录，不会再次扣减。
 
 ### 4.6.2 平台返回人脸/刷卡扣次结果
 
@@ -584,19 +872,21 @@ RECORDED 下载示例：
     "personId": "P10001",
     "code": 200,
     "deducted": true,
-    "message": "次数扣减完成",
+    "message": "次数和金额扣减完成",
     "remainingCount": 29,
-    "usedCount": 3
+    "usedCount": 3,
+    "remainingAmount": 7.5,
+    "usedAmount": 1.5
   },
   "time": "2026-08-12 14:30:06"
 }
 ```
 
-当 `code=200`、`deducted=true` 时，`remainingCount` 和 `usedCount` 必须是非负 JSON 数字；设备以平台值覆盖本地人员剩余次数和已用次数。顶层 `id` 用于幂等，重复回执不会重复应用；较晚到达且 `usedCount` 更小的旧回执不会把本地计数倒退。`deducted=false` 时记录为成功跳过，不修改本地次数。
+当 `code=200`、`deducted=true` 且人员开启次数规则时，`remainingCount` 和 `usedCount` 必须是非负 JSON 数字；设备以平台值校准本地剩余次数和已用次数。人员开启金额规则时，平台可同时返回非负 JSON 数字 `remainingAmount/usedAmount`，设备据此校准本地金额；未返回这两个金额字段时保留设备已经完成的本地金额扣减。设备也兼容 `passRemainingAmount/passUsedAmount` 字段名。顶层 `id` 用于幂等，重复回执不会重复应用；较晚到达且已用次数或已用金额更小的旧回执不会把本地状态倒退。`deducted=false` 时记录为成功跳过，不修改本地状态。
 
 ### 4.6.3 MQTT 断线通行的批量补报
 
-本节的“断线”是指设备仍运行在 `online_v1`，但网络链路/外网不可用，或者与 MQTT Broker 的连接已经断开；不是 `offline_v1` 运行模式。两种状态任意一个成立都按离线通行处理。网络和 MQTT 状态变化只更新统一离线标志，不直接写入通行次数；每次刷卡、二维码、人脸或密码实际完成 RS485 通行后只由对应完成事件记录一次，因此两个断线条件重复触发不会造成重复计数。二维码在该状态下使用本地人员、规则、有效期和楼层权限完成校验。
+本节的“断线”是指设备仍运行在 `online_v1`，但网络链路/外网不可用，或者与 MQTT Broker 的连接已经断开；不是 `offline_v1` 运行模式。两种状态任意一个成立都按离线通行处理。网络和 MQTT 状态变化只更新统一离线标志，不直接写入通行次数；每次刷卡、二维码、人脸或密码实际完成 RS485 通行后只扣减一次本地规则状态、记录一次批量补报，因此两个断线条件重复触发不会造成重复计数或重复扣款。二维码在该状态下使用本地人员、规则、有效期和楼层权限完成校验。
 
 网络恢复且 Broker 恢复连接后，设备按通行类型分别发送一条批量 `accessResult`。发生过网络断开后，即使设备内仍保留旧的 MQTT“已连接”状态，也不会在网络刚恢复时直接补报；设备会先向 mqttd 重新查询连接状态，收到断网后的 MQTT 已连接确认才发送。四种 method 为 `card.accessResult`、`qr.accessResult`、`face.accessResult` 和 `password.accessResult`；没有待报记录的类型不发送：
 
@@ -643,7 +933,7 @@ RECORDED 下载示例：
 
 `floor` 必须是 JSON 数字且为整数，范围为 `-8..-1` 或 `1..120`，不允许 `0`，也不接受字符串 `"8"`。`id/deviceId/personId` 均不能为空，且 `deviceId` 必须与本机一致。
 
-设备在 RS485 驱动返回实际结果后上报 `remoteCall.accessResult`。顶层 `id` 由设备重新生成；`success` 反映本次 RS485 结果：
+设备在 RS485 驱动返回实际结果后上报 `remoteCall.accessResult`。顶层 `id` 由设备重新生成；`success` 反映本次 RS485 结果。模式总开关开启且目标为113～120楼时不下发RS485，直接上报 `success=false`，并增加 `reason="楼层已被电梯模式占用"`：
 
 ```json
 {
@@ -784,7 +1074,7 @@ CREDENTIAL 示例：
 }
 ```
 
-此结果表示楼层数据校验和 RS485 实际执行结果。即使 `success=false`，Payload 当前也不包含失败原因；前端不要等待 `reason` 字段。
+此结果表示楼层数据校验和 RS485 实际执行结果。`success=false` 且存在明确失败原因时会携带可选 `reason`；模式总开关开启且 `floors` 全部位于113～120时，设备不下发RS485，回报 `reason="楼层已被电梯模式占用"`。CREDENTIAL 与 VISITOR 使用相同判断；混合包含低楼层与113～120楼时保持原有执行逻辑。
 
 ### 5.5 平台返回扣次结果 `qr.deductResult`
 
@@ -841,15 +1131,28 @@ CREDENTIAL 示例：
 3. 不要用新 ID 自动重发 `linuxReboot`、`remoteCall` 或人员写入请求。`remoteCall` 与人员同步重试都应复用原 ID 和完全相同的内容。
 4. `deletePlayFile`、`remoteCall.deductResult`、`qr.deductResult` 当前无后续业务回执；`qr.scanResult` 也无直接回执。前端应以 `remoteCall.accessResult` 判断设备执行结果，并在其后发送扣次结果。
 5. `sync.checkAllPersonHash` 会删除平台清单之外的本地人员，必须由有权限的全量同步任务调用。
-6. `Imagesresult.failed_faces` 使用下划线命名，而其他字段多为 camelCase；请按实际字段解析。
+6. `Imagesresult` 按人脸逐条发布，`data.faceHash` 标识当前图片；兼容字段 `failed_faces` 使用下划线命名且失败时最多包含当前一张，请按实际字段解析。
 7. online_v1 当前路由会清空独立 `streamUrlTopic`，所以“无 method、只含 URL”的历史流地址消息在标准 online_v1 配置下不会命中；直播应使用 `videoControl`。
 8. online_v1 的 `protocolMode` 在主程序中为 `offline`，用于关闭旧 `IcMqttGateway`。`openFloor`、`registerCardOne`、`sendQrCode`、`keep` 等旧 IC 方法属于 online_v2，不是本协议接口。
 9. 源码中没有 MQTT Payload 版本号。前后端发布协议变更时，建议后续增加显式 `protocolVersion` 或在 Topic 中做版本隔离。
+10. `floorLimit` 的确认表示本地状态已保存并已把 RS485 发送请求交给硬件队列，不表示分层板已经返回确认。
 
 ## 7. 联调验收清单
 
 - [ ] 能订阅 `device/ycLinux/{deviceId}/event`，并向对应 `/request` 发布 JSON 对象。
 - [ ] `getPlayFileList`、`getPlayInfo` 能按原 ID 收到响应。
+- [ ] `heartbeat` 回包的 method、deviceId 与 ID 正确，且 data.time 和顶层 time 一致。
+- [ ] `floorLimit` 的开放、限行、混合批次、重复楼层、冲突 action、边界楼层和错误参数均验证；单楼层、多楼层均为一次 `OPEN + 128位状态` 的132字节全量帧。
+- [ ] `floorLimit.query` 能在进程重启后返回持久化状态，1楼开放时 floorHex 最低位为 1。
+- [ ] `floorSchedule` 全量覆盖、空数组清空、hash 持久化、重复 hash、规则查询、星期边界、时间格式和同时间冲突均验证。
+- [ ] `floorSchedule.delete` 单个/批量删除、重复 hash、未知 hash 幂等和删除后重启持久化均验证。
+- [ ] 已配置定时规则的楼层仍可由 `floorLimit` 即时控制，并在下一个定时时间由 `floorSchedule` 再次覆盖。
+- [ ] 定时单楼层、多楼层132字节全量帧、同分钟防重复和 MQTT 断线期间本地执行均验证。
+- [ ] `elevatorMode` 设置、持久化、查询、字段边界和请求ID回显均验证。
+- [ ] 总开关开启时，OPEN帧的120～127位由模式状态覆盖，36字节HEX帧的120～127位清零，两类帧的0～119位均不变。
+- [ ] 总开关关闭时不修改任何原始楼层权限帧，113～120层权限恢复正常。
+- [ ] 人脸、密码、刷卡、人员、访客二维码和remoteCall的36字节帧不会触发模式通道；floorLimit和floorSchedule的132字节帧保持数据库模式状态。
+- [ ] 总开关开启时，remoteCall及刷卡、人脸、密码、人员/访客二维码的纯113～120楼授权在RS485前拒绝并上报“楼层已被电梯模式占用”；混合低楼层授权继续按原逻辑执行。
 - [ ] LIVE、NONE、RECORDED 下载和仅调音量四种 `videoControl` 路径均验证。
 - [ ] 正确处理 `videoControl` 的可选字段及设备主动音量事件。
 - [ ] 人员新增、hash 未变化、ID 幂等、ID 冲突、部分删除、全量 hash 对账均验证。
@@ -868,6 +1171,11 @@ CREDENTIAL 示例：
 | client_id 与 online_v1 Topic 生成 | `components/settings/mqttpage.cpp:34-73, 87-123` |
 | online_v1 路由选择与配置 | `components/settings/mqttpage.cpp:282-383, 594-629` |
 | method 注册总表 | `components/settings/mqtt/mqttmanager.cpp:691-829` |
+| floorLimit、floorLimit.query 与 heartbeat | `components/settings/mqtt/mqttmanager.cpp` |
+| floorSchedule 规则、hash删除、查询和本地定时执行 | `components/settings/mqtt/mqttmanager.cpp`、`mqttmanager.h` |
+| elevatorMode设置、查询与数据库持久化 | `components/settings/mqtt/mqttmanager.cpp`、`ic_board/rs485_floor_frame_builder.cpp` |
+| 所有RS485楼层帧的最终模式位保护 | `ic_board/rs485_driver_port.cpp`、`rs485_floor_frame_builder.cpp` |
+| online_v1 独立楼层状态位持久化 | `components/settings/mqtt/mqttmanager.cpp`、`common/sql/dbstore.cpp` |
 | remoteCall、accessResult 与 deductResult | `components/settings/mqtt/mqttmanager.cpp`、`common/sql/network_personnel_store.cpp` |
 | 人员同步回执与 resultcode | `components/settings/mqtt/mqttmanager.cpp:939-1037`、`mqttmanager.h:60-65` |
 | face.accessResult 与二维码流程 | `components/settings/mqtt/mqttmanager.cpp:1039-1532` |

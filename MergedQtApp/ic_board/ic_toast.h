@@ -21,7 +21,7 @@ class QPainter;
  * @brief IC 刷卡、二维码结果的全屏覆盖提示单例。
  *
  * 成功时绘制绿色呼吸边框，失败时绘制红色边框和居中文本；可按配置播放提示音。
- * 播音期间临时压低业务播放器音量并提升功放 DAC，播放结束或兜底超时后恢复。
+ * 播音期间临时压低业务播放器音量并提升 RK809 播放音量，播放结束或兜底超时后恢复。
  */
 class IcToast : public QWidget {
     Q_OBJECT
@@ -37,7 +37,7 @@ public:
     void showPass(int ms = 1200);
 
     /** @brief 本地化失败原因，显示红色提示并播放失败提示音。 */
-    void showFail(const QString& reason, int ms = 5000);
+    void showFail(const QString& reason, int ms = 5000, int resultCode = 0);
 
     /** @brief 显示普通居中文本提示，并在指定毫秒数后隐藏。 */
     void showText(const QString& text, int ms = 5000);
@@ -71,7 +71,7 @@ private:
     /** @brief 绘制当前成功绿色或失败红色的四边光晕。 */
     void paintPassEdgeFlash(QPainter& p);
 
-    /** @brief 将 Qt 资源中的音频复制到 GStreamer 可访问的临时文件。 */
+    /** @brief 将 common/audio 中的 Qt 资源复制到 GStreamer 可访问的临时文件。 */
     QString materializeResourceToTemp(const QString& resourcePath);
 
     /** @brief 延迟创建功放控制器并恢复持久化音量。 */
@@ -83,16 +83,16 @@ private:
     /** @brief 播放通过提示音。 */
     void playPassVoice();
 
-    /** @brief 播放失败提示音。 */
-    void playFailVoice();
+    /** @brief 按 MQTT 结果码播放对应失败提示音，未配置时使用通用失败音。 */
+    void playFailVoice(int resultCode);
 
-    /** @return 提示音使用的临时 DAC 值，上限为 55。 */
-    int boostedToastDac() const;
+    /** @return 提示音使用的 RK809 固定原始音量 200。 */
+    int boostedToastRawVolume() const;
 
-    /** @brief 保存并压低其他播放器音量，同时临时提升功放 DAC。 */
+    /** @brief 保存并压低其他播放器音量，同时临时提升 RK809 播放音量。 */
     void beginVoiceFocus();
 
-    /** @brief 恢复所有被压低的播放器和功放 DAC。 */
+    /** @brief 恢复所有被压低的播放器和 RK809 播放音量。 */
     void endVoiceFocus();
 
     /** @return 同类提示距上次触发达到冷却时间时返回 true，并重启计时。 */
@@ -137,11 +137,11 @@ private:
 
     GstPlayerWidget* voicePlayer_ = nullptr; /**< 专用无视频提示音播放器。 */
     QTimer voiceFocusRestoreTimer_;          /**< 2.2 秒兜底恢复语音焦点。 */
-    QString passVoiceFile_;                  /**< 临时目录中的通过提示音。 */
-    QString failVoiceFile_;                  /**< 临时目录中的失败提示音。 */
+    QString passVoiceFile_;                  /**< common/audio/code_200.mp3 的临时播放路径。 */
+    QString failVoiceFile_;                  /**< common/audio/fail.wav 的临时播放路径。 */
     AmpVolumeController* ampCtrl_ = nullptr; /**< 延迟创建的功放音量控制器。 */
     bool voiceFocusActive_ = false;          /**< 是否已保存并调整业务音量。 */
-    int savedAmpDac_ = -1;                   /**< 语音焦点前的原始 DAC；-1 表示未保存。 */
+    int savedAmpRawVolume_ = -1;             /**< 语音焦点前 RK809 原始音量；-1 表示未保存。 */
     QVector<DuckedPlayerState> duckedPlayers_; /**< 本次被压低的业务播放器列表。 */
 
     QFont baseFont_;                /**< 创建时保存的应用基础字体。 */

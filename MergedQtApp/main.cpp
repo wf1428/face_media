@@ -30,6 +30,7 @@
 
 #include "shell/AppShell.h"
 #include "components/input/InputCursorController.h"
+#include "components/multimedia/multimediademo.h"
 #include "components/splash/splashscreen.h"
 #include "common/sql/dbstore.h"
 #include "ic_board/ic_board.h"
@@ -59,6 +60,12 @@ protected:
     {
         auto *widget = qobject_cast<QWidget *>(watched);
         if (!widget || !widget->testAttribute(Qt::WA_InputMethodEnabled)) {
+            return QObject::eventFilter(watched, event);
+        }
+        // 多媒体后台中已接入项目自定义键盘的输入框自行管理输入面板。
+        // 跳过全局 Qt 虚拟键盘，避免一次点击先后出现两套键盘；人脸模块
+        // 未设置该属性，因此保持现有输入逻辑不变。
+        if (widget->property("ycestCustomKeyboard").toBool()) {
             return QObject::eventFilter(watched, event);
         }
         if (event->type() == QEvent::FocusIn ||
@@ -213,14 +220,15 @@ static void setupQtHeartbeat(QCoreApplication *app)
 /**
  * @brief 融合应用入口。
  *
- * 在 QApplication 创建前完成 EGLFS、OpenGL ES、虚拟键盘和日志环境配置，
+ * 在 QApplication 创建前完成 Wayland/OpenGL ES、虚拟键盘和日志环境配置，
  * 随后初始化外壳、启动页、数据库退出清理及 IC 板 I/O。
  */
 int main(int argc, char *argv[])
 {
     removeLegacyLinuxFbArguments(argc, argv);
 
-    // 尊重标准 Qt 外部平台变量；未指定时，RK3566 正式运行默认 EGLFS。
+    // 尊重标准 Qt 外部平台变量；未指定时，RK3566 正式运行默认 Wayland-EGL。
+    // 需要回退验证 EGLFS 时仍可显式设置 QT_QPA_PLATFORM=eglfs。
     // QT_YCEST_QPA_PLATFORM 仅作为兼容旧部署脚本的次级覆盖。
     QByteArray requestedQpa = qgetenv("QT_QPA_PLATFORM").trimmed();
     if (requestedQpa.isEmpty()) {
@@ -230,13 +238,18 @@ int main(int argc, char *argv[])
         requestedQpa.clear();
     }
     const QByteArray qpa = requestedQpa.isEmpty()
-            ? QByteArrayLiteral("eglfs")
+            ? QByteArrayLiteral("wayland-egl")
             : requestedQpa;
     qputenv("QT_QPA_PLATFORM", qpa);
     qputenv("QT_YCEST_VIDEO_OUTPUT", QByteArrayLiteral("qt"));
     qunsetenv("QT_QPA_FB_DRM");
     qputenv("QT_IM_MODULE", QByteArrayLiteral("qtvirtualkeyboard"));
     qputenv("QT_VIRTUALKEYBOARD_DESKTOP_DISABLE", QByteArrayLiteral("1"));
+
+    // 融合程序会同时使用多媒体 QOpenGLWidget 和人脸后台 QQuickWidget。
+    // Wayland 与 EGLFS 都应在 QApplication 创建前启用上下文共享，避免动态
+    // 打开/关闭密码键盘和管理后台时重复建立互不兼容的 EGL share group。
+    QCoreApplication::setAttribute(Qt::AA_ShareOpenGLContexts);
 
     if (qpa.toLower().startsWith("eglfs")) {
         if (qEnvironmentVariableIsEmpty("QT_QPA_EGLFS_INTEGRATION")) {
@@ -263,8 +276,6 @@ int main(int argc, char *argv[])
         }
 
         QCoreApplication::setAttribute(Qt::AA_UseOpenGLES);
-        QCoreApplication::setAttribute(Qt::AA_ShareOpenGLContexts);
-
         QSurfaceFormat format;
         format.setRenderableType(QSurfaceFormat::OpenGLES);
         format.setVersion(2, 0);
@@ -294,16 +305,23 @@ int main(int argc, char *argv[])
     VirtualKeyboardFocusFilter keyboardFilter(&a);
     a.installEventFilter(&keyboardFilter);
     InputCursorController inputCursorController(&a);
-    qInfo() << "[EGLFS-CURSOR] native KMS hardware cursor"
+    qInfo() << "native hardware cursor"
             << "platform=" << QGuiApplication::platformName();
     const QString activePlatform = QGuiApplication::platformName().trimmed().toLower();
     const bool eglfsRequested = qpa.toLower().startsWith("eglfs");
+    const bool waylandRequested = qpa.toLower().startsWith("wayland");
     if (eglfsRequested &&
         !activePlatform.contains(QStringLiteral("eglfs")) &&
         !activePlatform.contains(QStringLiteral("minimalegl"))) {
-        qCritical() << "[EGLFS] 平台初始化不一致，期望 eglfs，实际为"
-                    << activePlatform
+        qCritical() << "平台初始化不一致，期望"
+                    << qpa << "，实际为" << activePlatform
                     << "。请检查启动命令、QT_QPA_PLATFORM 和平台插件路径。";
+        return EXIT_FAILURE;
+    }
+    if (waylandRequested && !activePlatform.contains(QStringLiteral("wayland"))) {
+        qCritical() << "平台初始化不一致，期望"
+                    << qpa << "，实际为" << activePlatform
+                    << "。请检查 Weston、WAYLAND_DISPLAY 和平台插件路径。";
         return EXIT_FAILURE;
     }
 
@@ -314,9 +332,8 @@ int main(int argc, char *argv[])
 
     setupQtHeartbeat(&a);
 
-    // EGLFS 只有一个原生窗口和一个 EGL surface。必须在根窗口首次 show()
-    // 之前创建包含 VideoHoleWidget(QOpenGLWidget) 的完整控件树，否则 Qt 5.12
-    // 可能在后续引入 OpenGL 子控件时得到全黑画面。
+    // 根窗口首次 show() 前创建完整控件树。EGLFS 回退模式需要唯一 EGL
+    // surface，Wayland 下也可避免启动阶段重复创建、销毁子 surface。
     const QScreen *screen = QGuiApplication::primaryScreen();
     const QRect screenGeometry = screen ? screen->geometry() : QRect(0, 0, 1024, 768);
     AppShell shell;
@@ -340,20 +357,31 @@ int main(int argc, char *argv[])
             activeRoot->update();
         }
         shell.update();
-        qInfo() << "[EGLFS] splash hidden, main view exposed";
+
+        // 让主界面先完成一次显示，再放行 GStreamer。本次 singleShot 的接收者
+        // 归属控件树，应用退出时会自动取消尚未执行的回调。
+        QWidget *multimediaRoot = shell.multimediaRootWidget();
+        MultimediaDemo *multimedia = multimediaRoot
+                ? multimediaRoot->findChild<MultimediaDemo *>()
+                : nullptr;
+        if (multimedia) {
+            QTimer::singleShot(0, multimedia,
+                               &MultimediaDemo::startPlaybackAfterSplash);
+        } else {
+            qWarning() << "splash finished but multimedia page was not found";
+        }
+        qInfo() << "splash hidden, main view exposed";
     });
 
-    // 完整控件树准备好后，只创建一次 EGLFS/KMS 全屏原生窗口。
+    // 完整控件树准备好后，只创建一个由 Weston 管理的全屏顶层窗口。
     shell.showFullScreen();
     splash.raise();
     a.processEvents(QEventLoop::AllEvents, 100);
 
-    qInfo() << "[EGLFS] root shown"
+    qInfo() << "root shown"
             << "platform=" << QGuiApplication::platformName()
             << "screen=" << (screen ? screen->name() : QStringLiteral("<none>"))
             << "geometry=" << shell.geometry()
-            << "atomic=" << qgetenv("QT_QPA_EGLFS_KMS_ATOMIC")
-            << "swapInterval=" << qgetenv("QT_QPA_EGLFS_SWAPINTERVAL")
             << "videoOutput=" << qgetenv("QT_YCEST_VIDEO_OUTPUT");
 
     IcToast::instance(shell.multimediaRootWidget());

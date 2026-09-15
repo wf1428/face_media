@@ -19,6 +19,7 @@
 #include <QGuiApplication>
 
 #include "command_dialog.h"
+#include "common/responsive_ui.h"
 #include "platform/rk3566_platform.h"
 
 
@@ -28,38 +29,10 @@ void CommandDialog::triggerAction(const QString &actionKey)
     emit actionClicked(actionKey);
 }
 
-/** @brief 从配置读取对话框尺寸并限制在当前屏幕可用范围内。 */
-QSize CommandDialog::loadWindowSizeFromConfig() const
+/** @brief 返回实际宿主尺寸；调试后台不再读取多媒体画布配置。 */
+QSize CommandDialog::availableWindowSize() const
 {
-    // 外部资源根目录
-    const QString configPath = Rk3566Platform::uiConfigPath();
-    qDebug() << "开始读取磁盘配置文件:" << configPath;
-
-    // 默认窗口大小
-    int windowWidth = 1024;
-    int windowHeight = 768;
-
-    if (QFile::exists(configPath)) {
-        QSettings settings(configPath, QSettings::IniFormat);
-        settings.setIniCodec("UTF-8");
-
-        settings.beginGroup("backRect");
-        windowWidth = settings.value("backPic_x_Size", 1024).toInt();
-        windowHeight = settings.value("backPic_y_Size", 768).toInt();
-        settings.endGroup();
-
-        qDebug() << "读取配置文件成功:" << configPath
-                 << ", backPic_x_Size=" << windowWidth
-                 << ", backPic_y_Size=" << windowHeight;
-    } else {
-        qDebug() << "配置文件不存在，设置界面使用默认窗口大小: 1024x768";
-    }
-
-    // 防御性限制，避免异常值
-    if (windowWidth < 640)  windowWidth = 640;
-    if (windowHeight < 480) windowHeight = 480;
-
-    return QSize(windowWidth, windowHeight);
+    return ResponsiveUi::hostRect(parentWidget()).size();
 }
 
 
@@ -69,13 +42,19 @@ CommandDialog::CommandDialog(QWidget *parent)
 {
     setWindowTitle("命令配置");
     setModal(false);
-    setWindowFlag(Qt::WindowContextHelpButtonHint, false);
+    if (ResponsiveUi::isWaylandPlatform() && parentWidget()) {
+        setWindowFlags(Qt::Widget);
+    } else {
+        setWindowFlag(Qt::WindowContextHelpButtonHint, false);
+    }
 
     setStyle(QStyleFactory::create("Fusion"));
     setAttribute(Qt::WA_StyledBackground, true);
+    if (parentWidget()) {
+        parentWidget()->installEventFilter(this);
+    }
 
-    const QSize cfgSize = loadWindowSizeFromConfig();
-    QSize finalSize = cfgSize;
+    QSize finalSize = availableWindowSize();
 
     QScreen *screen = QGuiApplication::primaryScreen();
     if (screen) {
@@ -85,21 +64,22 @@ CommandDialog::CommandDialog(QWidget *parent)
         finalSize.setHeight(qMin(finalSize.height(), avail.height()));
     }
 
-    // 允许 800x600 这种小屏，不再强制拉到 920x620
-    if (finalSize.width() < 640)  finalSize.setWidth(640);
-    if (finalSize.height() < 480) finalSize.setHeight(480);
+    // 后台管理界面统一以 600x600 为最小逻辑分辨率。
+    if (finalSize.width() < 600)  finalSize.setWidth(600);
+    if (finalSize.height() < 600) finalSize.setHeight(600);
 
-    // 小屏启用紧凑布局
-    m_compactLayout = (finalSize.width() <= 900 || finalSize.height() <= 620);
+    // 调试后台统一使用可滚动的紧凑结构。这样窗口运行中横竖屏互换时只需
+    // 改变几何尺寸，不必销毁并重建正在编辑的控件。
+    m_compactLayout = true;
 
     resize(finalSize);
 
-    // 小屏不要强制 900x600，否则 800x600 会被撑出屏幕
-    if (m_compactLayout) {
-        setMinimumSize(640, 480);
-    } else {
-        setMinimumSize(900, 600);
+    if (ResponsiveUi::isWaylandPlatform() && parentWidget()) {
+        setGeometry(parentWidget()->rect());
     }
+
+    setMinimumSize(ResponsiveUi::kMinimumScreenExtent,
+                   ResponsiveUi::kMinimumScreenExtent);
 
     auto *root = new QVBoxLayout(this);
 
@@ -483,6 +463,7 @@ QWidget* CommandDialog::makeRow(const QString &key, const QString &labelText, co
     edit->setObjectName("edit");
     edit->setText(defaultValue);
     edit->setReadOnly(true);
+    edit->setProperty("ycestCustomKeyboard", true);
     edit->setFixedHeight(36);
     edit->setClearButtonEnabled(true);
     edit->setPlaceholderText(QString("请输入%1").arg(labelText));
@@ -849,6 +830,10 @@ void CommandDialog::onActionClicked(const QString& action)
 /** @brief 为输入框接入软键盘并处理对话框内的交互事件。 */
 bool CommandDialog::eventFilter(QObject *obj, QEvent *event)
 {
+    if (obj == parentWidget() && event->type() == QEvent::Resize) {
+        setGeometry(ResponsiveUi::hostRect(parentWidget()));
+    }
+
     if (event->type() == QEvent::MouseButtonPress)
     {
         QLineEdit *edit = qobject_cast<QLineEdit *>(obj);

@@ -19,6 +19,8 @@
 #include <QPalette>
 #include <QTimer>
 #include <QImageReader>
+#include <QPainter>
+#include <QPainterPath>
 #include <QSettings>
 #include <QFileInfo>
 #include <QFile>
@@ -36,8 +38,13 @@
 #include <QHostAddress>
 #include <QStringList>
 #include <QVector>
+#include <QMap>
 #include <cstdlib>
+#include "common/responsive_ui.h"
+#include "components/dialogs/ui_message_box.h"
+#include "modules/facegate/FaceGateQt/ui/CameraPreviewWidget.h"
 #include "platform/rk3566_platform.h"
+#include "volumepopup.h"
 
 /** @return 字节是可显示的大写字母楼层编码时返回 true。 */
 static inline bool isFloorUpperLetterAscii(char ch)
@@ -45,7 +52,69 @@ static inline bool isFloorUpperLetterAscii(char ch)
     return ch >= 'A' && ch <= 'Z';
 }
 
+/** @return 鼠标事件在目标控件中的局部坐标，不依赖 Wayland 全局窗口位置。 */
+static QPoint mousePositionIn(QObject *watched,
+                              const QMouseEvent *event,
+                              QWidget *target)
+{
+    if (!event || !target) {
+        return QPoint();
+    }
+    if (auto *source = qobject_cast<QWidget *>(watched)) {
+        QWidget *sourceRoot = source->window();
+        QWidget *targetRoot = target->window();
+        if (sourceRoot && sourceRoot == targetRoot) {
+            // QWidget::mapTo() 的目标必须位于调用控件的父级链上。音量面板、
+            // 网络面板和视频画布互为兄弟控件，不能直接 source->mapTo(target)。
+            // 先映射到共同的应用根窗口，再从根窗口映射到目标控件，既符合
+            // Qt 的层级约束，也不依赖 Wayland 不保证的桌面全局坐标。
+            const QPoint rootPosition = source == sourceRoot
+                    ? event->pos()
+                    : source->mapTo(sourceRoot, event->pos());
+            return target == targetRoot
+                    ? rootPosition
+                    : target->mapFrom(targetRoot, rootPosition);
+        }
+    }
+    return target->mapFromGlobal(event->globalPos());
+}
+
 namespace {
+
+/**
+ * @brief 扫描目录中名称符合规则的图片候选文件。
+ *
+ * 扩展名不参与判断，实际格式由 QImageReader 根据文件内容识别；同一编号
+ * 存在多个文件时，使用按文件名排序后的第一个，保证每次启动结果一致。
+ */
+static QMap<int, QString> scanIndexedImageFiles(const QString &directoryPath,
+                                                const QRegExp &baseNamePattern)
+{
+    QMap<int, QString> filesByIndex;
+    QDir directory(directoryPath);
+    if (!directory.exists()) {
+        return filesByIndex;
+    }
+
+    const QFileInfoList entries = directory.entryInfoList(
+                QDir::Files | QDir::Readable | QDir::NoDotAndDotDot,
+                QDir::Name | QDir::IgnoreCase);
+    for (const QFileInfo &entry : entries) {
+        QRegExp matchPattern(baseNamePattern);
+        if (!matchPattern.exactMatch(entry.completeBaseName())) {
+            continue;
+        }
+
+        bool ok = false;
+        const int index = matchPattern.cap(1).toInt(&ok);
+        if (!ok || index <= 0 || filesByIndex.contains(index)) {
+            continue;
+        }
+        filesByIndex.insert(index, entry.absoluteFilePath());
+    }
+
+    return filesByIndex;
+}
 
 /** 持续探测失败期间，同一直播地址每小时最多打印一次探测状态。 */
 constexpr qint64 kLiveProbeFailureLogIntervalMs = 60LL * 60LL * 1000LL;
@@ -60,6 +129,7 @@ static QString normalizePlaybackModeForCfg(const QString &raw)
     if (v == QStringLiteral("LIVE")) {
         return QStringLiteral("LIVE");
     }
+    
     if (v == QStringLiteral("RECORDED") || v == QStringLiteral("RECORED")) {
         return QStringLiteral("RECORDED");
     }
@@ -659,7 +729,6 @@ static bool isLikelyLiveHttpBodyForLiveRetry(const QString &url,
     return false;
 }
 
-
 } // namespace
 
 
@@ -800,16 +869,10 @@ MultimediaDemo::MultimediaDemo(QWidget *parent) :
     // 读取上次保存的音量和amp_flag，并按文件内容恢复一次硬件状态
     int v = m_ampCtrl->loadVolumeFromFile();
 
-    // ALSA 硬件音量与 GStreamer playbin 软件音量保持同步。即使 RK3566
-    // 声卡没有 simple-mixer 控件，播放器音量仍然能够生效。
-    connect(m_ampCtrl, &AmpVolumeController::volumeApplied, this, [this](int percent) {
-        const float value01 = qBound(0, percent, 100) / 100.0f;
-        if (mediaPlayer) mediaPlayer->setVolume(value01);
-        if (nextVideoPlayer) nextVideoPlayer->setVolume(value01);
-        if (m_liveProbePlayer) m_liveProbePlayer->setVolume(0.0f);
-    });
-    if (mediaPlayer) mediaPlayer->setVolume(v / 100.0f);
-    if (nextVideoPlayer) nextVideoPlayer->setVolume(v / 100.0f);
+    // 全局音量只由 RK809 numid=3 的 60~200 原始值控制，正常业务播放器
+    // 保持 GStreamer 软件音量为 1.0，避免百分比在软硬件两端重复衰减。
+    if (mediaPlayer) mediaPlayer->setVolume(1.0f);
+    if (nextVideoPlayer) nextVideoPlayer->setVolume(1.0f);
     if (m_liveProbePlayer) m_liveProbePlayer->setVolume(0.0f);
     m_ampCtrl->setVolume(v);
 
@@ -841,14 +904,59 @@ MultimediaDemo::MultimediaDemo(QWidget *parent) :
     m_signalUiReady = true;
     onTimeout(); // 显示串口启动后可能已经收到的最新完整帧
 
-    // 开机只在 online_v1/online_v2 模式下读取 [playback]，没有收到过云端播放指令则保持原逻辑。
-    QTimer::singleShot(1500, this, &MultimediaDemo::restorePlaybackStateFromNetCfg);
-
     // 根据背景图片配置设置窗体大小
     this->setFixedSize(backPic_x_Size, backPic_y_Size);
     LOG_INIT("窗体大小设置为: " << backPic_x_Size << "x" << backPic_y_Size);
 
     LOG_INIT("MultimediaDemo构造函数执行完成");
+}
+
+
+/** @brief splash 隐藏后启动视频区域，并延续原有的播放状态恢复时序。 */
+void MultimediaDemo::startPlaybackAfterSplash()
+{
+    const bool firstRelease = !m_startupPlaybackReleased;
+    m_startupPlaybackReleased = true;
+
+    // 播放状态恢复原本在构造完成 1.5 秒后执行；现在以 splash 结束为起点，
+    // 保持相同延迟和业务逻辑，同时避免启动页期间创建播放管线。
+    if (firstRelease) {
+        QTimer::singleShot(1500, this, &MultimediaDemo::restorePlaybackStateFromNetCfg);
+        LOG_VIDEO("启动页已结束，媒体播放门控已放行");
+    }
+
+    // splash 期间可能因人体感应切到了人脸模块。此时只记录已经放行，
+    // 等模块重新激活时再执行首次播放，不能在后台占用解码器。
+    if (m_modulePlaybackSuspended || !isVisible()) {
+        m_localPlaybackEnabled = false;
+        LOG_VIDEO("启动页已结束，但多媒体模块不在前台，首次播放继续等待");
+        return;
+    }
+
+    if (m_initialVideoPlaybackStarted) {
+        return;
+    }
+
+    m_initialVideoPlaybackStarted = true;
+    m_localPlaybackEnabled = true;
+
+    if (VideoDisplay_en) {
+        initVideoPlayer();
+
+        if (!videoRectMediaList.isEmpty()) {
+            if (!m_currentVideoRectIsImage && videoWidget) {
+                videoWidget->show();
+            }
+            QTimer::singleShot(1000, this, &MultimediaDemo::testVideoOptimizations);
+        } else if (videoWidget) {
+            videoWidget->hide();
+        }
+    } else {
+        stopVideoRectPictureDisplay();
+        if (videoWidget) {
+            videoWidget->hide();
+        }
+    }
 }
 
 
@@ -945,13 +1053,11 @@ void MultimediaDemo::suspendPlaybackForModuleSwitch()
     if (m_modulePlaybackSuspended) return;
 
     m_modulePlaybackSuspended = true;
-    // “正在前台播放 LIVE”和“仍期望 LIVE、但已回退本地等待重试”
-    // 是两个独立状态。模块切换时两者都要保留 LIVE 业务目标，
-    // 但只有前者适合在返回界面时直接重建 LIVE 播放。
-    m_resumeLiveAfterModuleSwitch = m_liveDesired &&
-                                    !m_desiredLiveUrl.trimmed().isEmpty();
-    m_resumeLiveDirectlyAfterModuleSwitch = m_resumeLiveAfterModuleSwitch &&
-                                            m_isLiveMode;
+    // m_liveDesired/m_desiredLiveUrl 是唯一 LIVE 业务目标。离开多媒体主页时
+    // 只停止解码和探测资源，不清除目标；返回后先播放本地，再重新验证
+    // LIVE 确实有媒体数据，避免把旧的连接状态误当成当前可用。
+    const bool hasLiveTarget = m_liveDesired &&
+                               !m_desiredLiveUrl.trimmed().isEmpty();
     m_localPlaybackEnabled = false;
     stopEmptyVideoListWatch();
     stopLiveWatchdog();
@@ -978,9 +1084,7 @@ void MultimediaDemo::suspendPlaybackForModuleSwitch()
     m_liveSwitching = false;
     m_leaving = false;
 
-    if (m_resumeLiveDirectlyAfterModuleSwitch) {
-        LOG_VIDEO("模块切换暂停：已保留LIVE目标，返回后恢复:" << m_desiredLiveUrl);
-    } else if (m_resumeLiveAfterModuleSwitch) {
+    if (hasLiveTarget) {
         LOG_VIDEO("模块切换暂停：已保留LIVE重试目标，返回后恢复本地轮播并继续探测:"
                   << m_desiredLiveUrl);
     } else {
@@ -992,34 +1096,463 @@ void MultimediaDemo::suspendPlaybackForModuleSwitch()
 void MultimediaDemo::resumePlaybackAfterModuleSwitch()
 {
     m_modulePlaybackSuspended = false;
-    m_localPlaybackEnabled = true;
 
-    const bool resumeLiveTarget = m_resumeLiveAfterModuleSwitch &&
-                                  m_liveDesired &&
-                                  !m_desiredLiveUrl.trimmed().isEmpty();
-    const bool resumeLiveDirectly = resumeLiveTarget &&
-                                    m_resumeLiveDirectlyAfterModuleSwitch;
-    m_resumeLiveAfterModuleSwitch = false;
-    m_resumeLiveDirectlyAfterModuleSwitch = false;
-
-    if (resumeLiveDirectly) {
-        LOG_VIDEO("模块切换返回：恢复暂停前的LIVE目标:" << m_desiredLiveUrl);
-        switchToLiveStream(m_desiredLiveUrl, m_desiredLiveKind);
-        startLiveRetry();
+    if (!m_startupPlaybackReleased) {
+        m_localPlaybackEnabled = false;
+        LOG_VIDEO("启动页尚未结束，模块恢复请求暂不启动播放器");
         return;
     }
 
+    if (!m_initialVideoPlaybackStarted) {
+        startPlaybackAfterSplash();
+        // 首次启动已经从列表首项开始，无需紧接着重复恢复一次。
+        return;
+    }
+
+    m_localPlaybackEnabled = true;
+
+    // LIVE 目标本身是权威状态。即使目标是在页面暂停期间由 MQTT 新下发，
+    // 返回时也必须继续重试，不能依赖进入页面前保存的瞬时标志。
+    const bool resumeLiveTarget = m_liveDesired &&
+                                  !m_desiredLiveUrl.trimmed().isEmpty();
     if (resumeLiveTarget) {
-        // 切换模块前 LIVE 已经因无帧回退到本地。返回时保持本地播放，
-        // 但必须重启 MultimediaDemo 自己的重试定时器，它才能在探测成功后切回 LIVE。
+        // 管理页面或人脸模块返回后统一从本地首项播放，并重新探测 LIVE。
+        // 只有探测到协议有效且存在媒体数据时，probeLiveStream() 才会切回直播。
         LOG_VIDEO("模块切换返回：恢复本地轮播并继续探测LIVE目标:"
                   << m_desiredLiveUrl);
         resumeLocalPlaylistFromStart();
         startLiveRetry();
+        QTimer::singleShot(0, this, [this]() { onLiveRetryTimeout(); });
         return;
     }
 
     resumeLocalPlaylistFromStart();
+}
+
+/** @brief 先彻底停止多媒体资源，再以配置 videoRect 显示摄像头识别画面。 */
+void MultimediaDemo::beginEmbeddedFaceRecognition()
+{
+    if (m_embeddedFaceRecognitionActive) {
+        return;
+    }
+
+    suspendPlaybackForModuleSwitch();
+    if (videoRectPictureTimer) {
+        videoRectPictureTimer->stop();
+    }
+    if (label_videoRectPicture) {
+        label_videoRectPicture->clear();
+        label_videoRectPicture->hide();
+    }
+    if (bufferIndicator) {
+        bufferIndicator->hide();
+    }
+
+    m_embeddedFaceRecognitionActive = true;
+    const QRect videoRect(VideoDisplay_x, VideoDisplay_y,
+                          VideoDisplay_x_Size, VideoDisplay_y_Size);
+    const QRect pictureRect(PicDisplay_x, PicDisplay_y,
+                            PicDisplay_x_Size, PicDisplay_y_Size);
+    if (videoRect == pictureRect && label_picture) {
+        if (pictureTimer && pictureTimer->isActive()) {
+            pictureTimer->stop();
+        }
+        label_picture->hide();
+        m_pictureSuppressedBySharedFaceRect = true;
+    }
+
+    if (m_facePreview) {
+        m_facePreview->setGeometry(videoRect);
+        m_facePreview->clearFrame();
+        m_facePreview->setState(VerifyState::Idle);
+        m_facePreview->setStateText(QStringLiteral("正在启动摄像头"));
+        m_facePreview->setRecognitionGuideEnabled(true);
+        m_facePreview->show();
+        m_facePreview->raise();
+        raiseMovingTextOverlay();
+    }
+    LOG_VIDEO("多媒体播放器已完全停止，videoRect 已切换到人脸识别预览");
+}
+
+/** @brief 停止人脸展示并按约定从本地播放列表第一项重新开始。 */
+void MultimediaDemo::endEmbeddedFaceRecognition()
+{
+    if (!m_embeddedFaceRecognitionActive && !m_modulePlaybackSuspended) {
+        return;
+    }
+
+    m_embeddedFaceRecognitionActive = false;
+    if (m_facePreview) {
+        m_facePreview->hide();
+        m_facePreview->clearFrame();
+        m_facePreview->setFaces(QVector<DetectedFace>());
+    }
+    clearRecognitionImages(true);
+    m_pictureSuppressedBySharedFaceRect = false;
+
+    // 新模式不恢复旧媒体位置；先从本地列表第一项开始。若业务仍期望
+    // LIVE，保留该目标并恢复后台探测，探测成功后仍按原逻辑切回直播。
+    m_modulePlaybackSuspended = false;
+    m_localPlaybackEnabled = m_startupPlaybackReleased && isVisible();
+    if (m_localPlaybackEnabled) {
+        resumeLocalPlaylistFromStart();
+        if (m_liveDesired && !m_desiredLiveUrl.trimmed().isEmpty()) {
+            startLiveRetry();
+            QTimer::singleShot(0, this, [this]() { onLiveRetryTimeout(); });
+        }
+    }
+    LOG_VIDEO("人脸识别预览已关闭，从本地播放列表第一项恢复");
+}
+
+void MultimediaDemo::setEmbeddedFaceFrame(const QImage &image)
+{
+    if (m_embeddedFaceRecognitionActive && m_facePreview) {
+        m_facePreview->setFrame(image);
+    }
+}
+
+void MultimediaDemo::setEmbeddedFaceFaces(const QVector<DetectedFace> &faces)
+{
+    if (m_embeddedFaceRecognitionActive && m_facePreview) {
+        QVector<DetectedFace> displayFaces = faces;
+        if (!m_recognitionImageLabels.isEmpty()
+                || !m_pendingRecognitionImages.isEmpty()) {
+            for (DetectedFace &face : displayFaces) {
+                face.matched = true;
+                face.overlayStatus = QStringLiteral("passed");
+                face.overlayText = m_latestRecognitionName.trimmed().isEmpty()
+                        ? QStringLiteral("验证通过")
+                        : m_latestRecognitionName.trimmed();
+            }
+        }
+        m_facePreview->setFaces(displayFaces);
+    }
+}
+
+void MultimediaDemo::setEmbeddedFaceState(VerifyState state, const QString &message)
+{
+    if (!m_embeddedFaceRecognitionActive || !m_facePreview) {
+        return;
+    }
+    const bool showingResult = !m_recognitionImageLabels.isEmpty()
+            || !m_pendingRecognitionImages.isEmpty();
+    m_facePreview->setState(showingResult ? VerifyState::Passed : state);
+    m_facePreview->setStateText(showingResult
+            ? (m_latestRecognitionName.trimmed().isEmpty()
+               ? QStringLiteral("验证通过")
+               : QStringLiteral("验证通过  %1").arg(
+                     m_latestRecognitionName.trimmed()))
+            : message);
+}
+
+void MultimediaDemo::setEmbeddedFaceUnavailable(const QString &message)
+{
+    if (m_embeddedFaceRecognitionActive && m_facePreview) {
+        m_facePreview->setCameraUnavailableMessage(message);
+    }
+}
+
+/** @brief 显示通过人员图；当前区域放不下时进入下一批等待队列。 */
+void MultimediaDemo::showRecognitionImage(const QImage &image,
+                                           const QString &name,
+                                           int durationMs)
+{
+    if (!m_embeddedFaceRecognitionActive || !m_recognitionResultHost
+            || image.isNull()) {
+        return;
+    }
+
+    if (!m_picturePausedForRecognitionResult) {
+        if (pictureTimer) {
+            pictureTimer->stop();
+        }
+        if (label_picture) {
+            label_picture->hide();
+        }
+        m_picturePausedForRecognitionResult = true;
+    }
+
+    if (m_facePreview) {
+        // 结果照片显示期间不再叠加虚线框和单人识别提示。
+        m_facePreview->setRecognitionGuideEnabled(false);
+    }
+
+    const RecognitionImageItem item{image, name, qMax(1, durationMs)};
+    m_latestRecognitionName = name;
+    if (!canAppendRecognitionImage(image)) {
+        m_pendingRecognitionImages.append(item);
+        return;
+    }
+    appendRecognitionImage(item);
+}
+
+/** @brief 将照片加入当前批次，并从真正显示时开始计算保持时间。 */
+void MultimediaDemo::appendRecognitionImage(const RecognitionImageItem &item)
+{
+    if (!m_recognitionResultHost || item.image.isNull()) {
+        return;
+    }
+    m_latestRecognitionName = item.name;
+    auto *imageLabel = new QLabel(m_recognitionResultHost);
+    imageLabel->setAlignment(Qt::AlignCenter);
+    imageLabel->setToolTip(item.name);
+    imageLabel->setStyleSheet(QStringLiteral("background:transparent;border:none;"));
+    imageLabel->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+    m_recognitionImageLabels.append(imageLabel);
+    m_recognitionImages.insert(imageLabel, item.image);
+    m_recognitionNames.insert(imageLabel, item.name);
+
+    auto *expiryTimer = new QTimer(imageLabel);
+    expiryTimer->setSingleShot(true);
+    connect(expiryTimer, &QTimer::timeout, this, [this, imageLabel]() {
+        if (!m_recognitionImageLabels.removeOne(imageLabel)) {
+            return;
+        }
+        m_recognitionImages.remove(imageLabel);
+        m_recognitionNames.remove(imageLabel);
+        imageLabel->hide();
+        imageLabel->deleteLater();
+        if (m_recognitionImageLabels.isEmpty()) {
+            if (!m_pendingRecognitionImages.isEmpty()) {
+                startNextRecognitionBatch();
+            } else {
+                if (m_recognitionResultHost) {
+                    m_recognitionResultHost->hide();
+                }
+                restorePictureAfterRecognitionResult();
+                if (m_embeddedFaceRecognitionActive && m_facePreview) {
+                    m_facePreview->setRecognitionGuideEnabled(true);
+                }
+            }
+        } else {
+            layoutRecognitionImages();
+        }
+    });
+
+    layoutRecognitionImages();
+    m_recognitionResultHost->show();
+    m_recognitionResultHost->raise();
+    raiseMovingTextOverlay();
+    expiryTimer->start(qMax(1, item.durationMs));
+    emit recognitionResultDisplayStarted();
+}
+
+/** @return 新照片保持既定宽度后，是否仍能完整放入当前区域。 */
+bool MultimediaDemo::canAppendRecognitionImage(const QImage &image) const
+{
+    if (!m_recognitionResultHost || image.isNull()) {
+        return false;
+    }
+    if (m_recognitionImageLabels.isEmpty()) {
+        return true;
+    }
+    const QRect videoRect(VideoDisplay_x, VideoDisplay_y,
+                          VideoDisplay_x_Size, VideoDisplay_y_Size);
+    const QRect pictureRect(PicDisplay_x, PicDisplay_y,
+                            PicDisplay_x_Size, PicDisplay_y_Size);
+    if (videoRect == pictureRect) {
+        return false;
+    }
+
+    constexpr int spacing = 12;
+    int occupiedWidth = 0;
+    for (QLabel *label : m_recognitionImageLabels) {
+        occupiedWidth += recognitionCardWidth(m_recognitionImages.value(label));
+    }
+    if (!m_recognitionImageLabels.isEmpty()) {
+        occupiedWidth += spacing * m_recognitionImageLabels.size();
+    }
+    return occupiedWidth + recognitionCardWidth(image)
+            <= m_recognitionResultHost->width();
+}
+
+/** @brief 当前批次全部消失后，把等待队列中能放下的照片组成下一批。 */
+void MultimediaDemo::startNextRecognitionBatch()
+{
+    while (!m_pendingRecognitionImages.isEmpty()) {
+        const RecognitionImageItem item = m_pendingRecognitionImages.first();
+        if (!m_recognitionImageLabels.isEmpty()
+                && !canAppendRecognitionImage(item.image)) {
+            break;
+        }
+        m_pendingRecognitionImages.removeFirst();
+        appendRecognitionImage(item);
+    }
+}
+
+/** @return 卡片沿用人脸虚线框的肖像比例，高度受 pic 区域限制。 */
+int MultimediaDemo::recognitionCardWidth(const QImage &image) const
+{
+    if (!m_recognitionResultHost || image.isNull()) {
+        return 0;
+    }
+    const QRect videoRect(VideoDisplay_x, VideoDisplay_y,
+                          VideoDisplay_x_Size, VideoDisplay_y_Size);
+    const QRect pictureRect(PicDisplay_x, PicDisplay_y,
+                            PicDisplay_x_Size, PicDisplay_y_Size);
+    if (videoRect == pictureRect && m_facePreview) {
+        return qMax(1, m_facePreview->recognitionGuideDisplayRect().width());
+    }
+
+    const QRect guide = m_facePreview
+            ? m_facePreview->recognitionGuideDisplayRect() : QRect();
+    const qreal aspect = guide.isEmpty()
+            ? 0.76
+            : static_cast<qreal>(guide.width())
+              / static_cast<qreal>(qMax(1, guide.height()));
+    return qBound(1, qRound(recognitionCardHeight() * aspect),
+                  qMax(1, m_recognitionResultHost->width()));
+}
+
+int MultimediaDemo::recognitionCardHeight() const
+{
+    if (!m_recognitionResultHost) {
+        return 0;
+    }
+    const QRect guide = m_facePreview
+            ? m_facePreview->recognitionGuideDisplayRect() : QRect();
+    const int desiredHeight = guide.isEmpty()
+            ? m_recognitionResultHost->height() - 4 : guide.height();
+    return qBound(1, desiredHeight,
+                  qMax(1, m_recognitionResultHost->height() - 4));
+}
+
+/** @brief 根据当前批次数量居中排列，卡片不因新增人员而继续缩窄。 */
+void MultimediaDemo::layoutRecognitionImages()
+{
+    if (!m_recognitionResultHost) {
+        return;
+    }
+    if (m_recognitionImageLabels.isEmpty()) {
+        m_recognitionResultHost->hide();
+        return;
+    }
+
+    const QRect videoRect(VideoDisplay_x, VideoDisplay_y,
+                          VideoDisplay_x_Size, VideoDisplay_y_Size);
+    const QRect pictureRect(PicDisplay_x, PicDisplay_y,
+                            PicDisplay_x_Size, PicDisplay_y_Size);
+    const bool sharedRect = videoRect == pictureRect;
+    m_recognitionResultHost->setStyleSheet(sharedRect
+            ? QStringLiteral("#recognitionResultHost{background:#000000;}")
+            : QStringLiteral("#recognitionResultHost{background:transparent;}"));
+
+    constexpr int spacing = 12;
+    int totalWidth = 0;
+    for (QLabel *label : m_recognitionImageLabels) {
+        totalWidth += recognitionCardWidth(m_recognitionImages.value(label));
+    }
+    totalWidth += spacing * qMax(0, m_recognitionImageLabels.size() - 1);
+    int x = qMax(0, (m_recognitionResultHost->width() - totalWidth) / 2);
+
+    for (QLabel *label : m_recognitionImageLabels) {
+        if (!label) {
+            continue;
+        }
+        const QImage source = m_recognitionImages.value(label);
+        QRect slot;
+        if (sharedRect && m_facePreview) {
+            slot = m_facePreview->recognitionGuideDisplayRect();
+        } else {
+            const int cardWidth = recognitionCardWidth(source);
+            const int cardHeight = recognitionCardHeight();
+            slot = QRect(x, (m_recognitionResultHost->height() - cardHeight) / 2,
+                         cardWidth, cardHeight);
+            x += cardWidth + spacing;
+        }
+        label->setGeometry(slot);
+        label->setPixmap(renderRecognitionCard(
+                             source, m_recognitionNames.value(label), slot.size()));
+        label->show();
+    }
+}
+
+/** @return 以圆角裁切图片，并在图片内部底部绘制姓名。 */
+QPixmap MultimediaDemo::renderRecognitionCard(const QImage &image,
+                                               const QString &name,
+                                               const QSize &size) const
+{
+    if (image.isNull() || size.isEmpty()) {
+        return QPixmap();
+    }
+
+    QPixmap card(size);
+    card.fill(Qt::transparent);
+    QPainter painter(&card);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+
+    const QRectF cardRect(QRect(QPoint(0, 0), size).adjusted(1, 1, -1, -1));
+    QPainterPath clipPath;
+    clipPath.addRoundedRect(cardRect, 14, 14);
+    painter.setClipPath(clipPath);
+
+    const QImage scaled = image.scaled(size, Qt::KeepAspectRatioByExpanding,
+                                       Qt::SmoothTransformation);
+    const QPoint imageTopLeft((size.width() - scaled.width()) / 2,
+                              (size.height() - scaled.height()) / 2);
+    painter.drawImage(imageTopLeft, scaled);
+
+    const int nameHeight = qBound(28, size.height() / 5, 46);
+    const QRect nameRect(0, size.height() - nameHeight,
+                         size.width(), nameHeight);
+    painter.fillRect(nameRect, QColor(0, 0, 0, 175));
+    QFont nameFont = painter.font();
+    nameFont.setBold(true);
+    nameFont.setPixelSize(qBound(14, nameHeight / 2, 22));
+    painter.setFont(nameFont);
+    painter.setPen(Qt::white);
+    const QString displayName = name.trimmed().isEmpty()
+            ? QStringLiteral("已授权人员") : name.trimmed();
+    const QString elidedName = QFontMetrics(nameFont).elidedText(
+                displayName, Qt::ElideRight, qMax(1, nameRect.width() - 16));
+    painter.drawText(nameRect.adjusted(8, 0, -8, 0),
+                     Qt::AlignCenter, elidedName);
+    return card;
+}
+
+void MultimediaDemo::clearRecognitionImages(bool restorePicturePlayback)
+{
+    const QList<QLabel *> labels = m_recognitionImageLabels;
+    m_recognitionImageLabels.clear();
+    m_recognitionImages.clear();
+    m_recognitionNames.clear();
+    m_pendingRecognitionImages.clear();
+    m_latestRecognitionName.clear();
+    for (QLabel *label : labels) {
+        delete label;
+    }
+    if (m_recognitionResultHost) {
+        m_recognitionResultHost->hide();
+    }
+    if (restorePicturePlayback) {
+        restorePictureAfterRecognitionResult();
+    }
+}
+
+void MultimediaDemo::restorePictureAfterRecognitionResult()
+{
+    if (!m_picturePausedForRecognitionResult
+            && !m_pictureSuppressedBySharedFaceRect) {
+        return;
+    }
+    if (m_embeddedFaceRecognitionActive && m_pictureSuppressedBySharedFaceRect) {
+        return;
+    }
+
+    m_picturePausedForRecognitionResult = false;
+    if (!PicDisplay_en || !label_picture || picturePixmapCache.isEmpty()) {
+        return;
+    }
+    currentPictureIndex = qBound(0, currentPictureIndex,
+                                 picturePixmapCache.size() - 1);
+    label_picture->setPixmap(picturePixmapCache.at(currentPictureIndex));
+    label_picture->show();
+    label_picture->raise();
+    raiseMovingTextOverlay();
+    if (pictureTimer && picturePixmapCache.size() > 1) {
+        pictureTimer->start(qMax(1, PicDisplay_Time) * 1000);
+    }
 }
 
 /** @brief 离开页面时停止全部播放器、探测和定时任务，避免后台占用解码资源。 */
@@ -1334,6 +1867,11 @@ void MultimediaDemo::playVideoRectMediaAt(int index)
 /** @brief 让主播放器播放 videoRect 视频项。 */
 void MultimediaDemo::playVideoRectVideo(const QString &filePath)
 {
+    if (!m_startupPlaybackReleased) {
+        LOG_VIDEO("启动页尚未结束，忽略提前的视频开播请求:" << filePath);
+        return;
+    }
+
     if (filePath.trimmed().isEmpty()) {
         playNextVideo();
         return;
@@ -1369,7 +1907,7 @@ void MultimediaDemo::playVideoRectVideo(const QString &filePath)
         videoWidget->resize(VideoDisplay_x_Size, VideoDisplay_y_Size);
         videoWidget->move(VideoDisplay_x, VideoDisplay_y);
         videoWidget->show();
-        // EGLFS 下视频是 Qt 场景中的 QOpenGLWidget。不要在每次切片时 raise，
+        // Qt 合成的视频是场景中的 QOpenGLWidget。不要在每次切片时 raise，
         // 否则会把已经显示的提示条、状态标签和软件光标压到下面。
         videoWidget->update();
     }
@@ -1465,6 +2003,7 @@ void MultimediaDemo::playVideoRectImage(const QString &filePath)
     label_videoRectPicture->setPixmap(scaled);
     label_videoRectPicture->show();
     label_videoRectPicture->raise();
+    raiseMovingTextOverlay();
 
     currentVideoIndex = -1;
     m_currentVideoRectIsImage = true;
@@ -1801,6 +2340,7 @@ void MultimediaDemo::pauseLocalPlaybackForDownload()
         if (label_videoRectPicture) {
             label_videoRectPicture->show();
             label_videoRectPicture->raise();
+            raiseMovingTextOverlay();
         }
     } else {
         if (videoWidget) {
@@ -2083,6 +2623,23 @@ void MultimediaDemo::initializeComponents()
     label_week = new QLabel(this);
     label_picture = new QLabel(this);
 
+    // 新识别模式只在多媒体页新增一份显示控件；摄像头和推理仍由
+    // FaceGateMainWindow 持有，避免迁移门禁业务和运行时重挂 OpenGL 控件。
+    m_facePreview = new CameraPreviewWidget(this);
+    m_facePreview->setObjectName(QStringLiteral("embeddedFacePreview"));
+    m_facePreview->setMinimumSize(0, 0);
+    m_facePreview->setOverlayWidths(0, 0);
+    m_facePreview->setRecognitionGuideEnabled(true);
+    m_facePreview->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+    m_facePreview->hide();
+
+    m_recognitionResultHost = new QWidget(this);
+    m_recognitionResultHost->setObjectName(QStringLiteral("recognitionResultHost"));
+    m_recognitionResultHost->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+    m_recognitionResultHost->setStyleSheet(
+                QStringLiteral("#recognitionResultHost{background:transparent;}"));
+    m_recognitionResultHost->hide();
+
     // videoRect 图片混播
     label_videoRectPicture = new QLabel(this);
     label_videoRectPicture->setObjectName("label_videoRectPicture");
@@ -2112,7 +2669,7 @@ void MultimediaDemo::initializeComponents()
     label_airCondiTemp->hide(); // 默认隐藏，根据配置显示
 
     // GStreamer 仍优先使用 MPP 硬件解码，解码后的 NV12 帧通过 appsink
-    // 交给该 QOpenGLWidget，由 Qt/EGLFS 完成最终合成。
+    // 交给该 QOpenGLWidget，由 Qt/OpenGL 完成最终合成。
     videoWidget = new VideoHoleWidget(this);
     videoWidget->setObjectName("videoWidget");
     videoWidget->setAttribute(Qt::WA_OpaquePaintEvent, true);
@@ -2154,7 +2711,7 @@ void MultimediaDemo::initializeComponents()
     mediaPlayer->setVideoOutput(videoWidget);
     nextVideoPlayer->setVideoOutput(nullptr);
 
-    // 将 [videoRect] 区域显式传给 Qt/EGLFS 视频画布。GStreamer 仅负责
+    // 将 [videoRect] 区域显式传给 Qt/OpenGL 视频画布。GStreamer 仅负责
     // 解码和输出 NV12 帧，不再使用 GstVideoOverlay/X11 窗口句柄。
     mediaPlayer->setDisplayRect(QRect(VideoDisplay_x,
                                       VideoDisplay_y,
@@ -2430,6 +2987,27 @@ void MultimediaDemo::readConfigurationFromFile()
     Logo4_x_Size = settings.value("Logo4_x_Size", 600).toInt();
     Logo4_y_Size = settings.value("Logo4_y_Size", 80).toInt();
     settings.endGroup();
+
+    // 读取底部滚动通知配置。速度固定为五档，越大越快。
+    settings.beginGroup("moveTextRect");
+    MoveTextDisplay_en = settings.value("MoveTextDisplay_en", false).toBool();
+    MoveTextDisplay_x = settings.value("MoveTextDisplay_x", 0).toInt();
+    MoveTextDisplay_y = settings.value("MoveTextDisplay_y", 730).toInt();
+    MoveTextDisplay_x_Size = settings.value("MoveTextDisplay_x_Size", 1024).toInt();
+    MoveTextDisplay_y_Size = settings.value("MoveTextDisplay_y_Size", 40).toInt();
+    MoveTextColorR = settings.value("MoveTextColorR", 255).toInt();
+    MoveTextColorG = settings.value("MoveTextColorG", 255).toInt();
+    MoveTextColorB = settings.value("MoveTextColorB", 255).toInt();
+    MoveTextSize = settings.value("MoveTextSize", 25).toInt();
+    MoveTextSpeed = qBound(1, settings.value("MoveTextSpeed", 2).toInt(), 5);
+    settings.endGroup();
+    LOG_CONFIG("读取滚动文字配置: enabled=" << MoveTextDisplay_en
+               << ", rect=(" << MoveTextDisplay_x << "," << MoveTextDisplay_y
+               << "," << MoveTextDisplay_x_Size << "x" << MoveTextDisplay_y_Size << ")"
+               << ", color=(" << MoveTextColorR << "," << MoveTextColorG
+               << "," << MoveTextColorB << ")"
+               << ", fontSize=" << MoveTextSize
+               << ", speedLevel=" << MoveTextSpeed);
     //打印读取结果
     LOG_CONFIG("读取方向显示配置: Diretion_en=" << Diretion_en << ", Diretion_x=" << Diretion_x << ", Diretion_y=" << Diretion_y << ", Diretion_x_Size=" << Diretion_x_Size << ", Diretion_y_Size=" << Diretion_y_Size);
 
@@ -2589,12 +3167,23 @@ void MultimediaDemo::readConfigurationFromFile()
         if (label_videoRectPicture) {
             label_videoRectPicture->setGeometry(configuredVideoRect);
         }
+        if (m_facePreview) {
+            m_facePreview->setGeometry(configuredVideoRect);
+        }
         if (mediaPlayer) {
             mediaPlayer->setDisplayRect(configuredVideoRect);
         }
         LOG_CONFIG("GStreamer视频区域已应用:" << configuredVideoRect);
     } else {
         LOG_CONFIG("警告: videoRect区域无效，继续使用默认区域:" << configuredVideoRect);
+    }
+
+    if (m_recognitionResultHost) {
+        const QRect configuredPictureRect(PicDisplay_x, PicDisplay_y,
+                                          PicDisplay_x_Size, PicDisplay_y_Size);
+        m_recognitionResultHost->setGeometry(
+                    configuredPictureRect == configuredVideoRect
+                    ? configuredVideoRect : configuredPictureRect);
     }
 
     // 读取空调配置
@@ -2817,217 +3406,65 @@ void MultimediaDemo::initializeConfiguration()
     // 楼层、方向和状态图片在启动阶段预加载，信号变化时只取缓存。
     preloadSignalUiPixmaps();
 
-    // 设置Logo1显示
-    if (Logo1_en) {
-        // 图片相对路径
-        const QString logo1Rel = "demoResources/images/logo/logo1.png";
+    // Logo 按资源组整体选择来源：只要外部目录存在任意 logo1～logo4，
+    // 整组就不再从 qrc 补图，避免外部资源与内置资源混合显示。
+    const QString externalLogoDir = QDir(extRoot).filePath("demoResources/images/logo");
+    const QString qrcLogoDir = QDir(qrcRoot).filePath("demoResources/images/logo");
+    const QRegExp logoNamePattern(QStringLiteral("^logo([1-4])$"), Qt::CaseInsensitive);
+    const QMap<int, QString> externalLogoFiles =
+            scanIndexedImageFiles(externalLogoDir, logoNamePattern);
+    const bool useExternalLogoGroup = !externalLogoFiles.isEmpty();
+    const QMap<int, QString> logoFiles = useExternalLogoGroup
+            ? externalLogoFiles
+            : scanIndexedImageFiles(qrcLogoDir, logoNamePattern);
 
-        // 外部优先、qrc 兜底
-        const QString logo1PathExt = QDir(extRoot).filePath(logo1Rel);
-        const QString logo1PathQrc = QDir(qrcRoot).filePath(logo1Rel);
+    LOG_CONFIG("Logo资源组来源: "
+               << (useExternalLogoGroup ? "外部目录" : "qrc内置资源")
+               << ", 匹配数量=" << logoFiles.size());
 
-        QPixmap logo1Pixmap;
-        QString usedPath;
+    QLabel *logoLabels[] = { label_logo1, label_logo2, label_logo3, label_logo4 };
+    const bool logoEnabled[] = { Logo1_en, Logo2_en, Logo3_en, Logo4_en };
+    const int logoX[] = { Logo1_x, Logo2_x, Logo3_x, Logo4_x };
+    const int logoY[] = { Logo1_y, Logo2_y, Logo3_y, Logo4_y };
+    const int logoWidth[] = {
+        Logo1_x_Size, Logo2_x_Size, Logo3_x_Size, Logo4_x_Size
+    };
+    const int logoHeight[] = {
+        Logo1_y_Size, Logo2_y_Size, Logo3_y_Size, Logo4_y_Size
+    };
 
-        // 1) 先尝试外部
-        LOG_CONFIG("尝试从外部目录加载logo1图片: " << logo1PathExt);
-        {
-            const QFileInfo fi(logo1PathExt);
-            if (fi.exists() && fi.isFile() && fi.isReadable()) {
-                logo1Pixmap = loadPixmapWithIgnoreWarnings(logo1PathExt);
-                if (!logo1Pixmap.isNull()) {
-                    usedPath = logo1PathExt;
-                } else {
-                    LOG_CONFIG("外部logo1存在但加载失败(可能损坏/格式不对): " << logo1PathExt);
-                }
-            } else {
-                LOG_CONFIG("外部logo1不可用(不存在/非文件/不可读): " << logo1PathExt);
-            }
+    for (int index = 1; index <= 4; ++index) {
+        QLabel *label = logoLabels[index - 1];
+        label->clear();
+        label->hide();
+
+        if (!logoEnabled[index - 1]) {
+            continue;
         }
 
-        // 2) 外部失败再用 qrc
-        if (logo1Pixmap.isNull()) {
-            LOG_CONFIG("尝试从qrc加载logo1图片: " << logo1PathQrc);
-            logo1Pixmap = loadPixmapWithIgnoreWarnings(logo1PathQrc);
-            if (!logo1Pixmap.isNull()) {
-                usedPath = logo1PathQrc;
-            } else {
-                LOG_CONFIG("qrc logo1加载失败: " << logo1PathQrc);
-            }
+        const QString imagePath = logoFiles.value(index);
+        if (imagePath.isEmpty()) {
+            LOG_CONFIG("logo" << index << "在当前资源组中不存在，保持隐藏");
+            continue;
         }
 
-        if (!logo1Pixmap.isNull()) {
-            label_logo1->move(Logo1_x, Logo1_y);
-            label_logo1->resize(Logo1_x_Size, Logo1_y_Size);
-            label_logo1->setPixmap(logo1Pixmap);
-            label_logo1->show();
-
-            LOG_CONFIG("logo1图片加载成功: " << usedPath);
-            LOG_CONFIG("logo1已设置位置和大小: (" << Logo1_x << ", " << Logo1_y << ") 大小: " << Logo1_x_Size << "x" << Logo1_y_Size);
-        } else {
-            LOG_CONFIG("警告: 无法加载logo1图片");
-            LOG_CONFIG("尝试的外部路径: " << logo1PathExt);
-            LOG_CONFIG("尝试的qrc路径: " << logo1PathQrc);
-        }
-    }
-
-
-    // 设置Logo2显示
-    if (Logo2_en) {
-        const QString logo2Rel = "demoResources/images/logo/logo2.png";
-        const QString logo2PathExt = QDir(extRoot).filePath(logo2Rel);
-        const QString logo2PathQrc = QDir(qrcRoot).filePath(logo2Rel);
-
-        QPixmap logo2Pixmap;
-        QString usedPath;
-
-        // 1) 外部优先
-        LOG_CONFIG("尝试从外部目录加载logo2图片: " << logo2PathExt);
-        {
-            const QFileInfo fi(logo2PathExt);
-            if (fi.exists() && fi.isFile() && fi.isReadable()) {
-                logo2Pixmap = loadPixmapWithIgnoreWarnings(logo2PathExt);
-                if (!logo2Pixmap.isNull()) {
-                    usedPath = logo2PathExt;
-                } else {
-                    LOG_CONFIG("外部logo2存在但加载失败(可能损坏/格式不对): " << logo2PathExt);
-                }
-            } else {
-                LOG_CONFIG("外部logo2不可用(不存在/非文件/不可读): " << logo2PathExt);
-            }
+        const QPixmap pixmap = loadPixmapWithIgnoreWarnings(imagePath);
+        if (pixmap.isNull()) {
+            LOG_CONFIG("logo" << index
+                       << "存在但无法解码，不回退到另一资源组: " << imagePath);
+            continue;
         }
 
-        // 2) 外部失败再用 qrc
-        if (logo2Pixmap.isNull()) {
-            LOG_CONFIG("尝试从qrc加载logo2图片: " << logo2PathQrc);
-            logo2Pixmap = loadPixmapWithIgnoreWarnings(logo2PathQrc);
-            if (!logo2Pixmap.isNull()) {
-                usedPath = logo2PathQrc;
-            } else {
-                LOG_CONFIG("qrc logo2加载失败: " << logo2PathQrc);
-            }
-        }
+        label->move(logoX[index - 1], logoY[index - 1]);
+        label->resize(logoWidth[index - 1], logoHeight[index - 1]);
+        label->setPixmap(pixmap);
+        label->show();
 
-        if (!logo2Pixmap.isNull()) {
-            label_logo2->move(Logo2_x, Logo2_y);
-            label_logo2->resize(Logo2_x_Size, Logo2_y_Size);
-            label_logo2->setPixmap(logo2Pixmap);
-            label_logo2->show();
-
-            LOG_CONFIG("logo2图片加载成功: " << usedPath);
-            LOG_CONFIG("logo2已设置位置和大小: (" << Logo2_x << ", " << Logo2_y
-                      << ") 大小: " << Logo2_x_Size << "x" << Logo2_y_Size);
-        } else {
-            LOG_CONFIG("警告: 无法加载logo2图片");
-            LOG_CONFIG("尝试的外部路径: " << logo2PathExt);
-            LOG_CONFIG("尝试的qrc路径: " << logo2PathQrc);
-        }
-    }
-
-
-    // 设置Logo3显示
-    if (Logo3_en) {
-        const QString logo3Rel = "demoResources/images/logo/logo3.png";
-        const QString logo3PathExt = QDir(extRoot).filePath(logo3Rel);
-        const QString logo3PathQrc = QDir(qrcRoot).filePath(logo3Rel);
-
-        QPixmap logo3Pixmap;
-        QString usedPath;
-
-        // 1) 外部优先
-        LOG_CONFIG("尝试从外部目录加载logo3图片: " << logo3PathExt);
-        {
-            const QFileInfo fi(logo3PathExt);
-            if (fi.exists() && fi.isFile() && fi.isReadable()) {
-                logo3Pixmap = loadPixmapWithIgnoreWarnings(logo3PathExt);
-                if (!logo3Pixmap.isNull()) {
-                    usedPath = logo3PathExt;
-                } else {
-                    LOG_CONFIG("外部logo3存在但加载失败(可能损坏/格式不对): " << logo3PathExt);
-                }
-            } else {
-                LOG_CONFIG("外部logo3不可用(不存在/非文件/不可读): " << logo3PathExt);
-            }
-        }
-
-        // 2) 外部失败再用 qrc
-        if (logo3Pixmap.isNull()) {
-            LOG_CONFIG("尝试从qrc加载logo3图片: " << logo3PathQrc);
-            logo3Pixmap = loadPixmapWithIgnoreWarnings(logo3PathQrc);
-            if (!logo3Pixmap.isNull()) {
-                usedPath = logo3PathQrc;
-            } else {
-                LOG_CONFIG("qrc logo3加载失败: " << logo3PathQrc);
-            }
-        }
-
-        if (!logo3Pixmap.isNull()) {
-            label_logo3->move(Logo3_x, Logo3_y);
-            label_logo3->resize(Logo3_x_Size, Logo3_y_Size);
-            label_logo3->setPixmap(logo3Pixmap);
-            label_logo3->show();
-
-            LOG_CONFIG("logo3图片加载成功: " << usedPath);
-            LOG_CONFIG("logo3已设置位置和大小: (" << Logo3_x << ", " << Logo3_y
-                      << ") 大小: " << Logo3_x_Size << "x" << Logo3_y_Size);
-        } else {
-            LOG_CONFIG("警告: 无法加载logo3图片");
-            LOG_CONFIG("尝试的外部路径: " << logo3PathExt);
-            LOG_CONFIG("尝试的qrc路径: " << logo3PathQrc);
-        }
-    }
-
-
-    // 设置Logo4显示
-    if (Logo4_en) {
-        const QString logo4Rel = "demoResources/images/logo/logo4.png";
-        const QString logo4PathExt = QDir(extRoot).filePath(logo4Rel);
-        const QString logo4PathQrc = QDir(qrcRoot).filePath(logo4Rel);
-
-        QPixmap logo4Pixmap;
-        QString usedPath;
-
-        // 1) 外部优先
-        LOG_CONFIG("尝试从外部目录加载logo4图片: " << logo4PathExt);
-        {
-            const QFileInfo fi(logo4PathExt);
-            if (fi.exists() && fi.isFile() && fi.isReadable()) {
-                logo4Pixmap = loadPixmapWithIgnoreWarnings(logo4PathExt);
-                if (!logo4Pixmap.isNull()) {
-                    usedPath = logo4PathExt;
-                } else {
-                    LOG_CONFIG("外部logo4存在但加载失败(可能损坏/格式不对): " << logo4PathExt);
-                }
-            } else {
-                LOG_CONFIG("外部logo4不可用(不存在/非文件/不可读): " << logo4PathExt);
-            }
-        }
-
-        // 2) 外部失败再用 qrc
-        if (logo4Pixmap.isNull()) {
-            LOG_CONFIG("尝试从qrc加载logo4图片: " << logo4PathQrc);
-            logo4Pixmap = loadPixmapWithIgnoreWarnings(logo4PathQrc);
-            if (!logo4Pixmap.isNull()) {
-                usedPath = logo4PathQrc;
-            } else {
-                LOG_CONFIG("qrc logo4加载失败: " << logo4PathQrc);
-            }
-        }
-
-        if (!logo4Pixmap.isNull()) {
-            label_logo4->move(Logo4_x, Logo4_y);
-            label_logo4->resize(Logo4_x_Size, Logo4_y_Size);
-            label_logo4->setPixmap(logo4Pixmap);
-            label_logo4->show();
-
-            LOG_CONFIG("logo4图片加载成功: " << usedPath);
-            LOG_CONFIG("logo4已设置位置和大小: (" << Logo4_x << ", " << Logo4_y
-                      << ") 大小: " << Logo4_x_Size << "x" << Logo4_y_Size);
-        } else {
-            LOG_CONFIG("警告: 无法加载logo4图片");
-            LOG_CONFIG("尝试的外部路径: " << logo4PathExt);
-            LOG_CONFIG("尝试的qrc路径: " << logo4PathQrc);
-        }
+        LOG_CONFIG("logo" << index << "图片加载成功: " << imagePath);
+        LOG_CONFIG("logo" << index << "已设置位置和大小: ("
+                   << logoX[index - 1] << ", " << logoY[index - 1]
+                   << ") 大小: " << logoWidth[index - 1]
+                   << "x" << logoHeight[index - 1]);
     }
 
 
@@ -3065,7 +3502,7 @@ void MultimediaDemo::initializeConfiguration()
     }
 
     // 背景图是在 VideoHoleWidget 创建之后才加载和 show() 的。这里重新固定
-    // EGLFS 合成层级，避免整块 BG01/back 标签遮住已经正常绘制的视频 FBO。
+    // Qt 合成层级，避免整块 BG01/back 标签遮住已经正常绘制的视频 FBO。
     if (videoWidget) {
         videoWidget->raise();
     }
@@ -3085,33 +3522,20 @@ void MultimediaDemo::initializeConfiguration()
     label_logo3->raise();
     label_logo4->raise();
 
-    LOG_INIT("EGLFS层级已固定：back/bg01(底层) -> videoWidget -> 业务UI标签(顶层)");
+    LOG_INIT("Qt合成层级已固定：back/bg01(底层) -> videoWidget -> 业务UI标签(顶层)");
 
     LOG_CONFIG("配置参数初始化完成:");
     LOG_CONFIG("  - 楼层显示位置: (" << First_Floor_x << ", " << First_Floor_y << ") 大小: " << First_Floor_x_Size << "x" << First_Floor_y_Size);
     LOG_CONFIG("  - 日期显示位置: (" << DateDisplay_x << ", " << DateDisplay_y << ")");
     LOG_CONFIG("  - 星期显示位置: (" << WeekDisplay_x << ", " << WeekDisplay_y << ")");
 
-    // 初始化视频播放
+    // 视频区域的几何和资源已经准备好，但真正播放由 splashFinished 放行。
     if (VideoDisplay_en) {
-        initVideoPlayer();
-
-        // 显示播放组件
-        if (!videoRectMediaList.isEmpty()) {
-            if (!m_currentVideoRectIsImage && videoWidget) {
-                videoWidget->show();
-            }
-            // 延迟调用测试函数，确保所有组件已初始化完成
-            QTimer::singleShot(1000, this, &MultimediaDemo::testVideoOptimizations);
-
-            // 新增：延时截图，等视频真正显示出来后再抓
-            //QTimer::singleShot(3000, this, &MultimediaDemo::testScreenGrab);
-        } else {
-            if (videoWidget) {
-                videoWidget->hide();
-            }
-        }
-
+        videoWidget->resize(VideoDisplay_x_Size, VideoDisplay_y_Size);
+        videoWidget->move(VideoDisplay_x, VideoDisplay_y);
+        videoWidget->hide();
+        stopVideoRectPictureDisplay(true);
+        LOG_VIDEO("视频区域初始化完成，等待启动页结束后开播");
     } else {
         stopVideoRectPictureDisplay();
         if (videoWidget) {
@@ -3182,13 +3606,106 @@ void MultimediaDemo::initializeConfiguration()
         label_picture->hide();
     }
 
-    // 让本窗口和所有子控件的右键都能被捕获
-    this->installEventFilter(this);
-    //qApp->installEventFilter(this);
+    initializeMovingText();
 
-    const auto children = this->findChildren<QWidget*>();
-    for (QWidget *w : children) {
-        w->installEventFilter(this);
+    // 页面显示期间由 showEvent() 只安装一条应用级过滤器。原先同时给本页、
+    // 全部子控件和 qApp 安装同一个过滤器，会让未被拦截的鼠标事件执行两遍，
+    // 动态新增控件也容易遗漏。
+}
+
+/** @brief 创建黑色裁剪区域，并只读取 U 盘静态目录中的 notice.txt。 */
+void MultimediaDemo::initializeMovingText()
+{
+    if (!MoveTextDisplay_en) {
+        LOG_CONFIG("滚动文字开关关闭");
+        return;
+    }
+    if (MoveTextDisplay_x_Size <= 0 || MoveTextDisplay_y_Size <= 0) {
+        LOG_CONFIG("滚动文字区域尺寸无效，保持关闭");
+        return;
+    }
+
+    m_moveTextViewport = new QWidget(this);
+    m_moveTextViewport->setObjectName(QStringLiteral("moveTextViewport"));
+    m_moveTextViewport->setGeometry(MoveTextDisplay_x, MoveTextDisplay_y,
+                                    MoveTextDisplay_x_Size, MoveTextDisplay_y_Size);
+    m_moveTextViewport->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+    m_moveTextViewport->setStyleSheet(
+                QStringLiteral("#moveTextViewport{background:#000000;}"));
+
+    m_moveTextLabel = new QLabel(m_moveTextViewport);
+    m_moveTextLabel->setTextFormat(Qt::PlainText);
+    m_moveTextLabel->setAlignment(Qt::AlignVCenter | Qt::AlignLeft);
+    m_moveTextLabel->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+
+    QFont font = m_moveTextLabel->font();
+    font.setPointSize(qMax(1, MoveTextSize));
+    m_moveTextLabel->setFont(font);
+    const QColor textColor(qBound(0, MoveTextColorR, 255),
+                           qBound(0, MoveTextColorG, 255),
+                           qBound(0, MoveTextColorB, 255));
+    m_moveTextLabel->setStyleSheet(QStringLiteral("background:transparent;color:%1;")
+                                   .arg(textColor.name()));
+
+    const QString noticePath = QStringLiteral(
+                "/mnt/UDISK/res/static/demoResources/images/logo/notice.txt");
+    QFile noticeFile(noticePath);
+    QString noticeText;
+    if (noticeFile.open(QIODevice::ReadOnly)) {
+        noticeText = QString::fromUtf8(noticeFile.readAll());
+        if (!noticeText.isEmpty() && noticeText.at(0).unicode() == 0xFEFF) {
+            noticeText.remove(0, 1);
+        }
+        noticeText.replace(QRegExp(QStringLiteral("[\\r\\n]+")), QStringLiteral(" "));
+        noticeText = noticeText.trimmed();
+    } else {
+        LOG_CONFIG("滚动文字文件无法读取: " << noticePath
+                   << ", error=" << noticeFile.errorString());
+    }
+
+    m_moveTextLabel->setText(noticeText);
+    const QFontMetrics metrics(font);
+    const int textWidth = noticeText.isEmpty()
+            ? 1 : metrics.horizontalAdvance(noticeText) + 8;
+    m_moveTextLabel->resize(textWidth, m_moveTextViewport->height());
+    m_moveTextOffsetX = m_moveTextViewport->width();
+    m_moveTextLabel->move(m_moveTextOffsetX, 0);
+
+    // 30ms 一帧，五档分别为 1/2/3/5/7 像素。
+    static const int speedSteps[5] = {1, 2, 3, 5, 7};
+    m_moveTextStepPx = speedSteps[MoveTextSpeed - 1];
+    m_moveTextTimer = new QTimer(m_moveTextViewport);
+    m_moveTextTimer->setInterval(30);
+    connect(m_moveTextTimer, &QTimer::timeout,
+            this, &MultimediaDemo::advanceMovingText);
+    if (!noticeText.isEmpty()) {
+        m_moveTextTimer->start();
+    }
+
+    m_moveTextViewport->show();
+    raiseMovingTextOverlay();
+    LOG_CONFIG("滚动文字已启用: " << noticePath
+               << ", speedLevel=" << MoveTextSpeed);
+}
+
+void MultimediaDemo::advanceMovingText()
+{
+    if (!m_moveTextViewport || !m_moveTextLabel
+            || m_moveTextLabel->text().isEmpty()) {
+        return;
+    }
+    m_moveTextOffsetX -= qMax(1, m_moveTextStepPx);
+    if (m_moveTextOffsetX + m_moveTextLabel->width() < 0) {
+        m_moveTextOffsetX = m_moveTextViewport->width();
+    }
+    m_moveTextLabel->move(m_moveTextOffsetX, 0);
+}
+
+/** @brief 媒体内容动态切层后，恢复滚动通知的常驻叠加层级。 */
+void MultimediaDemo::raiseMovingTextOverlay()
+{
+    if (m_moveTextViewport) {
+        m_moveTextViewport->raise();
     }
 }
 
@@ -3204,6 +3721,22 @@ void MultimediaDemo::initializeTimers()
     connect(timer, &QTimer::timeout, this, &MultimediaDemo::onTimeout);
     timer->start();
     LOG_INIT("信号板UI兜底定时器已启动，间隔: 300ms");
+
+#ifndef FACEGATE_LEGACY_PAGE_MODE
+    m_adminLongPressTimer = new QTimer(this);
+    m_adminLongPressTimer->setSingleShot(true);
+    m_adminLongPressTimer->setInterval(5000);
+    connect(m_adminLongPressTimer, &QTimer::timeout, this, [this]() {
+        if (!m_leftPressTracking || m_uiModalActive || !isVisible()
+                || !QApplication::mouseButtons().testFlag(Qt::LeftButton)) {
+            cancelAdminLongPress();
+            return;
+        }
+        m_adminLongPressTriggered = true;
+        deactivateUiIdle();
+        emit adminLongPressRequested();
+    });
+#endif
 
     // 日期定时器
     date_timer = new QTimer(this);
@@ -4260,6 +4793,8 @@ QPixmap MultimediaDemo::loadPixmapWithIgnoreWarnings(const QString &imagePath)
         }
 
         QImageReader reader(path);
+        reader.setDecideFormatFromContent(true);
+        reader.setAutoTransform(true);
         QImage image = reader.read();
 
         if (!image.isNull()) {
@@ -4311,29 +4846,23 @@ void MultimediaDemo::initPicturePlayer()
     picturePixmapCache.clear();
     currentPictureIndex = 0;
 
-    // 外部图片目录优先，目录不存在时使用 qrc 资源目录。
-    QString pictureDirPath = QDir(extRoot).filePath("demoResources/images/pic");
-    QDir pictureDir(pictureDirPath);
-    if (!pictureDir.exists()) {
-        LOG_FILE("外部图片目录不存在，尝试qrc目录:" << pictureDirPath);
-        pictureDirPath = QDir(qrcRoot).filePath("demoResources/images/pic");
-        pictureDir.setPath(pictureDirPath);
-    }
+    // pic 图片同样按资源组整体选择来源。文件名必须是 01、02……这样的
+    // 两位编号，扩展名不限制；只要外部组有任意合规文件，就不混入 qrc 图片。
+    const QString externalPictureDir =
+            QDir(extRoot).filePath("demoResources/images/pic");
+    const QString qrcPictureDir =
+            QDir(qrcRoot).filePath("demoResources/images/pic");
+    const QRegExp pictureNamePattern(QStringLiteral("^([0-9]{2})$"));
+    const QMap<int, QString> externalPictureFiles =
+            scanIndexedImageFiles(externalPictureDir, pictureNamePattern);
+    const bool useExternalPictureGroup = !externalPictureFiles.isEmpty();
+    const QMap<int, QString> selectedPictureFiles = useExternalPictureGroup
+            ? externalPictureFiles
+            : scanIndexedImageFiles(qrcPictureDir, pictureNamePattern);
 
-    if (pictureDir.exists()) {
-        const QStringList filters = QStringList()
-                << "*.png" << "*.jpg" << "*.jpeg"
-                << "*.bmp" << "*.gif";
-        pictureDir.setNameFilters(filters);
-
-        const QStringList fileNames = pictureDir.entryList(
-                    QDir::Files | QDir::Readable, QDir::Name);
-        for (const QString &fileName : fileNames) {
-            pictureFileList.append(pictureDir.absoluteFilePath(fileName));
-        }
-    } else {
-        LOG_FILE("警告: 外部和qrc图片目录均不存在:" << pictureDirPath);
-    }
+    pictureFileList = selectedPictureFiles.values();
+    LOG_IMAGE("图片资源组来源: "
+              << (useExternalPictureGroup ? "外部目录" : "qrc内置资源"));
 
     LOG_IMAGE("扫描到图片文件数量:" << pictureFileList.size());
     LOG_IMAGE("图片文件列表:" << pictureFileList);
@@ -4343,6 +4872,7 @@ void MultimediaDemo::initPicturePlayer()
     QList<QString> validPictureFiles;
     for (const QString &picturePath : pictureFileList) {
         QImageReader reader(picturePath);
+        reader.setDecideFormatFromContent(true);
         reader.setAutoTransform(true);
         reader.setScaledSize(targetSize);
 
@@ -4419,10 +4949,24 @@ void MultimediaDemo::showEvent(QShowEvent *e)
 {
     QWidget::showEvent(e);
 
-    m_localPlaybackEnabled = true;
+    if (!m_initialCursorStateApplied) {
+        // 系统首次进入多媒体页时直接隐藏光标；不启动八秒定时器，只有实际
+        // 鼠标移动、点击或滚轮事件才恢复显示。
+        if (!m_cursorHidden) {
+            QApplication::setOverrideCursor(QCursor(Qt::BlankCursor));
+            m_cursorHidden = true;
+        }
+        if (m_panelAutoHideTimer) {
+            m_panelAutoHideTimer->stop();
+        }
+        m_initialCursorStateApplied = true;
+    }
 
-    // 如果当前不是LIVE，并且本地列表为空，恢复空列表监测
-    if (!m_isLiveMode && !m_liveDesired && videoFileList.isEmpty()) {
+    m_localPlaybackEnabled = m_startupPlaybackReleased && !m_modulePlaybackSuspended;
+
+    // splash 结束之前即使底层页面已经可见，也不能启动扫描补播。
+    if (m_localPlaybackEnabled &&
+        !m_isLiveMode && !m_liveDesired && videoFileList.isEmpty()) {
         startEmptyVideoListWatch();
     }
 
@@ -4433,6 +4977,7 @@ void MultimediaDemo::showEvent(QShowEvent *e)
 /** @brief 页面隐藏时暂停不应在后台运行的交互状态。 */
 void MultimediaDemo::hideEvent(QHideEvent *e)
 {
+    cancelAdminLongPress();
     m_localPlaybackEnabled = false;
     stopEmptyVideoListWatch();
 
@@ -4511,6 +5056,69 @@ void MultimediaDemo::deactivateUiIdle()
     showCursorIfHidden();
 }
 
+/** @brief 释放前未达到五秒时，保持原有左键热点行为。 */
+bool MultimediaDemo::handleShortLeftClick(const QPoint &p)
+{
+    const QRect dateRect(DateDisplay_x, DateDisplay_y,
+                         DateDisplay_x_Size, DateDisplay_y_Size);
+    const QRect timeRect(TimeDisplay_x, TimeDisplay_y,
+                         TimeDisplay_x_Size, TimeDisplay_y_Size);
+    const QRect weekRect(WeekDisplay_x, WeekDisplay_y,
+                         WeekDisplay_x_Size, WeekDisplay_y_Size);
+
+    const bool hitDate = DateDisplay_en && dateRect.contains(p);
+    const bool hitTime = TimeDisplay_en && timeRect.contains(p);
+    const bool hitWeek = WeekDisplay_en && weekRect.contains(p);
+    if (hitDate || hitTime || hitWeek) {
+        suspendUiIdleForModal();
+        m_uiModalActive = true;
+        openDateTimeSetting();
+        m_uiModalActive = false;
+        updateIdleTimerState();
+        return true;
+    }
+
+    if (!m_volumeRect.contains(p)) {
+        return false;
+    }
+
+    const bool volShown = m_volPanel && m_volPanel->isShown();
+    const bool netShown = m_netInfoPanel && m_netInfoPanel->isShown();
+    if (volShown || netShown) {
+        if (volShown) {
+            m_volPanel->hideSlideOut();
+        }
+        if (netShown) {
+            m_netInfoPanel->hideSlideOut();
+        }
+        updateIdleTimerState();
+        return true;
+    }
+
+    const int volume = m_ampCtrl->loadVolumeFromFile();
+    m_volPanel->setCurrentVolume(volume);
+    m_volPanel->showSlideIn();
+    readNetConfiguration();
+    m_netInfoPanel->setInfo(m_netIp,
+                            m_mqttClientId,
+                            m_mqttRouteName,
+                            m_mqttHost,
+                            m_mqttSubTopics,
+                            m_streamUrl);
+    m_netInfoPanel->showSlideIn();
+    updateIdleTimerState();
+    return true;
+}
+
+void MultimediaDemo::cancelAdminLongPress()
+{
+    if (m_adminLongPressTimer) {
+        m_adminLongPressTimer->stop();
+    }
+    m_leftPressTracking = false;
+    m_adminLongPressTriggered = false;
+}
+
 
 // 右键触发密码 + 左键点击日期区域弹出校时
 bool MultimediaDemo::eventFilter(QObject *watched, QEvent *event)
@@ -4538,7 +5146,11 @@ bool MultimediaDemo::eventFilter(QObject *watched, QEvent *event)
     else if (event->type() == QEvent::MouseButtonPress ||
              event->type() == QEvent::MouseButtonRelease ||
              event->type() == QEvent::Wheel) {
-        refreshUiIdleStateByActivity();
+        if (m_cursorHidden) {
+            showCursorIfHidden();
+        } else {
+            refreshUiIdleStateByActivity();
+        }
     }
 
     // ★ 面板显示时：只要鼠标在面板内，任何鼠标事件都放行
@@ -4548,18 +5160,16 @@ bool MultimediaDemo::eventFilter(QObject *watched, QEvent *event)
             event->type() == QEvent::MouseMove) {
 
             auto *me = static_cast<QMouseEvent*>(event);
-            //QPoint inPanel = m_volPanel->mapFromGlobal(me->globalPos());
-
             bool inVolPanel = false;
             bool inNetPanel = false;
 
             if (m_volPanel && m_volPanel->isShown()) {
-                QPoint pt = m_volPanel->mapFromGlobal(me->globalPos());
+                const QPoint pt = mousePositionIn(watched, me, m_volPanel);
                 inVolPanel = m_volPanel->rect().contains(pt);
             }
 
             if (m_netInfoPanel && m_netInfoPanel->isShown()) {
-                QPoint pt = m_netInfoPanel->mapFromGlobal(me->globalPos());
+                const QPoint pt = mousePositionIn(watched, me, m_netInfoPanel);
                 inNetPanel = m_netInfoPanel->rect().contains(pt);
             }
 
@@ -4588,11 +5198,40 @@ bool MultimediaDemo::eventFilter(QObject *watched, QEvent *event)
         }
     }
 
+#ifndef FACEGATE_LEGACY_PAGE_MODE
+    // 无面板遮挡时，所有位置的左键按下都先进入长按候选。短按动作延迟到
+    // 释放时执行，保证按住五秒不会先弹出校时或音量面板。
+    if (event->type() == QEvent::MouseButtonPress) {
+        auto *me = static_cast<QMouseEvent *>(event);
+        if (me->button() == Qt::LeftButton) {
+            m_leftPressPoint = mousePositionIn(watched, me, this);
+            m_leftPressTracking = true;
+            m_adminLongPressTriggered = false;
+            if (m_adminLongPressTimer) {
+                m_adminLongPressTimer->start();
+            }
+            return true;
+        }
+        cancelAdminLongPress();
+    }
+
+    if (event->type() == QEvent::MouseButtonRelease) {
+        auto *me = static_cast<QMouseEvent *>(event);
+        if (me->button() == Qt::LeftButton && m_leftPressTracking) {
+            if (m_adminLongPressTimer) {
+                m_adminLongPressTimer->stop();
+            }
+            const bool longPressTriggered = m_adminLongPressTriggered;
+            m_leftPressTracking = false;
+            m_adminLongPressTriggered = false;
+            return longPressTriggered ? true : handleShortLeftClick(m_leftPressPoint);
+        }
+    }
+#endif
+
 
     if (event->type() == QEvent::MouseButtonPress) {
         auto *me = static_cast<QMouseEvent*>(event);
-        // 统一转成 this 的坐标：不依赖 watched，避免段错误/坐标乱
-        const QPoint p = this->mapFromGlobal(me->globalPos());
 
         // 0) 中键：切换鼠标光标显示/隐藏
         if (me->button() == Qt::MiddleButton) {
@@ -4631,78 +5270,15 @@ bool MultimediaDemo::eventFilter(QObject *watched, QEvent *event)
             return true;
         }
 
-        // 2) 左键：点中日期区域 -> 弹出设置日期/时间
+#ifdef FACEGATE_LEGACY_PAGE_MODE
+        // 旧页面模式维持左键按下即执行热点的原交互时序。
         if (me->button() == Qt::LeftButton) {
-
-            // A) 日期 / 时间 / 星期 任一区域命中 -> 弹出校时
-            const QRect dateRect(DateDisplay_x, DateDisplay_y,
-                                 DateDisplay_x_Size, DateDisplay_y_Size);
-
-            const QRect timeRect(TimeDisplay_x, TimeDisplay_y,
-                                 TimeDisplay_x_Size, TimeDisplay_y_Size);
-
-            const QRect weekRect(WeekDisplay_x, WeekDisplay_y,
-                                 WeekDisplay_x_Size, WeekDisplay_y_Size);
-
-            const bool hitDate = DateDisplay_en && dateRect.contains(p);
-            const bool hitTime = TimeDisplay_en && timeRect.contains(p);
-            const bool hitWeek = WeekDisplay_en && weekRect.contains(p);
-
-            if (hitDate || hitTime || hitWeek) {
-                suspendUiIdleForModal();   // 先显示光标，并停掉8秒隐藏
-                m_uiModalActive = true;
-
-                openDateTimeSetting();
-
-                m_uiModalActive = false;
-
-                // 键盘/校时结束后，回到本页逻辑
-                updateIdleTimerState();
-                return true;
-            }
-
-            // B) 视频区域命中 -> 弹出音量滑动条
-            if (m_volumeRect.contains(p)) {
-                const bool volShown = (m_volPanel && m_volPanel->isShown());
-                const bool netShown = (m_netInfoPanel && m_netInfoPanel->isShown());
-
-                // 已显示时，左键再次点击立即收回
-                if (volShown || netShown) {
-                    if (m_volPanel && volShown) {
-                        m_volPanel->hideSlideOut();
-                    }
-                    if (m_netInfoPanel && netShown) {
-                        m_netInfoPanel->hideSlideOut();
-                    }
-
-                    // 手动收回时，停止8秒定时
-                    updateIdleTimerState();
-                } else {
-                    // 显示音量
-                    int v = m_ampCtrl->loadVolumeFromFile();
-                    m_volPanel->setCurrentVolume(v);
-                    m_volPanel->showSlideIn();
-
-                    // 显示网络信息
-                    readNetConfiguration();
-                    m_netInfoPanel->setInfo(m_netIp,
-                                            m_mqttClientId,
-                                            m_mqttRouteName,
-                                            m_mqttHost,
-                                            m_mqttSubTopics,
-                                            m_streamUrl);
-
-                    // 弹出后开始8秒倒计时
-                    m_netInfoPanel->showSlideIn();
-                    updateIdleTimerState();
-                }
-
-                return true;
-            }
-
-            // 空白区域左键：不处理，放行
-            return false;
+            // 统一转成 this 的坐标：不依赖 watched，避免坐标错位。
+            const QPoint p = mousePositionIn(watched, me, this);
+            return handleShortLeftClick(p);
         }
+#endif
+
     }
 
     return false; // 默认放行
@@ -4866,14 +5442,14 @@ void MultimediaDemo::openDateTimeSetting()
 
     // 先设置系统时间Qt读取
     if (!setSystemTimeFromLocal(userLocal, &err)) {
-        QMessageBox::warning(this, QStringLiteral("失败"),
+        UiMessageBox::warning(this, QStringLiteral("失败"),
                              QStringLiteral("设置系统时间失败：") + err);
         return;
     }
 
     // 再写入 RTC
     if (!setRtcFromLocal(userLocal, &err)) {
-        QMessageBox::warning(this, QStringLiteral("失败"),
+        UiMessageBox::warning(this, QStringLiteral("失败"),
                              QStringLiteral("写入RTC失败：") + err);
         return;
     }
@@ -5222,10 +5798,14 @@ void MultimediaDemo::setStreamUrl(const QString& url, const QString& kind)
 
     LOG_VIDEO("收到LIVE目标，准备播放/重试: " << m_desiredLiveUrl << " kind=" << m_desiredLiveKind);
 
+    if (!m_startupPlaybackReleased) {
+        LOG_VIDEO("启动页尚未结束，仅记录LIVE目标，暂不创建播放管线:" << m_desiredLiveUrl);
+        return;
+    }
+
     if (m_modulePlaybackSuspended) {
-        m_resumeLiveAfterModuleSwitch = true;
-        m_resumeLiveDirectlyAfterModuleSwitch = true;
-        LOG_VIDEO("多媒体模块当前已暂停，仅记录LIVE目标，返回界面后恢复:" << m_desiredLiveUrl);
+        LOG_VIDEO("多媒体模块当前已暂停，仅记录LIVE目标，返回界面后重新探测:"
+                  << m_desiredLiveUrl);
         return;
     }
 
@@ -5244,6 +5824,10 @@ void MultimediaDemo::probeLiveStream(const QString& url)
 {
     const QString probeUrl = url.trimmed();
     if (probeUrl.isEmpty()) return;
+    if (!m_startupPlaybackReleased || m_modulePlaybackSuspended) {
+        LOG_VIDEO("多媒体播放尚未放行或模块已暂停，跳过直播探测:" << probeUrl);
+        return;
+    }
     if (m_liveProbeRunning) return;
 
     const bool logProbeAttempt = !m_liveProbeFailureLogElapsed.isValid() ||
@@ -5276,11 +5860,10 @@ void MultimediaDemo::probeLiveStream(const QString& url)
         }
 
         // 轻量探测是异步的；其回调可能晚于人体感应的模块切换。
-        // 人脸模块活动期间不能在后台重建解码链，只记录返回后直接恢复。
+        // 人脸模块活动期间不能在后台重建解码链；LIVE 目标继续由
+        // m_liveDesired/m_desiredLiveUrl 保存，返回后重新验证。
         if (m_modulePlaybackSuspended) {
-            m_resumeLiveAfterModuleSwitch = true;
-            m_resumeLiveDirectlyAfterModuleSwitch = true;
-            LOG_VIDEO("后台探测直播流成功，但多媒体模块已暂停，等待返回后恢复:"
+            LOG_VIDEO("后台探测直播流成功，但多媒体模块已暂停，等待返回后重新探测:"
                       << probeUrl << detail);
             return;
         }
@@ -5631,6 +6214,10 @@ void MultimediaDemo::probeLiveStream(const QString& url)
 void MultimediaDemo::switchToLiveStream(const QString& url, const QString& kind)
 {
     if (url.trimmed().isEmpty()) return;
+    if (!m_startupPlaybackReleased || m_modulePlaybackSuspended) {
+        LOG_VIDEO("多媒体播放尚未放行或模块已暂停，暂不启动直播:" << url);
+        return;
+    }
 
     m_localPlaybackEnabled = false;
     invalidatePendingLocalPlaybackStarts();
@@ -6705,29 +7292,38 @@ void MultimediaDemo::onVideoSnapshotReady(const QImage& videoImage)
         return;
     }
 
-    QScreen *screen = QGuiApplication::primaryScreen();
-    if (!screen) {
-        qWarning() << "[截图] primaryScreen is null";
+    QWidget *captureHost = ResponsiveUi::overlayHost(this);
+    if (!captureHost) {
+        qWarning() << "[截图] application root is null";
         return;
     }
 
-    QPixmap uiShot = screen->grabWindow(0);
+    // Wayland 客户端不能依赖抓取 compositor 的全局输出。应用本身全屏运行，
+    // 直接抓取现有根控件即可得到同样的 UI 底图，视频帧仍在后台单独合成。
+    QPixmap uiShot = captureHost->grab();
     if (uiShot.isNull()) {
-        qWarning() << "[截图] grabWindow(0) failed";
+        qWarning() << "[截图] application root grab failed";
         return;
     }
 
+    const qreal captureDpr = uiShot.devicePixelRatio();
     QImage finalImage = uiShot.toImage();
     if (finalImage.isNull()) {
         qWarning() << "[截图] uiShot.toImage() failed";
         return;
     }
+    // 后台合成统一使用实际像素坐标，避免 QPainter 再按 DPR 缩小一次图像。
+    finalImage.setDevicePixelRatio(1.0);
 
-    QPoint videoTopLeft = this->mapToGlobal(QPoint(VideoDisplay_x, VideoDisplay_y));
-    QRect videoRect(videoTopLeft.x(),
-                    videoTopLeft.y(),
-                    VideoDisplay_x_Size,
-                    VideoDisplay_y_Size);
+    // QWidget 坐标使用逻辑像素，而 QPixmap::toImage() 保存的是实际像素。
+    // Weston scale 不为 1 时同步换算视频区域，保证整幅 Qt 画面中的视频
+    // 补帧位置和大小仍与屏幕显示完全一致。
+    const QPoint videoTopLeft = this->mapTo(
+                captureHost, QPoint(VideoDisplay_x, VideoDisplay_y));
+    const QRect videoRect(qRound(videoTopLeft.x() * captureDpr),
+                          qRound(videoTopLeft.y() * captureDpr),
+                          qRound(VideoDisplay_x_Size * captureDpr),
+                          qRound(VideoDisplay_y_Size * captureDpr));
 
     m_snapshotWorkerBusy = true;
 

@@ -246,8 +246,8 @@ MQTT videoControl → MqttService::handleVideoControlMessage
 
 **帧格式** (来源: `V2/qt_ycest/ic_board/rs485_driver_port.cpp`):
 
-- 方向控制: 通过 `/dev/rs485_dir` GPIO 设备控制收发方向
-- 发送: 先设置 TX 方向 → 写数据 → 恢复 RX 方向
+- 方向控制: UART 内核驱动通过 RTS/DE 自动控制收发方向
+- 发送: 应用写入 `/dev/ttyS8`，方向切换由内核完成
 - 接收: 持续监听，数据到达后 emit `frameReceived`
 
 ### 4.4 MQTT IPC 协议
@@ -402,8 +402,8 @@ CEDARX_OUT = /home/meetyoo/100ask_s4_sdk/t113_tinasdk5.0-v1/out/t113_s4/100ask_d
 | `/mnt/UDISK/res/static/demoResources/images/video/` | 视频文件目录 |
 | `/run/app_stack/qt_heartbeat` | 心跳文件 |
 | `/tmp/mqttd.sock` | mqttd IPC socket |
-| `/dev/ttyAS1` | QR 扫描器串口 |
-| `/dev/ttyAS2` | IC 卡读卡器串口 |
-| `/dev/ttyAS4` | RS485 串口 |
-| `/dev/rs485_dir` | RS485 方向控制 GPIO |
-| `/dev/rtc1` | RTC 时钟设备 |
+| `/dev/ttyS5` | 信号板串口 |
+| `/dev/ttyS6` | QR 扫描器串口 |
+| `/dev/ttyS7` | IC 卡读卡器串口 |
+| `/dev/ttyS8` | RS485 串口（内核自动控制 RTS/DE） |
+| `/dev/rtc0` | RTC 时钟设备 |

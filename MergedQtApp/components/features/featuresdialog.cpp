@@ -8,18 +8,38 @@
 
 #include "featuresdialog.h"
 #include "ui_featuresdialog.h"
+#include "common/responsive_ui.h"
 
 #include <QDebug>
 #include <QCheckBox>
 #include <QTimer>
 #include <QSignalBlocker>
+#include <QEvent>
+#include <QHideEvent>
+#include <QShowEvent>
+#include <QWidget>
 
 /** @brief 创建功能复选框并建立互斥约束连接。 */
 FeaturesDialog::FeaturesDialog(QWidget *parent)
     : QDialog(parent)
     , ui(new Ui::FeaturesDialog)
 {
+    embeddedForWayland_ = ResponsiveUi::isWaylandPlatform() && parentWidget();
+    if (embeddedForWayland_) {
+        setWindowFlags(Qt::Widget);
+        parentWidget()->installEventFilter(this);
+    }
     ui->setupUi(this);
+    if (embeddedForWayland_) {
+        // setupUi() 会应用 .ui 中的 modal=false，Wayland 内嵌后重新恢复模态语义。
+        setModal(true);
+    }
+
+    const QSize targetSize = ResponsiveUi::dialogSize(
+                parent, QSize(450, 560), QSize(400, 480), 16);
+    setMinimumSize(qMin(400, targetSize.width()),
+                   qMin(480, targetSize.height()));
+    resize(targetSize);
 
     setupConnections();
 
@@ -33,7 +53,60 @@ FeaturesDialog::FeaturesDialog(QWidget *parent)
 /** @brief 释放 Qt Designer 界面对象。 */
 FeaturesDialog::~FeaturesDialog()
 {
+    delete waylandBlocker_;
     delete ui;
+}
+
+bool FeaturesDialog::eventFilter(QObject *watched, QEvent *event)
+{
+    if (embeddedForWayland_ && watched == parentWidget() && event &&
+            event->type() == QEvent::Resize) {
+        if (waylandBlocker_) {
+            waylandBlocker_->setGeometry(parentWidget()->rect());
+        }
+        centerInHost();
+    }
+    return QDialog::eventFilter(watched, event);
+}
+
+void FeaturesDialog::showEvent(QShowEvent *event)
+{
+    if (embeddedForWayland_ && parentWidget()) {
+        if (!waylandBlocker_) {
+            waylandBlocker_ = new QWidget(parentWidget());
+            waylandBlocker_->setObjectName(QStringLiteral("waylandModalBlocker"));
+            waylandBlocker_->setAttribute(Qt::WA_StyledBackground, true);
+            waylandBlocker_->setStyleSheet(QStringLiteral(
+                "#waylandModalBlocker{background:rgba(0,0,0,90);}"));
+        }
+        waylandBlocker_->setGeometry(parentWidget()->rect());
+        waylandBlocker_->show();
+        waylandBlocker_->raise();
+        centerInHost();
+    }
+
+    QDialog::showEvent(event);
+    if (embeddedForWayland_) {
+        raise();
+    }
+}
+
+void FeaturesDialog::hideEvent(QHideEvent *event)
+{
+    if (waylandBlocker_) {
+        waylandBlocker_->hide();
+    }
+    QDialog::hideEvent(event);
+}
+
+void FeaturesDialog::centerInHost()
+{
+    if (!embeddedForWayland_ || !parentWidget()) {
+        return;
+    }
+    const QRect host = parentWidget()->rect();
+    move(host.x() + qMax(0, (host.width() - width()) / 2),
+         host.y() + qMax(0, (host.height() - height()) / 2));
 }
 
 /** @brief 建立复选框和对话框按钮信号连接。 */

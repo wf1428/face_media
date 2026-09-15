@@ -7,7 +7,7 @@
  */
 
 #include "standbylockpage.h"
-#include <QMessageBox>
+#include "components/dialogs/ui_message_box.h"
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QVBoxLayout>
@@ -302,7 +302,7 @@ void StandbyLockPage::onApplyButtonClicked()
     lockEnabled = lockCheckBox->isChecked();
     
     // 显示成功提示
-    QMessageBox::information(this, "提示", "设置已应用", QMessageBox::Ok);
+    UiMessageBox::information(this, "提示", "设置已应用", QMessageBox::Ok);
     
     // 这里可以添加保存设置到配置文件的逻辑
     // 或者发送信号通知主程序更新设置
@@ -327,7 +327,7 @@ void StandbyLockPage::onResetButtonClicked()
     onStandbyCheckBoxStateChanged(standbyEnabled ? Qt::Checked : Qt::Unchecked);
     onLockCheckBoxStateChanged(lockEnabled ? Qt::Checked : Qt::Unchecked);
     
-    QMessageBox::information(this, "提示", "设置已重置为默认值", QMessageBox::Ok);
+    UiMessageBox::information(this, "提示", "设置已重置为默认值", QMessageBox::Ok);
 }
 
 /** @brief 待机开关变化时更新超时输入可用性。 */

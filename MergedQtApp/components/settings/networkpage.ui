@@ -127,25 +127,17 @@ QComboBox::down-arrow {
    </item>
    <item>
     <widget class="QStackedWidget" name="networkStack">
-     <property name="sizeIncrement">
-      <size>
-       <width>540</width>
-       <height>235</height>
-      </size>
-     </property>
      <property name="currentIndex">
       <number>0</number>
      </property>
      <widget class="QWidget" name="page">
+      <layout class="QVBoxLayout" name="wiredPageLayout">
+       <property name="leftMargin"><number>0</number></property>
+       <property name="topMargin"><number>0</number></property>
+       <property name="rightMargin"><number>0</number></property>
+       <property name="bottomMargin"><number>0</number></property>
+       <item>
       <widget class="QGroupBox" name="ipSettingsGroup">
-       <property name="geometry">
-        <rect>
-         <x>0</x>
-         <y>10</y>
-         <width>540</width>
-         <height>219</height>
-        </rect>
-       </property>
        <property name="styleSheet">
         <string notr="true">QGroupBox {
     font-size: 16px;
@@ -385,6 +377,8 @@ QComboBox::down-arrow {
         </item>
        </layout>
       </widget>
+       </item>
+      </layout>
      </widget>
      <widget class="QWidget" name="page_2"/>
     </widget>

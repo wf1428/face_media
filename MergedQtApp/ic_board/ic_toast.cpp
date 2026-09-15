@@ -13,7 +13,6 @@
 #include <QApplication>
 #include <QPainter>
 #include <QFontMetrics>
-#include <QScreen>
 #include <QColor>
 #include <QtMath>
 #include <QFile>
@@ -21,6 +20,7 @@
 #include <QDir>
 #include <QDebug>
 #include <QSettings>
+#include <QSaveFile>
 #include <QStandardPaths>
 #include "platform/rk3566_platform.h"
 
@@ -76,9 +76,11 @@ IcToast::IcToast(QWidget* mainWindow)
         endVoiceFocus();
     });
 
-    // 提前把 qrc 里的语音文件落到临时目录，交给 GStreamer playbin 播放
-    passVoiceFile_ = materializeResourceToTemp(":/static/audio/pass.wav");
-    failVoiceFile_ = materializeResourceToTemp(":/static/audio/fail.wav");
+    // 所有提示音统一从 common/audio 资源目录读取；GStreamer 播放临时文件。
+    passVoiceFile_ = materializeResourceToTemp(
+                QStringLiteral(":/common/audio/code_200.mp3"));
+    failVoiceFile_ = materializeResourceToTemp(
+                QStringLiteral(":/common/audio/fail.wav"));
 }
 
 /**
@@ -227,7 +229,7 @@ void IcToast::showPass(int ms)
  * @param reason 协议失败原因码或已本地化文本。
  * @param ms 文字提示自动隐藏时间，单位 ms。
  */
-void IcToast::showFail(const QString& reason, int ms)
+void IcToast::showFail(const QString& reason, int ms, int resultCode)
 {
     qWarning().noquote()
             << QString("[IC-TOAST] showFail enter reason=%1 ms=%2")
@@ -247,7 +249,7 @@ void IcToast::showFail(const QString& reason, int ms)
     showText(QStringLiteral("%1").arg(r), ms);
 
     // 再播失败语音
-    playFailVoice();
+    playFailVoice(resultCode);
 
     // 红框走和绿框一样的脉冲逻辑
     startPassEdgeFlash();
@@ -502,23 +504,13 @@ void IcToast::resizeToFitText() {
 }
 
 /**
- * @brief 将主屏幕中心映射到宿主局部坐标并居中文本框。
+ * @brief 使用宿主局部坐标居中文本框。
  */
 void IcToast::moveBoxToScreenCenter() {
     if (!main_) return;
 
-    // 1) 拿屏幕中心
-    QScreen* s = QApplication::primaryScreen();
-    if (!s) return;
-    QPoint screenCenter = s->geometry().center();
-
-    // 2) 把屏幕中心映射到主窗口坐标系
-    QPoint mainTopLeftGlobal = main_->mapToGlobal(QPoint(0,0));
-    QPoint centerInMain = screenCenter - mainTopLeftGlobal;
-
-    // 3) box在overlay中居中到这个点
     QRect r = boxRect_;
-    r.moveCenter(centerInMain);
+    r.moveCenter(main_->rect().center());
     boxRect_ = r;
 }
 
@@ -568,56 +560,45 @@ void IcToast::paintEvent(QPaintEvent*) {
                text_);
 }
 
-/**
- * @brief 将 qrc 音频资源复制到临时目录供 GStreamer playbin 读取。
- *
- * 已存在且大小相同的临时文件直接复用，避免每次提示重复写盘。
- */
+/** @brief 将 common/audio 音频资源复制到 GStreamer 可读取的临时文件。 */
 QString IcToast::materializeResourceToTemp(const QString& resourcePath)
 {
-    QFile in(resourcePath);
-    if (!in.exists()) {
-        qWarning() << "[IC-TOAST] voice resource not found:" << resourcePath;
+    QFile source(resourcePath);
+    if (!source.open(QIODevice::ReadOnly)) {
+        qWarning() << "[IC-TOAST] open voice resource failed:"
+                   << resourcePath << source.errorString();
         return QString();
     }
-    if (!in.open(QIODevice::ReadOnly)) {
-        qWarning() << "[IC-TOAST] open voice resource failed:" << resourcePath << in.errorString();
-        return QString();
+    const QByteArray data = source.readAll();
+
+    QString tempRoot = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
+    if (tempRoot.trimmed().isEmpty()) {
+        tempRoot = QStringLiteral("/tmp");
     }
-
-    const QByteArray data = in.readAll();
-    in.close();
-
-    QString tempDir = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
-    if (tempDir.trimmed().isEmpty()) {
-        tempDir = "/tmp";
-    }
-    tempDir += "/voice";
-    QDir().mkpath(tempDir);
-
-    const QString outPath = tempDir + "/" + QFileInfo(resourcePath).fileName();
-
-    QFile out(outPath);
-    if (out.exists() && out.size() == data.size()) {
-        return outPath;
-    }
-
-    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        qWarning() << "[IC-TOAST] open temp voice file failed:" << outPath << out.errorString();
+    const QString tempDir = QDir(tempRoot).filePath(QStringLiteral("voice"));
+    if (!QDir().mkpath(tempDir)) {
+        qWarning() << "[IC-TOAST] create voice temp directory failed:" << tempDir;
         return QString();
     }
 
-    if (out.write(data) != data.size()) {
-        qWarning() << "[IC-TOAST] write temp voice file failed:" << outPath << out.errorString();
-        out.close();
+    const QString outputPath = QDir(tempDir).filePath(QFileInfo(resourcePath).fileName());
+    QFile existing(outputPath);
+    if (existing.open(QIODevice::ReadOnly) && existing.readAll() == data) {
+        return outputPath;
+    }
+    existing.close();
+
+    QSaveFile output(outputPath);
+    if (!output.open(QIODevice::WriteOnly)
+            || output.write(data) != data.size()
+            || !output.commit()) {
+        qWarning() << "[IC-TOAST] write voice temp file failed:" << outputPath;
         return QString();
     }
-    out.close();
-
-    return outPath;
+    return outputPath;
 }
 
-/** @brief 延迟创建功放控制器，并在持久化音量大于 0 时恢复该音量。 */
+/** @brief 延迟创建功放控制器，并恢复持久化音量。 */
 void IcToast::ensureAmpReady()
 {
     if (!ampCtrl_) {
@@ -625,9 +606,7 @@ void IcToast::ensureAmpReady()
     }
 
     const int volume = ampCtrl_->loadVolumeFromFile();
-    if (volume > 0) {
-        ampCtrl_->setVolume(volume);
-    }
+    ampCtrl_->setVolume(volume);
 }
 
 /** @brief 检查路径、配置和播放器后播放提示音，并建立 2.2 秒语音焦点兜底。 */
@@ -666,18 +645,45 @@ void IcToast::playPassVoice()
     playVoiceFile(passVoiceFile_);
 }
 
-/** @brief 播放已物化的失败提示音。 */
-void IcToast::playFailVoice()
+/** @brief 按 MQTT 结果码播放专用失败音，其他错误沿用通用失败音。 */
+void IcToast::playFailVoice(int resultCode)
 {
+    switch (resultCode) {
+    case 4000:
+    case 4001:
+    case 4003:
+    case 4100:
+    case 4101:
+    case 4102:
+    case 4200:
+    case 4201:
+    case 4202:
+    case 4300:
+    case 4301:
+    case 4400:
+    case 4401:
+    case 4402:
+    case 4403:
+    case 4501: {
+        const QString resourcePath = QStringLiteral(":/common/audio/code_%1.mp3")
+                .arg(resultCode);
+        const QString codeVoice = materializeResourceToTemp(resourcePath);
+        if (!codeVoice.isEmpty()) {
+            playVoiceFile(codeVoice);
+            return;
+        }
+        break;
+    }
+    default:
+        break;
+    }
     playVoiceFile(failVoiceFile_);
 }
 
-/** @return 基础 DAC 43 加 7，且不超过 55。 */
-int IcToast::boostedToastDac() const
+/** @return 提示音使用的 RK809 固定原始音量 200。 */
+int IcToast::boostedToastRawVolume() const
 {
-    const int baseDac = 43;   // 固定初始 DAC
-    const int boostStep = 7;  // 在 43 基础上再提升
-    return qMin(55, baseDac + boostStep);
+    return ampCtrl_ ? 200 : 0;
 }
 
 /**
@@ -715,17 +721,17 @@ void IcToast::beginVoiceFocus()
         }
     }
 
-    // 2) 功放音量临时拉高一点
+    // 2) 播报期间 RK809 固定使用原始音量 200，结束后恢复用户主音量
     if (ampCtrl_) {
-        savedAmpDac_ = ampCtrl_->currentRawDac();
-        ampCtrl_->setRawDacTemporary(boostedToastDac());
+        savedAmpRawVolume_ = ampCtrl_->currentRawVolume();
+        ampCtrl_->setRawVolumeTemporary(boostedToastRawVolume());
     }
 
     // 3) 兜底恢复
     voiceFocusRestoreTimer_.start(2200);
 }
 
-/** @brief 恢复语音焦点前保存的播放器音量和功放 DAC。 */
+/** @brief 恢复语音焦点前保存的播放器音量和 RK809 播放音量。 */
 void IcToast::endVoiceFocus()
 {
     voiceFocusRestoreTimer_.stop();
@@ -737,12 +743,12 @@ void IcToast::endVoiceFocus()
     }
     duckedPlayers_.clear();
 
-    // 恢复功放音量
-    if (ampCtrl_ && savedAmpDac_ >= 0) {
-        ampCtrl_->setRawDacTemporary(savedAmpDac_);
+    // 恢复 RK809 播放音量
+    if (ampCtrl_ && savedAmpRawVolume_ >= 0) {
+        ampCtrl_->setRawVolumeTemporary(savedAmpRawVolume_);
     }
 
-    savedAmpDac_ = -1;
+    savedAmpRawVolume_ = -1;
     voiceFocusActive_ = false;
 }
 

@@ -225,7 +225,7 @@ void IcWorker::start()
                               << "reason=" << reason;
             IcEventBridge::instance()->emitFaceAccessFinished(
                         normalizedId, faceHash, floors,
-                        result.rs485Frame, false, reason);
+                        result.rs485Frame, false, reason, result.code);
             return;
         }
 
@@ -238,7 +238,7 @@ void IcWorker::start()
                                  << "frame=" << result.rs485Frame.toHex(' ');
             IcEventBridge::instance()->emitFaceAccessFinished(
                         normalizedId, faceHash, floors,
-                        result.rs485Frame, false, reason);
+                        result.rs485Frame, false, reason, 0);
             return;
         }
 
@@ -248,7 +248,7 @@ void IcWorker::start()
                                  << "personId=" << normalizedId;
             IcEventBridge::instance()->emitFaceAccessFinished(
                         normalizedId, faceHash, floors,
-                        result.rs485Frame, false, reason);
+                        result.rs485Frame, false, reason, 4501);
             return;
         }
 
@@ -258,7 +258,7 @@ void IcWorker::start()
                           << "frame=" << result.rs485Frame.toHex(' ');
         IcEventBridge::instance()->emitFaceAccessFinished(
                     normalizedId, faceHash, floors,
-                    result.rs485Frame, true, QString());
+                    result.rs485Frame, true, QString(), 200);
     }, Qt::QueuedConnection);
 
     // ================= 密码通行 =================
@@ -268,7 +268,7 @@ void IcWorker::start()
         if (runtimeIcModeFromIni() != RuntimeIcMode::OnlineV1) {
             IcEventBridge::instance()->emitPasswordAccessFinished(
                         QString(), QString(), QByteArray(), false,
-                        QStringLiteral("密码通行仅支持 online_v1 模式"));
+                        QStringLiteral("密码通行仅支持 online_v1 模式"), 0);
             return;
         }
 
@@ -290,7 +290,8 @@ void IcWorker::start()
                               << "code=" << result.code
                               << "reason=" << reason;
             IcEventBridge::instance()->emitPasswordAccessFinished(
-                        result.personId, floors, result.rs485Frame, false, reason);
+                        result.personId, floors, result.rs485Frame,
+                        false, reason, result.code);
             return;
         }
 
@@ -302,7 +303,8 @@ void IcWorker::start()
                                  << "floors=" << floors
                                  << "frame=" << result.rs485Frame.toHex(' ');
             IcEventBridge::instance()->emitPasswordAccessFinished(
-                        result.personId, floors, result.rs485Frame, false, reason);
+                        result.personId, floors, result.rs485Frame,
+                        false, reason, 0);
             return;
         }
 
@@ -318,12 +320,14 @@ void IcWorker::start()
             qWarning().noquote() << "[PASSWORD-ACCESS] DEDUCT_FAIL"
                                  << "personId=" << result.personId;
             IcEventBridge::instance()->emitPasswordAccessFinished(
-                        result.personId, floors, result.rs485Frame, false, reason);
+                        result.personId, floors, result.rs485Frame,
+                        false, reason, 4501);
             return;
         }
 
         IcEventBridge::instance()->emitPasswordAccessFinished(
-                    result.personId, floors, result.rs485Frame, true, QString());
+                    result.personId, floors, result.rs485Frame,
+                    true, QString(), 200);
     }, Qt::QueuedConnection);
 
     // ================= 刷卡 =================
@@ -383,7 +387,8 @@ void IcWorker::start()
             if (!result.pass) {
                 qInfo() << "[ONLINE-V1][IC] DENY"
                         << "code=" << result.code << result.reason;
-                IcEventBridge::instance()->emitToastFailRequested(result.reason);
+                IcEventBridge::instance()->emitToastFailRequested(
+                            result.reason, result.code);
                 IcEventBridge::instance()->emitCardAccessFinished(
                             result.personId, result.credential, floors,
                             result.rs485Frame, false, result.reason);

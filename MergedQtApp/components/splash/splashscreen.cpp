@@ -13,8 +13,6 @@
 #include <QPixmap>
 #include <QFont>
 #include <QIcon>
-#include <QApplication>
-#include <QDesktopWidget>
 #include <QScreen>
 #include <QGuiApplication>
 #include <QDebug>
@@ -27,23 +25,19 @@ SplashScreen::SplashScreen(QWidget *parent)
 
     setupUI();
 
-    // EGLFS 只能保留一个原生顶层窗口。存在父窗口时，启动页必须是普通子控件，
-    // 由唯一的 EGLFS 根窗口负责最终合成；仅桌面调试且没有父窗口时才保留顶层行为。
+    // 嵌入式运行只保留一个原生顶层窗口。存在父窗口时，启动页作为普通子控件
+    // 由应用根窗口合成；仅桌面调试且没有父窗口时保留顶层行为。
     if (parentWidget()) {
         setWindowFlags(Qt::Widget);
         setGeometry(parentWidget()->rect());
     } else {
         setWindowFlags(Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
-#if QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
         QScreen *screen = QGuiApplication::primaryScreen();
         if (screen) {
             setGeometry(screen->geometry());
         } else {
             showFullScreen();
         }
-#else
-        setGeometry(QApplication::desktop()->screen()->geometry());
-#endif
     }
 
     // 白底

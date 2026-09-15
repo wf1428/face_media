@@ -45,6 +45,15 @@ public:
     /** @brief 设置左右信息栏占用宽度，避免视频被覆盖。 */
     void setSideOverlayWidth(int width);
 
+    /** @brief 分别设置左右信息栏占用宽度，支持单侧综合信息栏布局。 */
+    void setOverlayWidths(int leftWidth, int rightWidth);
+
+    /** @brief 开关内嵌识别页的人脸引导框和单人识别提示。 */
+    void setRecognitionGuideEnabled(bool enabled);
+
+    /** @return 当前画面中实际绘制的识别引导框，坐标相对于本控件。 */
+    QRect recognitionGuideDisplayRect() const;
+
 signals:
     /** @brief 用户点击预览画面时发出，用于管理员入口计数。 */
     void clicked();
@@ -66,11 +75,17 @@ private:
     /** @return sourceSize 在可用视频区内保持比例的目标矩形。 */
     QRect videoTargetRect(const QSize &sourceSize) const;
 
+    /** @return 排除左右信息栏后的可用预览区域。 */
+    QRect previewContentRect() const;
+
     /** @return 人脸覆盖变化需要刷新的区域。 */
     QRect faceOverlayUpdateRect() const;
 
     /** @return 状态文本面板的绘制区域。 */
     QRect statusPanelRect() const;
+
+    /** @return 内嵌识别模式下位于清晰预览中央的人脸引导区域。 */
+    QRect recognitionGuideRect(const QRect &videoRect) const;
 
     QImage frame_;                       /**< 当前前景视频帧。 */
     QImage backgroundSourceFrame_;       /**< 生成静态背景的源帧。 */
@@ -80,7 +95,9 @@ private:
     QString stateText_ = "等待中";       /**< 当前状态提示。 */
     QString cameraUnavailableMessage_;   /**< 无画面时居中显示的摄像头异常提示。 */
     VerifyState state_ = VerifyState::Idle; /**< 当前验证状态。 */
-    int sideOverlayWidth_ = 0;           /**< 单侧信息覆盖区宽度，单位 px。 */
+    int leftOverlayWidth_ = 0;           /**< 左侧信息覆盖区宽度，单位 px。 */
+    int rightOverlayWidth_ = 0;          /**< 右侧信息覆盖区宽度，单位 px。 */
+    bool recognitionGuideEnabled_ = false; /**< 是否绘制单人识别引导框和顶部说明。 */
 };
 
 #endif

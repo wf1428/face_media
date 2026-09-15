@@ -14,6 +14,7 @@
 #include <QPainter>
 #include <QResizeEvent>
 #include <QSizePolicy>
+#include <QtMath>
 
 /** @brief 创建空预览并初始化静态背景缓存。 */
 CameraPreviewWidget::CameraPreviewWidget(QWidget *parent) : OpenGlImageWidget(parent)
@@ -78,11 +79,7 @@ QRect CameraPreviewWidget::videoTargetRect(const QSize &sourceSize) const
         return QRect();
     }
 
-    const int centerInset = qMin(qMax(sideOverlayWidth_, 0), width() / 3);
-    QRect clearArea = rect().adjusted(centerInset, 0, -centerInset, 0);
-    if (clearArea.width() < 80) {
-        clearArea = rect();
-    }
+    const QRect clearArea = previewContentRect();
 
     const QSize scaled = sourceSize.scaled(clearArea.size(), Qt::KeepAspectRatio);
     QRect target(
@@ -90,6 +87,17 @@ QRect CameraPreviewWidget::videoTargetRect(const QSize &sourceSize) const
         scaled);
     target.moveCenter(clearArea.center());
     return target;
+}
+
+/** @return 排除左右信息栏后的可用预览区域。 */
+QRect CameraPreviewWidget::previewContentRect() const
+{
+    const int maximumInset = qMax(0, width() - 80);
+    const int leftInset = qBound(0, leftOverlayWidth_, maximumInset);
+    const int rightInset = qBound(0, rightOverlayWidth_,
+                                  qMax(0, maximumInset - leftInset));
+    const QRect content = rect().adjusted(leftInset, 0, -rightInset, 0);
+    return content.width() >= 80 ? content : rect();
 }
 
 /** @return 人脸覆盖变化需要刷新的区域。 */
@@ -104,7 +112,8 @@ QRect CameraPreviewWidget::faceOverlayUpdateRect() const
 /** @return 状态文本面板的绘制区域。 */
 QRect CameraPreviewWidget::statusPanelRect() const
 {
-    const int panelWidth = qMin(560, qMax(260, width() - 420));
+    const QRect content = previewContentRect();
+    const int panelWidth = qMin(560, qMax(260, content.width() - 80));
     const int textWidth = qMax(1, panelWidth - 58);
 
     QFont statusFont = font();
@@ -116,7 +125,7 @@ QRect CameraPreviewWidget::statusPanelRect() const
                 Qt::AlignLeft | Qt::TextWordWrap,
                 stateText_);
     const int panelHeight = qMax(52, textBounds.height() + 20);
-    return QRect((width() - panelWidth) / 2,
+    return QRect(content.center().x() - panelWidth / 2,
                  height() - panelHeight - 30,
                  panelWidth,
                  panelHeight);
@@ -204,9 +213,55 @@ void CameraPreviewWidget::setState(VerifyState state)
 /** @brief 设置左右信息栏占用宽度，避免视频被覆盖。 */
 void CameraPreviewWidget::setSideOverlayWidth(int width)
 {
-    sideOverlayWidth_ = qMax(0, width);
+    setOverlayWidths(width, width);
+}
+
+/** @brief 分别设置左右覆盖宽度，并刷新清晰视频和状态区域。 */
+void CameraPreviewWidget::setOverlayWidths(int leftWidth, int rightWidth)
+{
+    const int boundedLeft = qMax(0, leftWidth);
+    const int boundedRight = qMax(0, rightWidth);
+    if (leftOverlayWidth_ == boundedLeft &&
+            rightOverlayWidth_ == boundedRight) {
+        return;
+    }
+    leftOverlayWidth_ = boundedLeft;
+    rightOverlayWidth_ = boundedRight;
     rebuildStaticBackground();
     update();
+}
+
+/** @brief 开关只用于多媒体页内嵌识别的引导元素，不改变旧人脸主页。 */
+void CameraPreviewWidget::setRecognitionGuideEnabled(bool enabled)
+{
+    if (recognitionGuideEnabled_ == enabled) {
+        return;
+    }
+    recognitionGuideEnabled_ = enabled;
+    update();
+}
+
+/** @return 与虚线框绘制完全一致的当前识别区域。 */
+QRect CameraPreviewWidget::recognitionGuideDisplayRect() const
+{
+    const QRect content = previewContentRect();
+    const QRect target = frame_.isNull() ? QRect() : videoTargetRect(frame_.size());
+    return recognitionGuideRect(target.isEmpty() ? content : target);
+}
+
+/** @return 位于视频中央、接近标准人脸肖像比例的识别引导区域。 */
+QRect CameraPreviewWidget::recognitionGuideRect(const QRect &videoRect) const
+{
+    if (videoRect.isEmpty()) {
+        return QRect();
+    }
+
+    const int guideHeight = qMax(1, qRound(videoRect.height() * 0.62));
+    const int guideWidth = qMin(qRound(guideHeight * 0.76),
+                                qRound(videoRect.width() * 0.48));
+    QRect guide(0, 0, guideWidth, guideHeight);
+    guide.moveCenter(videoRect.center());
+    return guide.intersected(videoRect.adjusted(8, 8, -8, -8));
 }
 
 /** @brief 用 OpenGL 纹理绘制视频，再叠加人脸框和状态面板。 */
@@ -251,7 +306,7 @@ void CameraPreviewWidget::paintGL()
         errorFont.setBold(true);
         p.setFont(errorFont);
         p.setPen(Qt::white);
-        p.drawText(rect().adjusted(36, 36, -36, -36),
+        p.drawText(previewContentRect().adjusted(36, 36, -36, -36),
                    Qt::AlignCenter | Qt::TextWordWrap,
                    cameraUnavailableMessage_);
     }
@@ -268,7 +323,8 @@ void CameraPreviewWidget::paintGL()
             );
 
             QColor boxColor = face.matched ? QColor(40, 210, 120) : QColor(245, 175, 45);
-            if (face.overlayStatus == QStringLiteral("passed")) {
+            if (state_ == VerifyState::Passed
+                    || face.overlayStatus == QStringLiteral("passed")) {
                 boxColor = QColor(40, 210, 120);
             } else if (face.overlayStatus == QStringLiteral("failed") ||
                        face.overlayStatus == QStringLiteral("liveness_failed")) {
@@ -284,12 +340,23 @@ void CameraPreviewWidget::paintGL()
             p.setBrush(Qt::NoBrush);
             p.drawRect(box);
 
-            QString label = face.overlayText;
-            if (label.isEmpty()) {
-                label = face.matched ? face.person.name : QStringLiteral("检测中");
-            }
-            if (label.isEmpty()) {
-                label = face.matched ? face.person.personNo : QStringLiteral("检测中");
+            QString label;
+            if (state_ == VerifyState::Passed) {
+                label = face.person.name.trimmed();
+                if (label.isEmpty()) {
+                    label = face.person.personNo.trimmed();
+                }
+                if (label.isEmpty()) {
+                    label = QStringLiteral("验证通过");
+                }
+            } else {
+                label = face.overlayText;
+                if (label.isEmpty()) {
+                    label = face.matched ? face.person.name : QStringLiteral("检测中");
+                }
+                if (label.isEmpty()) {
+                    label = face.matched ? face.person.personNo : QStringLiteral("检测中");
+                }
             }
             const QRect labelRect(box.left(), qMax(target.top(), box.top() - 30), qMax(120, box.width()), 26);
             p.setPen(Qt::NoPen);
@@ -302,6 +369,46 @@ void CameraPreviewWidget::paintGL()
             p.setFont(labelFont);
             p.drawText(labelRect.adjusted(8, 0, -8, 0), Qt::AlignVCenter | Qt::AlignLeft, label);
         }
+    }
+
+    if (recognitionGuideEnabled_) {
+        const QRect content = previewContentRect();
+        const QRect guide = recognitionGuideDisplayRect();
+        if (!guide.isEmpty()) {
+            QPen guidePen(QColor(255, 255, 255, 220), 3, Qt::DashLine,
+                          Qt::RoundCap, Qt::RoundJoin);
+            p.setPen(guidePen);
+            p.setBrush(Qt::NoBrush);
+            p.drawRoundedRect(guide, 18, 18);
+        }
+
+        const QString instruction = QStringLiteral("请保证只有一张人脸在识别区域内");
+        const int topBlackHeight = target.isEmpty()
+                ? 0 : qMax(0, target.top() - content.top());
+        QRect instructionRect;
+        if (topBlackHeight >= 40) {
+            instructionRect = QRect(content.left() + 12,
+                                    content.top(),
+                                    qMax(1, content.width() - 24),
+                                    topBlackHeight);
+        } else {
+            const int top = target.isEmpty() ? content.top() + 10 : target.top() + 10;
+            instructionRect = QRect(content.left() + 18,
+                                    top,
+                                    qMax(1, content.width() - 36),
+                                    44);
+            p.setPen(Qt::NoPen);
+            p.setBrush(QColor(0, 0, 0, 176));
+            p.drawRoundedRect(instructionRect, 7, 7);
+        }
+
+        QFont instructionFont = p.font();
+        instructionFont.setPointSize(15);
+        instructionFont.setBold(true);
+        p.setFont(instructionFont);
+        p.setPen(Qt::white);
+        p.drawText(instructionRect, Qt::AlignCenter | Qt::TextWordWrap,
+                   instruction);
     }
 
     QColor accent(70, 170, 255);

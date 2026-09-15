@@ -186,7 +186,7 @@ void CursorOverlay::attachToHost(QWidget *host)
         raise();
     }
 
-    qInfo() << "[EGLFS-CURSOR] overlay host changed"
+    qInfo() << "cursor overlay host changed"
             << "hostClass=" << host->metaObject()->className()
             << "hostObject=" << host->objectName()
             << "hostSize=" << host->size();
@@ -337,7 +337,7 @@ void CursorOverlay::moveToGlobalPosition(const QPoint &globalPos)
     ++moveEventsSinceDiagnostic_;
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
     if (lastDiagnosticMs_ == 0 || nowMs - lastDiagnosticMs_ >= 2000) {
-        qInfo() << "[EGLFS-CURSOR] software cursor input"
+        qInfo() << "software cursor input"
                 << "updates/2s=" << moveEventsSinceDiagnostic_
                 << "global=" << globalPos
                 << "local=" << local

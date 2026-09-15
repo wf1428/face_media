@@ -15,6 +15,8 @@
 class QLineEdit;
 class QLabel;
 class QPushButton;
+class QWidget;
+class QEvent;
 
 /** @brief 支持字母/数字模式、大小写和密码回显的屏幕键盘对话框。 */
 class KeyboardDialog : public QDialog
@@ -50,6 +52,9 @@ public:
 protected:
     /** @brief 显示时从屏幕底部弹出。 */
     void showEvent(QShowEvent *e) override;
+
+    /** @brief Wayland 宿主尺寸变化时同步覆盖层几何。 */
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
 private slots:
     /** @brief 把被点击字符键文本追加到编辑框。 */
@@ -89,6 +94,7 @@ private:
     void popupFromBottom();
 
 private:
+    QWidget *panel = nullptr;       /**< 随弹窗高度同步变化的键盘面板。 */
     QLabel   *titleLabel = nullptr;
     QLineEdit *edit = nullptr;
 
@@ -103,6 +109,7 @@ private:
     Mode mode = Mode::Alpha;
     bool shiftUpper = false;
     int maxLength = -1;
+    bool embeddedForWayland = false; /**< Wayland 下作为根窗口内部覆盖层显示。 */
 };
 
 

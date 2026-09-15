@@ -88,20 +88,22 @@ public:
     int livenessPassRequired = 5;    /**< 判定活体通过所需的通过帧数。 */
     int resultHoldMs = 2000;         /**< 验证结果界面保持时间，单位 ms。 */
     int sameFaceSuppressMs = 3000;   /**< 同一人员重复通过抑制窗口，单位 ms。 */
+    int accessDecisionTimeoutMs = 10000; /**< 人脸匹配后等待最终权限结果的超时。 */
     bool livenessEnabled = true;     /**< 是否在身份匹配后执行活体检测。 */
 
     QString snapshotDir = "./data/snapshots"; /**< 验证抓拍保存目录。 */
     bool saveFailedSnapshot = true;           /**< 是否保存验证失败抓拍。 */
 
     bool privacyMode = false;                 /**< 是否隐藏姓名等可识别个人信息。 */
+    bool showAccessPhoto = true;              /**< 通行成功后是否显示人员照片及下方姓名。 */
     int strangerPromptCooldownMs = 2000;      /**< 陌生人提示最小间隔，单位 ms。 */
 
     bool audioEnabled = true;                 /**< 语音提示总开关。 */
-    QString audioPlayer = QStringLiteral("aplay"); /**< 外部 WAV 播放程序。 */
+    QString audioPlayer = QStringLiteral("gstreamer"); /**< 进程内提示音播放后端。 */
     QString audioDevice = QStringLiteral("plughw:CARD=rockchiprk809co,DEV=0"); /**< ALSA 输出设备。 */
-    QString audioDir = QStringLiteral("./audio"); /**< 提示音文件目录。 */
-    int audioVolume = 80;                     /**< 逻辑播放音量，范围 0~100。 */
-    QString audioMixerControl = QStringLiteral("Playback"); /**< 系统混音器控制项。 */
+    QString audioDir = QStringLiteral("./common/audio"); /**< 统一提示音资源目录。 */
+    int audioVolume = 50;                     /**< 逻辑播放音量，范围 0~100。 */
+    QString audioMixerControl = QStringLiteral("numid=3"); /**< RK809 播放音量控制项。 */
     int audioCooldownMs = 1500;               /**< 同类语音提示冷却时间，单位 ms。 */
 
     // 各业务提示的独立开关、界面文本和 WAV 文件名。

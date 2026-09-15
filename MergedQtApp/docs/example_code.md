@@ -306,15 +306,14 @@ public:
     static QString heartbeatFile() { return QStringLiteral("/run/app_stack/qt_heartbeat"); }
     static QString ipcSocketPath() { return QStringLiteral("/tmp/mqttd.sock"); }
 
-    static QString qrDevice() { return QStringLiteral("/dev/ttyAS1"); }
+    static QString qrDevice() { return QStringLiteral("/dev/ttyS6"); }
     static int qrBaudRate() { return 9600; }
 
     static QString cardDevice() { return QStringLiteral("/dev/ttyAS2"); }
     static int cardBaudRate() { return 9600; }
 
-    static QString rs485Device() { return QStringLiteral("/dev/ttyAS4"); }
+    static QString rs485Device() { return QStringLiteral("/dev/ttyS8"); }
     static int rs485BaudRate() { return 9600; }
-    static QString rs485DirDevice() { return QStringLiteral("/dev/rs485_dir"); }
 
     static QString rtcDevice() { return QStringLiteral("/dev/rtc1"); }
 };

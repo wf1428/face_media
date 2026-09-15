@@ -9,6 +9,7 @@
 #include "MultimediaModuleAdapter.h"
 
 #include "mainwindow.h"
+#include "components/multimedia/multimediademo.h"
 
 #include <QDebug>
 
@@ -37,6 +38,17 @@ bool MultimediaModuleAdapter::initialize()
     }
     window_ = new MainWindow(widgetParent_);
     window_->setWindowFlags(Qt::Widget);
+    multimediaPage_ = window_->findChild<MultimediaDemo *>();
+    if (!multimediaPage_) {
+        qCritical() << "[MULTIMEDIA-ADAPTER] MultimediaDemo page was not found";
+        delete window_;
+        window_ = nullptr;
+        return false;
+    }
+    connect(multimediaPage_, &MultimediaDemo::adminLongPressRequested,
+            this, &MultimediaModuleAdapter::adminLongPressRequested);
+    connect(multimediaPage_, &MultimediaDemo::recognitionResultDisplayStarted,
+            this, &MultimediaModuleAdapter::recognitionResultDisplayStarted);
     shutdown_ = false;
     qInfo() << "[MULTIMEDIA-ADAPTER] initialized";
     return true;
@@ -85,4 +97,42 @@ bool MultimediaModuleAdapter::isActive() const
 bool MultimediaModuleAdapter::allowsPresenceSwitch() const
 {
     return isActive() && window_->allowsPresenceSwitch();
+}
+
+void MultimediaModuleAdapter::beginEmbeddedFaceRecognition()
+{
+    if (multimediaPage_) multimediaPage_->beginEmbeddedFaceRecognition();
+}
+
+void MultimediaModuleAdapter::endEmbeddedFaceRecognition()
+{
+    if (multimediaPage_) multimediaPage_->endEmbeddedFaceRecognition();
+}
+
+void MultimediaModuleAdapter::setEmbeddedFaceFrame(const QImage &image)
+{
+    if (multimediaPage_) multimediaPage_->setEmbeddedFaceFrame(image);
+}
+
+void MultimediaModuleAdapter::setEmbeddedFaceFaces(const QVector<DetectedFace> &faces)
+{
+    if (multimediaPage_) multimediaPage_->setEmbeddedFaceFaces(faces);
+}
+
+void MultimediaModuleAdapter::setEmbeddedFaceState(VerifyState state,
+                                                    const QString &message)
+{
+    if (multimediaPage_) multimediaPage_->setEmbeddedFaceState(state, message);
+}
+
+void MultimediaModuleAdapter::setEmbeddedFaceUnavailable(const QString &message)
+{
+    if (multimediaPage_) multimediaPage_->setEmbeddedFaceUnavailable(message);
+}
+
+void MultimediaModuleAdapter::showRecognitionImage(const QImage &image,
+                                                    const QString &name,
+                                                    int durationMs)
+{
+    if (multimediaPage_) multimediaPage_->showRecognitionImage(image, name, durationMs);
 }

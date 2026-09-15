@@ -1,0 +1,15 @@
+[Unit]
+Description=Disable and guard virtual console blanking
+After=local-fs.target
+Before=weston-kiosk.service face-media.service udisk-watcher.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/sbin/consoleblank-guard.sh once
+ExecStart=/usr/local/sbin/consoleblank-guard.sh run
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
+

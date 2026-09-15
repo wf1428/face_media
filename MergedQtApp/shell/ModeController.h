@@ -4,7 +4,8 @@
 #include <QObject>
 #include <QString>
 
-class IApplicationModule;
+class FaceGateModuleAdapter;
+class MultimediaModuleAdapter;
 class QStackedWidget;
 class QTimer;
 
@@ -17,14 +18,15 @@ public:
         MultimediaActive,
         SwitchingToFaceGate,
         FaceGateActive,
+        AdminActive,
         SwitchingToMultimedia,
         ShuttingDown
     };
     Q_ENUM(AppModeState)
 
     explicit ModeController(QStackedWidget *stack,
-                            IApplicationModule *multimediaModule,
-                            IApplicationModule *faceGateModule,
+                            MultimediaModuleAdapter *multimediaModule,
+                            FaceGateModuleAdapter *faceGateModule,
                             int recognitionReturnDelayMs,
                             QObject *parent = nullptr);
 
@@ -36,8 +38,11 @@ public slots:
     void handlePresenceDetected();
     void handlePresenceLost();
     void handleRecognitionFinished();
+    void handleRecognitionDisplayStarted();
     void handleFacePresenceChanged(bool present);
     void reconcilePresenceLevel(bool valid, bool present);
+    void handleAdminRequested();
+    void handleAdminSessionFinished();
 
 signals:
     void stateChanged(ModeController::AppModeState state);
@@ -50,8 +55,8 @@ private:
     void switchToMultimedia(const char *reason, bool waitForPresenceReset);
 
     QStackedWidget *stack_ = nullptr;
-    IApplicationModule *multimediaModule_ = nullptr;
-    IApplicationModule *faceGateModule_ = nullptr;
+    MultimediaModuleAdapter *multimediaModule_ = nullptr;
+    FaceGateModuleAdapter *faceGateModule_ = nullptr;
     QTimer *recognitionReturnTimer_ = nullptr;
     AppModeState state_ = AppModeState::SwitchingToMultimedia;
     bool started_ = false;

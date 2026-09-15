@@ -47,13 +47,15 @@ public:
                                     const QString &floors,
                                     const QByteArray &rs485Frame,
                                     bool success,
-                                    const QString &reason);
+                                    const QString &reason,
+                                    int resultCode = 0);
 
     /** @brief 发布人脸楼层权限判定及 RS485 实际发送结果。 */
     void emitFaceAccessFinished(const QString &personId, const QString &faceHash,
                                 const QString &floors,
                                 const QByteArray &rs485Frame, bool success,
-                                const QString &reason);
+                                const QString &reason,
+                                int resultCode = 0);
 
     /** @brief 发布一条需要异步编码并上传的人脸通行抓拍记录。 */
     void emitFaceUploadRequested(const QString &personId,
@@ -85,7 +87,7 @@ public:
     void emitToastPassRequested();
 
     /** @brief 请求主线程显示带原因的验证失败提示。 */
-    void emitToastFailRequested(const QString &reason);
+    void emitToastFailRequested(const QString &reason, int resultCode = 0);
 
     /** @brief 发布 RS485 异步发送结果。 */
     void emitRs485SendFinished(const QString &sourceTag, bool ok, const QString &reason);
@@ -124,13 +126,15 @@ signals:
                                 const QString &floors,
                                 const QByteArray &rs485Frame,
                                 bool success,
-                                const QString &reason);
+                                const QString &reason,
+                                int resultCode);
 
     /** @brief 人脸权限判定及楼层帧发送完成事件。 */
     void faceAccessFinished(const QString &personId, const QString &faceHash,
                             const QString &floors,
                             const QByteArray &rs485Frame, bool success,
-                            const QString &reason);
+                            const QString &reason,
+                            int resultCode);
 
     /** @brief 人脸识别结果需要上传抓拍记录。 */
     void faceUploadRequested(const QString &personId,
@@ -156,7 +160,7 @@ signals:
     void toastPassRequested();
 
     /** @brief UI 失败提示请求。 */
-    void toastFailRequested(const QString &reason);
+    void toastFailRequested(const QString &reason, int resultCode);
 
     /** @brief RS485 发送完成回执。 */
     void rs485SendFinished(const QString &sourceTag, bool ok, const QString &reason);

@@ -9,7 +9,7 @@
 #include "mqttpage.h"
 
 #include <QDebug>
-#include <QMessageBox>
+#include "components/dialogs/ui_message_box.h"
 #include <QGroupBox>
 #include <QGridLayout>
 #include <QDateTime>
@@ -892,13 +892,15 @@ void MqttPage::setupUI()
     });
 
     // 给可输入控件安装事件过滤器
-    ipcPathEdit->installEventFilter(this);
-    brokerAddressEdit->installEventFilter(this);
-    topicsInputEdit->installEventFilter(this);
-    publishTopicEdit->installEventFilter(this);
-    clientIdEdit->installEventFilter(this);
-    usernameEdit->installEventFilter(this);
-    passwordEdit->installEventFilter(this);
+    const QList<QLineEdit *> customKeyboardEdits = {
+        ipcPathEdit, brokerAddressEdit, topicsInputEdit, publishTopicEdit,
+        clientIdEdit, usernameEdit, passwordEdit
+    };
+    for (QLineEdit *edit : customKeyboardEdits) {
+        if (!edit) continue;
+        edit->setProperty("ycestCustomKeyboard", true);
+        edit->installEventFilter(this);
+    }
 
 
     auto markRouteDirty = [this](const QString &) {
@@ -934,10 +936,12 @@ void MqttPage::setupUI()
     fixField(passwordEdit);
 
     if (auto *portEdit = portSpinBox->findChild<QLineEdit*>()) {
+        portEdit->setProperty("ycestCustomKeyboard", true);
         portEdit->installEventFilter(this);
     }
 
     if (auto *kaEdit = keepaliveSpinBox->findChild<QLineEdit*>()) {
+        kaEdit->setProperty("ycestCustomKeyboard", true);
         kaEdit->installEventFilter(this);
     }
 
@@ -1098,11 +1102,11 @@ void MqttPage::openKeyboardForPort(QSpinBox *spin, const QString &title, int min
     bool okNum = false;
     int v = text.trimmed().toInt(&okNum);
     if (!okNum) {
-        QMessageBox::warning(this, "提示", "端口必须是数字");
+        UiMessageBox::warning(this, "提示", "端口必须是数字");
         return;
     }
     if (v < minV || v > maxV) {
-        QMessageBox::warning(this, "提示", QString("端口范围 %1-%2").arg(minV).arg(maxV));
+        UiMessageBox::warning(this, "提示", QString("端口范围 %1-%2").arg(minV).arg(maxV));
         return;
     }
 

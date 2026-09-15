@@ -9,7 +9,7 @@
 #include "networkpage.h"
 #include "ui_networkpage.h"
 
-#include <QMessageBox>
+#include "components/dialogs/ui_message_box.h"
 #include <QProcess>
 #include <QHostAddress>
 #include <QAbstractSocket>
@@ -342,9 +342,10 @@ NetworkPage::NetworkPage(QWidget *parent)
     connect(ui->cancelButton, &QPushButton::clicked,
             this, &NetworkPage::cancelRequested);
 
-    // apply（显式连接，避免自动连接失败）
+    // 使用不符合 connectSlotsByName 规则的槽名，只保留这一条显式连接，
+    // 避免 .ui 自动连接与手工连接叠加后一次点击执行两遍。
     connect(ui->applyButton, &QPushButton::clicked,
-            this, &NetworkPage::on_applyButton_clicked);
+            this, &NetworkPage::handleApplyClicked);
 
     // ✅ 这些输入框都改成“只读”，点击时弹键盘
     QLineEdit* edits[] = {
@@ -357,20 +358,21 @@ NetworkPage::NetworkPage(QWidget *parent)
     for (auto *e : edits) {
         e->setReadOnly(true);
         e->setFocusPolicy(Qt::StrongFocus);
+        e->setProperty("ycestCustomKeyboard", true);
         e->installEventFilter(this);
     }
 
     connect(ui->ipModeComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged),
-            this, &NetworkPage::on_ipModeComboBox_currentIndexChanged);
+            this, &NetworkPage::handleIpModeChanged);
 
     connect(ui->connectionTypeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
-            this, &NetworkPage::on_connectionTypeCombo_currentIndexChanged);
+            this, &NetworkPage::handleConnectionTypeChanged);
 
     // IP初始状态
-    on_ipModeComboBox_currentIndexChanged(ui->ipModeComboBox->currentIndex());
+    handleIpModeChanged(ui->ipModeComboBox->currentIndex());
 
     // 网络初始化显示
-    on_connectionTypeCombo_currentIndexChanged(ui->connectionTypeCombo->currentIndex());
+    handleConnectionTypeChanged(ui->connectionTypeCombo->currentIndex());
 
     //状态回显
     refreshUiFromSystem(ui, "eth0");
@@ -392,7 +394,7 @@ NetworkPage::~NetworkPage()
 
 
 /** @brief 有线连接模式切换时刷新可用控件。 */
-void NetworkPage::on_connectionTypeCombo_currentIndexChanged(int index)
+void NetworkPage::handleConnectionTypeChanged(int index)
 {
     // 0=有线 1=无线
     if (index == 0) {
@@ -408,7 +410,7 @@ void NetworkPage::on_connectionTypeCombo_currentIndexChanged(int index)
 }
 
 /** @brief DHCP/静态模式切换时更新输入框状态。 */
-void NetworkPage::on_ipModeComboBox_currentIndexChanged(int index)
+void NetworkPage::handleIpModeChanged(int index)
 {
     const bool isStatic = (index == 0);     // isStatic:0=静态
     setIpFieldsEnabled(!isStatic);
@@ -487,7 +489,7 @@ void NetworkPage::openKeyboardFor(QLineEdit *edit, const QString &title)
 
 
 /** @brief 保存并应用当前网络设置。 */
-void NetworkPage::on_applyButton_clicked()
+void NetworkPage::handleApplyClicked()
 {
     applyNetworkConfig(true);
 }
@@ -516,7 +518,7 @@ bool NetworkPage::applyNetworkConfig(bool showMessage)
         }
 
         if (showMessage) {
-            QMessageBox::warning(this, "权限不足", "未启用网络功能");
+            UiMessageBox::warning(this, "权限不足", "未启用网络功能");
         }
         appendLog("未启用网络功能");
         return false;
@@ -530,7 +532,7 @@ bool NetworkPage::applyNetworkConfig(bool showMessage)
     // 0=有线 1=无线
     if (ui->connectionTypeCombo->currentIndex() == 1) {
         if (showMessage) {
-            QMessageBox::information(this, "提示", "无线网络功能开发中，暂不可用。");
+            UiMessageBox::information(this, "提示", "无线网络功能开发中，暂不可用。");
         }
         appendLog("无线网络功能开发中，暂不可用");
         return false;
@@ -538,7 +540,7 @@ bool NetworkPage::applyNetworkConfig(bool showMessage)
 
     if (!runCmd("ip", {"link", "set", iface, "up"}, &err)) {
         if (showMessage) {
-            QMessageBox::critical(this, "失败", "拉起网卡失败: " + err);
+            UiMessageBox::critical(this, "失败", "拉起网卡失败: " + err);
         }
         appendLog(QString("拉起网卡失败: %1").arg(err));
         return false;
@@ -548,7 +550,7 @@ bool NetworkPage::applyNetworkConfig(bool showMessage)
         // DHCP 前先判断网线是否连接
         if (!isIfaceCarrierUp(iface)) {
             if (showMessage) {
-                QMessageBox::warning(this,
+                UiMessageBox::warning(this,
                                      "网线未连接",
                                      QString("未检测到 %1 网线连接，请插入网线后再获取DHCP。").arg(iface));
             }
@@ -564,7 +566,7 @@ bool NetworkPage::applyNetworkConfig(bool showMessage)
 
         if (!startDhcpDaemon(iface, &err)) {
             if (showMessage) {
-                QMessageBox::warning(this, "DHCP失败",
+                UiMessageBox::warning(this, "DHCP失败",
                                      "启动DHCP客户端失败（检查网线/上级设备DHCP）\n" + err);
             }
             appendLog(QString("启动DHCP客户端失败: %1").arg(err));
@@ -591,13 +593,13 @@ bool NetworkPage::applyNetworkConfig(bool showMessage)
             lastDns_ = getDnsFromResolvConf();
 
             if (showMessage) {
-                QMessageBox::information(this, "设置成功", "DHCP已启动并获取到网络参数");
+                UiMessageBox::information(this, "设置成功", "DHCP已启动并获取到网络参数");
             }
             appendLog(QString("DHCP已启动并获取到网络参数：ip=%1 mask=%2 gw=%3 dns=%4")
                       .arg(lastIp_, lastMask_, lastGateway_, lastDns_));
         } else {
             if (showMessage) {
-                QMessageBox::information(this, "提示", "DHCP已启动，等待获取网络参数");
+                UiMessageBox::information(this, "提示", "DHCP已启动，等待获取网络参数");
             }
             appendLog("DHCP已启动，但尚未获取到有效IP，等待定时器同步");
         }
@@ -616,7 +618,7 @@ bool NetworkPage::applyNetworkConfig(bool showMessage)
 
     if (!isIPv4(ip)) {
         if (showMessage) {
-            QMessageBox::warning(this, "输入错误", "IP 地址不合法");
+            UiMessageBox::warning(this, "输入错误", "IP 地址不合法");
         }
         appendLog("IP 地址不合法");
         return false;
@@ -625,7 +627,7 @@ bool NetworkPage::applyNetworkConfig(bool showMessage)
     int prefix = netmaskToPrefix(mask);
     if (prefix < 0) {
         if (showMessage) {
-            QMessageBox::warning(this, "输入错误", "子网掩码不合法（例如 255.255.255.0）");
+            UiMessageBox::warning(this, "输入错误", "子网掩码不合法（例如 255.255.255.0）");
         }
         appendLog("子网掩码不合法");
         return false;
@@ -633,7 +635,7 @@ bool NetworkPage::applyNetworkConfig(bool showMessage)
 
     if (!gw.isEmpty() && !isIPv4(gw)) {
         if (showMessage) {
-            QMessageBox::warning(this, "输入错误", "网关不合法");
+            UiMessageBox::warning(this, "输入错误", "网关不合法");
         }
         appendLog("网关不合法");
         return false;
@@ -641,7 +643,7 @@ bool NetworkPage::applyNetworkConfig(bool showMessage)
 
     if (!dns.isEmpty() && !isIPv4(dns)) {
         if (showMessage) {
-            QMessageBox::warning(this, "输入错误", "DNS 不合法");
+            UiMessageBox::warning(this, "输入错误", "DNS 不合法");
         }
         appendLog("DNS 不合法");
         return false;
@@ -649,7 +651,7 @@ bool NetworkPage::applyNetworkConfig(bool showMessage)
 
     if (!runCmd("ip", {"addr", "flush", "dev", iface}, &err)) {
         if (showMessage) {
-            QMessageBox::critical(this, "失败", "清理旧地址失败: " + err);
+            UiMessageBox::critical(this, "失败", "清理旧地址失败: " + err);
         }
         appendLog(QString("清理旧地址失败: %1").arg(err));
         return false;
@@ -658,7 +660,7 @@ bool NetworkPage::applyNetworkConfig(bool showMessage)
     const QString ipWithPrefix = QString("%1/%2").arg(ip).arg(prefix);
     if (!runCmd("ip", {"addr", "add", ipWithPrefix, "dev", iface}, &err)) {
         if (showMessage) {
-            QMessageBox::critical(this, "失败", "设置IP失败: " + err);
+            UiMessageBox::critical(this, "失败", "设置IP失败: " + err);
         }
         appendLog(QString("设置IP失败: %1").arg(err));
         return false;
@@ -667,7 +669,7 @@ bool NetworkPage::applyNetworkConfig(bool showMessage)
     if (!gw.isEmpty()) {
         if (!runCmd("ip", {"route", "replace", "default", "via", gw, "dev", iface}, &err)) {
             if (showMessage) {
-                QMessageBox::critical(this, "失败", "设置默认网关失败: " + err);
+                UiMessageBox::critical(this, "失败", "设置默认网关失败: " + err);
             }
             appendLog(QString("设置默认网关失败: %1").arg(err));
             return false;
@@ -678,7 +680,7 @@ bool NetworkPage::applyNetworkConfig(bool showMessage)
         QFile f("/etc/resolv.conf");
         if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
             if (showMessage) {
-                QMessageBox::warning(this, "提示", "IP已设置，但写入 /etc/resolv.conf 失败（DNS可能未更新）");
+                UiMessageBox::warning(this, "提示", "IP已设置，但写入 /etc/resolv.conf 失败（DNS可能未更新）");
             }
             appendLog("IP已设置，但写入 /etc/resolv.conf 失败（DNS可能未更新）");
         } else {
@@ -692,7 +694,7 @@ bool NetworkPage::applyNetworkConfig(bool showMessage)
     saveInputsToConfigFile(configDir_);
 
     if (showMessage) {
-        QMessageBox::information(this, "成功", QString("静态 IP 已应用（%1）").arg(iface));
+        UiMessageBox::information(this, "成功", QString("静态 IP 已应用（%1）").arg(iface));
     }
     appendLog(QString("静态 IP 已应用（%1）").arg(iface));
 

@@ -54,6 +54,18 @@ bool FaceGateModuleAdapter::initialize()
             this, &FaceGateModuleAdapter::recognitionFinished);
     connect(window_, &FaceGateMainWindow::facePresenceChanged,
             this, &FaceGateModuleAdapter::facePresenceChanged);
+    connect(window_, &FaceGateMainWindow::previewFrameChanged,
+            this, &FaceGateModuleAdapter::previewFrameChanged);
+    connect(window_, &FaceGateMainWindow::previewUnavailable,
+            this, &FaceGateModuleAdapter::previewUnavailable);
+    connect(window_, &FaceGateMainWindow::previewFacesChanged,
+            this, &FaceGateModuleAdapter::previewFacesChanged);
+    connect(window_, &FaceGateMainWindow::previewStateChanged,
+            this, &FaceGateModuleAdapter::previewStateChanged);
+    connect(window_, &FaceGateMainWindow::recognitionImageReady,
+            this, &FaceGateModuleAdapter::recognitionImageReady);
+    connect(window_, &FaceGateMainWindow::adminSessionFinished,
+            this, &FaceGateModuleAdapter::adminSessionFinished);
     shutdown_ = false;
     qInfo() << "[FACEGATE-ADAPTER] initialized"
             << "config=" << configPath_;
@@ -101,4 +113,12 @@ bool FaceGateModuleAdapter::isActive() const
 bool FaceGateModuleAdapter::allowsPresenceSwitch() const
 {
     return isActive() && window_->allowsPresenceSwitch();
+}
+
+/** @brief 由新模式的多媒体长按入口调用，认证和面板仍由 FaceGate 管理。 */
+void FaceGateModuleAdapter::requestOpenAdminManagement()
+{
+    if (window_ && active_ && !shutdown_) {
+        window_->requestOpenAdminManagement();
+    }
 }

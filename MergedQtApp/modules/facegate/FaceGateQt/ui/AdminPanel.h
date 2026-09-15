@@ -30,10 +30,12 @@ class QSlider;
 class QTableWidget;
 class QTabWidget;
 class QTimer;
-class QQuickWidget;
 class QWidget;
 class QHideEvent;
+class QResizeEvent;
 class QShowEvent;
+class QBoxLayout;
+class QGridLayout;
 
 /** @brief 后台线程采集的一次设备运行状态快照。 */
 struct DeviceStatusSnapshot {
@@ -58,7 +60,7 @@ class AdminPanel : public QDialog {
     Q_OBJECT
 
 public:
-    /** @brief 按当前配置创建导航、内容页和内嵌虚拟键盘。 */
+    /** @brief 按当前配置创建导航和内容页。 */
     explicit AdminPanel(const AppConfig &config, QWidget *parent = nullptr);
 
     /** @brief 停止设备状态采集线程。 */
@@ -94,9 +96,6 @@ public:
 
     /** @brief 填充验证日志表格。 */
     void setPassedVerifyLogs(const QVector<VerifyLogViewRecord> &records);
-
-    /** @brief 填充同步任务表格。 */
-    void setSyncTasks(const QVector<SyncTaskRecord> &records);
 
     /** @brief 填充系统事件表格。 */
     void setSystemEvents(const QVector<SystemEventLog> &records);
@@ -136,6 +135,9 @@ signals:
     /** @brief 活体开关修改请求。 */
     void livenessEnabledChanged(bool enabled);
 
+    /** @brief 通行照片及其姓名显示开关修改请求。 */
+    void accessPhotoDisplayChanged(bool enabled);
+
     /** @brief 人员列表刷新请求。 */
     void peopleRefreshRequested();
     void networkPeopleRefreshRequested();
@@ -148,9 +150,6 @@ signals:
 
     /** @brief 验证日志筛选刷新请求。 */
     void passedLogsRefreshRequested(const VerifyLogFilter &filter);
-
-    /** @brief 同步任务刷新请求。 */
-    void syncTasksRefreshRequested();
 
     /** @brief 设备信息刷新请求。 */
     void deviceInfoRefreshRequested();
@@ -201,6 +200,9 @@ protected:
     /** @brief 面板隐藏时停止设备状态刷新。 */
     void hideEvent(QHideEvent *event) override;
 
+    /** @brief 根据配置优先的参考分辨率切换侧栏或顶部导航。 */
+    void resizeEvent(QResizeEvent *event) override;
+
 private:
     /** @return 人员录入和管理组合页面。 */
     QWidget *createPersonManagementPage();
@@ -226,16 +228,13 @@ private:
     /** @return 验证日志查询页面。 */
     QWidget *createLogPage();
 
-    /** @return 同步任务与系统事件页面。 */
-    QWidget *createSyncPage();
-
     /** @return 备份和清理维护页面。 */
     QWidget *createMaintenancePage();
 
     /** @return 设备资源与运行状态页面。 */
     QWidget *createDeviceInfoPage();
 
-    /** @return 阈值、网络、音频和密码设置页面。 */
+    /** @return 阈值、网络、音频、显示和密码设置页面。 */
     QWidget *createSettingsPage();
 
     /** @brief 校验选择后请求修改人员编号。 */
@@ -301,20 +300,11 @@ private:
     /** @brief 在 GUI 线程把后台快照更新到标签。 */
     void applyDeviceStatusSnapshot(const DeviceStatusSnapshot &snapshot);
 
-    /** @brief 根据当前文本焦点和点击对象更新虚拟键盘。 */
-    void updateEmbeddedKeyboardVisibility();
-
-    /** @brief 隐藏内嵌虚拟键盘。 */
-    void hideEmbeddedKeyboard();
+    /** @brief 重排导航并刷新紧凑尺寸策略。 */
+    void applyResponsiveLayout();
 
     /** @brief 重新计算当前页面摄像头需求并在变化时发信号。 */
     void updateCameraRequirement();
-
-    /** @return widget 属于内嵌键盘对象树时返回 true。 */
-    bool clickedWidgetIsEmbeddedKeyboard(QWidget *widget) const;
-
-    /** @return widget 是可编辑文本控件时返回 true。 */
-    bool clickedWidgetIsTextEditor(QWidget *widget) const;
 
     /** @return 人员表格当前行的人员主键；无选择时返回 0。 */
     qint64 selectedPersonId() const;
@@ -330,6 +320,13 @@ private:
     StorageStats storageStats_;
     FaceEnrollWidget *enrollWidget_ = nullptr;
     class QListWidget *navList_ = nullptr;
+    QBoxLayout *rootLayout_ = nullptr;
+    QGridLayout *sideLayout_ = nullptr;
+    QWidget *sidebar_ = nullptr;
+    QLabel *adminTitle_ = nullptr;
+    QLabel *adminSubtitle_ = nullptr;
+    class QPushButton *backButton_ = nullptr;
+    bool topNavigation_ = false;
     QTableWidget *peopleTable_ = nullptr;
     QTableWidget *networkPeopleTable_ = nullptr;
     QWidget *networkPeoplePage_ = nullptr;
@@ -342,9 +339,7 @@ private:
     QJsonArray networkPeopleRecords_;
     bool networkDeletedView_ = false;
     QTableWidget *passedLogTable_ = nullptr;
-    QTableWidget *syncTaskTable_ = nullptr;
     QTableWidget *systemEventTable_ = nullptr;
-    QQuickWidget *keyboardWidget_ = nullptr;
     QWidget *contentShell_ = nullptr;
     class QCheckBox *livenessCheck_ = nullptr;
     class QCheckBox *showDeletedPeopleCheck_ = nullptr;

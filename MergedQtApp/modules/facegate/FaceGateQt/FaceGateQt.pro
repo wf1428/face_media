@@ -1,10 +1,11 @@
-QT += core gui widgets sql virtualkeyboard network qml quick quickwidgets
+QT += core gui widgets opengl sql virtualkeyboard network qml quick quickwidgets
 
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
 TARGET = FaceGateQt
 TEMPLATE = app
 CONFIG += c++17 thread link_pkgconfig
+PKGCONFIG += gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0 gstreamer-rtp-1.0
 
 packagesExist(librga) {
     PKGCONFIG += librga
@@ -54,10 +55,13 @@ SOURCES += \
     ../../../common/sql/dbstore.cpp \
     ../../../common/sql/network_personnel_store.cpp \
     ../../../platform/rk3566_platform.cpp \
+    ../../../components/multimedia/gst_player_widget.cpp \
+    ../../../components/multimedia/vol_ctrl.cpp \
     config/AppConfig.cpp \
     audio/AudioService.cpp \
     ../../../components/rga/RgaImageProcessor.cpp \
     ../../../components/input/InputCursorController.cpp \
+    ../../../components/settings/displayrotationpage.cpp \
     core/CameraCaptureBackend.cpp \
     core/CameraService.cpp \
     core/FaceEngine.cpp \
@@ -83,19 +87,24 @@ SOURCES += \
     ui/CameraPreviewWidget.cpp \
     ui/EnrollPreviewWidget.cpp \
     ui/FaceEnrollWidget.cpp \
+    ui/SharedVirtualKeyboard.cpp \
     ui/MainWindow.cpp
 
 HEADERS += \
     ../../../common/face_image_sync_bridge.h \
+    ../../../common/responsive_ui.h \
     ../../../common/storage_policy.h \
     ../../../common/sql/dbstore.h \
     ../../../common/sql/network_personnel_store.h \
     ../../../platform/rk3566_platform.h \
+    ../../../components/multimedia/gst_player_widget.h \
+    ../../../components/multimedia/vol_ctrl.h \
     config/AppConfig.h \
     config/CameraProfile.h \
     audio/AudioService.h \
     ../../../components/rga/RgaImageProcessor.h \
     ../../../components/input/InputCursorController.h \
+    ../../../components/settings/displayrotationpage.h \
     core/CameraCaptureBackend.h \
     core/CameraService.h \
     core/FaceEngine.h \
@@ -126,10 +135,13 @@ HEADERS += \
     ui/CameraPreviewWidget.h \
     ui/EnrollPreviewWidget.h \
     ui/FaceEnrollWidget.h \
+    ui/SharedVirtualKeyboard.h \
     ui/MainWindow.h
 
 
-RESOURCES += facegate_resources.qrc
+RESOURCES += \
+    facegate_resources.qrc \
+    ../../../common/audio_resources.qrc
 
 target.path = /home/cat/FaceGateQt
 INSTALLS += target

@@ -1,6 +1,6 @@
 /**
  * @file AppPasswordDialog.h
- * @brief 项目统一密码输入弹窗，内部集成虚拟键盘。
+ * @brief 使用人脸模块共享虚拟键盘的统一密码输入弹窗。
  *
  * @author Dulin
  * @date 2026-07-25
@@ -14,11 +14,11 @@
 
 class QEvent;
 class QLineEdit;
-class QQuickWidget;
 class QScrollArea;
+class QShowEvent;
 
 /**
- * @brief 项目统一密码输入弹窗，内部集成虚拟键盘。
+ * @brief 使用人脸模块共享虚拟键盘的统一密码输入弹窗。
  *
  * 用于替代 QInputDialog::getText(..., QLineEdit::Password)，避免系统输入弹窗
  * 与 Qt Virtual Keyboard 抢焦点、键盘不可点击或被管理页面裁剪。
@@ -32,7 +32,7 @@ public:
                                const QString &description,
                                QWidget *parent = nullptr);
 
-    /** @brief 销毁前释放虚拟键盘资源。 */
+    /** @brief 销毁前移除宿主尺寸监听并释放输入焦点。 */
     ~AppPasswordDialog() override;
 
     /** @return 旧密码输入。 */
@@ -50,39 +50,24 @@ public:
                                   QString *newPassword);
 
 protected:
-    /** @brief 管理文本焦点、键盘点击和键盘可见性。 */
+    /** @brief 处理宿主尺寸变化并保证聚焦输入框可见。 */
     bool eventFilter(QObject *watched, QEvent *event) override;
 
-    /** @brief 显示时稳定标题布局和键盘几何位置。 */
+    /** @brief 显示时稳定标题布局并聚焦第一个输入框。 */
     void showEvent(QShowEvent *event) override;
 
 private:
-    /** @brief 创建密码表单、滚动区域和虚拟键盘。 */
+    /** @brief 创建密码表单和滚动区域。 */
     void buildUi(const QString &title, const QString &description);
 
     /** @brief 加载统一密码弹窗样式。 */
     void loadStyleSheet();
-
-    /** @brief 显示虚拟键盘并保证当前编辑器可见。 */
-    void showKeyboard();
-
-    /** @brief 隐藏虚拟键盘。 */
-    void hideKeyboard();
-
-    /** @brief 根据弹窗可用高度调整键盘区域。 */
-    void updateKeyboardGeometry();
 
     /** @brief 滚动表单以露出当前聚焦输入框。 */
     void ensureFocusedEditorVisible();
 
     /** @brief 在字体布局完成后固定标题区域高度。 */
     void stabilizeHeaderLayout();
-
-    /** @return widget 是密码文本编辑器时返回 true。 */
-    bool isTextEditor(QWidget *widget) const;
-
-    /** @return widget 属于内嵌键盘对象树时返回 true。 */
-    bool isKeyboardWidget(QWidget *widget) const;
 
     /** @brief 校验非空、强度和两次新密码一致后接受对话框。 */
     void validateAndAccept();
@@ -92,7 +77,8 @@ private:
     QLineEdit *newPasswordEdit_ = nullptr;     /**< 新密码输入框。 */
     QLineEdit *confirmPasswordEdit_ = nullptr; /**< 新密码确认输入框。 */
     QScrollArea *contentScrollArea_ = nullptr; /**< 键盘出现时可滚动的表单区。 */
-    QQuickWidget *keyboardWidget_ = nullptr;   /**< 内嵌 Qt 虚拟键盘。 */
+    QWidget *keyboardClearance_ = nullptr;     /**< 让表单可滚动到共享键盘上方的留白。 */
+    bool embeddedForWayland_ = false;          /**< 是否复用管理后台的 Wayland surface。 */
 };
 
 #endif // APPPASSWORDDIALOG_H

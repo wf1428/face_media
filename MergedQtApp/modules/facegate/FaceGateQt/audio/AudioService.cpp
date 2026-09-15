@@ -1,6 +1,6 @@
 /**
  * @file AudioService.cpp
- * @brief 使用外部 aplay 进程播放门禁语音提示的实现。
+ * @brief 使用进程内 GStreamer 播放门禁语音提示的实现。
  *
  * @author Dulin
  * @date 2026-07-25
@@ -8,26 +8,53 @@
 
 #include "AudioService.h"
 
-#include <QCoreApplication>
+#include "components/multimedia/gst_player_widget.h"
+#include "components/multimedia/vol_ctrl.h"
+
 #include <QDateTime>
 #include <QDebug>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
-#include <QProcess>
-#include <QStringList>
+#include <QSaveFile>
+#include <QStandardPaths>
 
 /** @brief 创建尚未配置的音频服务。 */
 AudioService::AudioService(QObject *parent)
     : QObject(parent), config_(AppConfig::defaults())
 {
+    volumeController_ = new AmpVolumeController(this);
+    // AmpVolumeController 构造时已经读取（或首次创建）volume.dat，并完成
+    // RK809 输出路径及硬件音量初始化，这里只同步界面配置值。
+    config_.audioVolume = volumeController_->currentVolume();
+
+    player_ = new GstPlayerWidget;
+    player_->setVideoOutput(nullptr);
+    player_->setVolume(1.0f);
+    connect(player_, &GstPlayerWidget::videoFinished, this, [this]() {
+        emit audioStatus(QStringLiteral("GStreamer 提示音播放完成"));
+    });
+    connect(player_, &GstPlayerWidget::errorOccured, this, [this](const QString &error) {
+        emit audioError(QStringLiteral("GStreamer 提示音播放失败：%1").arg(error));
+    });
+}
+
+AudioService::~AudioService()
+{
+    if (player_) {
+        player_->stop();
+        delete player_;
+        player_ = nullptr;
+    }
 }
 
 /** @brief 替换完整运行配置，并应用音量设置。 */
 void AudioService::configure(const AppConfig &config)
 {
     config_ = config;
-    config_.audioVolume = qBound(0, config_.audioVolume, 100);
-    applySystemVolume(config_.audioVolume);
+    config_.audioVolume = volumeController_
+            ? volumeController_->currentVolume()
+            : qBound(0, config_.audioVolume, 100);
 }
 
 /** @brief 启用或关闭语音提示总开关。 */
@@ -36,14 +63,23 @@ void AudioService::setEnabled(bool enabled)
     config_.audioEnabled = enabled;
 }
 
-/** @brief 设置 0~100 的逻辑音量并尝试同步系统混音器。 */
+/** @brief 设置并持久化 0~100 音量，同时更新 RK809 硬件音量。 */
 void AudioService::setVolume(int volume)
 {
     config_.audioVolume = qBound(0, volume, 100);
-    applySystemVolume(config_.audioVolume);
+    if (volumeController_) {
+        volumeController_->setVolume(config_.audioVolume);
+    }
 }
 
-/** @brief 在提示类型启用且冷却允许时播放对应 WAV。 */
+int AudioService::volume() const
+{
+    return volumeController_
+            ? volumeController_->currentVolume()
+            : qBound(0, config_.audioVolume, 100);
+}
+
+/** @brief 在提示类型启用且冷却允许时播放对应音频。 */
 void AudioService::playPrompt(Prompt prompt)
 {
     if (!config_.audioEnabled) {
@@ -52,7 +88,40 @@ void AudioService::playPrompt(Prompt prompt)
     if (!promptEnabled(prompt)) {
         return;
     }
-    startAplay(absoluteAudioPath(promptFile(prompt)), false, prompt);
+    startGstreamer(absoluteAudioPath(promptFile(prompt)), false, prompt);
+}
+
+/** @brief 按统一通行结果码播放专用失败音，未配置的结果使用通用失败音。 */
+void AudioService::playAccessFailure(int resultCode)
+{
+    if (!config_.audioEnabled || !config_.promptVerifyFailedEnabled) {
+        return;
+    }
+
+    QString fileName = QStringLiteral("fail.wav");
+    switch (resultCode) {
+    case 4000:
+    case 4001:
+    case 4003:
+    case 4100:
+    case 4101:
+    case 4102:
+    case 4200:
+    case 4201:
+    case 4202:
+    case 4300:
+    case 4301:
+    case 4400:
+    case 4401:
+    case 4402:
+    case 4403:
+    case 4501:
+        fileName = QStringLiteral("code_%1.mp3").arg(resultCode);
+        break;
+    default:
+        break;
+    }
+    startGstreamer(absoluteAudioPath(fileName), false, Prompt::VerifyFailed);
 }
 
 /** @brief 按配置键测试播放指定提示，忽略业务冷却。 */
@@ -68,6 +137,10 @@ void AudioService::testPlay(const QString &promptKey)
         prompt = Prompt::Stranger;
     } else if (key == QStringLiteral("liveness_failed")) {
         prompt = Prompt::LivenessFailed;
+    } else if (key == QStringLiteral("face_access_timeout")) {
+        prompt = Prompt::FaceAccessTimeout;
+    } else if (key == QStringLiteral("face_liveness_unavailable")) {
+        prompt = Prompt::FaceLivenessUnavailable;
     } else if (key == QStringLiteral("enroll_success")) {
         prompt = Prompt::EnrollSuccess;
     } else if (key == QStringLiteral("enroll_failed")) {
@@ -76,13 +149,15 @@ void AudioService::testPlay(const QString &promptKey)
         emit audioError(QStringLiteral("未知音频事件：%1").arg(promptKey));
         return;
     }
-    startAplay(absoluteAudioPath(promptFile(prompt)), true, prompt);
+    startGstreamer(absoluteAudioPath(promptFile(prompt)), true, prompt);
 }
 
-/** @brief 兼容预留接口；当前 detached 播放模式下不执行停止操作。 */
+/** @brief 停止当前 GStreamer 提示音。 */
 void AudioService::stopCurrentPlayback()
 {
-    // 第一版使用 startDetached 启动短音频，不保留进程句柄。这里保留接口，便于后续扩展为可中断播放。
+    if (player_) {
+        player_->stop();
+    }
 }
 
 /** @return Prompt 对应的稳定配置键。 */
@@ -93,6 +168,8 @@ QString AudioService::keyForPrompt(Prompt prompt)
     case Prompt::VerifyFailed: return QStringLiteral("verify_failed");
     case Prompt::Stranger: return QStringLiteral("stranger");
     case Prompt::LivenessFailed: return QStringLiteral("liveness_failed");
+    case Prompt::FaceAccessTimeout: return QStringLiteral("face_access_timeout");
+    case Prompt::FaceLivenessUnavailable: return QStringLiteral("face_liveness_unavailable");
     case Prompt::EnrollSuccess: return QStringLiteral("enroll_success");
     case Prompt::EnrollFailed: return QStringLiteral("enroll_failed");
     }
@@ -107,6 +184,8 @@ bool AudioService::promptEnabled(Prompt prompt) const
     case Prompt::VerifyFailed: return config_.promptVerifyFailedEnabled;
     case Prompt::Stranger: return config_.promptStrangerEnabled;
     case Prompt::LivenessFailed: return config_.promptLivenessFailedEnabled;
+    case Prompt::FaceAccessTimeout: return config_.promptVerifyFailedEnabled;
+    case Prompt::FaceLivenessUnavailable: return config_.promptLivenessFailedEnabled;
     case Prompt::EnrollSuccess: return config_.promptEnrollSuccessEnabled;
     case Prompt::EnrollFailed: return config_.promptEnrollFailedEnabled;
     }
@@ -121,35 +200,62 @@ QString AudioService::promptFile(Prompt prompt) const
     case Prompt::VerifyFailed: return config_.promptVerifyFailedFile;
     case Prompt::Stranger: return config_.promptStrangerFile;
     case Prompt::LivenessFailed: return config_.promptLivenessFailedFile;
+    case Prompt::FaceAccessTimeout: return QStringLiteral("face_access_timeout.mp3");
+    case Prompt::FaceLivenessUnavailable: return QStringLiteral("face_liveness_unavailable.mp3");
     case Prompt::EnrollSuccess: return config_.promptEnrollSuccessFile;
     case Prompt::EnrollFailed: return config_.promptEnrollFailedFile;
     }
     return QString();
 }
 
-/** @return 相对 audioDir 解析后的音频绝对路径。 */
-QString AudioService::absoluteAudioPath(const QString &fileName) const
+/** @return common/audio 资源物化后的临时文件绝对路径。 */
+QString AudioService::absoluteAudioPath(const QString &fileName)
 {
-    const QString trimmedFile = fileName.trimmed();
-    if (trimmedFile.isEmpty()) {
+    const QString baseName = QFileInfo(fileName.trimmed()).fileName();
+    if (baseName.isEmpty()) {
+        emit audioError(QStringLiteral("音频文件名为空"));
         return QString();
     }
 
-    QFileInfo fileInfo(trimmedFile);
-    if (fileInfo.isAbsolute()) {
-        return fileInfo.absoluteFilePath();
+    const QString resourcePath = QStringLiteral(":/common/audio/%1").arg(baseName);
+    QFile source(resourcePath);
+    if (!source.open(QIODevice::ReadOnly)) {
+        const QString error = QStringLiteral("音频资源不存在：%1").arg(resourcePath);
+        qWarning().noquote() << error;
+        emit audioError(error);
+        return QString();
+    }
+    const QByteArray data = source.readAll();
+
+    QString tempRoot = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
+    if (tempRoot.trimmed().isEmpty()) {
+        tempRoot = QStringLiteral("/tmp");
+    }
+    const QString tempDir = QDir(tempRoot).filePath(QStringLiteral("voice"));
+    if (!QDir().mkpath(tempDir)) {
+        const QString error = QStringLiteral("无法创建提示音临时目录：%1").arg(tempDir);
+        qWarning().noquote() << error;
+        emit audioError(error);
+        return QString();
     }
 
-    QString dirText = config_.audioDir.trimmed();
-    if (dirText.isEmpty()) {
-        dirText = QStringLiteral("./audio");
+    const QString outputPath = QDir(tempDir).filePath(baseName);
+    QFile existing(outputPath);
+    if (existing.open(QIODevice::ReadOnly) && existing.readAll() == data) {
+        return outputPath;
     }
+    existing.close();
 
-    QDir dir(dirText);
-    if (!dir.isAbsolute()) {
-        dir = QDir(QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(dirText));
+    QSaveFile output(outputPath);
+    if (!output.open(QIODevice::WriteOnly)
+            || output.write(data) != data.size()
+            || !output.commit()) {
+        const QString error = QStringLiteral("无法生成提示音临时文件：%1").arg(outputPath);
+        qWarning().noquote() << error;
+        emit audioError(error);
+        return QString();
     }
-    return dir.absoluteFilePath(trimmedFile);
+    return outputPath;
 }
 
 /** @return 距同类提示上次播放达到 audioCooldownMs 时返回 true。 */
@@ -170,8 +276,8 @@ bool AudioService::cooldownAllowed(Prompt prompt) const
     return true;
 }
 
-/** @brief 校验文件并启动 aplay 进程。 */
-bool AudioService::startAplay(const QString &path, bool ignoreCooldown, Prompt prompt)
+/** @brief 校验文件并通过 GStreamer 启动播放。 */
+bool AudioService::startGstreamer(const QString &path, bool ignoreCooldown, Prompt prompt)
 {
     if (path.trimmed().isEmpty()) {
         emit audioError(QStringLiteral("音频文件路径为空"));
@@ -189,61 +295,18 @@ bool AudioService::startAplay(const QString &path, bool ignoreCooldown, Prompt p
         return false;
     }
 
-    QString program = config_.audioPlayer.trimmed();
-    if (program.isEmpty()) {
-        program = QStringLiteral("aplay");
-    }
-
-    QStringList args;
-    args << QStringLiteral("-q");
-    if (!config_.audioDevice.trimmed().isEmpty()) {
-        args << QStringLiteral("-D") << config_.audioDevice.trimmed();
-    }
-    args << info.absoluteFilePath();
-
-    const bool started = QProcess::startDetached(program, args);
-    if (!started) {
-        const QString message = QStringLiteral("启动音频播放失败：%1 %2").arg(program, args.join(QStringLiteral(" ")));
-        qWarning().noquote() << message;
-        emit audioError(message);
+    if (!player_) {
+        emit audioError(QStringLiteral("GStreamer 提示音播放器不可用"));
         return false;
     }
 
-    emit audioStatus(QStringLiteral("正在播放：%1").arg(info.fileName()));
-    return true;
-}
+    player_->stop();
+    player_->setVideoOutput(nullptr);
+    player_->setVolume(1.0f);
+    player_->setMedia(info.absoluteFilePath());
+    if (!player_->isAvailable()) return false;
+    player_->play();
 
-/** @brief 使用系统混音器工具设置配置的播放控制项。 */
-bool AudioService::applySystemVolume(int volume)
-{
-    if (!config_.audioEnabled) {
-        return true;
-    }
-    QString mixer = config_.audioMixerControl.trimmed();
-    if (mixer.isEmpty()) {
-        mixer = QStringLiteral("Playback");
-    }
-
-    const QString value = QString::number(qBound(0, volume, 100)) + QStringLiteral("%");
-    QStringList args;
-    args << QStringLiteral("sset") << mixer << value;
-
-    QProcess process;
-    process.start(QStringLiteral("amixer"), args);
-    if (!process.waitForFinished(1500)) {
-        process.kill();
-        emit audioError(QStringLiteral("音量设置超时"));
-        return false;
-    }
-
-    const bool ok = process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
-    if (!ok) {
-        const QString error = QString::fromLocal8Bit(process.readAllStandardError()).trimmed();
-        const QString message = error.isEmpty() ? QStringLiteral("音量设置失败") : QStringLiteral("音量设置失败：%1").arg(error);
-        qWarning().noquote() << message;
-        emit audioError(message);
-        return false;
-    }
-    emit audioStatus(QStringLiteral("音量已设置为 %1%2").arg(qBound(0, volume, 100)).arg(QStringLiteral("%")));
+    emit audioStatus(QStringLiteral("GStreamer 正在播放：%1").arg(info.fileName()));
     return true;
 }

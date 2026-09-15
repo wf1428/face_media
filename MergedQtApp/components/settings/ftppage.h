@@ -30,10 +30,8 @@
 #include <QTimer>
 #include <QFrame>
 #include <QIntValidator>
-#include <QFileDialog>
 #include <QDateTime>
 #include <QEvent>
-#include <QMessageBox>
 #include <QFileInfo>
 #include <QDir>
 #include <QMenu>
@@ -48,6 +46,7 @@
 #include "components/multimedia/gst_player_widget.h"
 #include "platform/rk3566_platform.h"
 
+class QResizeEvent;
 
 
 /**
@@ -159,11 +158,16 @@ protected:
     /** @brief 点击输入框时打开文本、密码或端口屏幕键盘。 */
     bool eventFilter(QObject *watched, QEvent *event) override;
 
+    /** @brief 在窄屏下把标题和双栏表单改为纵向排列。 */
+    void resizeEvent(QResizeEvent *event) override;
+
 private:
     /** @brief 以代码方式创建页面控件和布局。 */
     void buildUi();
     /** @brief 应用适配触摸屏的页面样式。 */
     void applyStyles();
+    /** @brief 按当前页面宽度切换横向或紧凑布局。 */
+    void applyResponsiveLayout();
 
     /// @name 软键盘辅助
     /// @{
@@ -217,8 +221,8 @@ private:
     void saveStreamUrlHistory();
     /** @brief 去重后把地址移到历史首位。 */
     void addStreamUrlHistory(const QString& url);
-    /** @brief 在指定全局位置显示流地址历史菜单。 */
-    void showStreamUrlHistoryPopup(const QPoint& globalPos);
+    /** @brief 在流地址输入框下方显示历史菜单。 */
+    void showStreamUrlHistoryPopup();
     /// @}
 
     /// @brief 从配置目录读取 FTP/MQTT 相关输入参数。

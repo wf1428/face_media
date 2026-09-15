@@ -10,11 +10,16 @@
 #include "FaceEnrollWidget.h"
 #include "AppMessageDialog.h"
 #include "AppPasswordDialog.h"
+#include "common/responsive_ui.h"
+#include "common/storage_policy.h"
 
 #include <QtQml/QQmlError>
+#include <QAbstractButton>
 #include <QAbstractItemView>
+#include <QAbstractScrollArea>
 #include <QAbstractSocket>
 #include <QApplication>
+#include <QBoxLayout>
 #include <QColor>
 #include <QCheckBox>
 #include <QCloseEvent>
@@ -39,30 +44,32 @@
 #include <QInputDialog>
 #include <QJsonObject>
 #include <QLabel>
+#include <QList>
 #include <QListWidget>
 #include <QListWidgetItem>
 #include <QLineEdit>
 #include <QLocale>
-#include <QMouseEvent>
 #include <QNetworkAddressEntry>
 #include <QPalette>
 #include <QNetworkInterface>
+#include <QPainter>
+#include <QPaintEvent>
 #include <QPushButton>
 #include <QProcess>
 #include <QPixmap>
-#include <QQuickWidget>
-#include <QGuiApplication>
 #include <QIcon>
-#include <QInputMethod>
 #include <QRadioButton>
 #include <QRegExp>
+#include <QResizeEvent>
 #include <QScrollArea>
+#include <QScrollBar>
 #include <QSlider>
 #include <QSize>
 #include <QSizePolicy>
+#include "components/settings/displayrotationpage.h"
 #include <QShowEvent>
+#include <QSpinBox>
 #include <QStorageInfo>
-#include <QUrl>
 #include <QStackedWidget>
 #include <QStringList>
 #include <QTabWidget>
@@ -73,6 +80,49 @@
 #include <QVBoxLayout>
 
 namespace {
+/** @brief 与移动端一致的管理设置滑动开关。 */
+class AdminToggleSwitch final : public QCheckBox
+{
+public:
+    explicit AdminToggleSwitch(QWidget *parent = nullptr)
+        : QCheckBox(parent)
+    {
+        setText(QString());
+        setCursor(Qt::PointingHandCursor);
+        setFocusPolicy(Qt::StrongFocus);
+        setFixedSize(66, 38);
+    }
+
+protected:
+    bool hitButton(const QPoint &position) const override
+    {
+        return rect().contains(position);
+    }
+
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+
+        const QRectF trackRect(1.0, 2.0, width() - 2.0, height() - 4.0);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(isEnabled()
+                         ? (isChecked() ? QColor("#4f83f1") : QColor("#6b7686"))
+                         : QColor("#3f4855"));
+        painter.drawRoundedRect(trackRect, trackRect.height() / 2.0,
+                                trackRect.height() / 2.0);
+
+        const qreal knobDiameter = trackRect.height() - 6.0;
+        const qreal knobX = isChecked()
+                ? trackRect.right() - knobDiameter - 3.0
+                : trackRect.left() + 3.0;
+        const QRectF knobRect(knobX, trackRect.top() + 3.0,
+                              knobDiameter, knobDiameter);
+        painter.setBrush(QColor("#ffffff"));
+        painter.drawEllipse(knobRect);
+    }
+};
+
 /** @brief 创建管理员表格使用的只读单元格。 */
 QTableWidgetItem *tableItem(const QString &text, qint64 id = 0)
 {
@@ -83,6 +133,247 @@ QTableWidgetItem *tableItem(const QString &text, qint64 id = 0)
         item->setData(Qt::UserRole, id);
     }
     return item;
+}
+
+/** @brief 为管理页及滚动视口设置不依赖桌面主题的深色调色板。 */
+void applyAdminSurface(QWidget *widget, const QColor &background = QColor("#162236"))
+{
+    if (!widget) {
+        return;
+    }
+
+    widget->setProperty("adminSurface", true);
+    widget->setAttribute(Qt::WA_StyledBackground, true);
+    widget->setAutoFillBackground(true);
+    QPalette palette = widget->palette();
+    palette.setColor(QPalette::Window, background);
+    palette.setColor(QPalette::Base, background);
+    palette.setColor(QPalette::AlternateBase, QColor("#1b2a40"));
+    palette.setColor(QPalette::WindowText, QColor("#e7eef8"));
+    palette.setColor(QPalette::Text, QColor("#eaf2fd"));
+    palette.setColor(QPalette::ButtonText, QColor("#eaf2fd"));
+    palette.setColor(QPalette::Highlight, QColor("#2b7fff"));
+    palette.setColor(QPalette::HighlightedText, QColor("#ffffff"));
+    widget->setPalette(palette);
+}
+
+/** @return 管理后台滚动条使用的统一深色样式。 */
+QString adminScrollBarStyle()
+{
+    return QStringLiteral(
+        "QScrollBar:vertical{background:#162236;width:12px;margin:0;border:none;}"
+        "QScrollBar:horizontal{background:#162236;height:12px;margin:0;border:none;}"
+        "QScrollBar::handle:vertical{background:#405571;min-height:30px;"
+        "border:none;border-radius:6px;margin:1px;}"
+        "QScrollBar::handle:horizontal{background:#405571;min-width:30px;"
+        "border:none;border-radius:6px;margin:1px;}"
+        "QScrollBar::handle:hover{background:#5a7292;}"
+        "QScrollBar::add-page,QScrollBar::sub-page{background:#162236;border:none;}"
+        "QScrollBar::add-line,QScrollBar::sub-line{width:0;height:0;"
+        "background:transparent;border:none;}"
+        "QScrollBar::up-arrow,QScrollBar::down-arrow,"
+        "QScrollBar::left-arrow,QScrollBar::right-arrow{width:0;height:0;}");
+}
+
+/** @brief 将深色滚动条样式直接应用到实际滚动区域。 */
+void applyAdminScrollBars(QAbstractScrollArea *area)
+{
+    if (!area) {
+        return;
+    }
+    const QString style = adminScrollBarStyle();
+    if (area->verticalScrollBar()) {
+        area->verticalScrollBar()->setStyleSheet(style);
+    }
+    if (area->horizontalScrollBar()) {
+        area->horizontalScrollBar()->setStyleSheet(style);
+    }
+}
+
+/** @brief 为输入框设置不受 Weston 原生主题覆盖的深色样式。 */
+void applyAdminEditorStyle(QLineEdit *edit)
+{
+    if (!edit) {
+        return;
+    }
+
+    QPalette palette = edit->palette();
+    palette.setColor(QPalette::Base, QColor("#111c2c"));
+    palette.setColor(QPalette::Text, QColor("#eef5ff"));
+    palette.setColor(QPalette::Highlight, QColor("#2b7fff"));
+    palette.setColor(QPalette::HighlightedText, QColor("#ffffff"));
+    palette.setColor(QPalette::Disabled, QPalette::Base, QColor("#182538"));
+    palette.setColor(QPalette::Disabled, QPalette::Text, QColor("#91a0b3"));
+    edit->setPalette(palette);
+    edit->setAttribute(Qt::WA_StyledBackground, true);
+    edit->setStyleSheet(QStringLiteral(
+        "QLineEdit{background-color:#111c2c;color:#eef5ff;"
+        "border:1px solid #394b63;border-radius:10px;padding:6px 9px;"
+        "selection-background-color:#2b7fff;selection-color:#ffffff;}"
+        "QLineEdit:focus{background-color:#142236;color:#ffffff;"
+        "border:1px solid #5eead4;}"
+        "QLineEdit:disabled{background-color:#182538;color:#91a0b3;"
+        "border:1px solid #2c3e55;}"));
+}
+
+/** @brief 统一深色管理界面内所有控件的前景色调色板。 */
+void applyAdminForegroundPalette(QWidget *root)
+{
+    if (!root) {
+        return;
+    }
+
+    QList<QWidget *> widgets = root->findChildren<QWidget *>();
+    widgets.prepend(root);
+    for (QWidget *widget : widgets) {
+        QPalette palette = widget->palette();
+        for (QPalette::ColorGroup group : {QPalette::Active, QPalette::Inactive}) {
+            palette.setColor(group, QPalette::WindowText, QColor("#e7eef8"));
+            palette.setColor(group, QPalette::Text, QColor("#eef5ff"));
+            palette.setColor(group, QPalette::ButtonText, QColor("#f4f8ff"));
+            palette.setColor(group, QPalette::ToolTipText, QColor("#ffffff"));
+        }
+        palette.setColor(QPalette::Disabled, QPalette::WindowText, QColor("#8292a8"));
+        palette.setColor(QPalette::Disabled, QPalette::Text, QColor("#8292a8"));
+        palette.setColor(QPalette::Disabled, QPalette::ButtonText, QColor("#8292a8"));
+        widget->setPalette(palette);
+    }
+}
+
+/** @brief 统一表格、表头和视口的深色调色板，避免 Weston 使用系统白底。 */
+void applyAdminTablePalette(QTableWidget *table)
+{
+    if (!table) {
+        return;
+    }
+
+    applyAdminSurface(table, QColor("#111c2c"));
+    table->setAutoFillBackground(false);
+    if (table->viewport()) {
+        applyAdminSurface(table->viewport(), QColor("#111c2c"));
+    }
+    if (table->horizontalHeader()) {
+        applyAdminSurface(table->horizontalHeader(), QColor("#213149"));
+        table->horizontalHeader()->setStyleSheet(QStringLiteral(
+            "QHeaderView{background:#213149;color:#d8e5f4;border:none;}"
+            "QHeaderView::section{background:#213149;color:#d8e5f4;"
+            "border:none;border-right:1px solid #33465f;"
+            "border-bottom:1px solid #33465f;padding:7px;font-weight:700;}"));
+        if (table->horizontalHeader()->viewport()) {
+            applyAdminSurface(table->horizontalHeader()->viewport(), QColor("#213149"));
+            table->horizontalHeader()->viewport()->setStyleSheet(
+                        QStringLiteral("background:#213149;color:#d8e5f4;"));
+        }
+    }
+    if (table->verticalHeader()) {
+        applyAdminSurface(table->verticalHeader(), QColor("#213149"));
+        if (table->verticalHeader()->viewport()) {
+            applyAdminSurface(table->verticalHeader()->viewport(), QColor("#213149"));
+        }
+    }
+
+    // 某些 RK356x/Weston 组合会让 QPA 原生主题覆盖父窗口的 QSS。
+    // 把关键样式直接挂到表格及其实际滚动条，确保视口、空白区和表头都生效。
+    table->setStyleSheet(QStringLiteral(
+        "QTableWidget{background:#111c2c;alternate-background-color:#162338;"
+        "color:#eaf2fd;border:1px solid #30445f;border-radius:12px;"
+        "gridline-color:#26374d;outline:0;}"
+        "QTableWidget::item{background:#111c2c;color:#eaf2fd;padding:7px;border:none;}"
+        "QTableWidget::item:alternate{background:#162338;}"
+        "QTableWidget::item:selected{background:#2b7fff;color:#ffffff;}"
+        "QHeaderView{background:#213149;color:#d8e5f4;}"
+        "QHeaderView::section{background:#213149;color:#d8e5f4;border:none;"
+        "border-right:1px solid #33465f;border-bottom:1px solid #33465f;"
+        "padding:7px;font-weight:700;}"
+        "QTableCornerButton::section{background:#213149;border:none;}"
+        "QAbstractScrollArea::corner{background:#162236;border:none;}"));
+
+    if (table->viewport()) {
+        table->viewport()->setStyleSheet(QStringLiteral(
+            "QWidget{background-color:#111c2c;color:#eaf2fd;border:none;}"));
+    }
+
+    applyAdminScrollBars(table);
+}
+
+/** @brief 直接设置筛选下拉框及弹出列表的深色样式。 */
+void applyAdminComboStyle(QComboBox *combo)
+{
+    if (!combo || !combo->view()) {
+        return;
+    }
+
+    combo->setStyleSheet(QStringLiteral(
+        "QComboBox{background:#111c2c;color:#eef5ff;border:1px solid #394b63;"
+        "border-radius:10px;padding:6px 34px 6px 9px;min-height:30px;}"
+        "QComboBox:focus{border:1px solid #5eead4;background:#142236;}"
+        "QComboBox::drop-down{width:30px;border:none;background:#213149;"
+        "border-top-right-radius:10px;border-bottom-right-radius:10px;}"
+        "QComboBox QAbstractItemView{background:#111c2c;color:#eef5ff;"
+        "selection-background-color:#2b7fff;selection-color:#ffffff;"
+        "border:1px solid #46617f;outline:0;padding:3px;}"
+        "QComboBox QAbstractItemView::item{background:#111c2c;color:#eef5ff;"
+        "min-height:34px;padding:4px 8px;}"
+        "QComboBox QAbstractItemView::item:selected{background:#2b7fff;color:#ffffff;}"));
+
+    applyAdminSurface(combo->view(), QColor("#111c2c"));
+    combo->view()->setStyleSheet(QStringLiteral(
+        "QAbstractItemView{background:#111c2c;color:#eef5ff;"
+        "alternate-background-color:#162338;border:1px solid #46617f;"
+        "selection-background-color:#2b7fff;selection-color:#ffffff;outline:0;}"
+        "QAbstractItemView::item{background:#111c2c;color:#eef5ff;"
+        "min-height:34px;padding:4px 8px;}"
+        "QAbstractItemView::item:selected{background:#2b7fff;color:#ffffff;}"));
+    if (combo->view()->viewport()) {
+        applyAdminSurface(combo->view()->viewport(), QColor("#111c2c"));
+        combo->view()->viewport()->setStyleSheet(QStringLiteral(
+            "background:#111c2c;color:#eef5ff;border:none;"));
+    }
+    QWidget *popupWindow = combo->view()->window();
+    if (popupWindow) {
+        applyAdminSurface(popupWindow, QColor("#111c2c"));
+    }
+}
+
+/** @brief 将输入弹窗固定为 Wayland 父窗口内的局部坐标子控件。 */
+void prepareAdminInputDialog(QInputDialog *dialog, QWidget *parent)
+{
+    if (!dialog) {
+        return;
+    }
+
+    dialog->setObjectName(QStringLiteral("adminInputDialog"));
+    dialog->setModal(true);
+    dialog->setAttribute(Qt::WA_StyledBackground, true);
+    if (parent && !parent->styleSheet().isEmpty()) {
+        // QInputDialog 在 Wayland 下可能被当作独立窗口处理，显式继承管理页
+        // 样式，避免内部标签、输入框和按钮退回系统白色主题。
+        dialog->setStyleSheet(parent->styleSheet());
+    }
+
+    const QList<QLineEdit *> editors = dialog->findChildren<QLineEdit *>();
+    for (QLineEdit *editor : editors) {
+        editor->setAttribute(Qt::WA_InputMethodEnabled, true);
+        applyAdminEditorStyle(editor);
+    }
+
+    if (!ResponsiveUi::isWaylandPlatform() || !parent) {
+        return;
+    }
+
+    dialog->setWindowFlags(Qt::Widget);
+    dialog->ensurePolished();
+    const int width = qBound(320, 500, qMax(320, parent->width() - 36));
+    const int height = qBound(210, dialog->sizeHint().height() + 30,
+                              qMax(210, parent->height() - 36));
+    dialog->setFixedSize(width, height);
+
+    // 输入时共享键盘占据底部，弹窗固定在键盘上方区域的中央。
+    const int keyboardHeight = ResponsiveUi::keyboardHeight(parent->height(), 300);
+    const int availableHeight = qMax(height, parent->height() - keyboardHeight);
+    const int x = qMax(0, (parent->width() - width) / 2);
+    const int y = qMax(0, (availableHeight - height) / 2);
+    dialog->move(x, y);
 }
 
 /** @brief 读取并裁剪单行系统文件内容。 */
@@ -551,54 +842,56 @@ private:
     qint64 lastCpuIdle_ = 0;
 };
 
-const int kEmbeddedKeyboardHeight = 300;
-const int kAdminSidebarWidth = 184;
+const int kAdminSidebarWidth = 198;
 const int kAdminOuterMargin = 16;
 const int kAdminTabMargin = 12;
 const int kAdminRowSpacing = 6;
 const int kDeviceInfoPageIndex = 0;
 const int kPersonManagementPageIndex = 1;
 const int kFaceRecordPageIndex = 2;
-const int kSyncPageIndex = 3;
-const int kMaintenancePageIndex = 4;
-const int kSettingsPageIndex = 5;
+const int kMaintenancePageIndex = 3;
 const int kNewPersonTabIndex = 0;
 const int kViewPeopleTabIndex = 1;
 const int kNetworkPeopleTabIndex = 2;
 }
 
-/** @brief 按当前配置创建导航、内容页和内嵌虚拟键盘。 */
+/** @brief 按当前配置创建导航和内容页面。 */
 AdminPanel::AdminPanel(const AppConfig &config, QWidget *parent)
     : QDialog(parent), config_(config)
 {
+    setObjectName(QStringLiteral("AdminPanel"));
+    // Wayland 下在创建子控件前确定窗口类型，管理页始终复用人脸根窗口
+    // 的 surface；虚拟键盘由 FaceGateMainWindow 的唯一共享实例提供。
+    if (ResponsiveUi::isWaylandPlatform() && parentWidget()) {
+        setWindowFlags(Qt::Widget);
+        setAttribute(Qt::WA_StyledBackground, true);
+    }
+
     setWindowTitle("人脸闸机管理");
     setModal(false);
-    resize(1024, 768);
-    // 管理界面目标屏幕为 1024x768。第二阶段样式加入图标和较大 padding 后，
-    // 部分子控件的 minimumSizeHint 会反向把顶层 QDialog 撑宽。固定目标尺寸，
-    // 再让右侧页面在内部换行/滚动，避免窗口超出屏幕。
-    setFixedSize(1024, 768);
+    setMinimumSize(ResponsiveUi::kMinimumScreenExtent,
+                   ResponsiveUi::kMinimumScreenExtent);
+    resize(ResponsiveUi::hostRect(parent).size());
 
     // 左侧为导航栏，右侧为当前管理页面。
-    auto *root = new QHBoxLayout(this);
-    root->setContentsMargins(0, 0, 0, 0);
-    root->setSpacing(0);
-    root->setSizeConstraint(QLayout::SetNoConstraint);
+    rootLayout_ = new QHBoxLayout(this);
+    rootLayout_->setContentsMargins(0, 0, 0, 0);
+    rootLayout_->setSpacing(0);
+    rootLayout_->setSizeConstraint(QLayout::SetNoConstraint);
 
-    auto *sidebar = new QFrame(this);
-    sidebar->setObjectName("sidebar");
-    sidebar->setFixedWidth(kAdminSidebarWidth);
-    auto *sideLayout = new QVBoxLayout(sidebar);
-    sideLayout->setContentsMargins(14, 18, 14, 18);
-    sideLayout->setSpacing(10);
+    sidebar_ = new QFrame(this);
+    sidebar_->setObjectName("sidebar");
+    sideLayout_ = new QGridLayout(sidebar_);
+    sideLayout_->setContentsMargins(14, 18, 14, 18);
+    sideLayout_->setSpacing(10);
 
-    auto *title = new QLabel("管理", sidebar);
-    title->setObjectName("adminTitle");
-    auto *subtitle = new QLabel("闸机控制台", sidebar);
-    subtitle->setObjectName("adminSubtitle");
+    adminTitle_ = new QLabel("管理", sidebar_);
+    adminTitle_->setObjectName("adminTitle");
+    adminSubtitle_ = new QLabel("闸机控制台", sidebar_);
+    adminSubtitle_->setObjectName("adminSubtitle");
 
     // 管理页面导航顺序必须与 stack_ 页面添加顺序一致。
-    navList_ = new QListWidget(sidebar);
+    navList_ = new QListWidget(sidebar_);
     navList_->setObjectName("navList");
     navList_->setIconSize(QSize(22, 22));
     navList_->setMinimumHeight(0);
@@ -609,29 +902,30 @@ AdminPanel::AdminPanel(const AppConfig &config, QWidget *parent)
     navList_->addItem(new QListWidgetItem(QIcon(QStringLiteral(":/icons/nav/device.svg")), QStringLiteral("本机信息")));
     navList_->addItem(new QListWidgetItem(QIcon(QStringLiteral(":/icons/nav/users.svg")), QStringLiteral("人员管理")));
     navList_->addItem(new QListWidgetItem(QIcon(QStringLiteral(":/icons/nav/logs.svg")), QStringLiteral("识别记录")));
-    navList_->addItem(new QListWidgetItem(QIcon(QStringLiteral(":/icons/nav/sync.svg")), QStringLiteral("同步")));
     navList_->addItem(new QListWidgetItem(QIcon(QStringLiteral(":/icons/nav/tools.svg")), QStringLiteral("运维维护")));
     navList_->addItem(new QListWidgetItem(QIcon(QStringLiteral(":/icons/nav/settings.svg")), QStringLiteral("设置")));
     navList_->setCurrentRow(kDeviceInfoPageIndex);
 
-    livenessCheck_ = new QCheckBox("活体检测", sidebar);
+    livenessCheck_ = new AdminToggleSwitch(this);
     livenessCheck_->setObjectName("livenessSwitch");
     livenessCheck_->setChecked(true);
 
-    auto *backButton = new QPushButton("返回", sidebar);
-    backButton->setObjectName("backButton");
-    setButtonIcon(backButton, QStringLiteral(":/icons/action/x.svg"));
+    backButton_ = new QPushButton(sidebar_);
+    backButton_->setObjectName("backButton");
+    backButton_->setToolTip(QStringLiteral("返回"));
+    backButton_->setAccessibleName(QStringLiteral("返回"));
+    setButtonIcon(backButton_, QStringLiteral(":/icons/action/x.svg"));
+    backButton_->setFixedSize(44, 40);
 
-    sideLayout->addWidget(title);
-    sideLayout->addWidget(subtitle);
-    sideLayout->addSpacing(18);
-    // 导航列表占满标题与底部活体开关之间的区域；条目超出时由列表自身滚动。
-    sideLayout->addWidget(navList_, 1);
-    sideLayout->addWidget(livenessCheck_);
-    sideLayout->addWidget(backButton);
+    sideLayout_->addWidget(adminTitle_, 0, 0);
+    sideLayout_->addWidget(adminSubtitle_, 1, 0);
+    sideLayout_->addWidget(navList_, 3, 0);
+    sideLayout_->addWidget(backButton_, 5, 0);
+    sideLayout_->setRowStretch(3, 1);
 
     stack_ = new QStackedWidget(this);
     stack_->setObjectName("contentStack");
+    applyAdminSurface(stack_);
     // 右侧页面不能把管理窗口的最小宽度撑大；宽表格和工具栏在页面内部滚动或换行。
     stack_->setMinimumWidth(0);
     stack_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
@@ -642,7 +936,6 @@ AdminPanel::AdminPanel(const AppConfig &config, QWidget *parent)
     stack_->addWidget(createDeviceInfoPage());
     stack_->addWidget(createPersonManagementPage());
     stack_->addWidget(createLogPage());
-    stack_->addWidget(createSyncPage());
     stack_->addWidget(createMaintenancePage());
     stack_->addWidget(createSettingsPage());
 
@@ -652,8 +945,6 @@ AdminPanel::AdminPanel(const AppConfig &config, QWidget *parent)
     contentShell_->setMinimumWidth(0);
     contentShell_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
     contentShell_->setAttribute(Qt::WA_StyledBackground, true);
-    contentShell_->installEventFilter(this);
-    qApp->installEventFilter(this);
 
     auto *contentLayout = new QVBoxLayout(contentShell_);
     contentLayout->setContentsMargins(0, 0, 0, 0);
@@ -661,29 +952,13 @@ AdminPanel::AdminPanel(const AppConfig &config, QWidget *parent)
     contentLayout->setSizeConstraint(QLayout::SetNoConstraint);
     contentLayout->addWidget(stack_, 1);
 
-    // 内嵌 QML 键盘默认隐藏，输入框获得焦点时作为覆盖层展开。
-    // 覆盖显示不再挤压 stack_，避免录入预览画面被键盘顶上去或缩小。
-    keyboardWidget_ = new QQuickWidget(contentShell_);
-    keyboardWidget_->setObjectName("embeddedKeyboard");
-    // 键盘必须作为 contentShell_ 的子控件参与同一个窗口事件链。
-    // 不使用独立顶层窗口，避免模态窗口/窗口管理器截断或吞掉键盘点击。
-    keyboardWidget_->setAttribute(Qt::WA_AcceptTouchEvents, true);
-    keyboardWidget_->setResizeMode(QQuickWidget::SizeRootObjectToView);
-    keyboardWidget_->setClearColor(QColor("#101820"));
-    keyboardWidget_->setFocusPolicy(Qt::NoFocus);
-    keyboardWidget_->setFixedHeight(kEmbeddedKeyboardHeight);
-    keyboardWidget_->setSource(QUrl(QStringLiteral("qrc:/qml/EmbeddedVirtualKeyboard.qml")));
-    qDebug().noquote() << "内嵌键盘 QML 状态：" << keyboardWidget_->status()
-                       << "错误数：" << keyboardWidget_->errors().size();
-    keyboardWidget_->hide();
-
-    root->addWidget(sidebar);
-    root->addWidget(contentShell_, 1);
+    rootLayout_->addWidget(sidebar_);
+    rootLayout_->addWidget(contentShell_, 1);
 
     connect(enrollWidget_, &FaceEnrollWidget::enrollRequested, this, &AdminPanel::enrollRequested);
     connect(enrollWidget_, &FaceEnrollWidget::cameraRequirementChanged, this, &AdminPanel::updateCameraRequirement);
     connect(livenessCheck_, &QCheckBox::toggled, this, &AdminPanel::livenessEnabledChanged);
-    connect(backButton, &QPushButton::clicked, this, &AdminPanel::close);
+    connect(backButton_, &QPushButton::clicked, this, &AdminPanel::close);
     connect(navList_, &QListWidget::currentRowChanged, this, [this](int row) {
         stack_->setCurrentIndex(row);
         updateDeviceStatusRefreshState();
@@ -694,8 +969,6 @@ AdminPanel::AdminPanel(const AppConfig &config, QWidget *parent)
             emit peopleRefreshRequested();
         } else if (row == kFaceRecordPageIndex && !passedLogsLoaded_) {
             QTimer::singleShot(0, this, [this]() { requestQueryVerifyLogs(); });
-        } else if (row == kSyncPageIndex) {
-            emit syncTasksRefreshRequested();
         } else if (row == kMaintenancePageIndex) {
             emit deviceInfoRefreshRequested();
         }
@@ -714,30 +987,27 @@ AdminPanel::AdminPanel(const AppConfig &config, QWidget *parent)
             deviceStatusCollector_, &QObject::deleteLater);
     deviceStatusThread_.start();
 
-    if (QGuiApplication::inputMethod()) {
-        connect(QGuiApplication::inputMethod(), &QInputMethod::visibleChanged, this, [this]() {
-            if (!QGuiApplication::inputMethod()->isVisible()) {
-                if (keyboardWidget_) {
-                    keyboardWidget_->hide();
-                }
-                return;
-            }
-            updateEmbeddedKeyboardVisibility();
-        });
-    }
-    connect(qApp, &QApplication::focusChanged, this, [this](QWidget *, QWidget *now) {
-        if (now && isAncestorOf(now) && now->testAttribute(Qt::WA_InputMethodEnabled)) {
-            if (QGuiApplication::inputMethod()) {
-                QGuiApplication::inputMethod()->show();
-            }
-        }
-        updateEmbeddedKeyboardVisibility();
-    });
-
     QFile adminStyleFile(QStringLiteral(":/qss/admin_panel.qss"));
     if (adminStyleFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
         setStyleSheet(QString::fromUtf8(adminStyleFile.readAll()));
     }
+
+    // 父级 QSS 完成 polish 后再次设置控件级样式，避免 Weston 原生样式
+    // 在最后一次 polish 时恢复表格视口、表头或滚动条的白色背景。
+    applyAdminForegroundPalette(this);
+    const QList<QLineEdit *> adminEditors = findChildren<QLineEdit *>();
+    for (QLineEdit *editor : adminEditors) {
+        applyAdminEditorStyle(editor);
+    }
+    QTableWidget *adminTables[] = {
+        peopleTable_, networkPeopleTable_, passedLogTable_,
+        systemEventTable_
+    };
+    for (QTableWidget *table : adminTables) {
+        applyAdminTablePalette(table);
+    }
+    applyAdminComboStyle(verifyResultCombo_);
+    applyResponsiveLayout();
 }
 
 /** @brief 停止设备状态采集线程后销毁面板。 */
@@ -755,15 +1025,13 @@ AdminPanel::~AdminPanel()
 QWidget *AdminPanel::createPersonManagementPage()
 {
     auto *page = new QWidget(this);
+    applyAdminSurface(page);
     auto *layout = new QVBoxLayout(page);
     layout->setContentsMargins(kAdminOuterMargin, 18, kAdminOuterMargin, 18);
     layout->setSpacing(10);
 
     auto *title = new QLabel("人员管理", page);
     title->setObjectName("pageTitle");
-    auto *hint = new QLabel("新建人员、查看已录入人员、修改编号、权限或删除人员", page);
-    hint->setObjectName("pageHint");
-    hint->setWordWrap(true);
 
     personTabs_ = new QTabWidget(page);
     personTabs_->setObjectName("personTabs");
@@ -780,7 +1048,6 @@ QWidget *AdminPanel::createPersonManagementPage()
     });
 
     layout->addWidget(title);
-    layout->addWidget(hint);
     layout->addWidget(personTabs_, 1);
     return page;
 }
@@ -789,6 +1056,7 @@ QWidget *AdminPanel::createPersonManagementPage()
 QWidget *AdminPanel::createPeoplePage()
 {
     auto *page = new QWidget(this);
+    applyAdminSurface(page, QColor("#1b2a40"));
     auto *layout = new QVBoxLayout(page);
     layout->setContentsMargins(kAdminOuterMargin, 18, kAdminOuterMargin, 18);
     layout->setSpacing(10);
@@ -796,8 +1064,10 @@ QWidget *AdminPanel::createPeoplePage()
     // 原来所有筛选框和操作按钮都放在同一条横向布局里，
     // 在 1024x768 屏幕上会把右侧页面最小宽度撑到超过可视区域，
     // 进而导致右侧内容和内嵌键盘一起被裁剪。这里改为两行紧凑布局。
-    auto *filterRow = new QHBoxLayout();
-    filterRow->setSpacing(kAdminRowSpacing);
+    auto *filterGrid = new QGridLayout();
+    filterGrid->setHorizontalSpacing(kAdminRowSpacing);
+    filterGrid->setVerticalSpacing(kAdminRowSpacing);
+    filterGrid->setContentsMargins(0, 0, 0, 0);
     verifyResultCombo_ = new QComboBox(page);
     verifyResultCombo_->addItem("全部", "all");
     verifyResultCombo_->addItem("通过", "passed");
@@ -807,19 +1077,20 @@ QWidget *AdminPanel::createPeoplePage()
     verifyResultCombo_->addItem("门禁拒绝", "access_denied");
     verifyResultCombo_->addItem("出门按钮", "exit_button");
     verifyResultCombo_->addItem("报警", "alarm");
-    verifyResultCombo_->setFixedWidth(88);
+    verifyResultCombo_->setMinimumWidth(80);
+    applyAdminComboStyle(verifyResultCombo_);
     verifyPersonNoEdit_ = new QLineEdit(page);
     verifyPersonNoEdit_->setPlaceholderText("人员编号");
-    verifyPersonNoEdit_->setFixedWidth(96);
+    verifyPersonNoEdit_->setMinimumWidth(84);
     verifyNameEdit_ = new QLineEdit(page);
     verifyNameEdit_->setPlaceholderText("姓名");
-    verifyNameEdit_->setFixedWidth(84);
+    verifyNameEdit_->setMinimumWidth(76);
     verifyStartEdit_ = new QDateTimeEdit(QDateTime::currentDateTime().addDays(-7), page);
     verifyStartEdit_->setDisplayFormat("yyyy-MM-dd HH:mm:ss");
-    verifyStartEdit_->setFixedWidth(146);
+    verifyStartEdit_->setMinimumWidth(132);
     verifyEndEdit_ = new QDateTimeEdit(QDateTime::currentDateTime(), page);
     verifyEndEdit_->setDisplayFormat("yyyy-MM-dd HH:mm:ss");
-    verifyEndEdit_->setFixedWidth(146);
+    verifyEndEdit_->setMinimumWidth(132);
     auto *refreshButton = new QPushButton("刷新", page);
     refreshButton->setObjectName("toolButton");
     setButtonIcon(refreshButton, QStringLiteral(":/icons/action/refresh.svg"));
@@ -850,13 +1121,16 @@ QWidget *AdminPanel::createPeoplePage()
     setButtonIcon(exportPeopleButton_, QStringLiteral(":/icons/action/download.svg"));
     showDeletedPeopleCheck_ = new QCheckBox("显示已删除", page);
 
-    filterRow->addWidget(verifyResultCombo_);
-    filterRow->addWidget(verifyPersonNoEdit_);
-    filterRow->addWidget(verifyNameEdit_);
-    filterRow->addWidget(verifyStartEdit_);
-    filterRow->addWidget(verifyEndEdit_);
-    filterRow->addWidget(refreshButton);
-    filterRow->addStretch();
+    filterGrid->addWidget(verifyResultCombo_, 0, 0);
+    filterGrid->addWidget(verifyPersonNoEdit_, 0, 1);
+    filterGrid->addWidget(verifyNameEdit_, 0, 2);
+    filterGrid->addWidget(refreshButton, 0, 3);
+    filterGrid->addWidget(verifyStartEdit_, 1, 0, 1, 2);
+    filterGrid->addWidget(verifyEndEdit_, 1, 2, 1, 2);
+    filterGrid->setColumnStretch(0, 1);
+    filterGrid->setColumnStretch(1, 1);
+    filterGrid->setColumnStretch(2, 1);
+    filterGrid->setColumnStretch(3, 1);
 
     buttonGrid->addWidget(modifyButton, 0, 0);
     buttonGrid->addWidget(permissionButton, 0, 1);
@@ -868,6 +1142,7 @@ QWidget *AdminPanel::createPeoplePage()
     buttonGrid->setColumnStretch(3, 1);
 
     peopleTable_ = new QTableWidget(page);
+    applyAdminTablePalette(peopleTable_);
     peopleTable_->setMinimumWidth(0);
     peopleTable_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
     peopleTable_->setColumnCount(8);
@@ -903,7 +1178,7 @@ QWidget *AdminPanel::createPeoplePage()
     peopleHeader->resizeSection(6, 148);
     peopleHeader->resizeSection(7, 76);
 
-    layout->addLayout(filterRow);
+    layout->addLayout(filterGrid);
     layout->addLayout(buttonGrid);
     layout->addWidget(peopleTable_, 1);
 
@@ -925,6 +1200,7 @@ QWidget *AdminPanel::createPeoplePage()
 QWidget *AdminPanel::createNetworkPeoplePage()
 {
     auto *page = new QWidget(this);
+    applyAdminSurface(page, QColor("#1b2a40"));
     networkPeoplePage_ = page;
     page->installEventFilter(this);
     auto *layout = new QVBoxLayout(page);
@@ -955,6 +1231,7 @@ QWidget *AdminPanel::createNetworkPeoplePage()
     buttonRow->addWidget(networkDeletedButton_);
 
     networkPeopleTable_ = new QTableWidget(page);
+    applyAdminTablePalette(networkPeopleTable_);
     networkPeopleTable_->setMinimumWidth(0);
     networkPeopleTable_->setSizePolicy(QSizePolicy::Ignored,
                                        QSizePolicy::Expanding);
@@ -1024,15 +1301,13 @@ QWidget *AdminPanel::createNetworkPeoplePage()
 QWidget *AdminPanel::createLogPage()
 {
     auto *page = new QWidget(this);
+    applyAdminSurface(page);
     auto *layout = new QVBoxLayout(page);
     layout->setContentsMargins(kAdminOuterMargin, 18, kAdminOuterMargin, 18);
     layout->setSpacing(10);
 
     auto *title = new QLabel("识别记录", page);
     title->setObjectName("pageTitle");
-    auto *hint = new QLabel("显示全部通行记录，包含通过、失败、活体失败、陌生人等事件", page);
-    hint->setObjectName("pageHint");
-    hint->setWordWrap(true);
 
     auto *buttonRow = new QHBoxLayout();
     auto *refreshButton = new QPushButton("刷新", page);
@@ -1046,12 +1321,13 @@ QWidget *AdminPanel::createLogPage()
     buttonRow->addStretch();
 
     passedLogTable_ = new QTableWidget(page);
+    applyAdminTablePalette(passedLogTable_);
     passedLogTable_->setMinimumWidth(0);
     passedLogTable_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
-    passedLogTable_->setColumnCount(13);
+    passedLogTable_->setColumnCount(8);
     passedLogTable_->setHorizontalHeaderLabels(QStringList()
-        << "日志ID" << "结果" << "人员编号" << "姓名" << "失败原因" << "余弦值" << "活体"
-        << "抓拍路径" << "设备SN" << "事件类型" << "方向" << "人员ID" << "时间");
+        << "日志ID" << "结果" << "人员ID" << "姓名" << "失败原因"
+        << "事件类型" << "方向" << "时间");
     passedLogTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
     passedLogTable_->setSelectionMode(QAbstractItemView::SingleSelection);
     passedLogTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -1078,18 +1354,12 @@ QWidget *AdminPanel::createLogPage()
     logHeader->resizeSection(1, 82);
     logHeader->resizeSection(2, 126);
     logHeader->resizeSection(3, 112);
-    logHeader->resizeSection(4, 86);
-    logHeader->resizeSection(5, 78);
-    logHeader->resizeSection(6, 78);
-    logHeader->resizeSection(7, 180);
-    logHeader->resizeSection(8, 120);
-    logHeader->resizeSection(9, 110);
-    logHeader->resizeSection(10, 70);
-    logHeader->resizeSection(11, 82);
-    logHeader->resizeSection(12, 178);
+    logHeader->resizeSection(4, 120);
+    logHeader->resizeSection(5, 110);
+    logHeader->resizeSection(6, 70);
+    logHeader->resizeSection(7, 178);
 
     layout->addWidget(title);
-    layout->addWidget(hint);
     layout->addLayout(buttonRow);
     layout->addWidget(passedLogTable_, 1);
 
@@ -1130,63 +1400,17 @@ QWidget *AdminPanel::createLogPage()
     return page;
 }
 
-/** @return 同步任务与系统事件页面。 */
-QWidget *AdminPanel::createSyncPage()
-{
-    auto *page = new QWidget(this);
-    auto *layout = new QVBoxLayout(page);
-    layout->setContentsMargins(kAdminOuterMargin, 18, kAdminOuterMargin, 18);
-    layout->setSpacing(10);
-
-    auto *title = new QLabel("远程同步", page);
-    title->setObjectName("pageTitle");
-    auto *hint = new QLabel("网络同步为预留功能，离线记录会继续保存在本地", page);
-    hint->setObjectName("pageHint");
-    hint->setWordWrap(true);
-    auto *refreshButton = new QPushButton("刷新同步队列", page);
-    refreshButton->setObjectName("toolButton");
-    setButtonIcon(refreshButton, QStringLiteral(":/icons/action/refresh.svg"));
-    syncTaskTable_ = new QTableWidget(page);
-    syncTaskTable_->setMinimumWidth(0);
-    syncTaskTable_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
-    syncTaskTable_->setColumnCount(7);
-    syncTaskTable_->setHorizontalHeaderLabels(QStringList()
-        << "任务ID" << "类型" << "状态" << "重试" << "错误" << "创建时间" << "负载JSON");
-    syncTaskTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
-    syncTaskTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    syncTaskTable_->setAutoFillBackground(false);
-    syncTaskTable_->viewport()->setAutoFillBackground(true);
-    syncTaskTable_->viewport()->setAttribute(Qt::WA_StyledBackground, true);
-    QPalette syncPalette = syncTaskTable_->palette();
-    syncPalette.setColor(QPalette::Base, QColor("#111c2c"));
-    syncPalette.setColor(QPalette::Window, QColor("#111c2c"));
-    syncTaskTable_->setPalette(syncPalette);
-    syncTaskTable_->viewport()->setPalette(syncPalette);
-    syncTaskTable_->verticalHeader()->setVisible(false);
-    syncTaskTable_->verticalHeader()->setDefaultSectionSize(38);
-    syncTaskTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
-    syncTaskTable_->horizontalHeader()->resizeSection(6, 220);
-    layout->addWidget(title);
-    layout->addWidget(hint);
-    layout->addWidget(refreshButton, 0, Qt::AlignLeft);
-    layout->addWidget(syncTaskTable_, 1);
-    connect(refreshButton, &QPushButton::clicked, this, &AdminPanel::syncTasksRefreshRequested);
-    return page;
-}
-
 /** @return 备份和清理维护页面。 */
 QWidget *AdminPanel::createMaintenancePage()
 {
     auto *page = new QWidget(this);
+    applyAdminSurface(page);
     auto *layout = new QVBoxLayout(page);
     layout->setContentsMargins(kAdminOuterMargin, 18, kAdminOuterMargin, 18);
     layout->setSpacing(10);
 
     auto *title = new QLabel("运维维护", page);
     title->setObjectName("pageTitle");
-    auto *hint = new QLabel("执行数据库备份、日志和抓拍清理，并查看最近系统错误", page);
-    hint->setObjectName("pageHint");
-    hint->setWordWrap(true);
 
     auto *buttonGrid = new QGridLayout();
     buttonGrid->setHorizontalSpacing(kAdminRowSpacing);
@@ -1215,6 +1439,7 @@ QWidget *AdminPanel::createMaintenancePage()
     buttonGrid->setColumnStretch(2, 1);
 
     systemEventTable_ = new QTableWidget(page);
+    applyAdminTablePalette(systemEventTable_);
     systemEventTable_->setMinimumWidth(0);
     systemEventTable_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
     systemEventTable_->setColumnCount(6);
@@ -1227,7 +1452,6 @@ QWidget *AdminPanel::createMaintenancePage()
     systemEventTable_->horizontalHeader()->resizeSection(4, 220);
 
     layout->addWidget(title);
-    layout->addWidget(hint);
     layout->addLayout(buttonGrid);
     layout->addWidget(systemEventTable_, 1);
 
@@ -1235,10 +1459,18 @@ QWidget *AdminPanel::createMaintenancePage()
     connect(cleanup30Button, &QPushButton::clicked, this, [this]() { emit maintenanceCleanupRequested(30); });
     connect(cleanup90Button, &QPushButton::clicked, this, [this]() { emit maintenanceCleanupRequested(90); });
     connect(cleanupCustomButton, &QPushButton::clicked, this, [this]() {
-        bool ok = false;
-        const int days = QInputDialog::getInt(this, "自定义清理天数", "清理多少天前的数据：", 30, 1, 3650, 1, &ok);
-        if (ok) {
-            emit maintenanceCleanupRequested(days);
+        QInputDialog dialog(this);
+        dialog.setWindowTitle(QStringLiteral("自定义清理天数"));
+        dialog.setLabelText(QStringLiteral("清理多少天前的数据："));
+        dialog.setInputMode(QInputDialog::IntInput);
+        dialog.setIntRange(1, 3650);
+        dialog.setIntStep(1);
+        dialog.setIntValue(30);
+        dialog.setOkButtonText(QStringLiteral("确定"));
+        dialog.setCancelButtonText(QStringLiteral("取消"));
+        prepareAdminInputDialog(&dialog, this);
+        if (dialog.exec() == QDialog::Accepted) {
+            emit maintenanceCleanupRequested(dialog.intValue());
         }
     });
     connect(refreshErrorsButton, &QPushButton::clicked, this, &AdminPanel::deviceInfoRefreshRequested);
@@ -1249,15 +1481,13 @@ QWidget *AdminPanel::createMaintenancePage()
 QWidget *AdminPanel::createDeviceInfoPage()
 {
     auto *page = new QWidget(this);
+    applyAdminSurface(page);
     auto *layout = new QVBoxLayout(page);
     layout->setContentsMargins(kAdminOuterMargin, 18, kAdminOuterMargin, 18);
     layout->setSpacing(10);
 
     auto *title = new QLabel("本机信息", page);
     title->setObjectName("pageTitle");
-    auto *hint = new QLabel("查看设备标识、存储容量和运行状态", page);
-    hint->setObjectName("pageHint");
-    hint->setWordWrap(true);
 
     auto *scrollArea = new QScrollArea(page);
     scrollArea->setObjectName("deviceInfoScroll");
@@ -1266,9 +1496,15 @@ QWidget *AdminPanel::createDeviceInfoPage()
     scrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     scrollArea->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     scrollArea->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    applyAdminScrollBars(scrollArea);
+    applyAdminSurface(scrollArea);
+    if (scrollArea->viewport()) {
+        applyAdminSurface(scrollArea->viewport());
+    }
 
     auto *scrollContent = new QWidget(scrollArea);
     scrollContent->setObjectName("deviceInfoScrollContent");
+    applyAdminSurface(scrollContent);
     auto *contentLayout = new QVBoxLayout(scrollContent);
     contentLayout->setContentsMargins(0, 4, 8, 8);
     contentLayout->setSpacing(12);
@@ -1308,29 +1544,28 @@ QWidget *AdminPanel::createDeviceInfoPage()
     scrollArea->setWidget(scrollContent);
 
     layout->addWidget(title);
-    layout->addWidget(hint);
     layout->addWidget(scrollArea, 1);
     updateDeviceSummaryLabels();
     return page;
 }
 
-/** @return 阈值、网络、音频和密码设置页面。 */
+/** @return 阈值、网络、音频、显示和密码设置页面。 */
 QWidget *AdminPanel::createSettingsPage()
 {
     auto *page = new QWidget(this);
+    applyAdminSurface(page);
     auto *layout = new QVBoxLayout(page);
     layout->setContentsMargins(kAdminOuterMargin, 18, kAdminOuterMargin, 18);
     layout->setSpacing(10);
 
     auto *title = new QLabel("设置", page);
     title->setObjectName("pageTitle");
-    auto *hint = new QLabel("配置网络参数、识别阈值和基础运行参数", page);
-    hint->setObjectName("pageHint");
-    hint->setWordWrap(true);
 
     auto *tabs = new QTabWidget(page);
+    tabs->setObjectName(QStringLiteral("settingsTabs"));
 
     auto *networkPage = new QWidget(tabs);
+    applyAdminSurface(networkPage, QColor("#1b2a40"));
     auto *networkLayout = new QVBoxLayout(networkPage);
     networkLayout->setContentsMargins(kAdminTabMargin, kAdminTabMargin, kAdminTabMargin, kAdminTabMargin);
     networkLayout->setSpacing(10);
@@ -1383,6 +1618,7 @@ QWidget *AdminPanel::createSettingsPage()
     updateNetworkEditorsEnabled();
 
     auto *thresholdPage = new QWidget(tabs);
+    applyAdminSurface(thresholdPage, QColor("#1b2a40"));
     auto *thresholdLayout = new QVBoxLayout(thresholdPage);
     thresholdLayout->setContentsMargins(kAdminTabMargin, kAdminTabMargin, kAdminTabMargin, kAdminTabMargin);
     thresholdLayout->setSpacing(14);
@@ -1416,6 +1652,27 @@ QWidget *AdminPanel::createSettingsPage()
     addSlider("人脸质量阈值", config_.faceQualityThreshold, defaultConfig.faceQualityThreshold, &faceQualitySlider_, &faceQualityValueLabel_);
     addSlider("检测置信阈值", config_.faceDetectThreshold, defaultConfig.faceDetectThreshold, &faceDetectSlider_, &faceDetectValueLabel_);
     addSlider("活体通过阈值", config_.livenessThreshold, defaultConfig.livenessThreshold, &livenessSlider_, &livenessValueLabel_);
+
+    auto *livenessGroup = new QGroupBox(QStringLiteral("活体检测"), thresholdPage);
+    auto *livenessLayout = new QHBoxLayout(livenessGroup);
+    livenessLayout->setContentsMargins(14, 18, 14, 14);
+    livenessLayout->setSpacing(14);
+    auto *livenessTextBox = new QVBoxLayout();
+    livenessTextBox->setSpacing(3);
+    auto *livenessTitle = new QLabel(QStringLiteral("启用活体检测"), livenessGroup);
+    livenessTitle->setObjectName(QStringLiteral("switchTitle"));
+    auto *livenessHint = new QLabel(
+                QStringLiteral("关闭后仅执行人脸比对，不再校验活体通过状态"),
+                livenessGroup);
+    livenessHint->setObjectName(QStringLiteral("switchHint"));
+    livenessHint->setWordWrap(true);
+    livenessTextBox->addWidget(livenessTitle);
+    livenessTextBox->addWidget(livenessHint);
+    livenessCheck_->setParent(livenessGroup);
+    livenessLayout->addLayout(livenessTextBox, 1);
+    livenessLayout->addWidget(livenessCheck_, 0, Qt::AlignVCenter);
+    thresholdLayout->addWidget(livenessGroup);
+
     auto *thresholdSaveButton = new QPushButton("保存阈值设置", thresholdPage);
     thresholdSaveButton->setObjectName("toolButton");
     setButtonIcon(thresholdSaveButton, QStringLiteral(":/icons/action/save.svg"));
@@ -1436,10 +1693,16 @@ QWidget *AdminPanel::createSettingsPage()
     audioScrollPage->setWidgetResizable(true);
     audioScrollPage->setFrameShape(QFrame::NoFrame);
     audioScrollPage->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    applyAdminScrollBars(audioScrollPage);
     audioScrollPage->viewport()->setAutoFillBackground(false);
+    applyAdminSurface(audioScrollPage, QColor("#1b2a40"));
+    if (audioScrollPage->viewport()) {
+        applyAdminSurface(audioScrollPage->viewport(), QColor("#1b2a40"));
+    }
 
     auto *audioPage = new QWidget(audioScrollPage);
     audioPage->setObjectName(QStringLiteral("audioSettingsScrollContent"));
+    applyAdminSurface(audioPage, QColor("#1b2a40"));
     auto *audioLayout = new QVBoxLayout(audioPage);
     audioLayout->setContentsMargins(kAdminTabMargin, kAdminTabMargin, kAdminTabMargin, kAdminTabMargin + 8);
     audioLayout->setSpacing(16);
@@ -1561,6 +1824,7 @@ QWidget *AdminPanel::createSettingsPage()
     connect(audioSaveButton, &QPushButton::clicked, this, &AdminPanel::requestSaveAudioConfig);
 
     auto *basicPage = new QWidget(tabs);
+    applyAdminSurface(basicPage, QColor("#1b2a40"));
     auto *basicLayout = new QVBoxLayout(basicPage);
     basicLayout->setContentsMargins(kAdminTabMargin, kAdminTabMargin, kAdminTabMargin, kAdminTabMargin);
     basicLayout->setSpacing(12);
@@ -1614,9 +1878,35 @@ QWidget *AdminPanel::createSettingsPage()
     tabs->addTab(thresholdPage, "识别阈值");
     tabs->addTab(audioScrollPage, QStringLiteral("音频设置"));
     tabs->addTab(basicPage, "基础设置");
+    auto *displayRotationPage = new DisplayRotationPage(tabs);
+    auto *accessPhotoGroup = new QGroupBox(
+                QStringLiteral("通行照片显示"), displayRotationPage);
+    auto *accessPhotoLayout = new QHBoxLayout(accessPhotoGroup);
+    accessPhotoLayout->setContentsMargins(16, 22, 16, 16);
+    accessPhotoLayout->setSpacing(12);
+    auto *accessPhotoTitle = new QLabel(
+                QStringLiteral("显示通行照片和姓名"), accessPhotoGroup);
+    accessPhotoTitle->setObjectName(QStringLiteral("metricName"));
+    auto *accessPhotoSwitch = new AdminToggleSwitch(accessPhotoGroup);
+    accessPhotoSwitch->setObjectName(QStringLiteral("accessPhotoDisplaySwitch"));
+    accessPhotoSwitch->setChecked(config_.showAccessPhoto);
+    accessPhotoLayout->addWidget(accessPhotoTitle, 1);
+    accessPhotoLayout->addWidget(accessPhotoSwitch, 0, Qt::AlignVCenter);
+    if (auto *displayLayout = qobject_cast<QVBoxLayout *>(displayRotationPage->layout())) {
+        displayLayout->insertWidget(1, accessPhotoGroup);
+    }
+    connect(accessPhotoSwitch, &QCheckBox::toggled,
+            this, &AdminPanel::accessPhotoDisplayChanged);
+    // 显示方向页面由多媒体和人脸后台共用。人脸后台必须把样式直接
+    // 应用到下拉框及其独立的 Wayland 弹出窗口，避免出现白底白字。
+    const QList<QComboBox *> displayRotationCombos =
+            displayRotationPage->findChildren<QComboBox *>();
+    for (QComboBox *combo : displayRotationCombos) {
+        applyAdminComboStyle(combo);
+    }
+    tabs->addTab(displayRotationPage, QStringLiteral("显示设置"));
 
     layout->addWidget(title);
-    layout->addWidget(hint);
     layout->addWidget(tabs, 1);
     return page;
 }
@@ -1866,16 +2156,27 @@ void AdminPanel::showNetworkPersonFaces(int row)
     const int dialogHeight = qBound(260, visibleRows * 184 + 116, 470);
 
     QDialog dialog(this);
+    const bool embeddedForWayland = ResponsiveUi::isWaylandPlatform();
     dialog.setModal(true);
-    dialog.setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
+    dialog.setObjectName(QStringLiteral("networkFacesDialog"));
+    if (embeddedForWayland) {
+        dialog.setWindowFlags(Qt::Widget);
+        dialog.setGeometry(rect());
+        dialog.setMinimumSize(0, 0);
+        dialog.setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+    } else {
+        dialog.setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
+        dialog.setFixedSize(dialogWidth, dialogHeight);
+    }
     dialog.setAttribute(Qt::WA_TranslucentBackground);
-    dialog.setFixedSize(dialogWidth, dialogHeight);
+    dialog.setAttribute(Qt::WA_StyledBackground, true);
 
     auto *outerLayout = new QVBoxLayout(&dialog);
     outerLayout->setContentsMargins(8, 8, 8, 8);
 
     auto *shell = new QFrame(&dialog);
     shell->setObjectName(QStringLiteral("networkFacesShell"));
+    shell->setFixedSize(dialogWidth - 16, dialogHeight - 16);
     shell->setStyleSheet(QStringLiteral(
         "QFrame#networkFacesShell {"
         "background:#162236;"
@@ -1883,7 +2184,7 @@ void AdminPanel::showNetworkPersonFaces(int row)
         "border-radius:14px;"
         "}"
         "QLabel { color:#edf5ff; border:none; background:transparent; }"));
-    outerLayout->addWidget(shell);
+    outerLayout->addWidget(shell, 0, Qt::AlignCenter);
 
     auto *shellLayout = new QVBoxLayout(shell);
     shellLayout->setContentsMargins(18, 14, 18, 16);
@@ -1987,9 +2288,13 @@ void AdminPanel::showNetworkPersonFaces(int row)
 
     connect(closeButton, &QPushButton::clicked, &dialog, &QDialog::accept);
 
-    const QPoint center = mapToGlobal(rect().center());
-    dialog.move(center.x() - dialog.width() / 2,
-                center.y() - dialog.height() / 2);
+    if (!embeddedForWayland) {
+        const QPoint center = mapToGlobal(rect().center());
+        dialog.move(center.x() - dialog.width() / 2,
+                    center.y() - dialog.height() / 2);
+    } else {
+        dialog.raise();
+    }
     dialog.exec();
 }
 
@@ -2070,19 +2375,17 @@ void AdminPanel::setPassedVerifyLogs(const QVector<VerifyLogViewRecord> &records
     passedLogTable_->setRowCount(records.size());
     for (int row = 0; row < records.size(); ++row) {
         const VerifyLogViewRecord &record = records[row];
+        const QString personId = record.personId > 0
+            ? QString::number(record.personId)
+            : record.personNo.trimmed();
         passedLogTable_->setItem(row, 0, tableItem(QString::number(record.logId)));
         passedLogTable_->setItem(row, 1, tableItem(record.result));
-        passedLogTable_->setItem(row, 2, tableItem(record.personNo));
+        passedLogTable_->setItem(row, 2, tableItem(personId.isEmpty() ? QStringLiteral("--") : personId));
         passedLogTable_->setItem(row, 3, tableItem(record.name));
         passedLogTable_->setItem(row, 4, tableItem(record.failReason));
-        passedLogTable_->setItem(row, 5, tableItem(QString::number(record.cosine, 'f', 3)));
-        passedLogTable_->setItem(row, 6, tableItem(QString::number(record.liveScore, 'f', 3)));
-        passedLogTable_->setItem(row, 7, tableItem(record.snapshotPath));
-        passedLogTable_->setItem(row, 8, tableItem(record.deviceSn));
-        passedLogTable_->setItem(row, 9, tableItem(record.eventType));
-        passedLogTable_->setItem(row, 10, tableItem(record.direction));
-        passedLogTable_->setItem(row, 11, tableItem(QString::number(record.personId)));
-        passedLogTable_->setItem(row, 12, tableItem(record.createdAt));
+        passedLogTable_->setItem(row, 5, tableItem(record.eventType));
+        passedLogTable_->setItem(row, 6, tableItem(record.direction));
+        passedLogTable_->setItem(row, 7, tableItem(record.createdAt));
     }
     passedLogTable_->horizontalHeader()->updateGeometry();
     passedLogTable_->setUpdatesEnabled(true);
@@ -2094,26 +2397,6 @@ void AdminPanel::setStorageStats(const StorageStats &stats)
 {
     storageStats_ = stats;
     updateDeviceSummaryLabels();
-}
-
-/** @brief 填充同步任务表格。 */
-void AdminPanel::setSyncTasks(const QVector<SyncTaskRecord> &records)
-{
-    if (!syncTaskTable_) {
-        return;
-    }
-    syncTaskTable_->setRowCount(records.size());
-    for (int row = 0; row < records.size(); ++row) {
-        const SyncTaskRecord &record = records[row];
-        syncTaskTable_->setItem(row, 0, tableItem(QString::number(record.id)));
-        syncTaskTable_->setItem(row, 1, tableItem(record.taskType));
-        syncTaskTable_->setItem(row, 2, tableItem(record.syncStatus));
-        syncTaskTable_->setItem(row, 3, tableItem(QString::number(record.retryCount)));
-        syncTaskTable_->setItem(row, 4, tableItem(record.lastError));
-        syncTaskTable_->setItem(row, 5, tableItem(record.createdAt));
-        syncTaskTable_->setItem(row, 6, tableItem(record.payloadJson));
-    }
-    syncTaskTable_->resizeRowsToContents();
 }
 
 /** @brief 填充系统事件表格。 */
@@ -2181,15 +2464,21 @@ void AdminPanel::requestModifySelectedPersonNo()
         return;
     }
 
-    bool ok = false;
-    const QString newNo = QInputDialog::getText(
-        this,
-        "修改人员编号",
-        "新的人员编号：",
-        QLineEdit::Normal,
-        selectedPersonNo(),
-        &ok).trimmed();
-    if (!ok || newNo.isEmpty()) {
+    QInputDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("修改人员编号"));
+    dialog.setLabelText(QStringLiteral("新的人员编号："));
+    dialog.setInputMode(QInputDialog::TextInput);
+    dialog.setTextEchoMode(QLineEdit::Normal);
+    dialog.setTextValue(selectedPersonNo());
+    dialog.setOkButtonText(QStringLiteral("确定"));
+    dialog.setCancelButtonText(QStringLiteral("取消"));
+    prepareAdminInputDialog(&dialog, this);
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    const QString newNo = dialog.textValue().trimmed();
+    if (newNo.isEmpty()) {
         return;
     }
 
@@ -2431,16 +2720,16 @@ void AdminPanel::requestSaveNetworkConfig()
 void AdminPanel::syncAudioEditorsToConfig()
 {
     config_.audioEnabled = audioEnabledCheck_ ? audioEnabledCheck_->isChecked() : config_.audioEnabled;
-    config_.audioPlayer = QStringLiteral("aplay");
+    config_.audioPlayer = QStringLiteral("gstreamer");
     if (config_.audioDevice.trimmed().isEmpty()) {
         config_.audioDevice = QStringLiteral("plughw:CARD=rockchiprk809co,DEV=0");
     }
     if (config_.audioDir.trimmed().isEmpty()) {
-        config_.audioDir = QStringLiteral("./audio");
+        config_.audioDir = QStringLiteral("./common/audio");
     }
     config_.audioVolume = audioVolumeSlider_ ? qBound(0, audioVolumeSlider_->value(), 100) : config_.audioVolume;
     if (config_.audioMixerControl.trimmed().isEmpty()) {
-        config_.audioMixerControl = QStringLiteral("Playback");
+        config_.audioMixerControl = QStringLiteral("numid=3");
     }
 
     auto checkValue = [this](const QString &key, bool fallback) {
@@ -2489,8 +2778,6 @@ void AdminPanel::requestTestAudioPrompt(const QString &promptKey)
 /** @brief 打开统一密码弹窗并请求修改管理员密码。 */
 void AdminPanel::requestAdminPasswordChange()
 {
-    hideEmbeddedKeyboard();
-
     QString oldPassword;
     QString newPassword;
     const bool accepted = AppPasswordDialog::getPasswordChange(this, &oldPassword, &newPassword);
@@ -2574,10 +2861,15 @@ void AdminPanel::updateDeviceSummaryLabels()
         peopleCapacityLabel_->setText(QString("%1/3000").arg(storageStats_.personCount));
     }
     if (faceCapacityLabel_) {
+        const qint64 gibibyte = 1024LL * 1024LL * 1024LL;
+        const qint64 registrationGiB = StoragePolicy::registrationLimitBytes() / gibibyte;
+        const int photoCapacity = StoragePolicy::registrationPhotoCapacity();
         faceCapacityLabel_->setText(
-            QStringLiteral("%1 张（%2 / 1 GiB，约 3000 张）")
+            QStringLiteral("%1 张（%2 / %3 GiB，约 %4 张）")
                 .arg(storageStats_.faceFeatureCount)
-                .arg(formatBytes(storageStats_.registrationPhotoBytes)));
+                .arg(formatBytes(storageStats_.registrationPhotoBytes))
+                .arg(registrationGiB)
+                .arg(photoCapacity));
     }
     if (verifyLogCountLabel_) {
         verifyLogCountLabel_->setText(QString::number(storageStats_.verifyLogCount));
@@ -2686,125 +2978,102 @@ bool AdminPanel::includeDeletedPeople() const
     return showDeletedPeopleCheck_ && showDeletedPeopleCheck_->isChecked();
 }
 
-/**
- * @brief 仅在输入框需要输入时，把 QML 键盘作为管理窗口底部浮层显示。
- */
-void AdminPanel::updateEmbeddedKeyboardVisibility()
-{
-    if (!keyboardWidget_ || !contentShell_) {
-        return;
-    }
-
-    QWidget *focus = QApplication::focusWidget();
-    const bool wantsInput = isVisible()
-        && focus
-        && isAncestorOf(focus)
-        && focus->testAttribute(Qt::WA_InputMethodEnabled);
-
-    if (wantsInput) {
-        const int availableHeight = contentShell_->height();
-        // contentShell_ 的布局最小宽度一旦被子页面撑大，geometry().width() 可能超过屏幕可视宽度。
-        // 键盘只按管理窗口内实际可见的右侧区域显示，避免再次被超宽页面带偏。
-        const int visibleWidth = qMax(0, width() - contentShell_->geometry().x());
-        const int availableWidth = qMin(contentShell_->width(), visibleWidth);
-        // 管理后台的键盘作为底部浮层显示。高度固定为 300，
-        // QML 内部会把 360 高的原始键盘等比缩放到当前高度，
-        // 这样既不会裁剪按键，也不会遮住大半个管理页面。
-        const int height = qMin(kEmbeddedKeyboardHeight, qMax(0, availableHeight));
-        keyboardWidget_->setGeometry(0, qMax(0, availableHeight - height), availableWidth, height);
-        keyboardWidget_->setFixedHeight(height);
-        keyboardWidget_->setVisible(height > 0);
-        keyboardWidget_->raise();
-        if (QGuiApplication::inputMethod()) {
-            QGuiApplication::inputMethod()->show();
-        }
-    } else {
-        hideEmbeddedKeyboard();
-    }
-}
-
-/** @brief 隐藏内嵌虚拟键盘。 */
-void AdminPanel::hideEmbeddedKeyboard()
-{
-    if (keyboardWidget_) {
-        keyboardWidget_->hide();
-    }
-    if (QGuiApplication::inputMethod()) {
-        QGuiApplication::inputMethod()->hide();
-    }
-}
-
-/** @return widget 属于内嵌键盘对象树时返回 true。 */
-bool AdminPanel::clickedWidgetIsEmbeddedKeyboard(QWidget *widget) const
-{
-    return keyboardWidget_
-        && widget
-        && (widget == keyboardWidget_ || keyboardWidget_->isAncestorOf(widget));
-}
-
-/** @return widget 是可编辑文本控件时返回 true。 */
-bool AdminPanel::clickedWidgetIsTextEditor(QWidget *widget) const
-{
-    if (!widget || !isAncestorOf(widget)) {
-        return false;
-    }
-    QWidget *cursor = widget;
-    while (cursor && cursor != this) {
-        if (cursor->inherits("QLineEdit") || cursor->testAttribute(Qt::WA_InputMethodEnabled)) {
-            return true;
-        }
-        cursor = cursor->parentWidget();
-    }
-    return false;
-}
-
-/** @brief 管理文本焦点、内嵌键盘点击和键盘可见性。 */
+/** @brief 处理内容页和网络同步提示的尺寸变化。 */
 bool AdminPanel::eventFilter(QObject *watched, QEvent *event)
 {
-    if (watched == contentShell_ && event->type() == QEvent::Resize) {
-        updateEmbeddedKeyboardVisibility();
-    }
     if (watched == networkPeoplePage_ && event->type() == QEvent::Resize) {
         positionNetworkSyncToast();
     }
-
-    if (event->type() == QEvent::MouseButtonPress) {
-        auto *mouseEvent = static_cast<QMouseEvent *>(event);
-        QWidget *clicked = QApplication::widgetAt(mouseEvent->globalPos());
-        if (!clicked) {
-            clicked = qobject_cast<QWidget *>(watched);
-        }
-
-        if (clickedWidgetIsTextEditor(clicked)) {
-            QTimer::singleShot(0, this, [this]() {
-                if (QGuiApplication::inputMethod()) {
-                    QGuiApplication::inputMethod()->show();
-                }
-                updateEmbeddedKeyboardVisibility();
-            });
-        } else if (keyboardWidget_ && keyboardWidget_->isVisible() &&
-                   !clickedWidgetIsEmbeddedKeyboard(clicked)) {
-            QWidget *focus = QApplication::focusWidget();
-            if (focus && isAncestorOf(focus) && focus->testAttribute(Qt::WA_InputMethodEnabled)) {
-                focus->clearFocus();
-            }
-            hideEmbeddedKeyboard();
-        }
-    }
-
     return QDialog::eventFilter(watched, event);
 }
 
-/**
- * @brief 通知 MainWindow 当前自动删除对话框正在关闭。
- */
+/** @brief 尺寸变化时重排导航和提示。 */
+void AdminPanel::resizeEvent(QResizeEvent *event)
+{
+    QDialog::resizeEvent(event);
+    applyResponsiveLayout();
+    positionNetworkSyncToast();
+}
+
+void AdminPanel::applyResponsiveLayout()
+{
+    if (!rootLayout_ || !sideLayout_ || !sidebar_ || !navList_ ||
+            !adminTitle_ || !adminSubtitle_ || !livenessCheck_ || !backButton_) {
+        return;
+    }
+
+    const bool top = ResponsiveUi::usesTopNavigation(
+                ResponsiveUi::layoutReferenceSize(this));
+    topNavigation_ = top;
+
+    sideLayout_->removeWidget(adminTitle_);
+    sideLayout_->removeWidget(adminSubtitle_);
+    sideLayout_->removeWidget(navList_);
+    sideLayout_->removeWidget(backButton_);
+
+    if (top) {
+        sidebar_->setStyleSheet(QStringLiteral(
+            "QFrame#sidebar{border-right:none;border-bottom:1px solid #2d3c52;}"));
+        rootLayout_->setDirection(QBoxLayout::TopToBottom);
+        sidebar_->setMinimumWidth(0);
+        sidebar_->setMaximumWidth(QWIDGETSIZE_MAX);
+        sidebar_->setMinimumHeight(72);
+        sidebar_->setMaximumHeight(86);
+        sideLayout_->setContentsMargins(8, 6, 8, 6);
+        sideLayout_->setSpacing(8);
+        sideLayout_->setRowStretch(3, 0);
+        sideLayout_->setColumnStretch(0, 1);
+
+        adminTitle_->hide();
+        adminSubtitle_->hide();
+        navList_->setFlow(QListView::LeftToRight);
+        navList_->setWrapping(false);
+        navList_->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+        navList_->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        navList_->setMinimumHeight(48);
+        navList_->setMaximumHeight(64);
+        sideLayout_->addWidget(navList_, 0, 0);
+        sideLayout_->addWidget(backButton_, 0, 1, Qt::AlignVCenter);
+    } else {
+        sidebar_->setStyleSheet(QString());
+        rootLayout_->setDirection(QBoxLayout::LeftToRight);
+        sidebar_->setMinimumHeight(0);
+        sidebar_->setMaximumHeight(QWIDGETSIZE_MAX);
+        sidebar_->setMinimumWidth(kAdminSidebarWidth);
+        sidebar_->setMaximumWidth(kAdminSidebarWidth);
+        sideLayout_->setContentsMargins(14, 18, 14, 18);
+        sideLayout_->setSpacing(10);
+        sideLayout_->setRowStretch(3, 1);
+        sideLayout_->setColumnStretch(0, 1);
+
+        adminTitle_->show();
+        adminSubtitle_->show();
+        navList_->setFlow(QListView::TopToBottom);
+        navList_->setWrapping(false);
+        navList_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        navList_->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+        navList_->setMinimumHeight(0);
+        navList_->setMaximumHeight(QWIDGETSIZE_MAX);
+        sideLayout_->addWidget(adminTitle_, 0, 0);
+        sideLayout_->addWidget(adminSubtitle_, 1, 0);
+        sideLayout_->addWidget(navList_, 3, 0);
+        sideLayout_->addWidget(backButton_, 5, 0, Qt::AlignHCenter);
+    }
+
+    sideLayout_->invalidate();
+    rootLayout_->invalidate();
+}
+
+/** @brief 通知 MainWindow 当前管理面板正在关闭。 */
 void AdminPanel::closeEvent(QCloseEvent *event)
 {
     if (deviceStatusTimer_) {
         deviceStatusTimer_->stop();
     }
-    qApp->removeEventFilter(this);
-    hideEmbeddedKeyboard();
+    QWidget *focus = QApplication::focusWidget();
+    if (focus && isAncestorOf(focus)) {
+        focus->clearFocus();
+    }
     emit closed();
     QDialog::closeEvent(event);
 }
@@ -2813,6 +3082,7 @@ void AdminPanel::closeEvent(QCloseEvent *event)
 void AdminPanel::showEvent(QShowEvent *event)
 {
     QDialog::showEvent(event);
+    applyResponsiveLayout();
     updateDeviceStatusRefreshState();
     if (stack_ && stack_->currentIndex() == kDeviceInfoPageIndex) {
         updateDeviceInfo();

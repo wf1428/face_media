@@ -54,6 +54,30 @@ QString compactJson(const QJsonValue &value)
     return {};
 }
 
+/**
+ * @return 服务端卡号的规范十进制/文本表示；兼容 JSON 字符串和整数。
+ *
+ * JSON 数字由 Qt 以 double 保存，只接受能够精确表示的非负整数，避免把
+ * 小数、负数或超过 JSON 安全整数范围的值静默转换成另一个卡号。
+ */
+QString cardIdFromJson(const QJsonValue &value)
+{
+    if (value.isString()) {
+        return value.toString().trimmed();
+    }
+    if (!value.isDouble()) {
+        return {};
+    }
+
+    const double number = value.toDouble();
+    constexpr double kMaxExactJsonInteger = 9007199254740991.0; // 2^53 - 1
+    if (!std::isfinite(number) || number < 0.0
+            || number > kMaxExactJsonInteger || std::floor(number) != number) {
+        return {};
+    }
+    return QString::number(static_cast<qulonglong>(number));
+}
+
 /** @return 与本地人员重复录入判断一致的 float 特征余弦相似度。 */
 float storedFeatureCosine(const QByteArray &left, const QByteArray &right)
 {
@@ -881,6 +905,15 @@ NetworkPersonnelImportResult NetworkPersonnelStore::importSpreadsheetPersonnel(
         }
         return values;
     };
+    auto jsonCardIdSet = [](const QJsonArray &items) {
+        QSet<QString> values;
+        for (const QJsonValue &value : items) {
+            const QString cardId = cardIdFromJson(
+                        value.toObject().value(QStringLiteral("cardId")));
+            if (!cardId.isEmpty()) values.insert(cardId);
+        }
+        return values;
+    };
     auto floorSet = [](const QJsonArray &floors) {
         QSet<QString> values;
         for (const QJsonValue &value : floors) {
@@ -934,7 +967,7 @@ NetworkPersonnelImportResult NetworkPersonnelStore::importSpreadsheetPersonnel(
         }
 
         const QJsonArray cards = record.value(QStringLiteral("icCards")).toArray();
-        for (const QString &cardId : jsonStringSet(cards, QStringLiteral("cardId"))) {
+        for (const QString &cardId : jsonCardIdSet(cards)) {
             const QList<QVariantMap> owners = DbStore::query(
                         QStringLiteral("SELECT person_id FROM network_ic_card WHERE card_id=?"),
                         {cardId});
@@ -1005,7 +1038,7 @@ NetworkPersonnelImportResult NetworkPersonnelStore::importSpreadsheetPersonnel(
                     && currentPerson.value(QStringLiteral("active")).toInt() == 1
                     && currentPerson.value(QStringLiteral("deleted")).toInt() == 0
                     && compactJson(jsonObject(currentPerson.value(QStringLiteral("person_json")).toString())) == compactJson(person)
-                    && currentCards == jsonStringSet(cards, QStringLiteral("cardId"))
+                    && currentCards == jsonCardIdSet(cards)
                     && currentQrs == jsonStringSet(qrCodes, QStringLiteral("qrUnique"))
                     && currentFloors == floorSet(floors)
                     && currentRules == compactJson(rules);
@@ -1072,7 +1105,7 @@ NetworkPersonnelImportResult NetworkPersonnelStore::importSpreadsheetPersonnel(
             continue;
         }
 
-        const QSet<QString> importedCards = jsonStringSet(cards, QStringLiteral("cardId"));
+        const QSet<QString> importedCards = jsonCardIdSet(cards);
         const QList<QVariantMap> storedCardRows = DbStore::query(
                     QStringLiteral("SELECT card_id FROM network_ic_card WHERE person_id=?"), {personId});
         for (const QVariantMap &storedCard : storedCardRows) {
@@ -1086,7 +1119,8 @@ NetworkPersonnelImportResult NetworkPersonnelStore::importSpreadsheetPersonnel(
         for (const QJsonValue &value : cards) {
             if (!writeOk) break;
             const QJsonObject card = value.toObject();
-            const QString cardId = card.value(QStringLiteral("cardId")).toString().trimmed();
+            const QString cardId = cardIdFromJson(
+                        card.value(QStringLiteral("cardId")));
             if (cardId.isEmpty()) continue;
             writeOk = DbStore::execute(
                         QStringLiteral("INSERT INTO network_ic_card(card_id,person_id,name,bind_time,active) "
@@ -2189,7 +2223,8 @@ NetworkPersonnelSyncResult NetworkPersonnelStore::applyFullPersonnel(
     const QJsonArray cards = data.value(QStringLiteral("icCards")).toArray();
     for (const QJsonValue &value : cards) {
         const QJsonObject card = value.toObject();
-        const QString cardId = card.value(QStringLiteral("cardId")).toString().trimmed();
+        const QString cardId = cardIdFromJson(
+                    card.value(QStringLiteral("cardId")));
         if (cardId.isEmpty()) {
             continue;
         }

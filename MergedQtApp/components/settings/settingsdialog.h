@@ -1,6 +1,6 @@
 /**
  * @file settingsdialog.h
- * @brief 网络、蓝牙、MQTT、系统、待机和 FTP 页面容器及信号中转器。
+ * @brief 网络、蓝牙、MQTT、系统、显示、待机和 FTP 页面容器及信号中转器。
  *
  * @author Dulin
  * @date 2026-07-25
@@ -30,9 +30,15 @@ class MqttPage;
 class SystemInfoPage;
 class StandbyLockPage;
 class FtpPage;
+class DisplayRotationPage;
+class QBoxLayout;
+class QEvent;
+class QGridLayout;
+class QResizeEvent;
+class QShowEvent;
 
 
-/** @brief 网络、蓝牙、MQTT、系统、待机和 FTP 页面容器及信号中转器。 */
+/** @brief 网络、蓝牙、MQTT、系统、显示、待机和 FTP 页面容器及信号中转器。 */
 class SettingsDialog : public QDialog
 {
     Q_OBJECT
@@ -49,6 +55,16 @@ public:
 
     /** @brief 立即执行保存配置对应的网络自动连接。 */
     void startNetworkAutoConnectNow();
+
+protected:
+    /** @brief 宿主尺寸变化时，按配置优先的参考分辨率重排导航。 */
+    bool eventFilter(QObject *watched, QEvent *event) override;
+
+    /** @brief 显示时将窗口几何限制到宿主实际可用区域。 */
+    void showEvent(QShowEvent *event) override;
+
+    /** @brief 窗口尺寸变化时立即重排导航。 */
+    void resizeEvent(QResizeEvent *event) override;
 
 private slots:
     /** @brief 切换到网络页面。 */
@@ -69,6 +85,9 @@ private slots:
     /** @brief 切换到 FTP 页面。 */
     void onFtpButtonClicked();
 
+    /** @brief 切换到显示旋转页面。 */
+    void onDisplayButtonClicked();
+
 private:
     /** @brief 创建导航栏和内容页面栈。 */
     void setupUI();
@@ -76,12 +95,27 @@ private:
     /** @brief 建立各子页面与多媒体主窗口之间的转发连接。 */
     void setupConnections();
 
+    /** @brief 按当前宽高重排设置导航。 */
+    void applyResponsiveLayout();
+
+    /** @brief 创建带滚动兜底的普通设置页容器。 */
+    QWidget *wrapScrollablePage(QWidget *page);
+
+    /** @brief 将窗口限制到当前宿主的实际区域。 */
+    void fitToHost();
+
     QPushButton *networkButton = nullptr;       /**< 网络连接按钮。 */
     QPushButton *bluetoothButton = nullptr;     /**< 蓝牙连接按钮。 */
     QPushButton *mqttButton = nullptr;          /**< MQTT 连接按钮。 */
     QPushButton *systemInfoButton = nullptr;    /**< 系统信息按钮。 */
     QPushButton *standbyLockButton = nullptr;   /**< 待机和锁屏按钮。 */
     QPushButton *ftpButton = nullptr;           /**< FTP 设置按钮。 */
+    QPushButton *displayButton = nullptr;       /**< 显示方向设置按钮。 */
+
+    QBoxLayout *mainLayout_ = nullptr;          /**< 可切换方向的设置窗口根布局。 */
+    QGridLayout *navigationLayout_ = nullptr;   /**< 横屏单列/窄屏网格导航。 */
+    QWidget *sidebarWidget_ = nullptr;          /**< 导航容器。 */
+    bool topNavigation_ = false;                /**< 当前是否使用顶部导航。 */
 
     QStackedWidget *contentStack; /**< 设置子页面内容栈。 */
 
@@ -92,6 +126,14 @@ private:
     SystemInfoPage *systemInfoPage = nullptr;
     StandbyLockPage *standbyLockPage = nullptr;
     FtpPage *ftpPage = nullptr;
+    DisplayRotationPage *displayPage = nullptr;
+    QWidget *networkContainer_ = nullptr;
+    QWidget *bluetoothContainer_ = nullptr;
+    QWidget *mqttContainer_ = nullptr;
+    QWidget *ftpContainer_ = nullptr;
+    QWidget *standbyLockContainer_ = nullptr;
+    QWidget *systemInfoContainer_ = nullptr;
+    QWidget *displayContainer_ = nullptr;
 
     // 自动连接管理
     AutoConnectManager *autoConnectMgr = nullptr;

@@ -61,11 +61,11 @@ signals:
 
 private slots:
     /** @brief DHCP/静态模式切换时更新输入框状态。 */
-    void on_ipModeComboBox_currentIndexChanged(int index);
+    void handleIpModeChanged(int index);
     /** @brief 保存并应用当前网络设置。 */
-    void on_applyButton_clicked();
+    void handleApplyClicked();
     /** @brief 有线连接模式切换时刷新可用控件。 */
-    void on_connectionTypeCombo_currentIndexChanged(int index);
+    void handleConnectionTypeChanged(int index);
 
 protected:
     /** @brief 点击可编辑字段时打开屏幕键盘。 */

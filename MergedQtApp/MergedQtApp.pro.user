@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE QtCreatorProject>
-<!-- Written by QtCreator 4.11.2, 2026-09-05T18:36:23. -->
+<!-- Written by QtCreator 4.11.2, 2026-09-12T18:24:58. -->
 <qtcreator>
  <data>
   <variable>EnvironmentId</variable>
@@ -241,8 +241,8 @@
       <value type="bool" key="ProjectExplorer.BuildStep.Enabled">true</value>
       <value type="QString" key="ProjectExplorer.ProjectConfiguration.Id">RemoteLinux.DirectUploadStep</value>
       <valuelist type="QVariantList" key="ProjectExplorer.RunConfiguration.LastDeployedFiles">
-       <value type="QString">/home/lubancat/face_media/build-MergedQtApp-lubancat_rk_ubuntu20-Debug/MergedQtApp</value>
        <value type="QString">/home/lubancat/face_media/build-MergedQtApp-lubancat_rk_ubuntu20-Release/MergedQtApp</value>
+       <value type="QString">/home/lubancat/face_media/build-MergedQtApp-lubancat_rk_ubuntu20-Debug/MergedQtApp</value>
       </valuelist>
       <valuelist type="QVariantList" key="ProjectExplorer.RunConfiguration.LastDeployedHosts">
        <value type="QString">lubancat</value>
@@ -259,12 +259,12 @@
       <value type="bool" key="RemoteLinux.GenericDirectUploadStep.IgnoreMissingFiles">false</value>
       <value type="bool" key="RemoteLinux.GenericDirectUploadStep.Incremental">true</value>
       <valuelist type="QVariantList" key="RemoteLinux.LastDeployedLocalTimes">
+       <value type="QDateTime">2026-09-12T17:53:30.430</value>
        <value type="QDateTime">2026-07-24T18:03:25.151</value>
-       <value type="QDateTime">2026-09-05T09:46:01.554</value>
       </valuelist>
       <valuelist type="QVariantList" key="RemoteLinux.LastDeployedRemoteTimes">
+       <value type="QDateTime">2026-09-12T17:53:34.000</value>
        <value type="QDateTime">2026-07-24T18:03:42.000</value>
-       <value type="QDateTime">2026-09-05T09:46:05.000</value>
       </valuelist>
      </valuemap>
      <value type="int" key="ProjectExplorer.BuildStepList.StepsCount">3</value>

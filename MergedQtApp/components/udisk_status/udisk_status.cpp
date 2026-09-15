@@ -130,6 +130,7 @@ void UdiskStatusOverlay::pollOnce()
         // 文件暂时不存在：给一次提示即可（2~3s 自动隐藏）
         if (m_lastState != "no_file") {
             m_lastState = "no_file";
+            m_lastStatusMessage.clear();
             m_lastProgress = -1;
 
             const int token = ++m_hideToken;
@@ -184,6 +185,7 @@ void UdiskStatusOverlay::updateFromJson(const QByteArray &data)
         if (prevState == "removed") {
             // 让 removed 的延迟隐藏自己完成
             m_lastState = state;
+            m_lastStatusMessage = msg;
             m_lastProgress = -1;
             return;
         }
@@ -193,7 +195,24 @@ void UdiskStatusOverlay::updateFromJson(const QByteArray &data)
         m_progress->setVisible(false);
         m_progress->setValue(0);
         m_lastState = state;
+        m_lastStatusMessage = msg;
         m_lastProgress = -1;
+        return;
+    }
+
+    // 重启后的新 Qt 实例可能先读到旧实例退出前写入的 restarting 状态。
+    // 只有亲历过本轮插入/复制流程的旧实例才显示“正在重启”；新实例先
+    // 隐藏该遗留状态，等待 watcher 验证启动成功后写入 done，再只显示
+    // “U盘已拔出，程序重启完成”。
+    if (state == "restarting" && !m_seenInserted) {
+        ++m_hideToken;
+        setVisible(false);
+        m_progress->setVisible(false);
+        m_progress->setValue(0);
+        m_lastState = state;
+        m_lastStatusMessage = msg;
+        m_lastProgress = progress;
+        emit udiskStateChanged(state, progress);
         return;
     }
 
@@ -217,7 +236,9 @@ void UdiskStatusOverlay::updateFromJson(const QByteArray &data)
     // copying：进度/文件/计数变化都要更新
     // 其它状态：state 或 message 变化才更新（脚本的 waiting/error 可能更新 message）
     const bool stateChanged = (state != m_lastState);
-    const bool msgChanged = (msg != m_label->text()); // 简单判断：文字不同就算变化
+    // 临时业务提示会改写同一个 QLabel，不能拿标签文本判断U盘消息是否变化，
+    // 否则临时提示结束后会把状态文件中的最后一条完成消息再次弹出。
+    const bool msgChanged = (msg != m_lastStatusMessage);
     const bool progressChanged = (progress != m_lastProgress);
 
     if (state == "copying") {
@@ -235,6 +256,7 @@ void UdiskStatusOverlay::updateFromJson(const QByteArray &data)
     }
 
     m_lastState = state;
+    m_lastStatusMessage = msg;
     m_lastProgress = progress;
 
     // 进入非 done/removed 状态：取消旧的延迟隐藏（防止处理中被隐藏）

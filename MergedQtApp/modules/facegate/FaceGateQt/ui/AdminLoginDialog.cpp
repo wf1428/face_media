@@ -1,6 +1,6 @@
 /**
  * @file AdminLoginDialog.cpp
- * @brief 带内嵌 Qt 虚拟键盘的管理员登录对话框的实现。
+ * @brief 使用人脸模块共享 Qt Virtual Keyboard 的管理员登录对话框实现。
  *
  * @author Dulin
  * @date 2026-07-25
@@ -8,43 +8,51 @@
 
 #include "AdminLoginDialog.h"
 #include "AppMessageDialog.h"
+#include "common/responsive_ui.h"
 
-#include <QApplication>
-#include <QColor>
 #include <QEvent>
 #include <QFile>
 #include <QFormLayout>
-#include <QGuiApplication>
 #include <QHBoxLayout>
-#include <QInputMethod>
 #include <QLabel>
 #include <QLineEdit>
-#include <QMouseEvent>
 #include <QPushButton>
-#include <QQuickWidget>
+#include <QShowEvent>
 #include <QSizePolicy>
 #include <QTimer>
-#include <QUrl>
 #include <QVBoxLayout>
 
-namespace {
-const int kLoginKeyboardHeight = 280;
-}
-
-/** @brief 按配置创建用户名、密码输入和虚拟键盘界面。 */
+/** @brief 按配置创建用户名、密码输入和登录界面。 */
 AdminLoginDialog::AdminLoginDialog(const AppConfig &config, QWidget *parent)
     : QDialog(parent), config_(config)
 {
+    embeddedForWayland_ = ResponsiveUi::isWaylandPlatform() && parentWidget();
     setWindowTitle(QStringLiteral("管理员登录"));
     setModal(true);
-    setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
+    if (embeddedForWayland_) {
+        // 登录框和人脸主页共用一个 Wayland surface。这样确认登录时只隐藏
+        // 普通子控件，不会销毁独立 xdg/wl-shell surface 及关联 EGL 资源。
+        setWindowFlags(Qt::Widget);
+        setMinimumSize(0, 0);
+        setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+        setGeometry(parentWidget()->rect());
+    } else {
+        setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
+    }
     setAttribute(Qt::WA_StyledBackground, true);
-    setMinimumSize(720, 540);
-    resize(760, 580);
+    if (!embeddedForWayland_) {
+        const QSize targetSize = ResponsiveUi::dialogSize(
+                    parent, QSize(760, 580), QSize(520, 520));
+        setMinimumSize(qMin(520, targetSize.width()),
+                       qMin(520, targetSize.height()));
+        resize(targetSize);
+    }
 
     userEdit_ = new QLineEdit(this);
     passwordEdit_ = new QLineEdit(this);
     passwordEdit_->setEchoMode(QLineEdit::Password);
+    // 输入框只接入人脸根窗口长期存在的共享 InputPanel；登录框自身不再
+    // 创建或销毁 QQuickWidget，因此确认登录后可以安全进入管理后台。
     userEdit_->setAttribute(Qt::WA_InputMethodEnabled, true);
     passwordEdit_->setAttribute(Qt::WA_InputMethodEnabled, true);
     userEdit_->setInputMethodHints(Qt::ImhNoPredictiveText);
@@ -82,6 +90,10 @@ AdminLoginDialog::AdminLoginDialog(const AppConfig &config, QWidget *parent)
     form->addRow(QStringLiteral("密码"), passwordEdit_);
 
     auto *formShell = new QWidget(this);
+    if (embeddedForWayland_) {
+        formShell->setMaximumWidth(760);
+        formShell->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    }
     auto *formShellLayout = new QVBoxLayout(formShell);
     formShellLayout->setContentsMargins(24, 18, 24, 12);
     formShellLayout->setSpacing(14);
@@ -89,29 +101,25 @@ AdminLoginDialog::AdminLoginDialog(const AppConfig &config, QWidget *parent)
     formShellLayout->addLayout(form);
     formShellLayout->addLayout(buttonRow);
 
-    // 登录框使用同窗口内嵌键盘，不能使用独立 Tool 窗口。
-    // dialog.exec() 会进入应用模态事件循环，独立键盘窗口在部分 X11/嵌入式环境下会被模态窗口拦截，表现为键盘可见但点不动。
-    keyboardWidget_ = new QQuickWidget(this);
-    keyboardWidget_->setObjectName("loginEmbeddedKeyboard");
-    keyboardWidget_->setAttribute(Qt::WA_AcceptTouchEvents, true);
-    keyboardWidget_->setResizeMode(QQuickWidget::SizeRootObjectToView);
-    keyboardWidget_->setClearColor(QColor("#101a2a"));
-    keyboardWidget_->setFocusPolicy(Qt::NoFocus);
-    keyboardWidget_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    keyboardWidget_->setFixedHeight(kLoginKeyboardHeight);
-    keyboardWidget_->setSource(QUrl(QStringLiteral("qrc:/qml/EmbeddedVirtualKeyboard.qml")));
-    keyboardWidget_->hide();
-
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
-    layout->addWidget(formShell);
-    layout->addStretch(1);
-    layout->addWidget(keyboardWidget_);
+    if (embeddedForWayland_) {
+        layout->addStretch(1);
+        layout->addWidget(formShell, 0, Qt::AlignHCenter);
+        layout->addStretch(1);
+        keyboardClearance_ = new QWidget(this);
+        keyboardClearance_->setFixedHeight(
+                    ResponsiveUi::keyboardHeight(height(), 300));
+        keyboardClearance_->setAttribute(Qt::WA_TransparentForMouseEvents);
+        layout->addWidget(keyboardClearance_);
+    } else {
+        layout->addWidget(formShell);
+    }
 
-    userEdit_->installEventFilter(this);
-    passwordEdit_->installEventFilter(this);
-    qApp->installEventFilter(this);
+    if (embeddedForWayland_ && parentWidget()) {
+        parentWidget()->installEventFilter(this);
+    }
 
     QString style;
     QFile adminStyleFile(QStringLiteral(":/qss/admin_panel.qss"));
@@ -131,11 +139,12 @@ AdminLoginDialog::AdminLoginDialog(const AppConfig &config, QWidget *parent)
     setStyleSheet(style);
 }
 
-/** @brief 销毁前释放键盘焦点和资源。 */
+/** @brief 销毁前移除宿主尺寸监听。 */
 AdminLoginDialog::~AdminLoginDialog()
 {
-    qApp->removeEventFilter(this);
-    hideKeyboard();
+    if (embeddedForWayland_ && parentWidget()) {
+        parentWidget()->removeEventFilter(this);
+    }
 }
 
 /** @return 当前密码输入框内容。 */
@@ -148,7 +157,8 @@ QString AdminLoginDialog::password() const
 void AdminLoginDialog::verify()
 {
     if (config_.verifyAdminPassword(userEdit_->text(), passwordEdit_->text())) {
-        hideKeyboard();
+        userEdit_->clearFocus();
+        passwordEdit_->clearFocus();
         accept();
         return;
     }
@@ -156,72 +166,42 @@ void AdminLoginDialog::verify()
     AppMessageDialog::warning(this, QStringLiteral("管理员登录"), QStringLiteral("用户名或密码错误"));
 }
 
-/** @brief 根据文本编辑器焦点和点击位置显示或隐藏内嵌键盘。 */
+/** @brief Wayland 宿主尺寸变化时同步覆盖层几何。 */
 bool AdminLoginDialog::eventFilter(QObject *watched, QEvent *event)
 {
-    if ((watched == userEdit_ || watched == passwordEdit_) &&
-        (event->type() == QEvent::FocusIn || event->type() == QEvent::MouseButtonRelease)) {
-        QTimer::singleShot(0, this, &AdminLoginDialog::showKeyboard);
-    }
-
-    if (event->type() == QEvent::MouseButtonPress) {
-        auto *mouse = static_cast<QMouseEvent *>(event);
-        QWidget *clicked = QApplication::widgetAt(mouse->globalPos());
-        if (isVisible() && clicked && isAncestorOf(clicked) &&
-            !isTextEditor(clicked) &&
-            !(keyboardWidget_ && (clicked == keyboardWidget_ || keyboardWidget_->isAncestorOf(clicked)))) {
-            hideKeyboard();
+    if (embeddedForWayland_ && watched == parentWidget() &&
+        event->type() == QEvent::Resize) {
+        setGeometry(parentWidget()->rect());
+        if (keyboardClearance_) {
+            keyboardClearance_->setFixedHeight(
+                        ResponsiveUi::keyboardHeight(height(), 300));
         }
     }
+
     return QDialog::eventFilter(watched, event);
 }
 
-/** @return widget 是可编辑文本输入控件时返回 true。 */
-bool AdminLoginDialog::isTextEditor(QWidget *widget) const
+/** @brief 显示时刷新 Wayland 覆盖层几何。 */
+void AdminLoginDialog::showEvent(QShowEvent *event)
 {
-    QWidget *cursor = widget;
-    while (cursor && cursor != this) {
-        if (cursor == userEdit_ || cursor == passwordEdit_) {
-            return true;
+    if (embeddedForWayland_ && parentWidget()) {
+        setGeometry(parentWidget()->rect());
+        if (keyboardClearance_) {
+            keyboardClearance_->setFixedHeight(
+                        ResponsiveUi::keyboardHeight(height(), 300));
         }
-        cursor = cursor->parentWidget();
     }
-    return false;
-}
-
-/** @brief 显示并定位内嵌虚拟键盘。 */
-void AdminLoginDialog::showKeyboard()
-{
-    if (keyboardWidget_) {
-        positionKeyboard();
-        keyboardWidget_->show();
-        keyboardWidget_->raise();
-    }
-    if (QGuiApplication::inputMethod()) {
-        QGuiApplication::inputMethod()->show();
-    }
-}
-
-/** @brief 隐藏内嵌虚拟键盘。 */
-void AdminLoginDialog::hideKeyboard()
-{
-    if (keyboardWidget_) {
-        keyboardWidget_->hide();
-    }
-    if (QGuiApplication::inputMethod()) {
-        QGuiApplication::inputMethod()->hide();
-    }
-}
-
-/** @brief 根据对话框可用区域更新键盘几何位置。 */
-void AdminLoginDialog::positionKeyboard()
-{
-    if (!keyboardWidget_) {
-        return;
+    QDialog::showEvent(event);
+    if (embeddedForWayland_) {
+        raise();
     }
 
-    // 键盘在当前登录对话框布局内显示，只需要保持固定高度并刷新布局。
-    keyboardWidget_->setFixedHeight(kLoginKeyboardHeight);
-    keyboardWidget_->updateGeometry();
-    adjustSize();
+    // 用户名已有配置默认值，直接聚焦密码框，由共享键盘自动显示。
+    if (passwordEdit_) {
+        QTimer::singleShot(80, this, [this]() {
+            if (isVisible() && passwordEdit_) {
+                passwordEdit_->setFocus();
+            }
+        });
+    }
 }

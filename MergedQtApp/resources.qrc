@@ -18,9 +18,6 @@
 	<file>static/styles/activities.png</file>
 	<file>static/styles/go-down.png</file>
 
-	<file>static/audio/pass.wav</file>
-        <file>static/audio/fail.wav</file>
-        
         <!-- demoResources files -->
         <file>static/demoResources/images/logo/BG01.jpg</file>
         <file>static/demoResources/images/logo/back.bmp</file>

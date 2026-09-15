@@ -19,9 +19,7 @@
 #include <QtGui>
 #include <QDir>
 #include <QList>
-#include <QInputDialog>
 #include <QLineEdit>
-#include <QMessageBox>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QScreen>
@@ -45,6 +43,7 @@
 #include "netinfo_popup.h"
 #include "vol_ctrl.h"
 #include "media_toast.h"
+#include "modules/facegate/FaceGateQt/core/VerificationTypes.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -103,6 +102,9 @@ namespace Ui {
 class MultimediaDemo;
 }
 
+class CameraPreviewWidget;
+class VolumePanel;
+
 /**
  * @brief 电梯多媒体主页面，协调信号板 UI、本地轮播、直播、音量和 MQTT 状态。
  *
@@ -147,6 +149,8 @@ public:
 
 
 public slots:
+    /** @brief 启动页结束后放行首次媒体播放；重复调用保持幂等。 */
+    void startPlaybackAfterSplash();
     /** @brief 模块临时切往人脸识别时停止播放器，但保留当前 LIVE 业务目标。 */
     void suspendPlaybackForModuleSwitch();
     /** @brief 模块重新显示时恢复暂停前的 LIVE 或本地轮播状态。 */
@@ -155,6 +159,21 @@ public slots:
     void leaveAndStopVideo();
     /** @brief 从列表首项恢复本地轮播。 */
     void resumeLocalPlaylistFromStart();
+
+    /** @brief 停止全部媒体输出并在 videoRect 显示内嵌人脸预览。 */
+    void beginEmbeddedFaceRecognition();
+    /** @brief 关闭内嵌人脸预览并从播放列表第一项恢复。 */
+    void endEmbeddedFaceRecognition();
+    /** @brief 更新内嵌人脸预览帧。 */
+    void setEmbeddedFaceFrame(const QImage &image);
+    /** @brief 更新内嵌人脸框。 */
+    void setEmbeddedFaceFaces(const QVector<DetectedFace> &faces);
+    /** @brief 更新内嵌识别状态。 */
+    void setEmbeddedFaceState(VerifyState state, const QString &message);
+    /** @brief 在配置区域显示一名通过人员图片。 */
+    void showRecognitionImage(const QImage &image, const QString &name, int durationMs);
+    /** @brief 显示摄像头不可用提示。 */
+    void setEmbeddedFaceUnavailable(const QString &message);
 
     /** @brief 应用 MQTT 下发音量并回报执行结果。 */
     void onMqttVolumeChanged(int volume);
@@ -258,6 +277,12 @@ signals:
     /** @brief 请求页面外层显示指定时长的状态提示。 */
     void statusMessageRequested(const QString &text, int durationMs = 3000);
 
+    /** @brief 多媒体主页面左键持续按住五秒后请求进入人脸管理界面。 */
+    void adminLongPressRequested();
+
+    /** @brief 一批等待中的通过图片开始显示，需要重新计算结果保持时间。 */
+    void recognitionResultDisplayStarted();
+
 
 protected:
     /** @brief 处理返回、音量和网络信息热区，并维护光标空闲状态。 */
@@ -269,6 +294,12 @@ protected:
     void hideEvent(QHideEvent *e) override;
 
 private:
+    struct RecognitionImageItem {
+        QImage image;
+        QString name;
+        int durationMs = 0;
+    };
+
     Ui::MultimediaDemo *ui;
 
     QHash<int, QString> m_floorRemap;  /**< 特殊楼层数字到显示文本的映射，如 14 -> "13A"。 */
@@ -286,8 +317,6 @@ private:
     // 直播流配置
     bool m_isLiveMode = false;
     bool m_modulePlaybackSuspended = false; /**< 人体感应切换模块期间暂存播放状态。 */
-    bool m_resumeLiveAfterModuleSwitch = false; /**< 返回多媒体界面时是否仍需要 LIVE 业务目标。 */
-    bool m_resumeLiveDirectlyAfterModuleSwitch = false; /**< 返回时是否直接打开 LIVE；false 表示恢复本地并后台重试。 */
 
     QTimer* m_liveWatchdogTimer = nullptr;
     qint64 m_lastLiveFrameMs = 0;       // 最近一次真实解码视频帧时间
@@ -333,6 +362,11 @@ private:
 
     // 鼠标状态变量
     bool m_cursorHidden = false;
+    bool m_initialCursorStateApplied = false; /**< 首次显示页面时是否已经应用默认隐藏。 */
+    QTimer *m_adminLongPressTimer = nullptr; /**< 管理入口五秒长按计时器。 */
+    bool m_leftPressTracking = false;        /**< 当前是否正在跟踪主页面左键长按。 */
+    bool m_adminLongPressTriggered = false;  /**< 本次按下是否已经触发管理入口。 */
+    QPoint m_leftPressPoint;                 /**< 短按释放后执行旧热点动作的位置。 */
     // 防重入 + 屏蔽标记
     bool m_leaving = false;
 
@@ -365,6 +399,21 @@ private:
     QLabel *label_logo2;
     QLabel *label_logo3;
     QLabel *label_logo4;
+    QWidget *m_moveTextViewport = nullptr; /**< moveTextRect 限定的黑色滚动区域。 */
+    QLabel *m_moveTextLabel = nullptr;     /**< notice.txt 单行滚动文字。 */
+    QTimer *m_moveTextTimer = nullptr;     /**< 滚动文字平移动画定时器。 */
+    int m_moveTextOffsetX = 0;             /**< 文字当前在区域内的横坐标。 */
+    int m_moveTextStepPx = 2;              /**< 每帧左移像素数，对应五档速度。 */
+    CameraPreviewWidget *m_facePreview = nullptr; /**< videoRect 内嵌人脸预览。 */
+    QWidget *m_recognitionResultHost = nullptr;   /**< 通过人员图片覆盖容器。 */
+    QList<QLabel *> m_recognitionImageLabels;     /**< 当前批次中能完整放入目标区域的通过图片。 */
+    QHash<QLabel *, QImage> m_recognitionImages;  /**< 通过图片原图，用于重新布局缩放。 */
+    QHash<QLabel *, QString> m_recognitionNames;  /**< 每张通过图片对应的人员姓名。 */
+    QList<RecognitionImageItem> m_pendingRecognitionImages; /**< 容量不足时等待下一批的图片。 */
+    QString m_latestRecognitionName; /**< 结果照片显示期间用于锁定人脸框的通过文字。 */
+    bool m_embeddedFaceRecognitionActive = false;
+    bool m_picturePausedForRecognitionResult = false;
+    bool m_pictureSuppressedBySharedFaceRect = false;
 
     // 图像对象
 
@@ -465,6 +514,18 @@ private:
     int Logo4_y;
     int Logo4_x_Size;
     int Logo4_y_Size;
+
+    // 滚动通知文字配置
+    bool MoveTextDisplay_en = false;
+    int MoveTextDisplay_x = 0;
+    int MoveTextDisplay_y = 730;
+    int MoveTextDisplay_x_Size = 1024;
+    int MoveTextDisplay_y_Size = 40;
+    int MoveTextColorR = 255;
+    int MoveTextColorG = 255;
+    int MoveTextColorB = 255;
+    int MoveTextSize = 25;
+    int MoveTextSpeed = 2;
 
     // 视频显示相关变量
     bool VideoDisplay_en;
@@ -608,7 +669,9 @@ private:
     // 本地视频列表
     QTimer *m_emptyVideoListTimer = nullptr;
     int m_emptyVideoScanIntervalMs = 1000; /**< 空列表时每秒重新扫描一次。 */
-    bool m_localPlaybackEnabled = true;    /**< 是否允许本地播放和空列表补播。 */
+    bool m_localPlaybackEnabled = false;   /**< splash 结束且模块在前台时才允许本地播放。 */
+    bool m_startupPlaybackReleased = false; /**< 启动页结束后置 true，阻止启动阶段提前开播。 */
+    bool m_initialVideoPlaybackStarted = false; /**< 首次视频区域初始化是否已经执行。 */
 
     // 网络信息
     NetInfoPanel *m_netInfoPanel = nullptr;
@@ -638,6 +701,30 @@ private:
 
 
 private:
+    /** @brief 执行原有日期、时间和视频区短按热点。 */
+    bool handleShortLeftClick(const QPoint &position);
+    /** @brief 取消尚未触发的管理入口长按。 */
+    void cancelAdminLongPress();
+    /** @brief 按固定卡片宽度和区域容量居中布局当前批次通过图片。 */
+    void layoutRecognitionImages();
+    /** @brief 将一张通过图片加入当前显示批次并启动其显示时长。 */
+    void appendRecognitionImage(const RecognitionImageItem &item);
+    /** @return 当前批次增加该图片后是否仍能完整容纳在目标区域。 */
+    bool canAppendRecognitionImage(const QImage &image) const;
+    /** @brief 当前批次全部结束后，从等待队列填充下一批。 */
+    void startNextRecognitionBatch();
+    /** @return 以识别虚线框比例和 pic 高度计算的固定卡片宽度。 */
+    int recognitionCardWidth(const QImage &image) const;
+    /** @return 以识别虚线框为基准、且不超过 pic 高度的卡片高度。 */
+    int recognitionCardHeight() const;
+    /** @return 带圆角及底部姓名栏的通过人员卡片。 */
+    QPixmap renderRecognitionCard(const QImage &image,
+                                  const QString &name,
+                                  const QSize &size) const;
+    /** @brief 清理所有临时通过图片并恢复 pic 轮播。 */
+    void clearRecognitionImages(bool restorePicturePlayback);
+    /** @brief 在临时通过图片全部消失后恢复 pic 区原有内容。 */
+    void restorePictureAfterRecognitionResult();
     /** @brief 加载图片并屏蔽现场资源文件可能产生的非致命解码告警。 */
     QPixmap loadPixmapWithIgnoreWarnings(const QString &imagePath);
     /** @brief 优先解析外部资源路径，不存在时回退到 qrc。 */
@@ -749,6 +836,12 @@ private:
 
     /** @brief 从 INI 加载特殊楼层数值到显示名称的映射。 */
     void loadFloorRemap(const QString& iniPath);
+    /** @brief 按 moveTextRect 配置读取外部 notice.txt 并启动滚动。 */
+    void initializeMovingText();
+    /** @brief 将通知文字向左推进一帧，完全离开后从右侧重新进入。 */
+    void advanceMovingText();
+    /** @brief 将滚动文字保持在媒体、普通图片和识别结果图片之上。 */
+    void raiseMovingTextOverlay();
     /** @brief 尝试显示当前楼层对应的专用图片。 */
     bool tryShowSpecialFloorImage(int Value);
 

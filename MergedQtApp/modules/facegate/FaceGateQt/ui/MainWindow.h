@@ -28,6 +28,7 @@ class CameraPreviewWidget;
 class MaintenanceWorker;
 class PersonExportWorker;
 class PersonImportWorker;
+class SharedVirtualKeyboard;
 class QLabel;
 class QPushButton;
 class QResizeEvent;
@@ -63,6 +64,9 @@ public:
     /** @return 仅在识别主页且未进行密码或管理交互时返回 true。 */
     bool allowsPresenceSwitch() const;
 
+    /** @brief 从应用外壳进入原有管理员认证和管理面板。 */
+    void requestOpenAdminManagement();
+
 signals:
     /** Emitted after the final access decision succeeds and the result is shown. */
     void recognitionSucceeded();
@@ -73,8 +77,26 @@ signals:
     /** @brief 主识别画面中的人脸检测状态发生变化。 */
     void facePresenceChanged(bool present);
 
+    /** @brief 向外部内嵌识别视图转发最新摄像头帧。 */
+    void previewFrameChanged(const QImage &image);
+
+    /** @brief 向外部内嵌识别视图转发摄像头不可用提示。 */
+    void previewUnavailable(const QString &message);
+
+    /** @brief 向外部内嵌识别视图转发人脸框。 */
+    void previewFacesChanged(const QVector<DetectedFace> &faces);
+
+    /** @brief 向外部内嵌识别视图转发识别状态。 */
+    void previewStateChanged(VerifyState state, const QString &message);
+
+    /** @brief 最终权限校验成功后提供人员显示图和姓名。 */
+    void recognitionImageReady(const QImage &image, const QString &name);
+
+    /** @brief 管理员登录取消或管理面板关闭后通知应用外壳。 */
+    void adminSessionFinished();
+
 protected:
-    /** @brief 窗口尺寸变化后重新布局左右覆盖面板。 */
+    /** @brief 窗口尺寸变化后重新布局右侧综合信息面板。 */
     void resizeEvent(QResizeEvent *event) override;
 
 private:
@@ -101,6 +123,9 @@ private:
 
     /** @brief 完成管理员认证后打开综合管理面板。 */
     void openAdminPanel();
+
+    /** @return 优先匹配底库录入原图，失败时回退验证抓拍。 */
+    QImage recognitionImageForLog(const VerifyLog &log) const;
 
     /** @brief 保存录入图像并投递后台特征提取。 */
     void handleEnrollRequest(const PersonInfo &person, const QImage &image);
@@ -160,6 +185,9 @@ private:
     /** @brief 保存音频配置并重新配置 AudioService。 */
     void handleAudioConfigSave(const AppConfig &audioConfig);
 
+    /** @brief 保存并立即应用通行照片及姓名显示开关。 */
+    void handleAccessPhotoDisplayChanged(bool enabled);
+
     /** @brief 请求 AudioService 测试指定提示音。 */
     void handleAudioTestPlay(const QString &promptKey);
 
@@ -181,7 +209,7 @@ private:
     /** @brief 刷新网络接口摘要。 */
     void updateNetworkSummary();
 
-    /** @brief 按窗口尺寸布局左右覆盖信息面板。 */
+    /** @brief 按窗口尺寸布局右侧综合信息面板。 */
     void layoutOverlayPanels();
 
     /** @brief 在右侧栏显示本次成功通行的抓拍缩略图和人员姓名。 */
@@ -222,9 +250,9 @@ private:
     QLabel *successfulAccessImageLabel_ = nullptr;
     QLabel *successfulAccessNameLabel_ = nullptr;
     QPushButton *passwordAccessButton_ = nullptr;
-    QWidget *leftOverlay_ = nullptr;
     QWidget *rightOverlay_ = nullptr;
     AdminPanel *adminPanel_ = nullptr;
+    SharedVirtualKeyboard *virtualKeyboard_ = nullptr; /**< 人脸模块唯一 Qt 虚拟键盘。 */
     QImage latestFrame_;
     QImage latestEnrollmentPreview_;
     QVector<FaceRecord> latestGallery_;
@@ -247,6 +275,7 @@ private:
     QTimer clockTimer_;
     QTimer networkTimer_;
     QTimer successfulAccessTimer_;
+    QTimer faceAccessTimeoutTimer_;       /**< 等待最终楼层权限结果的超时保护。 */
     QPixmap successfulAccessPixmap_;
     QThread faceInferenceThread_;
     FaceInferenceWorker *faceInferenceWorker_ = nullptr;

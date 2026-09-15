@@ -7,7 +7,7 @@
     <x>0</x>
     <y>0</y>
     <width>450</width>
-    <height>625</height>
+    <height>560</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -32,7 +32,7 @@ QLabel#titleLabel {
     color: #303133;
     font-size: 20px;
     font-weight: 600;
-    margin-bottom: 20px;
+    margin-bottom: 10px;
 }
 
 /* 分组框样式 */
@@ -56,7 +56,7 @@ QGroupBox::title {
 /* 复选框样式 */
 QCheckBox { 
     spacing: 12px; 
-    margin: 16px 0; 
+    margin: 8px 0; 
     color: #606266; 
     font-size: 14px; 
 }
@@ -84,8 +84,8 @@ QCheckBox::indicator:checked {
 QLabel#statusLabel { 
     color: #909399; 
     font-size: 14px; 
-    margin: 16px 0; 
-    padding: 12px; 
+    margin: 8px 0; 
+    padding: 8px; 
     background-color: #ecf5ff; 
     border: 1px solid #ebeef5; 
     border-radius: 6px;
@@ -93,7 +93,7 @@ QLabel#statusLabel {
 
 /* 按钮样式 */
 QPushButton { 
-    padding: 12px 24px; 
+    padding: 8px 18px; 
     border: 1px solid #dcdfe6; 
     border-radius: 6px; 
     background-color: white; 
@@ -135,7 +135,7 @@ QPushButton:default:pressed {
 QFrame#divider { 
     height: 1px; 
     background-color: #ebeef5; 
-    margin: 20px 0;
+    margin: 10px 0;
 }</string>
   </property>
   <property name="modal">
@@ -354,22 +354,6 @@ QFrame#divider {
     <hint type="destinationlabel">
      <x>540</x>
      <y>640</y>
-    </hint>
-   </hints>
-  </connection>
-  <connection>
-   <sender>applyButton</sender>
-   <signal>clicked()</signal>
-   <receiver>FeaturesDialog</receiver>
-   <slot>accept()</slot>
-   <hints>
-    <hint type="sourcelabel">
-     <x>420</x>
-     <y>560</y>
-    </hint>
-    <hint type="destinationlabel">
-     <x>275</x>
-     <y>325</y>
     </hint>
    </hints>
   </connection>

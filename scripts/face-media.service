@@ -1,14 +1,16 @@
 [Unit]
 Description=Face Media drivers, MQTT daemon and Qt application
-Wants=network-online.target
-After=network-online.target systemd-udev-settle.service
+Wants=network-online.target disable-console-blank.service weston-kiosk.service
+After=network-online.target systemd-udev-settle.service disable-console-blank.service weston-kiosk.service
+Before=udisk-watcher.service
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/home/cat/face_media
 Environment=APP_START_DELAY_SECONDS=5
-ExecStart=/home/cat/face_media/start_face_media.sh
+Environment=APP_RESTART_DELAY_SECONDS=2
+ExecStart=/usr/local/sbin/start_face_media.sh
 Restart=always
 RestartSec=5
 KillMode=control-group

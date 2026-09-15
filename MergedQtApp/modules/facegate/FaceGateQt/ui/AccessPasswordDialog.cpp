@@ -9,45 +9,51 @@
 #include "AccessPasswordDialog.h"
 
 #include "AppMessageDialog.h"
+#include "common/responsive_ui.h"
 
-#include <QColor>
+#include <QEvent>
 #include <QFrame>
-#include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QIcon>
-#include <QInputMethod>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
-#include <QQuickWidget>
 #include <QShowEvent>
 #include <QSize>
-#include <QSizePolicy>
 #include <QTimer>
-#include <QUrl>
 #include <QVBoxLayout>
-
-namespace {
-constexpr int kAccessKeyboardHeight = 280; /**< 内嵌虚拟键盘固定高度，单位 px。 */
-}
 
 /** @brief 初始化无边框模态窗口并创建密码输入界面。 */
 AccessPasswordDialog::AccessPasswordDialog(QWidget *parent)
     : QDialog(parent)
 {
+    embeddedForWayland_ = ResponsiveUi::isWaylandPlatform() && parentWidget();
     setModal(true);
-    setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
+    if (embeddedForWayland_) {
+        setWindowFlags(Qt::Widget);
+        setMinimumSize(0, 0);
+        setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+        setGeometry(parentWidget()->rect());
+        parentWidget()->installEventFilter(this);
+    } else {
+        setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
+        setMinimumSize(680, 560);
+        resize(720, 580);
+    }
     setAttribute(Qt::WA_StyledBackground, true);
     setObjectName(QStringLiteral("accessPasswordDialog"));
-    setMinimumSize(680, 560);
-    resize(720, 580);
     buildUi();
 }
 
-/** @brief 销毁前主动隐藏输入法，避免其残留在门禁主页。 */
+/** @brief 移除宿主尺寸监听并释放输入焦点。 */
 AccessPasswordDialog::~AccessPasswordDialog()
 {
-    hideKeyboard();
+    if (embeddedForWayland_ && parentWidget()) {
+        parentWidget()->removeEventFilter(this);
+    }
+    if (passwordEdit_) {
+        passwordEdit_->clearFocus();
+    }
 }
 
 /** @return 当前密码输入框文本；控件尚未创建时返回空字符串。 */
@@ -69,17 +75,33 @@ bool AccessPasswordDialog::getPassword(QWidget *parent, QString *password)
     return true;
 }
 
+/** @brief Wayland 宿主尺寸变化时同步覆盖层几何。 */
+bool AccessPasswordDialog::eventFilter(QObject *watched, QEvent *event)
+{
+    if (embeddedForWayland_ && watched == parentWidget() &&
+            event->type() == QEvent::Resize) {
+        setGeometry(parentWidget()->rect());
+    }
+    return QDialog::eventFilter(watched, event);
+}
+
 /** @brief 首次显示后聚焦密码框，并等待窗口稳定再拉起键盘。 */
 void AccessPasswordDialog::showEvent(QShowEvent *event)
 {
+    if (embeddedForWayland_ && parentWidget()) {
+        setGeometry(parentWidget()->rect());
+    }
     QDialog::showEvent(event);
     if (passwordEdit_) {
-        passwordEdit_->setFocus();
+        QTimer::singleShot(80, this, [this]() {
+            if (isVisible() && passwordEdit_) {
+                passwordEdit_->setFocus();
+            }
+        });
     }
-    QTimer::singleShot(80, this, &AccessPasswordDialog::showKeyboard);
 }
 
-/** @brief 创建密码卡片、操作按钮、样式和内嵌 QML 键盘。 */
+/** @brief 创建密码卡片、操作按钮和样式。 */
 void AccessPasswordDialog::buildUi()
 {
     auto *root = new QVBoxLayout(this);
@@ -88,6 +110,9 @@ void AccessPasswordDialog::buildUi()
 
     auto *card = new QFrame(this);
     card->setObjectName(QStringLiteral("accessPasswordCard"));
+    if (embeddedForWayland_) {
+        card->setMaximumWidth(720);
+    }
     auto *cardLayout = new QVBoxLayout(card);
     cardLayout->setContentsMargins(24, 20, 24, 20);
     cardLayout->setSpacing(14);
@@ -158,20 +183,12 @@ void AccessPasswordDialog::buildUi()
     cardLayout->addWidget(passwordEdit_);
     cardLayout->addLayout(buttonRow);
 
-    keyboardWidget_ = new QQuickWidget(this);
-    keyboardWidget_->setObjectName(QStringLiteral("accessPasswordKeyboard"));
-    keyboardWidget_->setAttribute(Qt::WA_AcceptTouchEvents, true);
-    keyboardWidget_->setResizeMode(QQuickWidget::SizeRootObjectToView);
-    keyboardWidget_->setClearColor(QColor(QStringLiteral("#101a2a")));
-    keyboardWidget_->setFocusPolicy(Qt::NoFocus);
-    keyboardWidget_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    keyboardWidget_->setFixedHeight(kAccessKeyboardHeight);
-    keyboardWidget_->setSource(
-                QUrl(QStringLiteral("qrc:/qml/EmbeddedVirtualKeyboard.qml")));
-    keyboardWidget_->hide();
-
-    root->addWidget(card);
-    root->addWidget(keyboardWidget_, 0);
+    if (embeddedForWayland_) {
+        root->addWidget(card, 0, Qt::AlignHCenter | Qt::AlignTop);
+    } else {
+        root->addWidget(card);
+    }
+    root->addStretch(1);
 
     setStyleSheet(QStringLiteral(
         "QDialog#accessPasswordDialog{background:#101a2a;color:#edf5f8;"
@@ -195,7 +212,7 @@ void AccessPasswordDialog::buildUi()
         "background:#2e405b;}"));
 }
 
-/** @brief 拒绝空密码；有效输入则先收起键盘再接受对话框。 */
+/** @brief 拒绝空密码；有效输入则释放焦点后接受对话框。 */
 void AccessPasswordDialog::acceptInput()
 {
     if (!passwordEdit_ || passwordEdit_->text().trimmed().isEmpty()) {
@@ -203,29 +220,6 @@ void AccessPasswordDialog::acceptInput()
                                   QStringLiteral("请输入人员通行密码"));
         return;
     }
-    hideKeyboard();
+    passwordEdit_->clearFocus();
     accept();
-}
-
-/** @brief 显示内嵌键盘，同时通知 Qt 输入法进入可见状态。 */
-void AccessPasswordDialog::showKeyboard()
-{
-    if (keyboardWidget_) {
-        keyboardWidget_->show();
-        keyboardWidget_->raise();
-    }
-    if (QGuiApplication::inputMethod()) {
-        QGuiApplication::inputMethod()->show();
-    }
-}
-
-/** @brief 同时隐藏内嵌键盘和 Qt 输入法。 */
-void AccessPasswordDialog::hideKeyboard()
-{
-    if (keyboardWidget_) {
-        keyboardWidget_->hide();
-    }
-    if (QGuiApplication::inputMethod()) {
-        QGuiApplication::inputMethod()->hide();
-    }
 }

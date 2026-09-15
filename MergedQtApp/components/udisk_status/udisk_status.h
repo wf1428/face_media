@@ -72,6 +72,7 @@ private:
     int m_doneTipMs = 2500;     // 提示显示时长（2~3s）
 
     QString m_lastState;
+    QString m_lastStatusMessage;  // 最近一次U盘状态消息，不受业务临时提示改写
     int m_lastProgress = -1;
 
     qint64 m_manualMessageUntilMs = 0;

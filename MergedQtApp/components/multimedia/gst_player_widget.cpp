@@ -848,7 +848,7 @@ void VideoHoleWidget::setNv12Frame(int width,
     const qint64 requiredBytes = static_cast<qint64>(width) * height * 3 / 2;
     if (width <= 0 || height <= 0 || (width & 1) || (height & 1) ||
         requiredBytes <= 0 || nv12Frame.size() < requiredBytes) {
-        qWarning() << "[EGLFS-GL] 忽略无效的RGA NV12输出"
+        qWarning() << "忽略无效的RGA NV12输出"
                    << "frame=" << QSize(width, height)
                    << "bytes=" << nv12Frame.size()
                    << "required=" << requiredBytes;
@@ -941,7 +941,7 @@ void VideoHoleWidget::initializeGL()
 
     const bool shaderOk = ensureShaderProgram();
     const GLenum initError = glGetError();
-    qInfo() << "[EGLFS-GL] VideoHoleWidget initializeGL"
+    qInfo() << "VideoHoleWidget initializeGL"
             << "size=" << size()
             << "contextValid=" << (currentContext && currentContext->isValid())
             << "contextMajor=" << contextMajor
@@ -1026,7 +1026,7 @@ void VideoHoleWidget::paintGL()
 
     if (!firstPaintLogged_) {
         firstPaintLogged_ = true;
-        qInfo() << "[EGLFS-GL] VideoHoleWidget first paintGL"
+        qInfo() << "VideoHoleWidget first paintGL"
                 << "widget=" << size()
                 << "surface=" << QSize(surfaceWidth, surfaceHeight)
                 << "frame=" << QSize(frameWidth_, frameHeight_)
@@ -1037,7 +1037,7 @@ void VideoHoleWidget::paintGL()
         !ensureShaderProgram() || yTexture_ == 0 || uvTexture_ == 0 ||
         vertexBuffer_ == 0) {
         if (textureUploadPending_) {
-            qWarning() << "[EGLFS-GL] 视频帧待上传但GL资源无效，跳过该帧"
+            qWarning() << "视频帧待上传但GL资源无效，跳过该帧"
                        << "frame=" << QSize(frameWidth_, frameHeight_);
             textureUploadPending_ = false;
             releasePendingFrameLease();
@@ -1046,7 +1046,7 @@ void VideoHoleWidget::paintGL()
     }
 
     if (textureUploadPending_ && nv12Frame_.isEmpty()) {
-        qWarning() << "[EGLFS-GL] 视频帧邮箱数据为空，跳过该帧"
+        qWarning() << "视频帧邮箱数据为空，跳过该帧"
                    << "frame=" << QSize(frameWidth_, frameHeight_);
         textureUploadPending_ = false;
         releasePendingFrameLease();
@@ -1102,7 +1102,7 @@ void VideoHoleWidget::paintGL()
 
         const GLenum uploadError = glGetError();
         if (uploadError != GL_NO_ERROR) {
-            qWarning() << "[EGLFS-GL] NV12纹理上传失败"
+            qWarning() << "NV12纹理上传失败"
                        << "glError=" << QStringLiteral("0x%1").arg(uploadError, 0, 16)
                        << "layout=" << (useRedGreenTextures_ ? "R8/RG8" : "LUMINANCE/LA")
                        << "frame=" << QSize(frameWidth_, frameHeight_);
@@ -1150,7 +1150,7 @@ void VideoHoleWidget::paintGL()
     const int vertexLocation = program_->attributeLocation("vertexIn");
     const int textureLocation = program_->attributeLocation("textureIn");
     if (vertexLocation < 0 || textureLocation < 0) {
-        qWarning() << "[EGLFS-GL] NV12着色器属性位置无效"
+        qWarning() << "NV12着色器属性位置无效"
                    << vertexLocation << textureLocation;
         program_->release();
         return;
@@ -1171,7 +1171,7 @@ void VideoHoleWidget::paintGL()
     const GLenum drawError = glGetError();
     if (!firstRenderedFrameLogged_ || drawError != GL_NO_ERROR) {
         firstRenderedFrameLogged_ = true;
-        qInfo() << "[EGLFS-GL] NV12 frame draw"
+        qInfo() << "NV12 frame draw"
                 << "frame=" << QSize(frameWidth_, frameHeight_)
                 << "viewport=" << QRect(x, y, renderWidth, renderHeight)
                 << "layout=" << (useRedGreenTextures_ ? "R8/RG8" : "LUMINANCE/LA")
@@ -1279,8 +1279,8 @@ void GstPlayerWidget::setVideoOutput(QWidget *widget)
     }
 
     if (useQtCompositedVideo()) {
-        // EGLFS 只有一个 Qt 原生窗口。视频画布保持为普通 Qt 子控件，
-        // 由 QOpenGLWidget 合成，不创建独立的 X11/KMS 视频窗口。
+        // 视频画布保持为普通 Qt 子控件，由 QOpenGLWidget 合成，不创建
+        // 独立的 Wayland/X11/KMS 视频窗口。
         videoWidget_->setAttribute(Qt::WA_TransparentForMouseEvents, true);
         videoWidget_->show();
     } else {
@@ -1521,7 +1521,7 @@ void GstPlayerWidget::requestSnapshot()
             image = canvas->videoSnapshot();
         }
         if (image.isNull()) {
-            error = QStringLiteral("Qt/EGLFS 视频画布尚无可截图内容");
+            error = QStringLiteral("Qt 视频画布尚无可截图内容");
         }
     } else if (videoSink_) {
         image = imageFromLastSample(&error);
@@ -1681,7 +1681,7 @@ GstElement *GstPlayerWidget::createVideoSink()
 GstElement *GstPlayerWidget::createQtCompositedVideoSink()
 {
     if (!QFileInfo::exists(QStringLiteral("/dev/rga"))) {
-        qCritical() << "[RGA] /dev/rga不存在，终止EGLFS视频链路；禁止CPU缩放回退";
+        qCritical() << "[RGA] /dev/rga不存在，终止Qt视频链路；禁止CPU缩放回退";
         return nullptr;
     }
 
@@ -1750,7 +1750,7 @@ GstElement *GstPlayerWidget::createQtCompositedVideoSink()
                      G_CALLBACK(&GstPlayerWidget::appSinkNewSample), this);
     appSink_ = sink;
 
-    qInfo() << "[GStreamer] EGLFS无桌面模式: MPP NV12 DMA-BUF"
+    qInfo() << "[GStreamer] Qt合成模式: MPP NV12 DMA-BUF"
             << "+ 非泄漏单帧queue + RGA缩放 + Qt OpenGL ES合成"
             << "CPU缩放回退=disabled";
     return bin;
@@ -1976,8 +1976,8 @@ void GstPlayerWidget::updateVideoOverlay()
 bool GstPlayerWidget::useQtCompositedVideo() const
 {
 #ifdef QT_YCEST_RK3566
-    // RK3566 正式版本固定走 EGLFS 单窗口 Qt 合成，禁止重新选择
-    // linuxfb、kmssink 或其他独立 DRM/X11 视频层。
+    // RK3566 正式版本固定走单窗口 Qt 合成，禁止重新选择 linuxfb、
+    // kmssink 或其他独立 DRM/X11/Wayland 视频层。
     return true;
 #else
     const QString requested = QString::fromLocal8Bit(qgetenv("QT_YCEST_VIDEO_OUTPUT"))
@@ -2819,7 +2819,7 @@ GstBusSyncReply GstPlayerWidget::busSyncHandler(GstBus *, GstMessage *message, g
     auto *self = static_cast<GstPlayerWidget *>(userData);
     if (!self || self->shuttingDown_.load()) return GST_BUS_PASS;
 
-    // EGLFS Qt 合成模式不使用 GstVideoOverlay，也没有独立视频窗口句柄。
+    // Qt 合成模式不使用 GstVideoOverlay，也没有独立视频窗口句柄。
     if (self->useQtCompositedVideo()) return GST_BUS_PASS;
 
     if (!gst_is_video_overlay_prepare_window_handle_message(message)) {

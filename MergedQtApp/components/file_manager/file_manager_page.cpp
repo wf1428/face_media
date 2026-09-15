@@ -10,10 +10,11 @@
 
 #include <QHBoxLayout>
 #include <QVBoxLayout>
-#include <QMessageBox>
+#include "components/dialogs/ui_message_box.h"
 #include <QHeaderView>
 #include <QFileInfo>
 #include <QResizeEvent>
+#include <QTimer>
 #include <QDir>
 #include <QFile>
 #include <QDesktopServices>
@@ -58,8 +59,7 @@ FileManagerPage::FileManagerPage(QWidget *parent)
     hdr->setStretchLastSection(false);
     hdr->setSectionResizeMode(QHeaderView::Interactive);
 
-    view->setColumnWidth(0, 600);
-    view->setColumnWidth(3, 180);
+    // 列宽在 resizeEvent 中按实际视口分配，不再绑定 1024x768。
 
     // 右键菜单
     view->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -84,6 +84,27 @@ FileManagerPage::FileManagerPage(QWidget *parent)
 
     // 默认根目录：
     setRoot(Rk3566Platform::storageRoot());
+}
+
+void FileManagerPage::resizeEvent(QResizeEvent *event)
+{
+    QWidget::resizeEvent(event);
+    updateColumnWidths();
+    // 父页面先收到 resize，树视图的 viewport 随后才由布局更新；下一轮事件
+    // 再计算一次，保证横竖切换后列宽使用最终可见宽度。
+    QTimer::singleShot(0, this, [this]() { updateColumnWidths(); });
+}
+
+void FileManagerPage::updateColumnWidths()
+{
+    if (!view || !view->viewport()) {
+        return;
+    }
+    const int available = qMax(320, view->viewport()->width() - 4);
+    view->setColumnWidth(0, available * 50 / 100);
+    view->setColumnWidth(1, available * 13 / 100);
+    view->setColumnWidth(2, available * 14 / 100);
+    view->setColumnWidth(3, available * 23 / 100);
 }
 
 /** @brief 切换浏览根目录并同步路径栏。 */
@@ -114,7 +135,7 @@ void FileManagerPage::onDoubleClicked(const QModelIndex &index)
 
     // 文件：尝试用系统打开（在某些嵌入式环境可能没有 xdg-open，这里失败就提示）
     if (!QDesktopServices::openUrl(QUrl::fromLocalFile(path))) {
-        QMessageBox::information(this, "打开文件", QString("无法调用系统打开：\n%1").arg(path));
+        UiMessageBox::information(this, "打开文件", QString("无法调用系统打开：\n%1").arg(path));
     }
 }
 
@@ -134,13 +155,13 @@ void FileManagerPage::onCustomContextMenu(const QPoint &pos)
     if (chosen != actDelete) return;
 
     QString text = info.isDir() ? "确定要删除文件夹及其所有内容吗？" : "确定要删除该文件吗？";
-    auto ret = QMessageBox::question(this, "删除确认", text + "\n\n" + path,
+    auto ret = UiMessageBox::question(this, "删除确认", text + "\n\n" + path,
                                     QMessageBox::Yes | QMessageBox::No,
                                     QMessageBox::No);
     if (ret != QMessageBox::Yes) return;
 
     if (!removePath(path)) {
-        QMessageBox::warning(this, "删除失败", "删除失败，权限不足或文件正在被占用：\n" + path);
+        UiMessageBox::warning(this, "删除失败", "删除失败，权限不足或文件正在被占用：\n" + path);
     } else {
         refresh();
     }
@@ -314,5 +335,3 @@ void FileManagerPage::applyStyle()
 
     this->setStyleSheet(qss);
 }
-
-

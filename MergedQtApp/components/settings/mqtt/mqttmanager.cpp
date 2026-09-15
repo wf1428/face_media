@@ -3219,7 +3219,7 @@ bool MqttManager::handleOnlineV1QrMessage(const QString &topic,
                                     "协议异常：楼层已请求发送后收到拒绝 scanResult，code=%1")
                                 .arg(code));
             } else {
-                IcEventBridge::instance()->emitToastFailRequested(reason);
+                IcEventBridge::instance()->emitToastFailRequested(reason, code);
                 clearPendingOnlineV1Qr();
             }
             return true;
