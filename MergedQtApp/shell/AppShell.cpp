@@ -58,7 +58,9 @@ bool AppShell::initialize()
     const int sr505ReconnectMs =
         settings.value(QStringLiteral("modeSwitch/sr505ReconnectMs"), 1000).toInt();
     const int recognitionReturnMs =
-        settings.value(QStringLiteral("modeSwitch/recognitionReturnMs"), 5000).toInt();
+        settings.value(QStringLiteral("modeSwitch/recognitionReturnMs"), 20000).toInt();
+    const int recognitionImageMs =
+        settings.value(QStringLiteral("modeSwitch/recognitionImageMs"), 3000).toInt();
     const QString fillLightDevice =
         settings.value(QStringLiteral("fillLight/device"), QStringLiteral("/dev/led"))
             .toString().trimmed();
@@ -97,14 +99,18 @@ bool AppShell::initialize()
             this, [](const QString &message) {
                 qWarning() << "[PRESENCE] fault" << message;
             });
+    connect(faceGateModule_, &FaceGateModuleAdapter::recognitionVerified,
+            modeController_, &ModeController::handleRecognitionVerified);
     connect(faceGateModule_, &FaceGateModuleAdapter::recognitionSucceeded,
-            this, [this]() {
-                if (fillLight_) {
-                    fillLight_->turnOff();
-                }
-            });
+            modeController_, &ModeController::handleRecognitionSucceeded);
     connect(faceGateModule_, &FaceGateModuleAdapter::recognitionFinished,
             modeController_, &ModeController::handleRecognitionFinished);
+    connect(faceGateModule_, &FaceGateModuleAdapter::duplicateRecognitionSuppressed,
+            this, [this](const QString &message) {
+                if (multimediaModule_) {
+                    multimediaModule_->showStatusMessage(message, 2500);
+                }
+            });
     connect(faceGateModule_, &FaceGateModuleAdapter::facePresenceChanged,
             modeController_, &ModeController::handleFacePresenceChanged);
 #ifndef FACEGATE_LEGACY_PAGE_MODE
@@ -112,16 +118,18 @@ bool AppShell::initialize()
             multimediaModule_, &MultimediaModuleAdapter::setEmbeddedFaceFrame);
     connect(faceGateModule_, &FaceGateModuleAdapter::previewUnavailable,
             multimediaModule_, &MultimediaModuleAdapter::setEmbeddedFaceUnavailable);
+    connect(faceGateModule_, &FaceGateModuleAdapter::previewUnavailable,
+            modeController_, &ModeController::handleCameraUnavailable);
     connect(faceGateModule_, &FaceGateModuleAdapter::previewFacesChanged,
             multimediaModule_, &MultimediaModuleAdapter::setEmbeddedFaceFaces);
     connect(faceGateModule_, &FaceGateModuleAdapter::previewStateChanged,
             multimediaModule_, &MultimediaModuleAdapter::setEmbeddedFaceState);
     connect(faceGateModule_, &FaceGateModuleAdapter::recognitionImageReady,
-            this, [this, recognitionReturnMs](const QImage &image,
-                                               const QString &name) {
+            this, [this, recognitionImageMs](const QImage &image,
+                                              const QString &name) {
                 if (multimediaModule_) {
                     multimediaModule_->showRecognitionImage(
-                                image, name, recognitionReturnMs);
+                                image, name, qMax(1, recognitionImageMs));
                 }
             });
     connect(multimediaModule_, &MultimediaModuleAdapter::adminLongPressRequested,
@@ -130,6 +138,8 @@ bool AppShell::initialize()
             modeController_, &ModeController::handleRecognitionDisplayStarted);
     connect(faceGateModule_, &FaceGateModuleAdapter::adminSessionFinished,
             modeController_, &ModeController::handleAdminSessionFinished);
+    connect(faceGateModule_, &FaceGateModuleAdapter::adminSessionStarted,
+            modeController_, &ModeController::handleAdminSessionStarted);
 #endif
     connect(presenceReconcileTimer_, &QTimer::timeout, this, [this]() {
         if (presenceSensor_ && modeController_) {
@@ -147,12 +157,6 @@ bool AppShell::initialize()
                 } else if (state == ModeController::AppModeState::MultimediaActive
                            && fillLight_) {
                     fillLight_->turnOff();
-                }
-            });
-    connect(modeController_, &ModeController::recognitionResumed,
-            this, [this]() {
-                if (fillLight_) {
-                    fillLight_->turnOn();
                 }
             });
     connect(modeController_, &ModeController::switchFailed,
@@ -176,6 +180,7 @@ bool AppShell::initialize()
             << "sr505Device=" << sr505Device
             << "fillLightDevice=" << fillLightDevice
             << "recognitionReturnMs=" << recognitionReturnMs
+            << "recognitionImageMs=" << recognitionImageMs
             << "facegateConfig=" << faceGateConfigPath();
     return true;
 }

@@ -20,6 +20,7 @@ struct NetworkAccessResult
     QString personId;
     QString credential;
     QString credentialType;
+    qint64 localPersonId = 0; /**< 本地离线人员数据库主键；网络人员始终为0。 */
     QList<int> floors;
     QByteArray rs485Frame;
 };

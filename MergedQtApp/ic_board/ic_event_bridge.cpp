@@ -86,6 +86,29 @@ void IcEventBridge::emitFaceAccessFinished(const QString &personId,
                             success, reason, resultCode);
 }
 
+void IcEventBridge::emitLocalFaceAccessFinished(const QString &personId,
+                                                const QString &faceHash,
+                                                const QString &floors,
+                                                const QByteArray &rs485Frame,
+                                                bool success,
+                                                const QString &reason,
+                                                int resultCode)
+{
+    emit localFaceAccessFinished(personId, faceHash, floors, rs485Frame,
+                                 success, reason, resultCode);
+}
+
+void IcEventBridge::emitLocalPasswordAccessFinished(const QString &personId,
+                                                    const QString &floors,
+                                                    const QByteArray &rs485Frame,
+                                                    bool success,
+                                                    const QString &reason,
+                                                    int resultCode)
+{
+    emit localPasswordAccessFinished(personId, floors, rs485Frame,
+                                     success, reason, resultCode);
+}
+
 /** @brief 把人脸通行抓拍上传任务投递给 MQTT 协调器。 */
 void IcEventBridge::emitFaceUploadRequested(const QString &personId,
                                             const QString &faceHash,

@@ -17,6 +17,7 @@ class CardSerial2Reader;
 class QrSerialReceiver;
 class OfflineQr;
 class NetworkAccessService;
+class LocalAccessService;
 
 /**
  * @brief IC 链路工作线程对象。
@@ -43,6 +44,7 @@ public slots:
 
 private:
     NetworkAccessService *networkAccess_ = nullptr;
+    LocalAccessService *localAccess_ = nullptr;
     IcSerialConfig io_;              /**< 数据库路径和硬件串口参数。 */
     bool started_ = false;           /**< 防止重复创建硬件对象。 */
 

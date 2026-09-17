@@ -44,6 +44,12 @@ PID_FILE="/tmp/udisk_watcher.pid"
 # Qt实时读取的状态文件（JSON，原子更新）
 STATUS_FILE="/tmp/udisk_status.json"
 
+# 人员导入由Qt界面显式预约。预约存在时，本次插入只提供
+# /media/usb0/Ycest/person，禁止触发任何UI资源或视频复制。
+PERSON_IMPORT_CONTROL_DIR="/run/face-media"
+PERSON_IMPORT_REQUEST="${PERSON_IMPORT_CONTROL_DIR}/person-import.request"
+PERSON_IMPORT_READY="${PERSON_IMPORT_CONTROL_DIR}/person-import.ready"
+
 # 可选日志
 LOG_FILE="/tmp/udisk_watcher.log"
 
@@ -168,6 +174,40 @@ is_running_pid() {
     kill -0 "$pid" 2>/dev/null
 }
 
+# 返回当前有效人员导入请求的令牌。请求文件第一行为应用PID，第二行为令牌。
+person_import_request_token() {
+    [ -r "$PERSON_IMPORT_REQUEST" ] || return 1
+
+    request_pid="$(sed -n '1p' "$PERSON_IMPORT_REQUEST" 2>/dev/null | tr -d '\r')"
+    request_token="$(sed -n '2p' "$PERSON_IMPORT_REQUEST" 2>/dev/null | tr -d '\r')"
+    case "$request_pid" in
+        ''|*[!0-9]*) request_pid="" ;;
+    esac
+
+    if [ -z "$request_pid" ] || [ -z "$request_token" ] \
+       || ! kill -0 "$request_pid" 2>/dev/null; then
+        rm -f "$PERSON_IMPORT_REQUEST" "$PERSON_IMPORT_READY" 2>/dev/null
+        return 1
+    fi
+
+    echo "$request_token"
+    return 0
+}
+
+# 原子发布本次预约对应的挂载点，Qt只有读到相同令牌后才会访问U盘。
+publish_person_import_ready() {
+    request_token="$1"
+    mountp="$2"
+    mkdir -p "$PERSON_IMPORT_CONTROL_DIR" 2>/dev/null || return 1
+    ready_tmp="${PERSON_IMPORT_READY}.tmp.$$"
+    printf '%s\n%s\n' "$request_token" "$mountp" > "$ready_tmp" 2>/dev/null || return 1
+    mv -f "$ready_tmp" "$PERSON_IMPORT_READY" 2>/dev/null || {
+        rm -f "$ready_tmp" 2>/dev/null
+        return 1
+    }
+    return 0
+}
+
 find_mountpoint_under_base() {
     # /proc/mounts 中挂载点通常不带末尾斜杠，匹配前先规范化。
     base="${1%/}"
@@ -237,7 +277,7 @@ count_video() {
     echo "$cnt"
 }
 
-# 判断 Ycest 下是否存在除 video 外的子目录
+# 判断 Ycest 下是否存在除 video、person 外的UI资源子目录
 has_non_video_dirs_under_ycest() {
     mountp="$1"
     src_root="${mountp}/${YCEST_SUBDIR}"
@@ -247,8 +287,10 @@ has_non_video_dirs_under_ycest() {
     for d in "$src_root"/*; do
         [ -d "$d" ] || continue
         name="${d##*/}"
-        [ "$name" = "video" ] && continue
-        return 0
+        case "$name" in
+            video|person) continue ;;
+            *) return 0 ;;
+        esac
     done
 
     return 1
@@ -256,8 +298,8 @@ has_non_video_dirs_under_ycest() {
 
 
 # =========================
-# 0) U盘内自拷贝 Ycest 下除 video 外的目录 -> images（最先执行）
-#    从:  <mountp>/Ycest 下除 video 外的所有子目录
+# 0) U盘内自拷贝 Ycest 下除 video、person 外的目录 -> images（最先执行）
+#    从:  <mountp>/Ycest 下除 video、person 外的所有子目录
 #    到:  /mnt/UDISK/res/static/demoResources/images
 # =========================
 copy_ycest_non_video_dirs_to_udisk_images_with_progress() {
@@ -280,7 +322,7 @@ copy_ycest_non_video_dirs_to_udisk_images_with_progress() {
         return 1
     fi
 
-    # 没有除 video 外的目录：直接跳过，不报错
+    # 没有除 video、person 外的UI资源目录：直接跳过，不报错
     if ! has_non_video_dirs_under_ycest "$mountp"; then
         write_status "copying" "未找到文件夹，跳过资源拷贝..." \
             "$mountp" "$src_root" "$dst_dir" 100 0 0 "" 0 "qrc"
@@ -298,7 +340,9 @@ copy_ycest_non_video_dirs_to_udisk_images_with_progress() {
         for d in "$src_root"/*; do
             [ -d "$d" ] || continue
             name="${d##*/}"
-            [ "$name" = "video" ] && continue
+            case "$name" in
+                video|person) continue ;;
+            esac
 
             # 先记录一级目录本身
             echo "$name" >> "$tmp_dir_list" 2>/dev/null
@@ -375,7 +419,9 @@ copy_ycest_non_video_dirs_to_udisk_images_with_progress() {
     for d in "$src_root"/*; do
         [ -d "$d" ] || continue
         name="${d##*/}"
-        [ "$name" = "video" ] && continue
+        case "$name" in
+            video|person) continue ;;
+        esac
 
         cp -a "$d" "$dst_dir"/ 2>/dev/null || cp -R "$d" "$dst_dir"/ 2>/dev/null
         if [ $? -ne 0 ]; then
@@ -662,14 +708,14 @@ do_job_once() {
     res_src="${mountp}/${YCEST_SUBDIR}"
     qrc_dst="${UDISK_DIR}/${QRC_DST_SUBDIR}"
 
-    # 0) 只有 Ycest 下存在除 video 外的子目录时，才清理images（保留video）并拷贝资源
+    # 0) 只有 Ycest 下存在除 video、person 外的UI资源目录时，才清理images（保留video）并拷贝资源
     if has_non_video_dirs_under_ycest "$mountp"; then
         if ! clear_udisk_images_dir "$mountp"; then
             write_status "error" "清理images目录失败" "$mountp" "$qrc_dst" "$qrc_dst" 0 0 0 "" 106 "qrc"
             return 1
         fi
 
-        # 做 U盘内 Ycest(除video外) -> images 拷贝
+        # 做 U盘内 Ycest(除video、person外) -> images 拷贝
         copy_ycest_non_video_dirs_to_udisk_images_with_progress "$mountp"
         rc=$?
         [ "$rc" -eq 0 ] || return "$rc"
@@ -719,6 +765,11 @@ daemon_loop() {
     inserted=0
     last_mount=""
     job_done=0   # 0=未完成；1=完成后等待拔出
+    restart_needed=0
+    person_session=0
+    person_token=""
+    person_request_active=0
+    rm -f "$PERSON_IMPORT_READY" 2>/dev/null
 
     write_status "idle" "等待插入U盘" "" "" "$UDISK_DIR" 0 0 0 "" 0 "all"
 
@@ -734,7 +785,49 @@ daemon_loop() {
                 inserted=1
                 last_mount="$mountp"
                 job_done=0
+                restart_needed=0
+                person_session=0
+                person_token=""
+                person_request_active=0
+                rm -f "$PERSON_IMPORT_READY" 2>/dev/null
                 write_status "inserted" "已插入U盘" "$mountp" "$video_src" "$UDISK_DIR" 0 0 0 "" 0 "all"
+            fi
+
+            # 点击“导入人员表”会提前写入预约。只要本次插入被预约，整轮都
+            # 不再执行UI资源和视频复制；即使应用完成或取消，也要等拔盘后
+            # 才恢复普通自动复制，避免同一块盘在导入结束后又被二次处理。
+            current_person_token="$(person_import_request_token 2>/dev/null)"
+            if [ "$person_session" -eq 0 ] && [ -n "$current_person_token" ]; then
+                person_session=1
+                person_token="$current_person_token"
+                person_request_active=1
+                job_done=1
+                if publish_person_import_ready "$person_token" "$mountp"; then
+                    write_status "person_ready" "人员导入U盘已就绪" \
+                        "$mountp" "${mountp}/Ycest/person" "" 0 0 0 "" 0 "person"
+                    ulog "person import session reserved: mount=$mountp token=$person_token"
+                else
+                    write_status "error" "人员导入就绪状态写入失败" \
+                        "$mountp" "${mountp}/Ycest/person" "" 0 0 0 "" 801 "person"
+                fi
+            fi
+
+            if [ "$person_session" -eq 1 ]; then
+                if [ -n "$current_person_token" ] && [ "$current_person_token" != "$person_token" ]; then
+                    person_token="$current_person_token"
+                    person_request_active=1
+                    if publish_person_import_ready "$person_token" "$mountp"; then
+                        write_status "person_ready" "人员导入U盘已就绪" \
+                            "$mountp" "${mountp}/Ycest/person" "" 0 0 0 "" 0 "person"
+                    fi
+                elif [ -z "$current_person_token" ] && [ "$person_request_active" -eq 1 ]; then
+                    person_request_active=0
+                    rm -f "$PERSON_IMPORT_READY" 2>/dev/null
+                    write_status "person_done" "人员导入处理完成，请拔出U盘" \
+                        "$mountp" "${mountp}/Ycest/person" "" 100 0 0 "" 0 "person"
+                fi
+                sleep "$POLL_INTERVAL"
+                continue
             fi
 
             # 如果已经全部拷贝完成，就只等待拔出，不再重复拷贝
@@ -752,6 +845,7 @@ daemon_loop() {
 
                 if [ "$rc" -eq 0 ]; then
                     job_done=1
+                    restart_needed=1
                 else
                     job_done=0
                 fi
@@ -769,11 +863,14 @@ daemon_loop() {
             # 未检测到挂载点：认为拔出
             if [ "$inserted" -eq 1 ]; then
                 was_done="$job_done"
+                was_restart_needed="$restart_needed"
+                was_person_session="$person_session"
 
                 inserted=0
                 last_mount=""
+                rm -f "$PERSON_IMPORT_READY" 2>/dev/null
 
-                if [ "$was_done" -eq 1 ]; then
+                if [ "$was_done" -eq 1 ] && [ "$was_restart_needed" -eq 1 ]; then
                     write_status "restarting" "U盘已拔出，正在重启程序..." \
                         "" "" "$UDISK_DIR" 100 0 0 "" 0 "all"
                     # 只在整批文件复制成功且U盘已经拔出后读取目标配置。
@@ -789,11 +886,17 @@ daemon_loop() {
                         write_status "done" "U盘已拔出，程序重启完成" \
                             "" "" "$UDISK_DIR" 100 0 0 "" 0 "all"
                     fi
+                elif [ "$was_person_session" -eq 1 ]; then
+                    write_status "removed" "人员导入U盘已拔出" "" "" "$UDISK_DIR" 0 0 0 "" 0 "person"
                 else
                     write_status "removed" "U盘已拔出" "" "" "$UDISK_DIR" 0 0 0 "" 0 "all"
                 fi
 
                 job_done=0
+                restart_needed=0
+                person_session=0
+                person_token=""
+                person_request_active=0
             fi
         fi
         sleep "$POLL_INTERVAL"

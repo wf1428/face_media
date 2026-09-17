@@ -1,6 +1,6 @@
 /**
  * @file UsbPersonExportTarget.cpp
- * @brief 人员 XLSX 导出所需的 U 盘检测、可写挂载、目录创建和安全卸载。
+ * @brief 人员 XLSX 导出所需的固定U盘挂载检测、目录创建和安全卸载。
  *
  * @author Dulin
  * @date 2026-08-28
@@ -11,21 +11,11 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
-#include <QFileInfo>
-#include <QList>
 #include <QProcess>
-#include <QSet>
 #include <QThread>
 #include <QUuid>
 
 namespace {
-
-/** @brief 从 /proc/mounts 识别出的已挂载 USB 卷。 */
-struct MountedVolume
-{
-    QString device;      /**< 块设备节点。 */
-    QString mountPoint;  /**< 已有挂载目录。 */
-};
 
 /** @brief 还原 /proc/mounts 对空格、制表符和反斜杠的八进制转义。 */
 QString decodeMountField(QString value)
@@ -36,51 +26,16 @@ QString decodeMountField(QString value)
     return value;
 }
 
-/** @return 当前已挂载的 /dev/sd* USB 卷。 */
-QList<MountedVolume> mountedUsbVolumes()
+bool isMountedAt(const QString &mountPoint)
 {
-    QList<MountedVolume> result;
     QFile mounts(QStringLiteral("/proc/mounts"));
-    if (!mounts.open(QIODevice::ReadOnly | QIODevice::Text)) return result;
+    if (!mounts.open(QIODevice::ReadOnly | QIODevice::Text)) return false;
     while (!mounts.atEnd()) {
         const QStringList fields = QString::fromUtf8(mounts.readLine()).trimmed()
                 .split(QLatin1Char(' '), QString::SkipEmptyParts);
-        if (fields.size() < 2) continue;
-        const QString device = decodeMountField(fields.at(0));
-        if (!device.startsWith(QStringLiteral("/dev/sd"))) continue;
-        MountedVolume volume;
-        volume.device = device;
-        volume.mountPoint = decodeMountField(fields.at(1));
-        result.append(volume);
+        if (fields.size() >= 2 && decodeMountField(fields.at(1)) == mountPoint) return true;
     }
-    return result;
-}
-
-/**
- * @brief 枚举尚未挂载的 USB 块设备。
- * @return 优先返回分区节点；没有分区时才返回整盘节点。
- */
-QStringList unmountedUsbDevices(const QList<MountedVolume> &mounted)
-{
-    QSet<QString> mountedDevices;
-    for (const MountedVolume &volume : mounted) mountedDevices.insert(volume.device);
-    QStringList partitions;
-    QStringList wholeDevices;
-    const QDir blockDir(QStringLiteral("/sys/class/block"));
-    const QFileInfoList entries = blockDir.entryInfoList(
-                QStringList() << QStringLiteral("sd*"),
-                QDir::Dirs | QDir::NoDotAndDotDot,
-                QDir::Name);
-    for (const QFileInfo &entry : entries) {
-        const QString device = QStringLiteral("/dev/") + entry.fileName();
-        if (mountedDevices.contains(device) || !QFileInfo::exists(device)) continue;
-        if (QFileInfo::exists(entry.absoluteFilePath() + QStringLiteral("/partition"))) {
-            partitions.append(device);
-        } else {
-            wholeDevices.append(device);
-        }
-    }
-    return partitions.isEmpty() ? wholeDevices : partitions;
+    return false;
 }
 
 /** @brief 执行有限时长的系统挂载命令，并保留标准错误作为失败原因。 */
@@ -108,14 +63,14 @@ bool runProcess(const QString &program, const QStringList &arguments, QString *e
     return true;
 }
 
-/** @brief 创建 person 目录并通过临时探针文件验证介质确实可写。 */
+/** @brief 创建 Ycest/person 目录并通过临时探针文件验证介质确实可写。 */
 bool preparePersonDirectory(const QString &mountPoint,
                             QString *personDirectory,
                             QString *error)
 {
-    const QString directory = QDir(mountPoint).absoluteFilePath(QStringLiteral("person"));
+    const QString directory = QDir(mountPoint).absoluteFilePath(QStringLiteral("Ycest/person"));
     if (!QDir().mkpath(directory)) {
-        if (error) *error = QStringLiteral("无法在U盘根目录创建 person 文件夹");
+        if (error) *error = QStringLiteral("无法在U盘创建 Ycest/person 文件夹");
         return false;
     }
 
@@ -137,10 +92,9 @@ bool preparePersonDirectory(const QString &mountPoint,
 } // namespace
 
 /**
- * @brief 轮询已挂载和未挂载设备，直到取得可写的人员导出目录。
+ * @brief 轮询固定挂载点 /media/usb0，直到取得可写的人员导出目录。
  *
- * 已挂载但只读的卷会尝试重新挂载为可写；应用自行挂载的设备使用固定挂载点，
- * 失败时立即卸载并清理目录，避免把半完成挂载留给下一次任务。
+ * 挂载点为只读时只尝试就地重新挂载，不枚举任何块设备。
  */
 UsbPersonExportVolume UsbPersonExportTarget::waitForWritableVolume(
         int timeoutMs,
@@ -156,11 +110,10 @@ UsbPersonExportVolume UsbPersonExportTarget::waitForWritableVolume(
             return result;
         }
 
-        const QList<MountedVolume> mounted = mountedUsbVolumes();
-        for (const MountedVolume &source : mounted) {
+        const QString fixedMountPoint = QStringLiteral("/media/usb0");
+        if (isMountedAt(fixedMountPoint)) {
             UsbPersonExportVolume result;
-            result.device = source.device;
-            result.mountPoint = source.mountPoint;
+            result.mountPoint = fixedMountPoint;
             if (preparePersonDirectory(result.mountPoint,
                                        &result.personDirectory,
                                        &result.error)) {
@@ -171,7 +124,7 @@ UsbPersonExportVolume UsbPersonExportTarget::waitForWritableVolume(
             if (runProcess(QStringLiteral("mount"),
                            QStringList() << QStringLiteral("-o")
                                          << QStringLiteral("remount,rw")
-                                         << source.device << source.mountPoint,
+                                         << fixedMountPoint,
                            &remountError)
                     && preparePersonDirectory(result.mountPoint,
                                               &result.personDirectory,
@@ -184,51 +137,18 @@ UsbPersonExportVolume UsbPersonExportTarget::waitForWritableVolume(
             }
             lastError = result.error;
         }
-
-        const QStringList devices = unmountedUsbDevices(mounted);
-        for (const QString &device : devices) {
-            const QString mountPoint = QStringLiteral("/mnt/facegate_person_export");
-            if (!QDir().mkpath(mountPoint)) {
-                lastError = QStringLiteral("无法创建U盘挂载目录：%1").arg(mountPoint);
-                continue;
-            }
-            QString mountError;
-            if (!runProcess(QStringLiteral("mount"),
-                            QStringList() << QStringLiteral("-o") << QStringLiteral("rw")
-                                          << device << mountPoint,
-                            &mountError)) {
-                lastError = QStringLiteral("U盘挂载失败：%1").arg(mountError);
-                continue;
-            }
-
-            UsbPersonExportVolume result;
-            result.device = device;
-            result.mountPoint = mountPoint;
-            result.mountedByApplication = true;
-            if (!preparePersonDirectory(mountPoint,
-                                        &result.personDirectory,
-                                        &result.error)) {
-                QString ignored;
-                runProcess(QStringLiteral("umount"), QStringList() << mountPoint, &ignored);
-                QDir().rmdir(mountPoint);
-                lastError = result.error;
-                continue;
-            }
-            result.ok = true;
-            return result;
-        }
         QThread::msleep(500);
     }
 
     UsbPersonExportVolume result;
     result.error = lastError.isEmpty()
-            ? QStringLiteral("等待U盘超时，请确认U盘已插入且可以写入")
+            ? QStringLiteral("等待U盘超时，请确认U盘已挂载到 /media/usb0 且可以写入")
             : lastError;
     return result;
 }
 
 /**
- * @brief 先执行 sync，再卸载卷并移除应用创建的挂载目录。
+ * @brief 先执行 sync，再卸载固定挂载目录。
  *
  * 即使 sync 报错仍尝试卸载，以优先释放系统资源；最终把同步失败返回调用方。
  */
@@ -245,7 +165,6 @@ bool UsbPersonExportTarget::flushAndUnmount(const UsbPersonExportVolume &volume,
         if (error) *error = QStringLiteral("U盘卸载失败：%1").arg(unmountError);
         return false;
     }
-    if (volume.mountedByApplication) QDir().rmdir(volume.mountPoint);
     if (!synced) {
         if (error) *error = QStringLiteral("U盘数据同步失败：%1").arg(syncError);
         return false;

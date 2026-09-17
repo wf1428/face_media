@@ -46,7 +46,6 @@ private:
     AppConfig config_;                 /**< 管理员用户名和密码散列配置。 */
     QLineEdit *userEdit_ = nullptr;    /**< 用户名输入框。 */
     QLineEdit *passwordEdit_ = nullptr; /**< 密码输入框。 */
-    QWidget *keyboardClearance_ = nullptr; /**< 为底部共享键盘预留的布局空间。 */
     bool embeddedForWayland_ = false;  /**< 是否复用人脸主界面的 Wayland surface。 */
 };
 

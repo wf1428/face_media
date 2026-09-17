@@ -10,11 +10,13 @@
 #include "FaceEnrollWidget.h"
 #include "AppMessageDialog.h"
 #include "AppPasswordDialog.h"
+#include "UsbPersonImportSource.h"
 #include "common/responsive_ui.h"
 #include "common/storage_policy.h"
 
 #include <QtQml/QQmlError>
 #include <QAbstractButton>
+#include <QAbstractAnimation>
 #include <QAbstractItemView>
 #include <QAbstractScrollArea>
 #include <QAbstractSocket>
@@ -31,12 +33,14 @@
 #include <QDialog>
 #include <QDir>
 #include <QEvent>
+#include <QEasingCurve>
 #include <QFrame>
 #include <QFile>
 #include <QFileInfo>
 #include <QFontMetrics>
 #include <QGroupBox>
 #include <QGridLayout>
+#include <QGraphicsOpacityEffect>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QHideEvent>
@@ -54,8 +58,11 @@
 #include <QNetworkInterface>
 #include <QPainter>
 #include <QPaintEvent>
+#include <QPen>
 #include <QPushButton>
 #include <QProcess>
+#include <QProgressBar>
+#include <QPropertyAnimation>
 #include <QPixmap>
 #include <QIcon>
 #include <QRadioButton>
@@ -78,6 +85,7 @@
 #include <QTextStream>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QVariantAnimation>
 
 namespace {
 /** @brief 与移动端一致的管理设置滑动开关。 */
@@ -85,12 +93,26 @@ class AdminToggleSwitch final : public QCheckBox
 {
 public:
     explicit AdminToggleSwitch(QWidget *parent = nullptr)
-        : QCheckBox(parent)
+        : QCheckBox(parent), animation_(this)
     {
         setText(QString());
         setCursor(Qt::PointingHandCursor);
         setFocusPolicy(Qt::StrongFocus);
         setFixedSize(66, 38);
+
+        animation_.setDuration(190);
+        animation_.setEasingCurve(QEasingCurve::OutCubic);
+        connect(&animation_, &QVariantAnimation::valueChanged,
+                this, [this](const QVariant &value) {
+            position_ = value.toReal();
+            update();
+        });
+        connect(this, &QCheckBox::toggled, this, [this](bool checked) {
+            animation_.stop();
+            animation_.setStartValue(position_);
+            animation_.setEndValue(checked ? 1.0 : 0.0);
+            animation_.start();
+        });
     }
 
 protected:
@@ -101,26 +123,38 @@ protected:
 
     void paintEvent(QPaintEvent *) override
     {
+        if (animation_.state() != QAbstractAnimation::Running) {
+            position_ = isChecked() ? 1.0 : 0.0;
+        }
         QPainter painter(this);
         painter.setRenderHint(QPainter::Antialiasing, true);
 
         const QRectF trackRect(1.0, 2.0, width() - 2.0, height() - 4.0);
         painter.setPen(Qt::NoPen);
-        painter.setBrush(isEnabled()
-                         ? (isChecked() ? QColor("#4f83f1") : QColor("#6b7686"))
-                         : QColor("#3f4855"));
+        const QColor offColor = isEnabled() ? QColor("#566477") : QColor("#3f4855");
+        const QColor onColor = isEnabled() ? QColor("#36d4c7") : QColor("#4a6770");
+        const auto blend = [this](int off, int on) {
+            return qRound(off + (on - off) * position_);
+        };
+        painter.setBrush(QColor(blend(offColor.red(), onColor.red()),
+                                blend(offColor.green(), onColor.green()),
+                                blend(offColor.blue(), onColor.blue())));
         painter.drawRoundedRect(trackRect, trackRect.height() / 2.0,
                                 trackRect.height() / 2.0);
 
         const qreal knobDiameter = trackRect.height() - 6.0;
-        const qreal knobX = isChecked()
-                ? trackRect.right() - knobDiameter - 3.0
-                : trackRect.left() + 3.0;
+        const qreal knobStart = trackRect.left() + 3.0;
+        const qreal knobEnd = trackRect.right() - knobDiameter - 3.0;
+        const qreal knobX = knobStart + (knobEnd - knobStart) * position_;
         const QRectF knobRect(knobX, trackRect.top() + 3.0,
                               knobDiameter, knobDiameter);
         painter.setBrush(QColor("#ffffff"));
         painter.drawEllipse(knobRect);
     }
+
+private:
+    QVariantAnimation animation_;
+    qreal position_ = 0.0;
 };
 
 /** @brief 创建管理员表格使用的只读单元格。 */
@@ -866,6 +900,9 @@ AdminPanel::AdminPanel(const AppConfig &config, QWidget *parent)
         setWindowFlags(Qt::Widget);
         setAttribute(Qt::WA_StyledBackground, true);
     }
+    // 管理面板作为人脸主界面上的全屏子控件时必须自行绘制完整不透明背景。
+    // 不能依赖底层页面清屏，否则 Wayland 复合时未绘制区域会露出摄像头主页。
+    applyAdminSurface(this, QColor("#142033"));
 
     setWindowTitle("人脸闸机管理");
     setModal(false);
@@ -954,6 +991,35 @@ AdminPanel::AdminPanel(const AppConfig &config, QWidget *parent)
 
     rootLayout_->addWidget(sidebar_);
     rootLayout_->addWidget(contentShell_, 1);
+
+    actionToast_ = new QLabel(this);
+    actionToast_->setAlignment(Qt::AlignCenter);
+    actionToast_->setWordWrap(true);
+    actionToast_->setAttribute(Qt::WA_TransparentForMouseEvents);
+    actionToast_->hide();
+    actionToastOpacity_ = new QGraphicsOpacityEffect(actionToast_);
+    actionToastOpacity_->setOpacity(0.0);
+    actionToast_->setGraphicsEffect(actionToastOpacity_);
+    actionToastAnimation_ = new QPropertyAnimation(actionToastOpacity_, "opacity", this);
+    connect(actionToastAnimation_, &QPropertyAnimation::finished, this, [this]() {
+        if (actionToast_ && actionToastAnimation_->endValue().toReal() < 0.01) {
+            actionToast_->hide();
+        }
+    });
+    actionToastTimer_ = new QTimer(this);
+    actionToastTimer_->setSingleShot(true);
+    actionToastTimer_->setInterval(1700);
+    connect(actionToastTimer_, &QTimer::timeout, this, [this]() {
+        if (!actionToast_ || !actionToastOpacity_) {
+            return;
+        }
+        actionToastAnimation_->stop();
+        actionToastAnimation_->setDuration(220);
+        actionToastAnimation_->setStartValue(actionToastOpacity_->opacity());
+        actionToastAnimation_->setEndValue(0.0);
+        actionToastAnimation_->setEasingCurve(QEasingCurve::InCubic);
+        actionToastAnimation_->start();
+    });
 
     connect(enrollWidget_, &FaceEnrollWidget::enrollRequested, this, &AdminPanel::enrollRequested);
     connect(enrollWidget_, &FaceEnrollWidget::cameraRequirementChanged, this, &AdminPanel::updateCameraRequirement);
@@ -1119,7 +1185,16 @@ QWidget *AdminPanel::createPeoplePage()
     exportPeopleButton_ = new QPushButton("导出人员表", page);
     exportPeopleButton_->setObjectName("toolButton");
     setButtonIcon(exportPeopleButton_, QStringLiteral(":/icons/action/download.svg"));
-    showDeletedPeopleCheck_ = new QCheckBox("显示已删除", page);
+    auto *showDeletedShell = new QWidget(page);
+    auto *showDeletedLayout = new QHBoxLayout(showDeletedShell);
+    showDeletedLayout->setContentsMargins(4, 0, 4, 0);
+    showDeletedLayout->setSpacing(10);
+    auto *showDeletedLabel = new QLabel(QStringLiteral("显示已删除"), showDeletedShell);
+    showDeletedLabel->setObjectName(QStringLiteral("optionLabel"));
+    showDeletedPeopleCheck_ = new AdminToggleSwitch(showDeletedShell);
+    showDeletedLayout->addWidget(showDeletedLabel);
+    showDeletedLayout->addWidget(showDeletedPeopleCheck_);
+    showDeletedLayout->addStretch();
 
     filterGrid->addWidget(verifyResultCombo_, 0, 0);
     filterGrid->addWidget(verifyPersonNoEdit_, 0, 1);
@@ -1138,7 +1213,7 @@ QWidget *AdminPanel::createPeoplePage()
     buttonGrid->addWidget(importPeopleButton_, 0, 3);
     buttonGrid->addWidget(deleteButton, 1, 0);
     buttonGrid->addWidget(exportPeopleButton_, 1, 1);
-    buttonGrid->addWidget(showDeletedPeopleCheck_, 1, 2);
+    buttonGrid->addWidget(showDeletedShell, 1, 2, 1, 2);
     buttonGrid->setColumnStretch(3, 1);
 
     peopleTable_ = new QTableWidget(page);
@@ -1585,7 +1660,7 @@ QWidget *AdminPanel::createSettingsPage()
     netmaskEdit_->setAttribute(Qt::WA_InputMethodEnabled, true);
     gatewayEdit_->setAttribute(Qt::WA_InputMethodEnabled, true);
     dnsEdit_->setAttribute(Qt::WA_InputMethodEnabled, true);
-    auto *networkSaveButton = new QPushButton("保存网络设置", networkPage);
+    auto *networkSaveButton = new QPushButton("保存", networkPage);
     networkSaveButton->setObjectName("toolButton");
     setButtonIcon(networkSaveButton, QStringLiteral(":/icons/action/save.svg"));
     networkLayout->addWidget(dhcpRadio_);
@@ -1673,7 +1748,7 @@ QWidget *AdminPanel::createSettingsPage()
     livenessLayout->addWidget(livenessCheck_, 0, Qt::AlignVCenter);
     thresholdLayout->addWidget(livenessGroup);
 
-    auto *thresholdSaveButton = new QPushButton("保存阈值设置", thresholdPage);
+    auto *thresholdSaveButton = new QPushButton("保存", thresholdPage);
     thresholdSaveButton->setObjectName("toolButton");
     setButtonIcon(thresholdSaveButton, QStringLiteral(":/icons/action/save.svg"));
     auto *thresholdResetButton = new QPushButton("恢复默认配置", thresholdPage);
@@ -1713,9 +1788,10 @@ QWidget *AdminPanel::createSettingsPage()
     audioBasicLayout->setHorizontalSpacing(14);
     audioBasicLayout->setVerticalSpacing(14);
 
-    audioEnabledCheck_ = new QCheckBox(QStringLiteral("启用本地 WAV 音频播报"), audioBasicGroup);
+    auto *audioEnabledLabel = new QLabel(QStringLiteral("启用本地 WAV 音频播报"), audioBasicGroup);
+    audioEnabledLabel->setObjectName(QStringLiteral("optionLabel"));
+    audioEnabledCheck_ = new AdminToggleSwitch(audioBasicGroup);
     audioEnabledCheck_->setChecked(config_.audioEnabled);
-    audioEnabledCheck_->setMinimumHeight(34);
 
     audioVolumeSlider_ = new QSlider(Qt::Horizontal, audioBasicGroup);
     audioVolumeSlider_->setRange(0, 100);
@@ -1735,7 +1811,8 @@ QWidget *AdminPanel::createSettingsPage()
     audioVolumeNameLabel->setObjectName("metricName");
     audioVolumeNameLabel->setMinimumHeight(34);
 
-    audioBasicLayout->addWidget(audioEnabledCheck_, 0, 0, 1, 3);
+    audioBasicLayout->addWidget(audioEnabledLabel, 0, 0, 1, 2);
+    audioBasicLayout->addWidget(audioEnabledCheck_, 0, 2, Qt::AlignRight | Qt::AlignVCenter);
     audioBasicLayout->addWidget(audioVolumeNameLabel, 1, 0);
     audioBasicLayout->addWidget(audioVolumeSlider_, 1, 1);
     audioBasicLayout->addWidget(audioVolumeValueLabel_, 1, 2);
@@ -1774,9 +1851,8 @@ QWidget *AdminPanel::createSettingsPage()
         titleLabel->setMinimumHeight(36);
         titleLabel->setAlignment(Qt::AlignVCenter | Qt::AlignLeft);
 
-        auto *enabledCheck = new QCheckBox(promptGroup);
+        auto *enabledCheck = new AdminToggleSwitch(promptGroup);
         enabledCheck->setChecked(enabled);
-        enabledCheck->setMinimumHeight(36);
 
         auto *textEdit = new QLineEdit(text, promptGroup);
         textEdit->setAttribute(Qt::WA_InputMethodEnabled, true);
@@ -1810,7 +1886,7 @@ QWidget *AdminPanel::createSettingsPage()
     addPromptRow(6, QStringLiteral("enroll_failed"), QStringLiteral("录入失败"), config_.promptEnrollFailedEnabled, config_.promptEnrollFailedText);
     promptLayout->setColumnStretch(2, 1);
 
-    auto *audioSaveButton = new QPushButton(QStringLiteral("保存音频设置"), audioPage);
+    auto *audioSaveButton = new QPushButton(QStringLiteral("保存"), audioPage);
     audioSaveButton->setObjectName("toolButton");
     audioSaveButton->setMinimumHeight(36);
     setButtonIcon(audioSaveButton, QStringLiteral(":/icons/action/save.svg"));
@@ -1828,11 +1904,13 @@ QWidget *AdminPanel::createSettingsPage()
     auto *basicLayout = new QVBoxLayout(basicPage);
     basicLayout->setContentsMargins(kAdminTabMargin, kAdminTabMargin, kAdminTabMargin, kAdminTabMargin);
     basicLayout->setSpacing(12);
-    auto *basicText = new QLabel(QString("采集帧数：%1\n活体通过帧数：%2\n结果保持：%3 ms\n同人抑制：%4 ms")
+    auto *basicText = new QLabel(QString("采集帧数：%1\n活体通过帧数：%2\n识别窗口：%3 ms\n结果保持：%4 ms\n同人抑制：%5 ms\n权限校验超时：%6 ms")
         .arg(config_.collectFrameCount)
         .arg(config_.livenessPassRequired)
+        .arg(config_.recognitionWindowMs)
         .arg(config_.resultHoldMs)
-        .arg(config_.sameFaceSuppressMs), basicPage);
+        .arg(config_.sameFaceSuppressMs)
+        .arg(config_.accessDecisionTimeoutMs), basicPage);
     basicText->setObjectName("pageHint");
     basicText->setWordWrap(true);
 
@@ -1879,6 +1957,7 @@ QWidget *AdminPanel::createSettingsPage()
     tabs->addTab(audioScrollPage, QStringLiteral("音频设置"));
     tabs->addTab(basicPage, "基础设置");
     auto *displayRotationPage = new DisplayRotationPage(tabs);
+    applyAdminSurface(displayRotationPage, QColor("#1b2a40"));
     auto *accessPhotoGroup = new QGroupBox(
                 QStringLiteral("通行照片显示"), displayRotationPage);
     auto *accessPhotoLayout = new QHBoxLayout(accessPhotoGroup);
@@ -2440,6 +2519,53 @@ void AdminPanel::setStatusText(const QString &text)
     }
 }
 
+/** @brief 在管理界面中央显示安卓风格的轻量操作结果提示。 */
+void AdminPanel::showActionToast(const QString &text, bool success)
+{
+    if (!actionToast_ || text.trimmed().isEmpty()) {
+        return;
+    }
+
+    actionToast_->setText(text.trimmed());
+    actionToast_->setStyleSheet(QStringLiteral(
+        "QLabel{background:%1;color:#ffffff;border:1px solid %2;"
+        "border-radius:13px;padding:10px 18px;font-size:16px;font-weight:700;}"
+    ).arg(success ? QStringLiteral("rgba(26,42,58,238)")
+                  : QStringLiteral("rgba(70,31,39,242)"),
+          success ? QStringLiteral("#4b647e") : QStringLiteral("#e56b7d")));
+
+    const int maxWidth = qMax(180, qMin(420, width() - 48));
+    const QFontMetrics metrics(actionToast_->font());
+    const QRect textRect = metrics.boundingRect(
+                QRect(0, 0, maxWidth - 36, 140),
+                Qt::AlignCenter | Qt::TextWordWrap,
+                actionToast_->text());
+    actionToast_->setFixedSize(qMin(maxWidth, qMax(180, textRect.width() + 42)),
+                               qMax(46, textRect.height() + 24));
+    positionActionToast();
+    actionToastOpacity_->setOpacity(0.0);
+    actionToast_->show();
+    actionToast_->raise();
+
+    actionToastAnimation_->stop();
+    actionToastAnimation_->setDuration(150);
+    actionToastAnimation_->setStartValue(0.0);
+    actionToastAnimation_->setEndValue(1.0);
+    actionToastAnimation_->setEasingCurve(QEasingCurve::OutCubic);
+    actionToastAnimation_->start();
+    actionToastTimer_->start();
+}
+
+/** @brief 将轻量提示保持在当前管理窗口正中央。 */
+void AdminPanel::positionActionToast()
+{
+    if (!actionToast_) {
+        return;
+    }
+    actionToast_->move(qMax(0, (width() - actionToast_->width()) / 2),
+                       qMax(0, (height() - actionToast_->height()) / 2));
+}
+
 /** @return 当前选中页面或录入模式需要摄像头时返回 true。 */
 bool AdminPanel::cameraRequired() const
 {
@@ -2521,20 +2647,32 @@ void AdminPanel::requestToggleSelectedPersonEnabled()
     emit personEnabledChangeRequested(id, enableNext);
 }
 
-/** @brief 提示插入U盘并请求在后台导入 person 目录中的 XLS/XLSX。 */
+/** @brief 提示插入U盘并请求在后台导入本地人员及人脸图片。 */
 void AdminPanel::requestImportPeopleFromUsb()
 {
-    AppMessageDialog::information(
+    QString requestError;
+    const QString requestToken = UsbPersonImportSource::beginImportRequest(&requestError);
+    if (requestToken.isEmpty()) {
+        AppMessageDialog::warning(
+                    this, QStringLiteral("导入本地人员"),
+                    requestError.isEmpty() ? QStringLiteral("无法准备人员导入")
+                                           : requestError);
+        return;
+    }
+
+    const bool confirmed = AppMessageDialog::confirm(
                 this,
-                QStringLiteral("导入网络人员"),
-                QStringLiteral("请插入U盘，并确认U盘根目录下存在 person 文件夹，"
-                               "person 文件夹中放置导出的 xls 或 xlsx 人员表。\n\n"
-                               "点击确定后，系统将在后台等待并自动导入。"));
-    emit peopleImportRequested();
+                QStringLiteral("导入本地人员"),
+                QStringLiteral("请先插入U盘再点击确定后进行导入"));
+    if (!confirmed) {
+        UsbPersonImportSource::endImportRequest(requestToken);
+        return;
+    }
+    emit peopleImportRequested(requestToken);
 }
 
-/** @brief 切换导入忙碌状态，防止导入和导出任务并发启动。 */
-void AdminPanel::setPersonImportBusy(bool busy, const QString &message)
+/** @brief 切换导入忙碌状态和居中动画进度弹窗。 */
+void AdminPanel::setPersonImportBusy(bool busy, int progress)
 {
     if (importPeopleButton_) {
         importPeopleButton_->setEnabled(!busy);
@@ -2542,7 +2680,89 @@ void AdminPanel::setPersonImportBusy(bool busy, const QString &message)
                                           : QStringLiteral("导入人员表"));
     }
     if (exportPeopleButton_) exportPeopleButton_->setEnabled(!busy);
-    if (!message.isEmpty()) setStatusText(message);
+
+    if (!busy) {
+        if (personImportSpinnerTimer_) personImportSpinnerTimer_->stop();
+        if (personImportProgressOverlay_) {
+            personImportProgressOverlay_->hide();
+            personImportProgressOverlay_->deleteLater();
+        }
+        personImportProgressOverlay_ = nullptr;
+        personImportSpinnerLabel_ = nullptr;
+        personImportProgressBar_ = nullptr;
+        personImportSpinnerTimer_ = nullptr;
+        personImportSpinnerAngle_ = 0;
+        return;
+    }
+
+    if (!personImportProgressOverlay_) {
+        personImportProgressOverlay_ = new QWidget(this);
+        personImportProgressOverlay_->setObjectName(QStringLiteral("personImportProgressOverlay"));
+        personImportProgressOverlay_->setAttribute(Qt::WA_StyledBackground, true);
+        personImportProgressOverlay_->setStyleSheet(
+                    QStringLiteral("QWidget#personImportProgressOverlay { background: rgba(2, 6, 23, 178); }"));
+
+        auto *overlayLayout = new QVBoxLayout(personImportProgressOverlay_);
+        overlayLayout->setContentsMargins(24, 24, 24, 24);
+
+        auto *card = new QFrame(personImportProgressOverlay_);
+        card->setObjectName(QStringLiteral("personImportProgressCard"));
+        card->setMinimumSize(420, 260);
+        card->setMaximumWidth(520);
+        card->setStyleSheet(QStringLiteral(
+            "QFrame#personImportProgressCard { background: #0f172a; border: 1px solid #475569; border-radius: 18px; }"
+            "QLabel#personImportProgressTitle { color: #f8fafc; font-size: 24px; font-weight: 700; }"
+            "QProgressBar#personImportProgressBar { color: #f8fafc; background: #1e293b; border: 1px solid #475569;"
+            " border-radius: 9px; text-align: center; min-height: 22px; font-size: 15px; }"
+            "QProgressBar#personImportProgressBar::chunk { background: #2dd4bf; border-radius: 8px; }"));
+
+        auto *cardLayout = new QVBoxLayout(card);
+        cardLayout->setContentsMargins(36, 30, 36, 30);
+        cardLayout->setSpacing(24);
+
+        auto *title = new QLabel(QStringLiteral("导入中"), card);
+        title->setObjectName(QStringLiteral("personImportProgressTitle"));
+        title->setAlignment(Qt::AlignCenter);
+        cardLayout->addWidget(title);
+
+        personImportSpinnerLabel_ = new QLabel(card);
+        personImportSpinnerLabel_->setFixedSize(72, 72);
+        personImportSpinnerLabel_->setAlignment(Qt::AlignCenter);
+        cardLayout->addWidget(personImportSpinnerLabel_, 0, Qt::AlignHCenter);
+
+        personImportProgressBar_ = new QProgressBar(card);
+        personImportProgressBar_->setObjectName(QStringLiteral("personImportProgressBar"));
+        personImportProgressBar_->setRange(0, 100);
+        personImportProgressBar_->setFormat(QStringLiteral("%p%"));
+        personImportProgressBar_->setTextVisible(true);
+        cardLayout->addWidget(personImportProgressBar_);
+
+        overlayLayout->addWidget(card, 0, Qt::AlignCenter);
+        personImportSpinnerTimer_ = new QTimer(personImportProgressOverlay_);
+        const auto updateSpinner = [this]() {
+            if (!personImportSpinnerLabel_) return;
+            QPixmap pixmap(72, 72);
+            pixmap.fill(Qt::transparent);
+            QPainter painter(&pixmap);
+            painter.setRenderHint(QPainter::Antialiasing, true);
+            painter.translate(36.0, 36.0);
+            painter.rotate(personImportSpinnerAngle_);
+            painter.translate(-36.0, -36.0);
+            QPen pen(QColor(QStringLiteral("#2dd4bf")), 6.0, Qt::SolidLine, Qt::RoundCap);
+            painter.setPen(pen);
+            painter.drawArc(QRectF(9.0, 9.0, 54.0, 54.0), 0, 270 * 16);
+            personImportSpinnerLabel_->setPixmap(pixmap);
+            personImportSpinnerAngle_ = (personImportSpinnerAngle_ + 12) % 360;
+        };
+        connect(personImportSpinnerTimer_, &QTimer::timeout, this, updateSpinner);
+        updateSpinner();
+        personImportSpinnerTimer_->start(40);
+    }
+
+    personImportProgressBar_->setValue(qBound(0, progress, 100));
+    personImportProgressOverlay_->setGeometry(rect());
+    personImportProgressOverlay_->raise();
+    personImportProgressOverlay_->show();
 }
 
 /** @brief 提示插入U盘并在同一弹窗内选择导出人员范围。 */
@@ -2810,6 +3030,8 @@ void AdminPanel::requestApplyDateTime()
     }
 
     setStatusText(message);
+    showActionToast(ok ? QStringLiteral("时间设置成功")
+                       : QStringLiteral("时间设置失败"), ok);
     if (!ok) {
         AppMessageDialog::warning(this, "设置", message);
     }
@@ -2993,6 +3215,11 @@ void AdminPanel::resizeEvent(QResizeEvent *event)
     QDialog::resizeEvent(event);
     applyResponsiveLayout();
     positionNetworkSyncToast();
+    positionActionToast();
+    if (personImportProgressOverlay_) {
+        personImportProgressOverlay_->setGeometry(rect());
+        personImportProgressOverlay_->raise();
+    }
 }
 
 void AdminPanel::applyResponsiveLayout()
@@ -3017,10 +3244,10 @@ void AdminPanel::applyResponsiveLayout()
         rootLayout_->setDirection(QBoxLayout::TopToBottom);
         sidebar_->setMinimumWidth(0);
         sidebar_->setMaximumWidth(QWIDGETSIZE_MAX);
-        sidebar_->setMinimumHeight(72);
-        sidebar_->setMaximumHeight(86);
-        sideLayout_->setContentsMargins(8, 6, 8, 6);
-        sideLayout_->setSpacing(8);
+        sidebar_->setMinimumHeight(100);
+        sidebar_->setMaximumHeight(120);
+        sideLayout_->setContentsMargins(10, 8, 10, 8);
+        sideLayout_->setSpacing(12);
         sideLayout_->setRowStretch(3, 0);
         sideLayout_->setColumnStretch(0, 1);
 
@@ -3030,8 +3257,13 @@ void AdminPanel::applyResponsiveLayout()
         navList_->setWrapping(false);
         navList_->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
         navList_->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-        navList_->setMinimumHeight(48);
-        navList_->setMaximumHeight(64);
+        navList_->setMinimumHeight(76);
+        navList_->setMaximumHeight(96);
+        const int navWidth = qMax(1, width() - backButton_->width() - 44);
+        const int itemWidth = qMax(104, (navWidth - 24) / qMax(1, navList_->count()));
+        for (int index = 0; index < navList_->count(); ++index) {
+            navList_->item(index)->setSizeHint(QSize(itemWidth, 62));
+        }
         sideLayout_->addWidget(navList_, 0, 0);
         sideLayout_->addWidget(backButton_, 0, 1, Qt::AlignVCenter);
     } else {
@@ -3054,6 +3286,9 @@ void AdminPanel::applyResponsiveLayout()
         navList_->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
         navList_->setMinimumHeight(0);
         navList_->setMaximumHeight(QWIDGETSIZE_MAX);
+        for (int index = 0; index < navList_->count(); ++index) {
+            navList_->item(index)->setSizeHint(QSize(kAdminSidebarWidth - 28, 52));
+        }
         sideLayout_->addWidget(adminTitle_, 0, 0);
         sideLayout_->addWidget(adminSubtitle_, 1, 0);
         sideLayout_->addWidget(navList_, 3, 0);

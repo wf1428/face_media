@@ -9,7 +9,9 @@
 #ifndef MAIN_WINDOW_H
 #define MAIN_WINDOW_H
 
+#include <QByteArray>
 #include <QElapsedTimer>
+#include <QHash>
 #include <QMainWindow>
 #include <QPointer>
 #include <QPixmap>
@@ -64,10 +66,16 @@ public:
     /** @return 仅在识别主页且未进行密码或管理交互时返回 true。 */
     bool allowsPresenceSwitch() const;
 
+    /** @brief 外壳切换识别阶段后重新开始一次干净的验证。 */
+    void restartRecognition(const QString &message);
+
     /** @brief 从应用外壳进入原有管理员认证和管理面板。 */
     void requestOpenAdminManagement();
 
 signals:
+    /** @brief 单次人脸识别窗口已经验证出底库人员，不代表权限已经下发。 */
+    void recognitionVerified();
+
     /** Emitted after the final access decision succeeds and the result is shown. */
     void recognitionSucceeded();
 
@@ -92,8 +100,24 @@ signals:
     /** @brief 最终权限校验成功后提供人员显示图和姓名。 */
     void recognitionImageReady(const QImage &image, const QString &name);
 
+    /** @brief 已授权人员在 60 秒限制期内再次刷脸。 */
+    void duplicateRecognitionSuppressed(const QString &message);
+
+    /** @brief 合并本地/网络人脸结果供UI统一处理，不用作MQTT事件。 */
+    void faceAccessUiFinished(const QString &personId, const QString &faceHash,
+                              const QString &floors, const QByteArray &rs485Frame,
+                              bool success, const QString &reason, int resultCode);
+
+    /** @brief 合并本地/网络密码结果供UI统一处理。 */
+    void passwordAccessUiFinished(const QString &personId, const QString &floors,
+                                  const QByteArray &rs485Frame, bool success,
+                                  const QString &reason, int resultCode);
+
     /** @brief 管理员登录取消或管理面板关闭后通知应用外壳。 */
     void adminSessionFinished();
+
+    /** @brief 管理员认证成功、管理面板即将显示时通知应用外壳。 */
+    void adminSessionStarted();
 
 protected:
     /** @brief 窗口尺寸变化后重新布局右侧综合信息面板。 */
@@ -114,6 +138,15 @@ private:
 
     /** @brief 在推理线程重置验证状态机。 */
     void resetFaceVerification(const QString &message);
+
+    /** @return 验证日志对应的稳定人员去重键。 */
+    QString accessPersonKey(const VerifyLog &log) const;
+
+    /** @return 该人员距离允许再次刷脸剩余秒数；0 表示没有限制。 */
+    int duplicateRemainingSeconds(const VerifyLog &log) const;
+
+    /** @brief 记录一次已经成功下发权限的人员及时间。 */
+    void rememberSuccessfulAccess(const VerifyLog &log);
 
     /** @brief 统计限定时间内的预览点击次数并触发管理员登录。 */
     void handleAdminTap();
@@ -164,8 +197,8 @@ private:
     /** @brief 请求刷新存储统计。 */
     void refreshAdminStorageStats();
 
-    /** @brief 启动U盘网络人员 XLS/XLSX 后台导入。 */
-    void handlePeopleImport();
+    /** @brief 启动U盘本地人员 XLS/XLSX 及人脸图片后台导入。 */
+    void handlePeopleImport(const QString &requestToken);
 
     /** @brief 将网络、本地或全部人员以固定XLSX格式导出到U盘。 */
     void handlePeopleExport(const QString &personnelScope);
@@ -259,9 +292,7 @@ private:
     QVector<PersonAdminRecord> latestPeople_;
     QVector<VerifyLogViewRecord> latestPassedLogs_;
     StorageStats latestStorageStats_;
-    qint64 lastPassedPersonId_ = 0;       /**< 最近通过人员主键，用于重复抑制。 */
-    QString lastPassedPersonNo_;         /**< 最近通过人员编号。 */
-    QElapsedTimer lastPassedTimer_;      /**< 同人重复通过抑制计时器。 */
+    QHash<QString, qint64> successfulAccessMs_; /**< 各人员最近一次权限下发时间。 */
     bool livenessEnabled_ = true;        /**< 当前活体开关。 */
     bool adminLoginActive_ = false;      /**< 管理员密码登录弹窗是否正在处理输入。 */
     bool adminModeActive_ = false;       /**< 管理面板是否打开。 */

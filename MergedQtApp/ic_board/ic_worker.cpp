@@ -11,6 +11,7 @@
 #include "ic_event_bridge.h"
 #include "core_migration_audit/core_network_card_compat.h"
 #include "common/sql/dbstore.h"
+#include "local_access_service.h"
 #include "network_access_service.h"
 
 #include <QDateTime>
@@ -138,6 +139,11 @@ void IcWorker::start()
         qWarning() << "[IC-WORKER] online_v1 network access database init failed:"
                    << DbStore::lastError();
     }
+    localAccess_ = new LocalAccessService;
+    if (!localAccess_->initialize()) {
+        qWarning() << "[IC-WORKER] local access database init failed:"
+                   << DbStore::lastError();
+    }
 
     qInfo() << "[IC-WORKER] start thread=" << QThread::currentThread()
             << "floorNum=" << cfg.floorNum
@@ -195,8 +201,33 @@ void IcWorker::start()
                      this,
                      [this](const QString &personId, qint64 localPersonId,
                             const QString &personName, const QString &faceHash) {
-        Q_UNUSED(localPersonId)
         Q_UNUSED(personName)
+
+        if (localPersonId > 0) {
+            const NetworkAccessResult result = localAccess_
+                    ? localAccess_->checkFacePerson(localPersonId, QDateTime::currentDateTime())
+                    : NetworkAccessResult();
+            QStringList floorTexts;
+            for (int floor : result.floors) floorTexts.append(QString::number(floor));
+            const QString floors = floorTexts.join(QLatin1Char(','));
+            const QString localNo = personId.trimmed().isEmpty()
+                    ? QString::number(localPersonId) : personId.trimmed();
+            if (!result.pass) {
+                IcEventBridge::instance()->emitLocalFaceAccessFinished(
+                            localNo, faceHash, floors, result.rs485Frame, false,
+                            result.reason.isEmpty() ? QStringLiteral("本地人脸权限校验失败") : result.reason,
+                            result.code);
+                return;
+            }
+            const bool sent = rs485_ && rs485_->sendFrame(result.rs485Frame);
+            const bool recorded = sent && localAccess_ && localAccess_->recordSuccessfulAccess(result);
+            IcEventBridge::instance()->emitLocalFaceAccessFinished(
+                        localNo, faceHash, floors, result.rs485Frame, recorded,
+                        !sent ? QStringLiteral("RS485楼层权限下发失败")
+                              : (!recorded ? QStringLiteral("本地通行次数/金额扣减失败") : QString()),
+                        recorded ? 200 : (!sent ? 0 : 4501));
+            return;
+        }
 
         if (runtimeIcModeFromIni() != RuntimeIcMode::OnlineV1) {
             qInfo().noquote() << "[FACE-ACCESS] ignored outside online_v1"
@@ -265,6 +296,29 @@ void IcWorker::start()
     QObject::connect(IcEventBridge::instance(), &IcEventBridge::passwordAccessRequested,
                      this,
                      [this](const QString &password) {
+        const NetworkAccessResult localResult = localAccess_
+                ? localAccess_->checkPassword(password, QDateTime::currentDateTime())
+                : NetworkAccessResult();
+        if (localResult.pass || !localResult.personId.isEmpty()) {
+            QStringList localFloors;
+            for (int floor : localResult.floors) localFloors.append(QString::number(floor));
+            const QString floors = localFloors.join(QLatin1Char(','));
+            if (!localResult.pass) {
+                IcEventBridge::instance()->emitLocalPasswordAccessFinished(
+                            localResult.personId, floors, localResult.rs485Frame,
+                            false, localResult.reason, localResult.code);
+                return;
+            }
+            const bool sent = rs485_ && rs485_->sendFrame(localResult.rs485Frame);
+            const bool recorded = sent && localAccess_
+                    && localAccess_->recordSuccessfulAccess(localResult);
+            IcEventBridge::instance()->emitLocalPasswordAccessFinished(
+                        localResult.personId, floors, localResult.rs485Frame, recorded,
+                        !sent ? QStringLiteral("RS485楼层权限下发失败")
+                              : (!recorded ? QStringLiteral("本地通行次数/金额扣减失败") : QString()),
+                        recorded ? 200 : (!sent ? 0 : 4501));
+            return;
+        }
         if (runtimeIcModeFromIni() != RuntimeIcMode::OnlineV1) {
             IcEventBridge::instance()->emitPasswordAccessFinished(
                         QString(), QString(), QByteArray(), false,
@@ -343,6 +397,24 @@ void IcWorker::start()
                  << "hex=" << frame.toHex(' ');
 
         const auto c = DeviceConfigSync::cfg();
+
+        const NetworkAccessResult localResult = localAccess_
+                ? localAccess_->checkCardFrame(frame, QDateTime::currentDateTime())
+                : NetworkAccessResult();
+        if (localResult.pass || !localResult.personId.isEmpty()) {
+            if (!localResult.pass) {
+                IcEventBridge::instance()->emitToastFailRequested(localResult.reason, localResult.code);
+                return;
+            }
+            const bool sent = rs485_ && rs485_->sendFrame(localResult.rs485Frame);
+            const bool recorded = sent && localAccess_
+                    && localAccess_->recordSuccessfulAccess(localResult);
+            if (recorded) IcEventBridge::instance()->emitToastPassRequested();
+            else IcEventBridge::instance()->emitToastFailRequested(
+                        !sent ? QStringLiteral("RS485发送失败")
+                              : QStringLiteral("本地通行次数/金额扣减失败"));
+            return;
+        }
 
         const RuntimeIcMode runtimeMode = runtimeIcModeFromIni();
         if (runtimeMode == RuntimeIcMode::OfflineV1) {
@@ -512,6 +584,26 @@ void IcWorker::start()
                      [this](const QString& frame) {
         qInfo() << "[QR RX] frame:" << frame;
 
+        QString localQrCode;
+        if (!parseOnlineQrCode(frame, &localQrCode)) localQrCode = frame.trimmed();
+        const NetworkAccessResult localResult = localAccess_
+                ? localAccess_->checkQrCode(localQrCode, QDateTime::currentDateTime())
+                : NetworkAccessResult();
+        if (localResult.pass || !localResult.personId.isEmpty()) {
+            if (!localResult.pass) {
+                IcEventBridge::instance()->emitToastFailRequested(localResult.reason, localResult.code);
+                return;
+            }
+            const bool sent = rs485_ && rs485_->sendFrame(localResult.rs485Frame);
+            const bool recorded = sent && localAccess_
+                    && localAccess_->recordSuccessfulAccess(localResult);
+            if (recorded) IcEventBridge::instance()->emitToastPassRequested();
+            else IcEventBridge::instance()->emitToastFailRequested(
+                        !sent ? QStringLiteral("RS485发送失败")
+                              : QStringLiteral("本地通行次数/金额扣减失败"));
+            return;
+        }
+
         const RuntimeIcMode runtimeMode = runtimeIcModeFromIni();
         if (runtimeMode == RuntimeIcMode::OnlineV2) {
             QString qrCode;
@@ -581,6 +673,8 @@ void IcWorker::stop()
 
     delete networkAccess_;
     networkAccess_ = nullptr;
+    delete localAccess_;
+    localAccess_ = nullptr;
 
     DbStore::checkpoint();
     DbStore::close();

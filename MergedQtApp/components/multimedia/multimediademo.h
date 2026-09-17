@@ -160,9 +160,9 @@ public slots:
     /** @brief 从列表首项恢复本地轮播。 */
     void resumeLocalPlaylistFromStart();
 
-    /** @brief 停止全部媒体输出并在 videoRect 显示内嵌人脸预览。 */
+    /** @brief 保持视频播放，在 pictureRect 内以摄像头预览替换 PIC 轮播。 */
     void beginEmbeddedFaceRecognition();
-    /** @brief 关闭内嵌人脸预览并从播放列表第一项恢复。 */
+    /** @brief 关闭 pictureRect 内的人脸预览并恢复 PIC 轮播。 */
     void endEmbeddedFaceRecognition();
     /** @brief 更新内嵌人脸预览帧。 */
     void setEmbeddedFaceFrame(const QImage &image);
@@ -174,6 +174,8 @@ public slots:
     void showRecognitionImage(const QImage &image, const QString &name, int durationMs);
     /** @brief 显示摄像头不可用提示。 */
     void setEmbeddedFaceUnavailable(const QString &message);
+    /** @brief 通过页面既有覆盖层显示短时业务提示。 */
+    void showTransientStatus(const QString &message, int durationMs = 3000);
 
     /** @brief 应用 MQTT 下发音量并回报执行结果。 */
     void onMqttVolumeChanged(int volume);
@@ -384,6 +386,9 @@ private:
     DirectionStatus dir_status;
     StateStatus state_status;
     bool RunMode; /**< false 为正常运行，true 为演示运行。 */
+    QTimer *m_elevatorDemoTimer = nullptr; /**< 演示模式下每秒推进一次楼层。 */
+    int m_demoFloor = -8;                  /**< 当前演示楼层，范围 -8～32。 */
+    DirectionStatus m_demoDirection = UP;  /**< 当前演示运行方向。 */
 
     // UI组件
     QLabel *label_direction;
@@ -404,16 +409,16 @@ private:
     QTimer *m_moveTextTimer = nullptr;     /**< 滚动文字平移动画定时器。 */
     int m_moveTextOffsetX = 0;             /**< 文字当前在区域内的横坐标。 */
     int m_moveTextStepPx = 2;              /**< 每帧左移像素数，对应五档速度。 */
-    CameraPreviewWidget *m_facePreview = nullptr; /**< videoRect 内嵌人脸预览。 */
-    QWidget *m_recognitionResultHost = nullptr;   /**< 通过人员图片覆盖容器。 */
+    CameraPreviewWidget *m_facePreview = nullptr; /**< pictureRect 内嵌人脸预览。 */
+    QWidget *m_recognitionResultHost = nullptr;   /**< pictureRect 通过人员图片覆盖容器。 */
     QList<QLabel *> m_recognitionImageLabels;     /**< 当前批次中能完整放入目标区域的通过图片。 */
     QHash<QLabel *, QImage> m_recognitionImages;  /**< 通过图片原图，用于重新布局缩放。 */
     QHash<QLabel *, QString> m_recognitionNames;  /**< 每张通过图片对应的人员姓名。 */
     QList<RecognitionImageItem> m_pendingRecognitionImages; /**< 容量不足时等待下一批的图片。 */
     QString m_latestRecognitionName; /**< 结果照片显示期间用于锁定人脸框的通过文字。 */
     bool m_embeddedFaceRecognitionActive = false;
-    bool m_picturePausedForRecognitionResult = false;
-    bool m_pictureSuppressedBySharedFaceRect = false;
+    bool m_picturePausedForFaceOverlay = false;
+    bool m_embeddedFacePresent = false;
 
     // 图像对象
 
@@ -748,8 +753,10 @@ private:
     void initializeTimers();
     /** @brief 读取配置后初始化界面可见性和几何参数。 */
     void initializeConfiguration();
-    /** @brief 演示模式下生成一帧模拟信号板数据。 */
+    /** @brief 初始化信号板接收缓冲及电梯演示状态。 */
     void simulateBufferData();
+    /** @brief 演示模式下每秒推进楼层，并在端点反向循环。 */
+    void onElevatorDemoTimeout();
     /** @brief 从设备配置文件加载显示、媒体和功能参数。 */
     void readConfigurationFromFile();
     /** @brief 用十位和个位标签显示普通数字楼层。 */

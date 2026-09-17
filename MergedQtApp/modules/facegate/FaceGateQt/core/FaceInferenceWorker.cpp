@@ -445,3 +445,49 @@ void FaceInferenceWorker::validateSyncedFaceImages(
                     : firstFailureMessage,
                 validatedFaces, failedFaces);
 }
+
+void FaceInferenceWorker::validateLocalImportFaceImages(
+        const QString &token,
+        const QJsonArray &faces,
+        const AppConfig &config)
+{
+    QJsonArray validatedFaces;
+    QJsonArray failedFaces;
+    if (token.trimmed().isEmpty() || faces.isEmpty()) {
+        emit localImportFaceImagesValidated(token, validatedFaces, failedFaces);
+        return;
+    }
+
+    ensureObjects();
+    engine_->updateConfig(config);
+    const bool ready = engine_->isReady() || engine_->initialize(config);
+    for (const QJsonValue &value : faces) {
+        QJsonObject face = value.toObject();
+        if (!ready) {
+            face.insert(QStringLiteral("message"),
+                        QStringLiteral("人脸识别服务未就绪"));
+            failedFaces.append(face);
+            continue;
+        }
+        FaceFeatureData feature;
+        QString errorText;
+        float detectConfidence = -1.0f;
+        const QString imagePath = face.value(QStringLiteral("imagePath"))
+                .toString().trimmed();
+        if (!engine_->extractFeatureFromImage(
+                    imagePath, feature, &errorText, &detectConfidence)) {
+            QString message = errorText.trimmed();
+            if (message.isEmpty()) message = QStringLiteral("人脸图片质量未通过");
+            face.insert(QStringLiteral("message"), message);
+            failedFaces.append(face);
+            continue;
+        }
+        face.insert(QStringLiteral("featureBase64"),
+                    QString::fromLatin1(feature.blob.toBase64()));
+        face.insert(QStringLiteral("modelVersion"), feature.modelVersion);
+        face.insert(QStringLiteral("faceQuality"), feature.quality);
+        face.insert(QStringLiteral("recognitionQuality"), detectConfidence);
+        validatedFaces.append(face);
+    }
+    emit localImportFaceImagesValidated(token, validatedFaces, failedFaces);
+}

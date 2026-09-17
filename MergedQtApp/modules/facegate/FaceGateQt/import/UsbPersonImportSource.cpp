@@ -1,6 +1,6 @@
 /**
  * @file UsbPersonImportSource.cpp
- * @brief U 盘人员表导入源实现；挂载、复制和卸载均不在界面线程执行。
+ * @brief U盘人员导入预约及Excel临时复制实现。
  *
  * @author Dulin
  * @date 2026-08-28
@@ -8,114 +8,63 @@
 
 #include "UsbPersonImportSource.h"
 
+#include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
-#include <QProcess>
-#include <QSet>
+#include <QList>
+#include <QSaveFile>
+#include <QStringList>
 #include <QThread>
 #include <QUuid>
 
 namespace {
+const QString kImportControlDirectory = QStringLiteral("/run/face-media");
+const QString kImportRequestPath = kImportControlDirectory
+        + QStringLiteral("/person-import.request");
+const QString kImportReadyPath = kImportControlDirectory
+        + QStringLiteral("/person-import.ready");
 
-/** @brief 一次人员表查找使用的 USB 卷信息。 */
-struct UsbVolume
+/** @return 控制文件去除回车后的非空行。 */
+QStringList controlFileLines(const QString &path)
 {
-    QString device;      /**< 块设备节点。 */
-    QString mountPoint;  /**< 已有或临时挂载目录。 */
-    bool mounted = false; /**< 卷当前是否处于挂载状态。 */
-};
-
-/** @brief 还原 /proc/mounts 对空格、制表符和反斜杠的八进制转义。 */
-QString decodeMountField(QString value)
-{
-    value.replace(QStringLiteral("\\040"), QStringLiteral(" "));
-    value.replace(QStringLiteral("\\011"), QStringLiteral("\t"));
-    value.replace(QStringLiteral("\\134"), QStringLiteral("\\"));
-    return value;
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) return {};
+    QStringList lines;
+    const QList<QByteArray> rawLines = file.readAll().split('\n');
+    for (const QByteArray &rawLine : rawLines) {
+        const QString line = QString::fromUtf8(rawLine).trimmed();
+        if (!line.isEmpty()) lines.append(line);
+    }
+    return lines;
 }
 
-/** @return 当前已挂载的 /dev/sd* USB 卷。 */
-QList<UsbVolume> mountedUsbVolumes()
+/** @return udisk 服务为指定令牌确认的挂载点。 */
+QString readyMountPoint(const QString &requestToken)
 {
-    QList<UsbVolume> result;
-    QFile mounts(QStringLiteral("/proc/mounts"));
-    if (!mounts.open(QIODevice::ReadOnly | QIODevice::Text)) return result;
-    while (!mounts.atEnd()) {
-        const QString line = QString::fromUtf8(mounts.readLine()).trimmed();
-        const QStringList fields = line.split(QLatin1Char(' '), QString::SkipEmptyParts);
-        if (fields.size() < 2) continue;
-        const QString device = decodeMountField(fields.at(0));
-        if (!device.startsWith(QStringLiteral("/dev/sd"))) continue;
-        UsbVolume volume;
-        volume.device = device;
-        volume.mountPoint = decodeMountField(fields.at(1));
-        volume.mounted = true;
-        result.append(volume);
+    const QStringList lines = controlFileLines(kImportReadyPath);
+    if (requestToken.isEmpty() || lines.size() < 2 || lines.at(0) != requestToken) {
+        return QString();
     }
-    return result;
+    return QDir(lines.at(1)).exists() ? QDir(lines.at(1)).absolutePath()
+                                      : QString();
 }
 
-/**
- * @brief 枚举尚未挂载的 USB 块设备。
- * @return 优先返回分区节点；没有分区时才返回整盘节点。
- */
-QStringList unmountedUsbDevices(const QList<UsbVolume> &mounted)
+/** @return U盘 Ycest/person 目录。 */
+QString sourcePersonDirectory(const QString &mountPoint)
 {
-    QSet<QString> mountedDevices;
-    for (const UsbVolume &volume : mounted) mountedDevices.insert(volume.device);
-    QStringList partitions;
-    QStringList wholeDevices;
-    const QDir blockDir(QStringLiteral("/sys/class/block"));
-    const QFileInfoList entries = blockDir.entryInfoList(QStringList() << QStringLiteral("sd*"),
-                                                         QDir::Dirs | QDir::NoDotAndDotDot,
-                                                         QDir::Name);
-    for (const QFileInfo &entry : entries) {
-        const QString device = QStringLiteral("/dev/") + entry.fileName();
-        if (mountedDevices.contains(device) || !QFileInfo::exists(device)) continue;
-        if (QFileInfo::exists(entry.absoluteFilePath() + QStringLiteral("/partition"))) {
-            partitions.append(device);
-        } else {
-            wholeDevices.append(device);
-        }
-    }
-    return partitions.isEmpty() ? wholeDevices : partitions;
+    return QDir(mountPoint).absoluteFilePath(QStringLiteral("Ycest/person"));
 }
 
-/** @brief 执行有限时长的挂载命令，并保留标准错误作为失败原因。 */
-bool runProcess(const QString &program, const QStringList &arguments, QString *error)
+/** @return Ycest/person 按文件名排序后的第一个非临时 XLS/XLSX。 */
+QString firstWorkbook(const QString &mountPoint)
 {
-    QProcess process;
-    process.start(program, arguments);
-    if (!process.waitForStarted(5000)) {
-        if (error) *error = QStringLiteral("无法启动 %1：%2").arg(program, process.errorString());
-        return false;
-    }
-    if (!process.waitForFinished(15000)) {
-        process.kill();
-        process.waitForFinished(1000);
-        if (error) *error = QStringLiteral("%1 执行超时").arg(program);
-        return false;
-    }
-    if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
-        if (error) {
-            const QString detail = QString::fromLocal8Bit(process.readAllStandardError()).trimmed();
-            *error = detail.isEmpty() ? QStringLiteral("%1 执行失败").arg(program) : detail;
-        }
-        return false;
-    }
-    return true;
-}
-
-/** @return person 目录中最新的非临时 XLS/XLSX 文件路径。 */
-QString newestWorkbook(const QString &mountPoint)
-{
-    const QDir personDir(QDir(mountPoint).absoluteFilePath(QStringLiteral("person")));
+    const QDir personDir(sourcePersonDirectory(mountPoint));
     if (!personDir.exists()) return QString();
     const QFileInfoList files = personDir.entryInfoList(
-                QDir::Files | QDir::Readable, QDir::Time);
+                QDir::Files | QDir::Readable, QDir::Name | QDir::IgnoreCase);
     for (const QFileInfo &file : files) {
         const QString suffix = file.suffix();
         const bool supported = suffix.compare(QStringLiteral("xls"), Qt::CaseInsensitive) == 0
@@ -127,61 +76,106 @@ QString newestWorkbook(const QString &mountPoint)
     return QString();
 }
 
-/** @brief 卸载指定卷；空挂载点视为无需处理。 */
-bool unmountVolume(const QString &mountPoint, QString *error)
-{
-    if (mountPoint.isEmpty()) return true;
-    return runProcess(QStringLiteral("umount"), QStringList() << mountPoint, error);
-}
-
 /**
- * @brief 将卷中最新人员表复制到本机唯一临时文件。
+ * @brief 将指定挂载目录中列表第一个人员表复制到临时目录。
  * @return 包含来源文件名和临时路径的复制结果。
  */
-UsbPersonImportFile copyWorkbook(const UsbVolume &volume)
+UsbPersonImportFile copyWorkbook(const QString &mountPoint)
 {
     UsbPersonImportFile result;
-    const QString workbook = newestWorkbook(volume.mountPoint);
+    result.mountPoint = mountPoint;
+    const QString workbook = firstWorkbook(mountPoint);
     if (workbook.isEmpty()) {
-        result.error = QStringLiteral("U盘 person 目录下未找到 xls 或 xlsx 文件");
+        result.error = QStringLiteral("U盘 Ycest/person 目录下未找到 xls 或 xlsx 文件");
         return result;
     }
 
-    const QString tempDirectory = QStringLiteral("/tmp/facegate_person_import");
+    const QString tempBase = QStringLiteral("/tmp/facegate_person_import");
+    const QString tempDirectory = QDir(tempBase).absoluteFilePath(
+                QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss_zzz"))
+                + QLatin1Char('_')
+                + QUuid::createUuid().toString(QUuid::WithoutBraces));
     if (!QDir().mkpath(tempDirectory)) {
         result.error = QStringLiteral("无法创建人员导入临时目录");
         return result;
     }
+    result.temporaryRoot = tempDirectory;
     const QFileInfo sourceInfo(workbook);
     result.sourceFileName = sourceInfo.fileName();
-    result.temporaryPath = QDir(tempDirectory).absoluteFilePath(
-                QStringLiteral("%1_%2.%3")
-                .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss")),
-                     QUuid::createUuid().toString(QUuid::WithoutBraces),
-                     sourceInfo.suffix().toLower()));
+    result.temporaryPath = QDir(tempDirectory).absoluteFilePath(sourceInfo.fileName());
     if (!QFile::copy(workbook, result.temporaryPath)) {
         result.error = QStringLiteral("复制人员表到临时目录失败");
+        QDir(tempDirectory).removeRecursively();
+        result.temporaryRoot.clear();
         result.temporaryPath.clear();
         return result;
     }
+
+    const QString imageDirectory = QDir(sourcePersonDirectory(mountPoint))
+            .absoluteFilePath(QStringLiteral("img"));
+    if (QDir(imageDirectory).exists()) result.sourceImageDirectory = imageDirectory;
     result.ok = true;
     return result;
 }
 
 } // namespace
 
+/** @brief 原子写入人员导入预约，使预约早于U盘插入事件。 */
+QString UsbPersonImportSource::beginImportRequest(QString *error)
+{
+    if (!QDir().mkpath(kImportControlDirectory)) {
+        if (error) *error = QStringLiteral("无法创建U盘导入控制目录");
+        return QString();
+    }
+
+    const QString token = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QFile::remove(kImportReadyPath);
+    QSaveFile request(kImportRequestPath);
+    if (!request.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        if (error) *error = QStringLiteral("无法创建人员导入请求：%1").arg(request.errorString());
+        return QString();
+    }
+    const QByteArray content = QByteArray::number(QCoreApplication::applicationPid())
+            + '\n' + token.toUtf8() + '\n';
+    if (request.write(content) != content.size() || !request.commit()) {
+        if (error) *error = QStringLiteral("无法提交人员导入请求：%1").arg(request.errorString());
+        return QString();
+    }
+    return token;
+}
+
+/** @brief 仅清理属于本批次的请求和就绪文件。 */
+void UsbPersonImportSource::endImportRequest(const QString &requestToken)
+{
+    if (requestToken.isEmpty()) return;
+
+    const QStringList requestLines = controlFileLines(kImportRequestPath);
+    if (requestLines.size() >= 2 && requestLines.at(1) == requestToken) {
+        QFile::remove(kImportRequestPath);
+    }
+    const QStringList readyLines = controlFileLines(kImportReadyPath);
+    if (!readyLines.isEmpty() && readyLines.at(0) == requestToken) {
+        QFile::remove(kImportReadyPath);
+    }
+}
+
 /**
  * @brief 轮询 U 盘并把人员表复制到本机，完成后再返回调用方。
  *
- * 未挂载设备以只读方式挂载。若卸载失败，会删除已经复制的临时文件并返回失败，
- * 避免界面误以为介质已经可以安全拔出。
+ * 只有 udisk watcher 用同一令牌写入 ready 文件后才访问挂载目录。
+ * Excel 复制完成后保持U盘挂载，供后续直接读取 img 目录；应用不再卸载U盘。
  */
 UsbPersonImportFile UsbPersonImportSource::waitAndCopy(int timeoutMs,
-                                                       const std::atomic_bool *cancelled)
+                                                       const std::atomic_bool *cancelled,
+                                                       const QString &requestToken)
 {
+    if (requestToken.trimmed().isEmpty()) {
+        UsbPersonImportFile result;
+        result.error = QStringLiteral("人员导入请求无效");
+        return result;
+    }
     QElapsedTimer timer;
     timer.start();
-    QString lastError;
     while (timer.elapsed() < timeoutMs) {
         if (cancelled && cancelled->load()) {
             UsbPersonImportFile cancelledResult;
@@ -189,62 +183,15 @@ UsbPersonImportFile UsbPersonImportSource::waitAndCopy(int timeoutMs,
             return cancelledResult;
         }
 
-        const QList<UsbVolume> mounted = mountedUsbVolumes();
-        for (const UsbVolume &volume : mounted) {
-            const QString workbook = newestWorkbook(volume.mountPoint);
-            if (workbook.isEmpty()) continue;
-            UsbPersonImportFile result = copyWorkbook(volume);
-            QString unmountError;
-            if (!unmountVolume(volume.mountPoint, &unmountError)) {
-                if (result.ok) {
-                    QFile::remove(result.temporaryPath);
-                    result.ok = false;
-                    result.temporaryPath.clear();
-                }
-                result.error = QStringLiteral("人员表已找到，但U盘卸载失败：%1").arg(unmountError);
-            }
-            return result;
-        }
-
-        const QStringList devices = unmountedUsbDevices(mounted);
-        for (const QString &device : devices) {
-            const QString mountPoint = QStringLiteral("/mnt/facegate_person_import");
-            if (!QDir().mkpath(mountPoint)) {
-                lastError = QStringLiteral("无法创建U盘挂载目录：%1").arg(mountPoint);
-                continue;
-            }
-            QString mountError;
-            if (!runProcess(QStringLiteral("mount"),
-                            QStringList() << QStringLiteral("-o") << QStringLiteral("ro")
-                                          << device << mountPoint,
-                            &mountError)) {
-                lastError = QStringLiteral("U盘挂载失败：%1").arg(mountError);
-                continue;
-            }
-            UsbVolume volume;
-            volume.device = device;
-            volume.mountPoint = mountPoint;
-            volume.mounted = true;
-            UsbPersonImportFile result = copyWorkbook(volume);
-            QString unmountError;
-            if (!unmountVolume(mountPoint, &unmountError)) {
-                if (result.ok) {
-                    QFile::remove(result.temporaryPath);
-                    result.ok = false;
-                    result.temporaryPath.clear();
-                }
-                result.error = QStringLiteral("U盘卸载失败：%1").arg(unmountError);
-            }
-            QDir().rmdir(mountPoint);
-            if (result.ok || !result.error.contains(QStringLiteral("未找到"))) return result;
-            lastError = result.error;
+        const QString mountPoint = readyMountPoint(requestToken);
+        if (!mountPoint.isEmpty() && !firstWorkbook(mountPoint).isEmpty()) {
+            return copyWorkbook(mountPoint);
         }
         QThread::msleep(500);
     }
 
     UsbPersonImportFile result;
-    result.error = lastError.isEmpty()
-            ? QStringLiteral("等待U盘超时，请确认U盘已插入且根目录存在 person/*.xls 或 person/*.xlsx")
-            : lastError;
+    result.error = QStringLiteral(
+                "等待U盘超时，请确认 udisk 服务正常，且 /media/usb0/Ycest/person 下存在人员表");
     return result;
 }

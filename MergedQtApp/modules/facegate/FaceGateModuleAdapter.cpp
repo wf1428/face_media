@@ -48,10 +48,14 @@ bool FaceGateModuleAdapter::initialize()
     const AppConfig config = AppConfig::load(configPath_);
     window_ = new FaceGateMainWindow(config, widgetParent_);
     window_->setWindowFlags(Qt::Widget);
+    connect(window_, &FaceGateMainWindow::recognitionVerified,
+            this, &FaceGateModuleAdapter::recognitionVerified);
     connect(window_, &FaceGateMainWindow::recognitionSucceeded,
             this, &FaceGateModuleAdapter::recognitionSucceeded);
     connect(window_, &FaceGateMainWindow::recognitionFinished,
             this, &FaceGateModuleAdapter::recognitionFinished);
+    connect(window_, &FaceGateMainWindow::duplicateRecognitionSuppressed,
+            this, &FaceGateModuleAdapter::duplicateRecognitionSuppressed);
     connect(window_, &FaceGateMainWindow::facePresenceChanged,
             this, &FaceGateModuleAdapter::facePresenceChanged);
     connect(window_, &FaceGateMainWindow::previewFrameChanged,
@@ -66,6 +70,8 @@ bool FaceGateModuleAdapter::initialize()
             this, &FaceGateModuleAdapter::recognitionImageReady);
     connect(window_, &FaceGateMainWindow::adminSessionFinished,
             this, &FaceGateModuleAdapter::adminSessionFinished);
+    connect(window_, &FaceGateMainWindow::adminSessionStarted,
+            this, &FaceGateModuleAdapter::adminSessionStarted);
     shutdown_ = false;
     qInfo() << "[FACEGATE-ADAPTER] initialized"
             << "config=" << configPath_;
@@ -113,6 +119,14 @@ bool FaceGateModuleAdapter::isActive() const
 bool FaceGateModuleAdapter::allowsPresenceSwitch() const
 {
     return isActive() && window_->allowsPresenceSwitch();
+}
+
+/** @brief 外壳完成画面阶段切换后重置验证上下文。 */
+void FaceGateModuleAdapter::restartRecognition(const QString &message)
+{
+    if (window_ && active_ && !shutdown_) {
+        window_->restartRecognition(message);
+    }
 }
 
 /** @brief 由新模式的多媒体长按入口调用，认证和面板仍由 FaceGate 管理。 */

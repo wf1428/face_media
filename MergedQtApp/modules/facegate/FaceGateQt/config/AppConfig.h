@@ -86,9 +86,10 @@ public:
 
     int collectFrameCount = 5;       /**< 一次验证采集的候选帧数。 */
     int livenessPassRequired = 5;    /**< 判定活体通过所需的通过帧数。 */
+    int recognitionWindowMs = 4000;  /**< 检测到人脸后单次连续识别窗口，单位 ms。 */
     int resultHoldMs = 2000;         /**< 验证结果界面保持时间，单位 ms。 */
-    int sameFaceSuppressMs = 3000;   /**< 同一人员重复通过抑制窗口，单位 ms。 */
-    int accessDecisionTimeoutMs = 10000; /**< 人脸匹配后等待最终权限结果的超时。 */
+    int sameFaceSuppressMs = 60000;  /**< 已授权人员重复刷脸抑制窗口，单位 ms。 */
+    int accessDecisionTimeoutMs = 5000; /**< 人脸匹配后等待最终权限结果的超时。 */
     bool livenessEnabled = true;     /**< 是否在身份匹配后执行活体检测。 */
 
     QString snapshotDir = "./data/snapshots"; /**< 验证抓拍保存目录。 */

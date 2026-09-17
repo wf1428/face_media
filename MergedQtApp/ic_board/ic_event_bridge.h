@@ -57,6 +57,16 @@ public:
                                 const QString &reason,
                                 int resultCode = 0);
 
+    /** @brief 发布本地人员人脸通行结果，该事件不供 MQTT 订阅。 */
+    void emitLocalFaceAccessFinished(const QString &personId, const QString &faceHash,
+                                     const QString &floors, const QByteArray &rs485Frame,
+                                     bool success, const QString &reason, int resultCode = 0);
+
+    /** @brief 发布本地人员密码通行结果，不上报 MQTT。 */
+    void emitLocalPasswordAccessFinished(const QString &personId, const QString &floors,
+                                         const QByteArray &rs485Frame, bool success,
+                                         const QString &reason, int resultCode = 0);
+
     /** @brief 发布一条需要异步编码并上传的人脸通行抓拍记录。 */
     void emitFaceUploadRequested(const QString &personId,
                                  const QString &faceHash,
@@ -135,6 +145,14 @@ signals:
                             const QByteArray &rs485Frame, bool success,
                             const QString &reason,
                             int resultCode);
+
+    void localFaceAccessFinished(const QString &personId, const QString &faceHash,
+                                 const QString &floors, const QByteArray &rs485Frame,
+                                 bool success, const QString &reason, int resultCode);
+
+    void localPasswordAccessFinished(const QString &personId, const QString &floors,
+                                     const QByteArray &rs485Frame, bool success,
+                                     const QString &reason, int resultCode);
 
     /** @brief 人脸识别结果需要上传抓拍记录。 */
     void faceUploadRequested(const QString &personId,

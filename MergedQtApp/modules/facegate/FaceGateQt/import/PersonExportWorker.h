@@ -45,7 +45,7 @@ signals:
      * @param ok  文件写入、同步和卸载均成功时为 true。
      * @param personCount  实际写入人员记录数。
      * @param kindName  导出的人员范围名称。
-     * @param fileName  U 盘 person 目录中的输出文件名。
+     * @param fileName  U 盘 Ycest/person 目录中的输出文件名。
      * @param message  完成说明或失败原因。
      */
     void finished(bool ok,

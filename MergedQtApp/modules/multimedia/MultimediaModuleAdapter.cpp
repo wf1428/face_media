@@ -136,3 +136,11 @@ void MultimediaModuleAdapter::showRecognitionImage(const QImage &image,
 {
     if (multimediaPage_) multimediaPage_->showRecognitionImage(image, name, durationMs);
 }
+
+void MultimediaModuleAdapter::showStatusMessage(const QString &message,
+                                                 int durationMs)
+{
+    if (multimediaPage_) {
+        multimediaPage_->showTransientStatus(message, durationMs);
+    }
+}

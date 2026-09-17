@@ -78,6 +78,11 @@ public slots:
                                   const QJsonArray &faces,
                                   const AppConfig &config);
 
+    /** @brief 校验U盘本地人员图片并提取特征，不触发网络同步。 */
+    void validateLocalImportFaceImages(const QString &token,
+                                       const QJsonArray &faces,
+                                       const AppConfig &config);
+
 signals:
     /** @brief 转发人脸引擎状态。 */
     void engineStatus(const QString &message);
@@ -117,6 +122,11 @@ signals:
                                    const QString &message,
                                    const QJsonArray &validatedFaces,
                                    const QJsonArray &failedFaces);
+
+    /** @brief 返回U盘本地人员图片的质量和特征校验结果。 */
+    void localImportFaceImagesValidated(const QString &token,
+                                        const QJsonArray &validatedFaces,
+                                        const QJsonArray &failedFaces);
 
 private:
     /** @brief 在当前线程延迟创建 FaceEngine 和 VerificationController 并连接信号。 */

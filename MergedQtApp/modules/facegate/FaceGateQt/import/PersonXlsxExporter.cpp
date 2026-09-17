@@ -9,6 +9,7 @@
 #include "PersonXlsxExporter.h"
 
 #include "common/sql/dbstore.h"
+#include "common/sql/local_personnel_store.h"
 #include "common/sql/network_personnel_store.h"
 #include "platform/rk3566_platform.h"
 
@@ -230,12 +231,13 @@ QString joinedColumn(const QString &sql,
 }
 
 /** @return 指定人员的人脸名称或图像文件名列表。 */
-QString faceFileList(const QString &personId)
+QString faceFileList(const QString &personId, bool local = false)
 {
     QStringList values;
-    const QList<QVariantMap> rows = DbStore::query(
-                QStringLiteral("SELECT name,image_path FROM network_face "
-                               "WHERE person_id=? ORDER BY id"), {personId});
+    const QList<QVariantMap> rows = DbStore::query(local
+                ? QStringLiteral("SELECT '' AS name,image_path FROM face_feature WHERE person_id=? ORDER BY id")
+                : QStringLiteral("SELECT name,image_path FROM network_face WHERE person_id=? ORDER BY id"),
+                {personId});
     for (const QVariantMap &row : rows) {
         QString value = row.value(QStringLiteral("name")).toString().trimmed();
         if (value.isEmpty()) {
@@ -247,12 +249,14 @@ QString faceFileList(const QString &personId)
 }
 
 /** @return 按“设备:楼层,楼层”格式分组的人员楼层权限。 */
-QString floorText(const QString &personId)
+QString floorText(const QString &personId, bool local = false)
 {
     QMap<QString, QStringList> devices;
     const QList<QVariantMap> rows = DbStore::query(
-                QStringLiteral("SELECT device_id,floor_no FROM network_floor "
-                               "WHERE person_id=? ORDER BY device_id,floor_no"), {personId});
+                QStringLiteral("SELECT device_id,floor_no FROM %1 "
+                               "WHERE person_id=? ORDER BY device_id,floor_no")
+                .arg(local ? QStringLiteral("local_floor") : QStringLiteral("network_floor")),
+                {personId});
     for (const QVariantMap &row : rows) {
         devices[row.value(QStringLiteral("device_id")).toString()]
                 .append(QString::number(row.value(QStringLiteral("floor_no")).toInt()));
@@ -267,7 +271,7 @@ QString floorText(const QString &personId)
 }
 
 /** @return 优先使用原始规则文本，否则由定时规则表重建的可读文本。 */
-QString timingText(const QString &personId, const QJsonObject &rules)
+QString timingText(const QString &personId, const QJsonObject &rules, bool local = false)
 {
     const QString stored = jsonText(rules, QStringLiteral("timingRuleText")).trimmed();
     if (!stored.isEmpty()) return stored;
@@ -277,8 +281,10 @@ QString timingText(const QString &personId, const QJsonObject &rules)
     };
     QStringList result;
     const QList<QVariantMap> rows = DbStore::query(
-                QStringLiteral("SELECT days_json,start_time,end_time FROM network_timing_rule "
-                               "WHERE person_id=? ORDER BY rule_order"), {personId});
+                QStringLiteral("SELECT days_json,start_time,end_time FROM %1 "
+                               "WHERE person_id=? ORDER BY rule_order")
+                .arg(local ? QStringLiteral("local_timing_rule")
+                           : QStringLiteral("network_timing_rule")), {personId});
     for (const QVariantMap &row : rows) {
         QStringList days;
         for (const QJsonValue &value : jsonArray(row.value(QStringLiteral("days_json")).toString())) {
@@ -336,27 +342,58 @@ QString enabledFeatures(const QJsonObject &person,
  *
  * JSON 字段优先于兼容列，缺失时再回退到结构化表，保证新旧数据库均可导出。
  */
-QStringList networkPersonRow(const QVariantMap &row, int sequence)
+QStringList networkPersonRow(const QVariantMap &row, int sequence, bool local = false)
 {
-    const QString personId = row.value(QStringLiteral("person_id")).toString();
-    const QJsonObject person = jsonObject(row.value(QStringLiteral("person_json")).toString());
+    const QString personId = row.value(local ? QStringLiteral("id")
+                                             : QStringLiteral("person_id")).toString();
+    QJsonObject person = jsonObject(row.value(QStringLiteral("person_json")).toString());
+    if (local) {
+        const QList<QPair<QString, QString>> fallbacks = {
+            {QStringLiteral("employeeNo"), QStringLiteral("employee_no")},
+            {QStringLiteral("department"), QStringLiteral("department")},
+            {QStringLiteral("position"), QStringLiteral("position")},
+            {QStringLiteral("phone"), QStringLiteral("phone")},
+            {QStringLiteral("idCard"), QStringLiteral("id_card")},
+            {QStringLiteral("personType"), QStringLiteral("person_type")},
+            {QStringLiteral("account"), QStringLiteral("account")},
+            {QStringLiteral("initialPassword"), QStringLiteral("initial_password")},
+            {QStringLiteral("groupName"), QStringLiteral("group_name")},
+            {QStringLiteral("accessTemplateName"), QStringLiteral("access_template_name")},
+            {QStringLiteral("ruleTemplateName"), QStringLiteral("rule_template_name")},
+            {QStringLiteral("enabledFeaturesText"), QStringLiteral("enabled_features_text")},
+            {QStringLiteral("controlTypeText"), QStringLiteral("control_type_text")},
+            {QStringLiteral("relayText"), QStringLiteral("relay_text")},
+            {QStringLiteral("remoteCallText"), QStringLiteral("remote_call_text")}
+        };
+        for (const auto &fallback : fallbacks) {
+            if (jsonText(person, fallback.first).trimmed().isEmpty()) {
+                const QString value = row.value(fallback.second).toString();
+                if (!value.isEmpty()) person.insert(fallback.first, value);
+            }
+        }
+    }
     const QList<QVariantMap> ruleRows = DbStore::query(
-                QStringLiteral("SELECT * FROM network_access_rule WHERE person_id=? LIMIT 1"),
+                QStringLiteral("SELECT * FROM %1 WHERE person_id=? LIMIT 1")
+                .arg(local ? QStringLiteral("local_access_rule")
+                           : QStringLiteral("network_access_rule")),
                 {personId});
     const QVariantMap ruleRow = ruleRows.value(0);
     const QJsonObject rules = jsonObject(ruleRow.value(QStringLiteral("raw_json")).toString());
     const QList<QVariantMap> usageRows = DbStore::query(
-                QStringLiteral("SELECT remaining_count,remaining_amount "
-                               "FROM network_access_usage "
-                               "WHERE person_id=? LIMIT 1"), {personId});
+                QStringLiteral("SELECT remaining_count,remaining_amount FROM %1 "
+                               "WHERE person_id=? LIMIT 1")
+                .arg(local ? QStringLiteral("local_access_usage")
+                           : QStringLiteral("network_access_usage")), {personId});
 
     const QString cards = joinedColumn(
-                QStringLiteral("SELECT card_id FROM network_ic_card "
-                               "WHERE person_id=? AND active=1 ORDER BY card_id"),
+                QStringLiteral("SELECT card_id FROM %1 WHERE person_id=? AND active=1 ORDER BY card_id")
+                .arg(local ? QStringLiteral("local_ic_card")
+                           : QStringLiteral("network_ic_card")),
                 {personId}, QStringLiteral("card_id"));
     const QString qrCodes = joinedColumn(
-                QStringLiteral("SELECT qr_unique FROM network_qr_code "
-                               "WHERE person_id=? AND active=1 ORDER BY qr_unique"),
+                QStringLiteral("SELECT qr_unique FROM %1 WHERE person_id=? AND active=1 ORDER BY qr_unique")
+                .arg(local ? QStringLiteral("local_qr_code")
+                           : QStringLiteral("network_qr_code")),
                 {personId}, QStringLiteral("qr_unique"));
 
     double countRemaining = 0;
@@ -368,7 +405,7 @@ QStringList networkPersonRow(const QVariantMap &row, int sequence)
             || jsonNumber(rules, QStringLiteral("countDataRemaining"), &countRemaining);
     const bool hasCountTotal = jsonNumber(rules, QStringLiteral("countDataTotal"), &countTotal)
             || mapNumber(ruleRow, QStringLiteral("count_total"), &countTotal);
-    const QString counts = hasCountRemaining || hasCountTotal
+    const QString counts = hasCountRemaining && hasCountTotal
             ? compactNumber(countRemaining) + QLatin1Char('/') + compactNumber(countTotal)
             : QString();
 
@@ -381,7 +418,7 @@ QStringList networkPersonRow(const QVariantMap &row, int sequence)
             || jsonNumber(rules, QStringLiteral("amountDataRemaining"), &amountRemaining);
     const bool hasAmountTotal = jsonNumber(rules, QStringLiteral("amountDataTotal"), &amountTotal)
             || mapNumber(ruleRow, QStringLiteral("amount_total"), &amountTotal);
-    const QString amounts = hasAmountRemaining || hasAmountTotal
+    const QString amounts = hasAmountRemaining && hasAmountTotal
             ? QStringLiteral("¥") + compactNumber(amountRemaining)
               + QStringLiteral("/¥") + compactNumber(amountTotal)
             : QString();
@@ -400,16 +437,17 @@ QStringList networkPersonRow(const QVariantMap &row, int sequence)
     QString durationEnd = jsonText(rules, QStringLiteral("durationDataEndTime"));
     if (durationStart.isEmpty()) durationStart = ruleRow.value(QStringLiteral("duration_start")).toString();
     if (durationEnd.isEmpty()) durationEnd = ruleRow.value(QStringLiteral("duration_end")).toString();
-    const QString duration = durationStart.isEmpty() && durationEnd.isEmpty()
-            ? QString() : durationStart + QStringLiteral(" ~ ") + durationEnd;
+    const QString duration = !durationStart.isEmpty() && !durationEnd.isEmpty()
+            ? durationStart + QStringLiteral(" ~ ") + durationEnd : QString();
 
     QString controlType = jsonText(person, QStringLiteral("controlTypeText"));
-    if (controlType.isEmpty() && (rules.value(QStringLiteral("controlElevator")).toBool()
-                                  || ruleRow.value(QStringLiteral("control_elevator")).toInt() != 0)) {
-        const int valueType = rules.contains(QStringLiteral("controlElevatorDataValueType"))
-                ? rules.value(QStringLiteral("controlElevatorDataValueType")).toInt()
-                : ruleRow.value(QStringLiteral("elevator_value_type")).toInt();
-        controlType = valueType == 1 ? QStringLiteral("直梯") : QStringLiteral("门禁");
+    double controlValueType = 0.0;
+    const bool hasControlValueType = jsonNumber(
+                rules, QStringLiteral("controlElevatorDataValueType"), &controlValueType)
+            || mapNumber(ruleRow, QStringLiteral("elevator_value_type"), &controlValueType);
+    if (controlType.isEmpty() && hasControlValueType) {
+        controlType = int(controlValueType) == 1
+                ? QStringLiteral("直梯") : QStringLiteral("门禁");
     }
     QString password = QStringLiteral("否");
     if (rules.value(QStringLiteral("cardPassword")).toBool()
@@ -418,11 +456,16 @@ QStringList networkPersonRow(const QVariantMap &row, int sequence)
     }
 
     const QList<QVariantMap> faceCountRows = DbStore::query(
-                QStringLiteral("SELECT COUNT(*) AS count FROM network_face WHERE person_id=?"),
+                local ? QStringLiteral("SELECT COUNT(*) AS count FROM face_feature WHERE person_id=?")
+                      : QStringLiteral("SELECT COUNT(*) AS count FROM network_face WHERE person_id=?"),
                 {personId});
     const bool hasFace = (!faceCountRows.isEmpty()
                           && faceCountRows.first().value(QStringLiteral("count")).toInt() > 0)
             || person.value(QStringLiteral("hasFace")).toBool();
+    QString faceFiles = faceFileList(personId, local);
+    if (local && faceFiles.isEmpty()) {
+        faceFiles = row.value(QStringLiteral("face_file_list")).toString();
+    }
 
     QString type = jsonText(person, QStringLiteral("personType"));
     if (type.isEmpty()) type = row.value(QStringLiteral("person_type")).toString();
@@ -447,14 +490,16 @@ QStringList networkPersonRow(const QVariantMap &row, int sequence)
             ? row.value(QStringLiteral("id_card")).toString()
             : jsonText(person, QStringLiteral("idCard")),
         dateText(row, person), personTypeText(type),
-        jsonText(person, QStringLiteral("account")),
+        jsonText(person, QStringLiteral("account")).isEmpty()
+            ? row.value(local ? QStringLiteral("person_no") : QStringLiteral("person_id")).toString()
+            : jsonText(person, QStringLiteral("account")),
         jsonText(person, QStringLiteral("initialPassword")),
         jsonText(person, QStringLiteral("groupName")),
         cards, qrCodes, hasFace ? QStringLiteral("是") : QStringLiteral("否"),
         jsonText(person, QStringLiteral("accessTemplateName")),
         jsonText(person, QStringLiteral("ruleTemplateName")),
-        floorText(personId), enabledFeatures(person, rules, ruleRow),
-        timingText(personId, rules), counts, amounts,
+        floorText(personId, local), enabledFeatures(person, rules, ruleRow),
+        timingText(personId, rules, local), counts, amounts,
         hasUnitPrice ? QStringLiteral("¥") + compactNumber(unitPrice) : QString(),
         duration,
         !jsonText(person, QStringLiteral("remoteCallText")).isEmpty()
@@ -464,7 +509,7 @@ QStringList networkPersonRow(const QVariantMap &row, int sequence)
         !jsonText(person, QStringLiteral("relayText")).isEmpty()
             ? jsonText(person, QStringLiteral("relayText"))
             : jsonText(rules, QStringLiteral("relayText")),
-        password, faceFileList(personId),
+        password, faceFiles,
         hasCountAdd ? compactNumber(countAdd) : QString(),
         hasAmountAdd ? compactNumber(amountAdd) : QString()
     };
@@ -498,27 +543,24 @@ ExportRows loadNetworkRows()
 ExportRows loadLocalRows()
 {
     ExportRows result;
+    LocalPersonnelStore localStore;
+    if (!localStore.initialize()) {
+        result.error = DbStore::lastError();
+        return result;
+    }
     const QList<QVariantMap> people = DbStore::query(
-                QStringLiteral("SELECT p.id,p.person_no,p.name,p.enabled,COUNT(f.id) AS face_count "
-                               "FROM person p LEFT JOIN face_feature f ON f.person_id=p.id "
-                               "WHERE COALESCE(p.deleted,0)=0 "
-                               "GROUP BY p.id,p.person_no,p.name,p.enabled ORDER BY p.id"));
+                QStringLiteral("SELECT * FROM person WHERE COALESCE(deleted,0)=0 ORDER BY id"));
     if (!DbStore::lastError().isEmpty()) {
         result.error = DbStore::lastError();
         return result;
     }
     int sequence = 1;
     for (const QVariantMap &person : people) {
-        QStringList row;
-        row.reserve(31);
-        for (int column = 0; column < 31; ++column) row.append(QString());
-        row[0] = QString::number(sequence++);
-        row[1] = person.value(QStringLiteral("name")).toString();
-        row[2] = person.value(QStringLiteral("person_no")).toString();
-        row[9] = person.value(QStringLiteral("person_no")).toString();
-        row[14] = person.value(QStringLiteral("face_count")).toInt() > 0
-                ? QStringLiteral("是") : QStringLiteral("否");
-        result.rows.append(row);
+        result.rows.append(networkPersonRow(person, sequence++, true));
+        if (!DbStore::lastError().isEmpty()) {
+            result.error = DbStore::lastError();
+            return result;
+        }
     }
     result.ok = true;
     return result;

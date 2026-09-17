@@ -38,33 +38,38 @@ public slots:
     void handlePresenceDetected();
     void handlePresenceLost();
     void handleRecognitionFinished();
+    void handleRecognitionVerified();
+    void handleRecognitionSucceeded();
     void handleRecognitionDisplayStarted();
     void handleFacePresenceChanged(bool present);
+    void handleCameraUnavailable(const QString &message);
     void reconcilePresenceLevel(bool valid, bool present);
     void handleAdminRequested();
+    void handleAdminSessionStarted();
     void handleAdminSessionFinished();
 
 signals:
     void stateChanged(ModeController::AppModeState state);
     void switchFailed(const QString &message);
-    /** @brief 结果保持结束且人体仍在时通知外壳恢复识别附属设备。 */
-    void recognitionResumed();
 
 private:
     void setState(AppModeState state);
-    void switchToMultimedia(const char *reason, bool waitForPresenceReset);
+    void leaveForegroundRecognition(const char *reason, bool cameraFailure);
 
     QStackedWidget *stack_ = nullptr;
     MultimediaModuleAdapter *multimediaModule_ = nullptr;
     FaceGateModuleAdapter *faceGateModule_ = nullptr;
-    QTimer *recognitionReturnTimer_ = nullptr;
+    QTimer *foregroundRecognitionTimer_ = nullptr;
+    int foregroundRecognitionMs_ = 20000;
     AppModeState state_ = AppModeState::SwitchingToMultimedia;
     bool started_ = false;
-    bool recognitionResultPending_ = false;
     bool waitForPresenceReset_ = false;
     bool presenceLevelValid_ = false;
     bool presencePresent_ = false;
     bool facePresent_ = false;
+    bool foregroundCameraUnavailable_ = false;
+    /** 前台20秒已到，但需等待当前PIR高电平结束后再恢复PIC。 */
+    bool foregroundExitPendingForPresenceLost_ = false;
 };
 
 #endif // MODECONTROLLER_H

@@ -74,6 +74,7 @@ SOURCES += \
     common/protocols/signalboard_decoder.cpp \
     common/protocols/signalboard_splitter.cpp \
     common/sql/dbstore.cpp \
+    common/sql/local_personnel_store.cpp \
     common/sql/network_personnel_store.cpp \
     common/workers/icboard_worker.cpp \
     common/workers/signalboard_worker.cpp \
@@ -111,6 +112,7 @@ SOURCES += \
     ic_board/ic_offline.cpp \
     ic_board/ic_offline_checker.cpp \
     ic_board/ic_offline_qr.cpp \
+    ic_board/local_access_service.cpp \
     ic_board/network_access_service.cpp \
     ic_board/rs485_floor_frame_builder.cpp \
     ic_board/ic_toast.cpp \
@@ -179,6 +181,7 @@ HEADERS += \
     common/protocols/signalboard_decoder.h \
     common/protocols/signalboard_splitter.h \
     common/sql/dbstore.h \
+    common/sql/local_personnel_store.h \
     common/sql/network_personnel_store.h \
     common/workers/icboard_worker.h \
     common/workers/signalboard_worker.h \
@@ -216,6 +219,7 @@ HEADERS += \
     ic_board/ic_offline.h \
     ic_board/ic_offline_checker.h \
     ic_board/ic_offline_qr.h \
+    ic_board/local_access_service.h \
     ic_board/network_access_service.h \
     ic_board/rs485_floor_frame_builder.h \
     ic_board/ic_toast.h \

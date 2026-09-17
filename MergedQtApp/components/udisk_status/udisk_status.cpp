@@ -180,6 +180,21 @@ void UdiskStatusOverlay::updateFromJson(const QByteArray &data)
     // 记录上一个状态（用于 idle/removed 的“别立刻压掉提示”）
     const QString prevState = m_lastState;
 
+    // 人员导入由人脸管理页自己的进度弹窗展示。udisk watcher 在这些状态
+    // 下只负责保留挂载点，避免全局U盘提示覆盖导入确认框或导入进度。
+    if (state == "person_ready" || state == "person_done") {
+        ++m_hideToken;
+        setVisible(false);
+        m_progress->setVisible(false);
+        m_progress->setValue(state == "person_done" ? 100 : 0);
+        m_lastState = state;
+        m_lastStatusMessage = msg;
+        m_lastProgress = progress;
+        m_seenInserted = true;
+        emit udiskStateChanged(state, m_progress->value());
+        return;
+    }
+
     // ========= 1) idle：隐藏（但刚 removed 时别立刻压掉 2~3s 提示） =========
     if (state == "idle") {
         if (prevState == "removed") {

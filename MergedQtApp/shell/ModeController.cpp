@@ -17,30 +17,32 @@ ModeController::ModeController(QStackedWidget *stack,
       multimediaModule_(multimediaModule),
       faceGateModule_(faceGateModule)
 {
-    recognitionReturnTimer_ = new QTimer(this);
-    recognitionReturnTimer_->setSingleShot(true);
-    recognitionReturnTimer_->setInterval(qMax(0, recognitionReturnDelayMs));
-    connect(recognitionReturnTimer_, &QTimer::timeout, this, [this]() {
-        recognitionResultPending_ = false;
+    foregroundRecognitionMs_ = qMax(1000, recognitionReturnDelayMs);
+    foregroundRecognitionTimer_ = new QTimer(this);
+    foregroundRecognitionTimer_->setSingleShot(true);
+    foregroundRecognitionTimer_->setInterval(foregroundRecognitionMs_);
+    connect(foregroundRecognitionTimer_, &QTimer::timeout, this, [this]() {
         if (!started_ || state_ != AppModeState::FaceGateActive) {
             return;
         }
+        if (foregroundCameraUnavailable_ || !faceGateModule_->isActive()) {
+            leaveForegroundRecognition(
+                        "20s foreground camera failure timeout expired", true);
+            return;
+        }
         if (!faceGateModule_->allowsPresenceSwitch()) {
-            qInfo() << "[MODE] recognition return suppressed by password/admin UI";
+            qInfo() << "[MODE] foreground timeout delayed by protected face operation";
+            foregroundRecognitionTimer_->start(500);
             return;
         }
-#ifdef FACEGATE_LEGACY_PAGE_MODE
         if (presenceLevelValid_ && presencePresent_) {
-            qInfo() << "[MODE] recognition result hold expired; presence remains high";
-            emit recognitionResumed();
+            foregroundExitPendingForPresenceLost_ = true;
+            qInfo() << "[MODE] foreground timeout expired while PIR remains high;"
+                       " keeping camera visible until PIR returns low";
             return;
         }
-        switchToMultimedia("recognition result timeout with no presence", false);
-#else
-        // 新模式必须回到播放列表，且在 SR505 先回低之前不重新触发，避免
-        // 200ms 电平校准在人体仍停留时立即再次打开摄像头。
-        switchToMultimedia("recognition result hold expired", true);
-#endif
+        leaveForegroundRecognition(
+                    "20s foreground recognition inactivity expired", false);
     });
 }
 
@@ -64,6 +66,8 @@ bool ModeController::start()
     }
 
     started_ = true;
+    foregroundRecognitionTimer_->stop();
+    foregroundExitPendingForPresenceLost_ = false;
     setState(AppModeState::MultimediaActive);
     qInfo() << "[MODE] initial multimedia mode active";
     return true;
@@ -75,12 +79,13 @@ void ModeController::shutdown()
         return;
     }
     setState(AppModeState::ShuttingDown);
-    recognitionReturnTimer_->stop();
-    recognitionResultPending_ = false;
+    foregroundRecognitionTimer_->stop();
     waitForPresenceReset_ = false;
     presenceLevelValid_ = false;
     presencePresent_ = false;
     facePresent_ = false;
+    foregroundCameraUnavailable_ = false;
+    foregroundExitPendingForPresenceLost_ = false;
     if (multimediaModule_) {
         multimediaModule_->deactivate();
     }
@@ -121,15 +126,16 @@ void ModeController::handlePresenceDetected()
     }
 
     qInfo() << "[MODE] switching multimedia -> facegate";
-    recognitionReturnTimer_->stop();
-    recognitionResultPending_ = false;
+    foregroundRecognitionTimer_->stop();
     facePresent_ = false;
+    foregroundCameraUnavailable_ = false;
+    foregroundExitPendingForPresenceLost_ = false;
     setState(AppModeState::SwitchingToFaceGate);
 #ifdef FACEGATE_LEGACY_PAGE_MODE
     multimediaModule_->deactivate();
     stack_->setCurrentWidget(faceGateModule_->rootWidget());
 #else
-    // 顺序不可反转：先让 GStreamer/MPP 和图片混播完整停止，再启动摄像头。
+    // 视频始终保持播放；这里只把 pictureRect 从 PIC 切换为摄像头预览。
     multimediaModule_->beginEmbeddedFaceRecognition();
 #endif
     faceGateModule_->activate();
@@ -143,83 +149,107 @@ void ModeController::handlePresenceDetected()
 #else
         multimediaModule_->endEmbeddedFaceRecognition();
 #endif
+        // 摄像头未连接时避免当前持续高电平每 200 ms 立即重复拉起失败链路。
+        waitForPresenceReset_ = presenceLevelValid_ && presencePresent_;
         setState(AppModeState::MultimediaActive);
+        foregroundCameraUnavailable_ = false;
         emit switchFailed(QStringLiteral("facegate activation failed; multimedia restored"));
         return;
     }
 
+    faceGateModule_->restartRecognition(QStringLiteral("正在识别"));
     setState(AppModeState::FaceGateActive);
-    qInfo() << "[MODE] facegate mode active";
+    foregroundRecognitionTimer_->start(foregroundRecognitionMs_);
+    qInfo() << "[MODE] facegate mode active; foreground inactivity timer started";
 }
 
 void ModeController::handlePresenceLost()
 {
     presenceLevelValid_ = true;
     presencePresent_ = false;
+    if (foregroundExitPendingForPresenceLost_
+            && state_ == AppModeState::FaceGateActive) {
+        foregroundExitPendingForPresenceLost_ = false;
+        leaveForegroundRecognition(
+                    "PIR returned low after foreground timeout", false);
+        return;
+    }
     if (waitForPresenceReset_ && state_ == AppModeState::MultimediaActive) {
         waitForPresenceReset_ = false;
         qInfo() << "[MODE] SR505 reset to low; next high level is armed";
         return;
     }
-    if (!started_ || state_ != AppModeState::FaceGateActive) {
+    if (!started_) {
         qInfo() << "[MODE] presenceLost ignored"
                 << "state=" << static_cast<int>(state_);
         return;
     }
-    if (recognitionResultPending_) {
-        qInfo() << "[MODE] presenceLost ignored while recognition result is held";
-        return;
-    }
-    if (facePresent_) {
-        qInfo() << "[MODE] presenceLost ignored while a face is detected";
-        return;
-    }
-    if (!faceGateModule_->allowsPresenceSwitch()) {
-        qInfo() << "[MODE] presenceLost ignored during password/admin UI";
-        return;
-    }
-
-    switchToMultimedia("SR505 low level", false);
+    // 前台 20 秒周期内，PIR 电平只记录状态，不触发页面切换或刷新计时。
+    qInfo() << "[MODE] presenceLost recorded without mode transition"
+            << "state=" << static_cast<int>(state_);
 }
 
 void ModeController::handleRecognitionFinished()
 {
-    if (!started_ || state_ != AppModeState::FaceGateActive ||
-        !faceGateModule_->allowsPresenceSwitch()) {
-        qInfo() << "[MODE] recognition result return ignored in protected/non-face state";
-        return;
-    }
+    // 4 秒窗口失败不刷新前台倒计时；识别通过由 handleRecognitionVerified() 刷新。
+}
 
-    recognitionResultPending_ = true;
-    recognitionReturnTimer_->start();
-    qInfo() << "[MODE] recognition result hold started"
-            << "durationMs=" << recognitionReturnTimer_->interval();
+/** @brief 只有 4 秒窗口内身份验证通过，才刷新前台 20 秒倒计时。 */
+void ModeController::handleRecognitionVerified()
+{
+    if (started_ && state_ == AppModeState::FaceGateActive
+            && !foregroundCameraUnavailable_) {
+        foregroundRecognitionTimer_->start(foregroundRecognitionMs_);
+        qInfo() << "[MODE] verified face refreshed foreground inactivity timer";
+    }
+}
+
+/** @brief 权限下发成功后，从该时刻重新计算完整的前台 20 秒周期。 */
+void ModeController::handleRecognitionSucceeded()
+{
+    if (started_ && state_ == AppModeState::FaceGateActive
+            && !foregroundCameraUnavailable_) {
+        foregroundRecognitionTimer_->start(foregroundRecognitionMs_);
+        qInfo() << "[MODE] successful access refreshed foreground cycle";
+    }
 }
 
 /** @brief 等待图片开始新一批显示时重新计算完整的结果保持时间。 */
 void ModeController::handleRecognitionDisplayStarted()
 {
 #ifndef FACEGATE_LEGACY_PAGE_MODE
-    if (!started_ || state_ != AppModeState::FaceGateActive) {
+    if (!started_ || state_ != AppModeState::FaceGateActive
+            || foregroundCameraUnavailable_) {
         return;
     }
-    recognitionResultPending_ = true;
-    recognitionReturnTimer_->start();
+    foregroundRecognitionTimer_->start(foregroundRecognitionMs_);
 #endif
 }
 
 void ModeController::handleFacePresenceChanged(bool present)
 {
     facePresent_ = present;
-    if (present || !started_ || state_ != AppModeState::FaceGateActive ||
-        recognitionResultPending_ || !presenceLevelValid_ || presencePresent_) {
-        return;
+    // 检测到新的人脸意味着新的 4 秒窗口即将开始，从此刻重新计算前台 20 秒。
+    if (present && started_ && state_ == AppModeState::FaceGateActive
+            && !foregroundCameraUnavailable_) {
+        foregroundRecognitionTimer_->start(foregroundRecognitionMs_);
+        qInfo() << "[MODE] face detection started a new recognition window;"
+                   " foreground inactivity timer refreshed";
     }
-    if (!faceGateModule_->allowsPresenceSwitch()) {
-        return;
-    }
+}
 
-    switchToMultimedia("no face while presence is low", false);
+/** @brief 摄像头运行中断后保证错误画面最多保持一个前台周期。 */
+void ModeController::handleCameraUnavailable(const QString &message)
+{
+    if (!started_ || state_ != AppModeState::FaceGateActive) {
+        return;
+    }
+    if (!foregroundCameraUnavailable_) {
+        foregroundCameraUnavailable_ = true;
+        foregroundRecognitionTimer_->start(foregroundRecognitionMs_);
+    }
+    qWarning().noquote() << "[MODE] foreground camera unavailable;"
+                           " forced recovery timer started:" << message;
 }
 
 void ModeController::reconcilePresenceLevel(bool valid, bool present)
@@ -227,6 +257,13 @@ void ModeController::reconcilePresenceLevel(bool valid, bool present)
     presenceLevelValid_ = valid;
     presencePresent_ = valid && present;
     if (!valid || !started_) {
+        return;
+    }
+    if (foregroundExitPendingForPresenceLost_
+            && state_ == AppModeState::FaceGateActive && !present) {
+        foregroundExitPendingForPresenceLost_ = false;
+        leaveForegroundRecognition(
+                    "PIR low level reconciled after foreground timeout", false);
         return;
     }
     if (waitForPresenceReset_) {
@@ -240,48 +277,38 @@ void ModeController::reconcilePresenceLevel(bool valid, bool present)
         if (multimediaModule_->allowsPresenceSwitch()) {
             handlePresenceDetected();
         }
-    } else if (state_ == AppModeState::FaceGateActive && !present) {
-        if (!recognitionResultPending_ && !facePresent_ &&
-            faceGateModule_->allowsPresenceSwitch()) {
-            handlePresenceLost();
-        }
     }
 }
 
-void ModeController::switchToMultimedia(const char *reason, bool waitForPresenceReset)
+/** @brief 前台超时后关闭摄像头和推理、恢复 PIC，并重新等待一次有效 PIR 触发。 */
+void ModeController::leaveForegroundRecognition(const char *reason,
+                                                bool cameraFailure)
 {
     if (!started_ || state_ != AppModeState::FaceGateActive) {
         return;
     }
 
-    qInfo() << "[MODE] switching facegate -> multimedia" << "reason=" << reason;
-    setState(AppModeState::SwitchingToMultimedia);
+    if (cameraFailure) {
+        qWarning() << "[MODE] leaving failed foreground camera"
+                   << "reason=" << reason;
+    } else {
+        qInfo() << "[MODE] foreground recognition finished"
+                << "reason=" << reason;
+    }
+    foregroundRecognitionTimer_->stop();
     faceGateModule_->deactivate();
 #ifdef FACEGATE_LEGACY_PAGE_MODE
     stack_->setCurrentWidget(multimediaModule_->rootWidget());
     multimediaModule_->activate();
-
-    if (!multimediaModule_->isActive()) {
-        qWarning() << "[MODE] multimedia activation failed; restoring facegate";
-        stack_->setCurrentWidget(faceGateModule_->rootWidget());
-        faceGateModule_->activate();
-        setState(faceGateModule_->isActive()
-                 ? AppModeState::FaceGateActive
-                 : AppModeState::SwitchingToMultimedia);
-        emit switchFailed(QStringLiteral("multimedia activation failed"));
-        return;
-    }
 #else
     stack_->setCurrentWidget(multimediaModule_->rootWidget());
     multimediaModule_->endEmbeddedFaceRecognition();
 #endif
-
-    recognitionReturnTimer_->stop();
-    recognitionResultPending_ = false;
     facePresent_ = false;
-    waitForPresenceReset_ = waitForPresenceReset;
+    foregroundCameraUnavailable_ = false;
+    foregroundExitPendingForPresenceLost_ = false;
+    waitForPresenceReset_ = presenceLevelValid_ && presencePresent_;
     setState(AppModeState::MultimediaActive);
-    qInfo() << "[MODE] multimedia mode active";
 }
 
 /** @brief 多媒体页长按后切到原 FaceGate 根窗口并打开原管理认证流程。 */
@@ -300,8 +327,8 @@ void ModeController::handleAdminRequested()
         return;
     }
 
-    recognitionReturnTimer_->stop();
-    recognitionResultPending_ = false;
+    foregroundRecognitionTimer_->stop();
+    foregroundExitPendingForPresenceLost_ = false;
     if (state_ == AppModeState::MultimediaActive) {
         multimediaModule_->beginEmbeddedFaceRecognition();
         faceGateModule_->activate();
@@ -318,6 +345,18 @@ void ModeController::handleAdminRequested()
 #endif
 }
 
+/** @brief 管理认证成功后暂停播放器；普通前台识别不经过此路径。 */
+void ModeController::handleAdminSessionStarted()
+{
+#ifndef FACEGATE_LEGACY_PAGE_MODE
+    if (!started_ || state_ != AppModeState::AdminActive) {
+        return;
+    }
+    multimediaModule_->deactivate();
+    qInfo() << "[MODE] face admin panel entered; multimedia playback stopped";
+#endif
+}
+
 /** @brief 管理登录取消或后台关闭后回到多媒体并等待人体传感器复位。 */
 void ModeController::handleAdminSessionFinished()
 {
@@ -328,8 +367,12 @@ void ModeController::handleAdminSessionFinished()
     faceGateModule_->deactivate();
     stack_->setCurrentWidget(multimediaModule_->rootWidget());
     multimediaModule_->endEmbeddedFaceRecognition();
-    recognitionResultPending_ = false;
+    // 密码成功进入后台时多媒体模块已经停用；重新激活会按原有约定
+    // 从本地播放列表第一项开始，并恢复仍然有效的 LIVE 探测目标。
+    multimediaModule_->activate();
+    foregroundRecognitionTimer_->stop();
     facePresent_ = false;
+    foregroundExitPendingForPresenceLost_ = false;
     waitForPresenceReset_ = presenceLevelValid_ && presencePresent_;
     setState(AppModeState::MultimediaActive);
 #endif

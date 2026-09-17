@@ -44,7 +44,7 @@ QToolTip {
 
 #navList::item {
     min-height: 42px;
-    padding: 6px 8px;
+    padding: 8px 10px;
     border-radius: 14px;
     margin: 3px 0px;
 }
@@ -62,7 +62,7 @@ QToolTip {
 
 #livenessSwitch, QCheckBox {
     color: #dce7f5;
-    font-size: 14px;
+    font-size: 15px;
     spacing: 8px;
 }
 
@@ -105,7 +105,7 @@ QCheckBox::indicator:checked {
 
 #pageHint {
     color: #a9b8cc;
-    font-size: 15px;
+    font-size: 16px;
 }
 
 #toolButton, #dialogPrimaryButton {
@@ -113,7 +113,7 @@ QCheckBox::indicator:checked {
     color: #ffffff;
     border: 1px solid #4c93ff;
     border-radius: 12px;
-    font-size: 14px;
+    font-size: 15px;
     font-weight: 750;
     padding: 7px 10px;
     min-height: 30px;
@@ -132,7 +132,7 @@ QCheckBox::indicator:checked {
     color: #ffffff;
     border: 1px solid #f17889;
     border-radius: 12px;
-    font-size: 14px;
+    font-size: 15px;
     font-weight: 750;
     padding: 7px 10px;
     min-height: 30px;
@@ -165,6 +165,7 @@ QTabBar::tab {
     border-top-right-radius: 13px;
     margin-right: 4px;
     min-width: 76px;
+    font-size: 15px;
 }
 
 QTabBar::tab:selected {
@@ -232,13 +233,20 @@ QGroupBox::title {
 
 #metricName {
     color: #a7b6ca;
-    font-size: 13px;
+    font-size: 15px;
     min-width: 90px;
+}
+
+#optionLabel {
+    color: #e3edf8;
+    background: transparent;
+    font-size: 15px;
+    font-weight: 650;
 }
 
 #metricValue {
     color: #f4f8ff;
-    font-size: 14px;
+    font-size: 15px;
     font-weight: 800;
 }
 
@@ -252,7 +260,7 @@ QGroupBox::title {
 #switchHint {
     color: #91a3ba;
     background: transparent;
-    font-size: 13px;
+    font-size: 14px;
 }
 
 QCheckBox#livenessSwitch {
@@ -275,7 +283,7 @@ QLineEdit, QDateTimeEdit, QComboBox {
     border: 1px solid #394b63;
     border-radius: 12px;
     padding: 6px 9px;
-    font-size: 14px;
+    font-size: 15px;
     selection-background-color: #2b7fff;
     min-height: 30px;
 }
@@ -343,7 +351,7 @@ QComboBox QAbstractItemView::item:selected {
 
 QRadioButton {
     color: #d8e4f2;
-    font-size: 14px;
+    font-size: 15px;
     padding: 5px 0px;
     spacing: 8px;
 }
@@ -374,7 +382,7 @@ QTableWidget, QTableView {
     border: 1px solid #30445f;
     border-radius: 14px;
     color: #eaf2fd;
-    font-size: 13px;
+    font-size: 14px;
     gridline-color: #26374d;
     outline: 0;
 }

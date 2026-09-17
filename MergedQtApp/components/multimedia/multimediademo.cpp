@@ -1129,41 +1129,30 @@ void MultimediaDemo::resumePlaybackAfterModuleSwitch()
     resumeLocalPlaylistFromStart();
 }
 
-/** @brief 先彻底停止多媒体资源，再以配置 videoRect 显示摄像头识别画面。 */
+/** @brief 保持视频持续播放，在配置 pictureRect 内用摄像头替换 PIC 轮播。 */
 void MultimediaDemo::beginEmbeddedFaceRecognition()
 {
     if (m_embeddedFaceRecognitionActive) {
         return;
     }
 
-    suspendPlaybackForModuleSwitch();
-    if (videoRectPictureTimer) {
-        videoRectPictureTimer->stop();
-    }
-    if (label_videoRectPicture) {
-        label_videoRectPicture->clear();
-        label_videoRectPicture->hide();
-    }
-    if (bufferIndicator) {
-        bufferIndicator->hide();
-    }
-
     m_embeddedFaceRecognitionActive = true;
-    const QRect videoRect(VideoDisplay_x, VideoDisplay_y,
-                          VideoDisplay_x_Size, VideoDisplay_y_Size);
+    m_embeddedFacePresent = false;
     const QRect pictureRect(PicDisplay_x, PicDisplay_y,
                             PicDisplay_x_Size, PicDisplay_y_Size);
-    if (videoRect == pictureRect && label_picture) {
-        if (pictureTimer && pictureTimer->isActive()) {
-            pictureTimer->stop();
-        }
-        label_picture->hide();
-        m_pictureSuppressedBySharedFaceRect = true;
+    clearRecognitionImages(false);
+    if (pictureTimer) {
+        pictureTimer->stop();
     }
+    if (label_picture) {
+        label_picture->hide();
+    }
+    m_picturePausedForFaceOverlay = true;
 
     if (m_facePreview) {
-        m_facePreview->setGeometry(videoRect);
+        m_facePreview->setGeometry(pictureRect);
         m_facePreview->clearFrame();
+        m_facePreview->setFaces(QVector<DetectedFace>());
         m_facePreview->setState(VerifyState::Idle);
         m_facePreview->setStateText(QStringLiteral("正在启动摄像头"));
         m_facePreview->setRecognitionGuideEnabled(true);
@@ -1171,37 +1160,25 @@ void MultimediaDemo::beginEmbeddedFaceRecognition()
         m_facePreview->raise();
         raiseMovingTextOverlay();
     }
-    LOG_VIDEO("多媒体播放器已完全停止，videoRect 已切换到人脸识别预览");
+    LOG_VIDEO("视频保持播放，pictureRect 已由 PIC 切换到人脸识别预览");
 }
 
-/** @brief 停止人脸展示并按约定从本地播放列表第一项重新开始。 */
+/** @brief 停止 pictureRect 内的人脸展示并恢复 PIC 轮播，视频保持原状态。 */
 void MultimediaDemo::endEmbeddedFaceRecognition()
 {
-    if (!m_embeddedFaceRecognitionActive && !m_modulePlaybackSuspended) {
+    if (!m_embeddedFaceRecognitionActive) {
         return;
     }
 
     m_embeddedFaceRecognitionActive = false;
+    m_embeddedFacePresent = false;
     if (m_facePreview) {
         m_facePreview->hide();
         m_facePreview->clearFrame();
         m_facePreview->setFaces(QVector<DetectedFace>());
     }
     clearRecognitionImages(true);
-    m_pictureSuppressedBySharedFaceRect = false;
-
-    // 新模式不恢复旧媒体位置；先从本地列表第一项开始。若业务仍期望
-    // LIVE，保留该目标并恢复后台探测，探测成功后仍按原逻辑切回直播。
-    m_modulePlaybackSuspended = false;
-    m_localPlaybackEnabled = m_startupPlaybackReleased && isVisible();
-    if (m_localPlaybackEnabled) {
-        resumeLocalPlaylistFromStart();
-        if (m_liveDesired && !m_desiredLiveUrl.trimmed().isEmpty()) {
-            startLiveRetry();
-            QTimer::singleShot(0, this, [this]() { onLiveRetryTimeout(); });
-        }
-    }
-    LOG_VIDEO("人脸识别预览已关闭，从本地播放列表第一项恢复");
+    LOG_VIDEO("pictureRect 人脸识别预览已关闭，PIC 轮播已恢复；视频保持播放");
 }
 
 void MultimediaDemo::setEmbeddedFaceFrame(const QImage &image)
@@ -1214,6 +1191,22 @@ void MultimediaDemo::setEmbeddedFaceFrame(const QImage &image)
 void MultimediaDemo::setEmbeddedFaceFaces(const QVector<DetectedFace> &faces)
 {
     if (m_embeddedFaceRecognitionActive && m_facePreview) {
+        const bool facePresent = !faces.isEmpty();
+        const bool newFaceArrival = facePresent && !m_embeddedFacePresent;
+        m_embeddedFacePresent = facePresent;
+        if (newFaceArrival && m_recognitionImageLabels.isEmpty()
+                && m_pendingRecognitionImages.isEmpty()) {
+            if (pictureTimer) {
+                pictureTimer->stop();
+            }
+            if (label_picture) {
+                label_picture->hide();
+            }
+            m_picturePausedForFaceOverlay = true;
+            m_facePreview->show();
+            m_facePreview->raise();
+            raiseMovingTextOverlay();
+        }
         QVector<DetectedFace> displayFaces = faces;
         if (!m_recognitionImageLabels.isEmpty()
                 || !m_pendingRecognitionImages.isEmpty()) {
@@ -1252,6 +1245,12 @@ void MultimediaDemo::setEmbeddedFaceUnavailable(const QString &message)
     }
 }
 
+/** @brief 复用主窗口已有覆盖提示层显示短时业务消息。 */
+void MultimediaDemo::showTransientStatus(const QString &message, int durationMs)
+{
+    emit statusMessageRequested(message, qMax(1, durationMs));
+}
+
 /** @brief 显示通过人员图；当前区域放不下时进入下一批等待队列。 */
 void MultimediaDemo::showRecognitionImage(const QImage &image,
                                            const QString &name,
@@ -1262,14 +1261,14 @@ void MultimediaDemo::showRecognitionImage(const QImage &image,
         return;
     }
 
-    if (!m_picturePausedForRecognitionResult) {
+    if (!m_picturePausedForFaceOverlay) {
         if (pictureTimer) {
             pictureTimer->stop();
         }
         if (label_picture) {
             label_picture->hide();
         }
-        m_picturePausedForRecognitionResult = true;
+        m_picturePausedForFaceOverlay = true;
     }
 
     if (m_facePreview) {
@@ -1346,14 +1345,6 @@ bool MultimediaDemo::canAppendRecognitionImage(const QImage &image) const
     if (m_recognitionImageLabels.isEmpty()) {
         return true;
     }
-    const QRect videoRect(VideoDisplay_x, VideoDisplay_y,
-                          VideoDisplay_x_Size, VideoDisplay_y_Size);
-    const QRect pictureRect(PicDisplay_x, PicDisplay_y,
-                            PicDisplay_x_Size, PicDisplay_y_Size);
-    if (videoRect == pictureRect) {
-        return false;
-    }
-
     constexpr int spacing = 12;
     int occupiedWidth = 0;
     for (QLabel *label : m_recognitionImageLabels) {
@@ -1386,14 +1377,6 @@ int MultimediaDemo::recognitionCardWidth(const QImage &image) const
     if (!m_recognitionResultHost || image.isNull()) {
         return 0;
     }
-    const QRect videoRect(VideoDisplay_x, VideoDisplay_y,
-                          VideoDisplay_x_Size, VideoDisplay_y_Size);
-    const QRect pictureRect(PicDisplay_x, PicDisplay_y,
-                            PicDisplay_x_Size, PicDisplay_y_Size);
-    if (videoRect == pictureRect && m_facePreview) {
-        return qMax(1, m_facePreview->recognitionGuideDisplayRect().width());
-    }
-
     const QRect guide = m_facePreview
             ? m_facePreview->recognitionGuideDisplayRect() : QRect();
     const qreal aspect = guide.isEmpty()
@@ -1417,7 +1400,7 @@ int MultimediaDemo::recognitionCardHeight() const
                   qMax(1, m_recognitionResultHost->height() - 4));
 }
 
-/** @brief 根据当前批次数量居中排列，卡片不因新增人员而继续缩窄。 */
+/** @brief 根据当前批次数量靠 pictureRect 最右侧排列，卡片不因新增人员而缩窄。 */
 void MultimediaDemo::layoutRecognitionImages()
 {
     if (!m_recognitionResultHost) {
@@ -1428,14 +1411,8 @@ void MultimediaDemo::layoutRecognitionImages()
         return;
     }
 
-    const QRect videoRect(VideoDisplay_x, VideoDisplay_y,
-                          VideoDisplay_x_Size, VideoDisplay_y_Size);
-    const QRect pictureRect(PicDisplay_x, PicDisplay_y,
-                            PicDisplay_x_Size, PicDisplay_y_Size);
-    const bool sharedRect = videoRect == pictureRect;
-    m_recognitionResultHost->setStyleSheet(sharedRect
-            ? QStringLiteral("#recognitionResultHost{background:#000000;}")
-            : QStringLiteral("#recognitionResultHost{background:transparent;}"));
+    m_recognitionResultHost->setStyleSheet(
+                QStringLiteral("#recognitionResultHost{background:transparent;}"));
 
     constexpr int spacing = 12;
     int totalWidth = 0;
@@ -1443,23 +1420,19 @@ void MultimediaDemo::layoutRecognitionImages()
         totalWidth += recognitionCardWidth(m_recognitionImages.value(label));
     }
     totalWidth += spacing * qMax(0, m_recognitionImageLabels.size() - 1);
-    int x = qMax(0, (m_recognitionResultHost->width() - totalWidth) / 2);
+    int x = qMax(0, m_recognitionResultHost->width() - totalWidth);
 
     for (QLabel *label : m_recognitionImageLabels) {
         if (!label) {
             continue;
         }
         const QImage source = m_recognitionImages.value(label);
-        QRect slot;
-        if (sharedRect && m_facePreview) {
-            slot = m_facePreview->recognitionGuideDisplayRect();
-        } else {
-            const int cardWidth = recognitionCardWidth(source);
-            const int cardHeight = recognitionCardHeight();
-            slot = QRect(x, (m_recognitionResultHost->height() - cardHeight) / 2,
+        const int cardWidth = recognitionCardWidth(source);
+        const int cardHeight = recognitionCardHeight();
+        const QRect slot(x,
+                         (m_recognitionResultHost->height() - cardHeight) / 2,
                          cardWidth, cardHeight);
-            x += cardWidth + spacing;
-        }
+        x += cardWidth + spacing;
         label->setGeometry(slot);
         label->setPixmap(renderRecognitionCard(
                              source, m_recognitionNames.value(label), slot.size()));
@@ -1532,15 +1505,14 @@ void MultimediaDemo::clearRecognitionImages(bool restorePicturePlayback)
 
 void MultimediaDemo::restorePictureAfterRecognitionResult()
 {
-    if (!m_picturePausedForRecognitionResult
-            && !m_pictureSuppressedBySharedFaceRect) {
+    if (!m_picturePausedForFaceOverlay) {
         return;
     }
-    if (m_embeddedFaceRecognitionActive && m_pictureSuppressedBySharedFaceRect) {
-        return;
+    if (m_facePreview) {
+        m_facePreview->hide();
     }
 
-    m_picturePausedForRecognitionResult = false;
+    m_picturePausedForFaceOverlay = false;
     if (!PicDisplay_en || !label_picture || picturePixmapCache.isEmpty()) {
         return;
     }
@@ -2592,6 +2564,7 @@ MultimediaDemo::~MultimediaDemo()
     delete nextVideoPlayer;
     delete timer;
     delete date_timer;
+    delete m_elevatorDemoTimer;
     delete pictureTimer;
     delete mediaPlayer;
     delete m_liveProbePlayer;
@@ -2937,7 +2910,7 @@ void MultimediaDemo::readConfigurationFromFile()
     QSettings settings(configPath, QSettings::IniFormat);
     LOG_DEBUG("实际使用的配置文件路径: " << configPath);
 
-    // 读取运行模式。正常运行时不启动空调演示定时器。
+    // 读取运行模式。0 为正常串口显示，1 为电梯及空调演示显示。
     settings.beginGroup("DisplayDirRect");
     RunMode = settings.value("RunMode", false).toBool();
     settings.endGroup();
@@ -3167,9 +3140,6 @@ void MultimediaDemo::readConfigurationFromFile()
         if (label_videoRectPicture) {
             label_videoRectPicture->setGeometry(configuredVideoRect);
         }
-        if (m_facePreview) {
-            m_facePreview->setGeometry(configuredVideoRect);
-        }
         if (mediaPlayer) {
             mediaPlayer->setDisplayRect(configuredVideoRect);
         }
@@ -3178,12 +3148,20 @@ void MultimediaDemo::readConfigurationFromFile()
         LOG_CONFIG("警告: videoRect区域无效，继续使用默认区域:" << configuredVideoRect);
     }
 
-    if (m_recognitionResultHost) {
-        const QRect configuredPictureRect(PicDisplay_x, PicDisplay_y,
-                                          PicDisplay_x_Size, PicDisplay_y_Size);
-        m_recognitionResultHost->setGeometry(
-                    configuredPictureRect == configuredVideoRect
-                    ? configuredVideoRect : configuredPictureRect);
+    const QRect configuredPictureRect(PicDisplay_x, PicDisplay_y,
+                                      PicDisplay_x_Size, PicDisplay_y_Size);
+    if (configuredPictureRect.width() > 0
+            && configuredPictureRect.height() > 0) {
+        if (m_facePreview) {
+            m_facePreview->setGeometry(configuredPictureRect);
+        }
+        if (m_recognitionResultHost) {
+            m_recognitionResultHost->setGeometry(configuredPictureRect);
+        }
+        LOG_CONFIG("人脸预览及结果区域已应用 pictureRect:"
+                   << configuredPictureRect);
+    } else {
+        LOG_CONFIG("警告: pictureRect区域无效:" << configuredPictureRect);
     }
 
     // 读取空调配置
@@ -3722,6 +3700,18 @@ void MultimediaDemo::initializeTimers()
     timer->start();
     LOG_INIT("信号板UI兜底定时器已启动，间隔: 300ms");
 
+    // 演示数据只在 RunMode=1 时生成。串口客户端仍照常运行和保存最新帧，
+    // 这里只切换 UI 采用的数据源，不停止或改动串口接收链路。
+    if (RunMode) {
+        m_elevatorDemoTimer = new QTimer(this);
+        m_elevatorDemoTimer->setTimerType(Qt::CoarseTimer);
+        m_elevatorDemoTimer->setInterval(1000);
+        connect(m_elevatorDemoTimer, &QTimer::timeout,
+                this, &MultimediaDemo::onElevatorDemoTimeout);
+        m_elevatorDemoTimer->start();
+        LOG_INIT("电梯运行演示定时器已启动，楼层范围 -8～32，间隔: 1000ms");
+    }
+
 #ifndef FACEGATE_LEGACY_PAGE_MODE
     m_adminLongPressTimer = new QTimer(this);
     m_adminLongPressTimer->setSingleShot(true);
@@ -3777,7 +3767,7 @@ void MultimediaDemo::initializeTimers()
     LOG_INIT("定时器初始化完成");
 }
 
-/** @brief 演示模式下生成一帧模拟信号板数据。 */
+/** @brief 初始化信号板接收缓冲及电梯演示状态。 */
 void MultimediaDemo::simulateBufferData()
 {
     LOG_BUFFER("开始初始化数据缓冲区");
@@ -3789,8 +3779,38 @@ void MultimediaDemo::simulateBufferData()
 
     // 程序刚启动，还没有收到信号板完整帧。
     m_signalBoardFrameReceived = false;
+    m_demoFloor = -8;
+    m_demoDirection = UP;
 
     LOG_BUFFER("数据缓冲区初始化完成，所有值设置为0");
+}
+
+/** @brief 在 -8～32 层之间往返运行，并同步刷新上下方向箭头。 */
+void MultimediaDemo::onElevatorDemoTimeout()
+{
+    if (!RunMode) {
+        return;
+    }
+
+    constexpr int minimumFloor = -8;
+    constexpr int maximumFloor = 32;
+    if (m_demoDirection == UP) {
+        if (m_demoFloor < maximumFloor) {
+            ++m_demoFloor;
+        } else {
+            m_demoDirection = DN;
+            --m_demoFloor;
+        }
+    } else {
+        if (m_demoFloor > minimumFloor) {
+            --m_demoFloor;
+        } else {
+            m_demoDirection = UP;
+            ++m_demoFloor;
+        }
+    }
+
+    onTimeout();
 }
 
 
@@ -3803,12 +3823,28 @@ void MultimediaDemo::onTimeout()
         return;
     }
 
+    // 演示模式只替换显示数据源。真实串口帧仍由 onSignalBoardState()
+    // 完整接收并保存，因此 RunMode=0 的正常路径不受影响。
+    const bool displayFrameReady = RunMode || m_signalBoardFrameReceived;
+    const int displayDirectionAscii = RunMode
+            ? (m_demoDirection == UP ? 0x31 : 0x33)
+            : my_buf[1];
+    const int displayModeAscii = RunMode ? 0 : my_buf[2];
+    const int demoFloorMagnitude = qAbs(m_demoFloor);
+    const int displayFloorTen = RunMode ? demoFloorMagnitude / 10 : my_buf[3];
+    const int displayFloorOne = RunMode ? demoFloorMagnitude % 10 : my_buf[4];
+    const bool displayFloorBlank = RunMode ? false : m_floorBlank;
+    const char displayFloorPrefix = RunMode
+            ? (m_demoFloor < 0 ? '-' : 0)
+            : m_floorPrefix;
+    const char displayFloorLetter = RunMode ? 0 : m_floorLetter;
+
     // 1) 方向显示：仅在方向实际变化时更新。
-    if (Diretion_en && m_signalBoardFrameReceived) {
+    if (Diretion_en && displayFrameReady) {
         DirectionStatus targetDirection = LE;
-        if (my_buf[1] == 0x31) {
+        if (displayDirectionAscii == 0x31) {
             targetDirection = UP;
-        } else if (my_buf[1] == 0x33) {
+        } else if (displayDirectionAscii == 0x33) {
             targetDirection = DN;
         }
 
@@ -3846,42 +3882,45 @@ void MultimediaDemo::onTimeout()
 
     // 2) 楼层显示：生成稳定键值，只在楼层内容变化时重绘。
     QString floorKey;
-    if (!m_signalBoardFrameReceived) {
+    if (!displayFrameReady) {
         floorKey = QStringLiteral("NO_FRAME");
-    } else if (m_floorBlank) {
+    } else if (displayFloorBlank) {
         floorKey = QStringLiteral("BLANK");
-    } else if (isFloorUpperLetterAscii(m_floorLetter)) {
-        floorKey = QStringLiteral("LETTER:%1").arg(QChar(m_floorLetter));
-    } else if (m_floorPrefix == 'B' || m_floorPrefix == '-') {
+    } else if (isFloorUpperLetterAscii(displayFloorLetter)) {
+        floorKey = QStringLiteral("LETTER:%1").arg(QChar(displayFloorLetter));
+    } else if (displayFloorPrefix == 'B' || displayFloorPrefix == '-') {
         floorKey = QStringLiteral("PREFIX:%1:%2")
-                .arg(QChar(m_floorPrefix))
-                .arg(my_buf[4]);
+                .arg(QChar(displayFloorPrefix))
+                .arg(displayFloorOne);
     } else {
-        floorKey = QStringLiteral("NUMBER:%1:%2").arg(my_buf[3]).arg(my_buf[4]);
+        floorKey = QStringLiteral("NUMBER:%1:%2")
+                .arg(displayFloorTen).arg(displayFloorOne);
     }
 
     if (floorKey != m_lastRenderedFloorKey) {
         m_lastRenderedFloorKey = floorKey;
 
         // 使用局部函数处理楼层。内部 return 只结束楼层绘制，不能跳过状态刷新。
-        [this]() {
-            if (!m_signalBoardFrameReceived || m_floorBlank) {
+        [this, displayFrameReady, displayFloorBlank, displayFloorTen,
+         displayFloorOne, displayFloorPrefix, displayFloorLetter]() {
+            if (!displayFrameReady || displayFloorBlank) {
                 label_ten->hide();
                 label_one->hide();
                 return;
             }
 
-            const int ten = my_buf[3];
-            const int one = my_buf[4];
+            const int ten = displayFloorTen;
+            const int one = displayFloorOne;
             const int floorValue = ten * 10 + one;
-            const bool isNegativeFloor = (m_floorPrefix == 'B' || m_floorPrefix == '-');
-            const bool isLetterFloor = isFloorUpperLetterAscii(m_floorLetter);
+            const bool isNegativeFloor = (displayFloorPrefix == 'B'
+                                          || displayFloorPrefix == '-');
+            const bool isLetterFloor = isFloorUpperLetterAscii(displayFloorLetter);
 
             if (DisPlayPicOrText == 0) {
                 // 单字母楼层 A-Z
                 if (isLetterFloor) {
                     const QString letterPath = QString(":/static/demoResources/images/tl/%1.png")
-                            .arg(QChar(m_floorLetter));
+                            .arg(QChar(displayFloorLetter));
                     const QPixmap pxLetter = cachedSignalUiPixmap(letterPath);
                     label_ten->hide();
 
@@ -3891,7 +3930,7 @@ void MultimediaDemo::onTimeout()
                                   First_Floor_x, First_Floor_y,
                                   First_Floor_x_Size, First_Floor_y_Size);
                     } else {
-                        displaySingleLetterFloorAsText(m_floorLetter);
+                        displaySingleLetterFloorAsText(displayFloorLetter);
                     }
                     return;
                 }
@@ -3904,7 +3943,7 @@ void MultimediaDemo::onTimeout()
                 // 负楼层 / 地下楼层
                 if (isNegativeFloor) {
                     const QString prefixPath = QString(":/static/demoResources/images/tl/%1.png")
-                            .arg(QChar(m_floorPrefix));
+                            .arg(QChar(displayFloorPrefix));
                     const QString onePath = QString(":/static/demoResources/images/tl/%1.png").arg(one);
                     const QPixmap pxPrefix = cachedSignalUiPixmap(prefixPath);
                     const QPixmap pxOne = cachedSignalUiPixmap(onePath);
@@ -3917,7 +3956,7 @@ void MultimediaDemo::onTimeout()
                                   First_FloorS_x, First_FloorS_y,
                                   First_Floor_x_Size, First_Floor_y_Size);
                     } else {
-                        displayPrefixedFloorAsText(m_floorPrefix, one);
+                        displayPrefixedFloorAsText(displayFloorPrefix, one);
                     }
                     return;
                 }
@@ -3955,9 +3994,9 @@ void MultimediaDemo::onTimeout()
                 }
             } else {
                 if (isLetterFloor) {
-                    displaySingleLetterFloorAsText(m_floorLetter);
+                    displaySingleLetterFloorAsText(displayFloorLetter);
                 } else if (isNegativeFloor) {
-                    displayPrefixedFloorAsText(m_floorPrefix, one);
+                    displayPrefixedFloorAsText(displayFloorPrefix, one);
                 } else {
                     displayFloorAsText(floorValue, ten, one);
                 }
@@ -3967,14 +4006,14 @@ void MultimediaDemo::onTimeout()
 
     // 3) 状态显示：先确定目标状态，再判断是否需要更新，避免持续状态反复显隐。
     StateStatus targetState = NORMAL;
-    if (m_signalBoardFrameReceived) {
-        if (my_buf[2] == 0x31 && Flag1_en) {
+    if (displayFrameReady) {
+        if (displayModeAscii == 0x31 && Flag1_en) {
             targetState = FULL;
-        } else if (my_buf[2] == 0x32 && Flag1_en) {
+        } else if (displayModeAscii == 0x32 && Flag1_en) {
             targetState = Overload;
-        } else if (my_buf[2] == 0x33 && Flag2_en) {
+        } else if (displayModeAscii == 0x33 && Flag2_en) {
             targetState = FIRE;
-        } else if (my_buf[2] == 0x34 && Flag2_en) {
+        } else if (displayModeAscii == 0x34 && Flag2_en) {
             targetState = REPAIR;
         }
     }
@@ -5560,8 +5599,9 @@ void MultimediaDemo::onSignalBoardState(const SignalBoardState& st)
         m_floorBlank = true;
     }
 
-    // 完整帧一到立即更新；内部变化检测会过滤重复帧。
-    if (m_signalUiReady) {
+    // 正常模式完整帧一到立即更新。演示模式仍接收并保存串口帧，
+    // 但显示只由独立的 1 秒演示定时器推进。
+    if (m_signalUiReady && !RunMode) {
         onTimeout();
     }
 }

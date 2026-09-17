@@ -17,6 +17,7 @@
 #include "MaintenanceWorker.h"
 #include "PersonExportWorker.h"
 #include "PersonImportWorker.h"
+#include "UsbPersonImportSource.h"
 #include "SnapshotService.h"
 #include "SharedVirtualKeyboard.h"
 #include "common/face_image_sync_bridge.h"
@@ -258,13 +259,19 @@ bool FaceGateMainWindow::isModuleActive() const
 bool FaceGateMainWindow::allowsPresenceSwitch() const
 {
     if (!moduleActive_ || adminLoginActive_ || adminModeActive_ ||
-        passwordAccessActive_ ||
+        passwordAccessActive_ || faceAccessPending_ ||
         (adminPanel_ && adminPanel_->isVisible())) {
         return false;
     }
 
     QWidget *modal = QApplication::activeModalWidget();
     return !modal || (modal != this && !isAncestorOf(modal));
+}
+
+/** @brief 由外壳在阶段切换后显式开始新的识别窗口。 */
+void FaceGateMainWindow::restartRecognition(const QString &message)
+{
+    resetFaceVerification(message);
 }
 
 /** @brief 创建预览和右侧综合信息面板。 */
@@ -816,7 +823,8 @@ void FaceGateMainWindow::startServices()
         }
 
         preview_->setFrame(frame.image);
-        if (!moduleActive_ || !faceInferenceWorker_ || faceFramePending_) {
+        if (!moduleActive_ || !faceInferenceWorker_ || faceFramePending_
+                || faceAccessPending_ || passwordAccessActive_) {
             return;
         }
         faceFramePending_ = true;
@@ -941,16 +949,23 @@ void FaceGateMainWindow::startServices()
             if (!moduleActive_ || adminModeActive_ || passwordAccessActive_) {
                 return;
             }
-            if (config_.sameFaceSuppressMs > 0 &&
-                lastPassedTimer_.isValid() &&
-                lastPassedTimer_.elapsed() < config_.sameFaceSuppressMs &&
-                ((log.personId > 0 && log.personId == lastPassedPersonId_) ||
-                 (!log.personNo.isEmpty() && log.personNo == lastPassedPersonNo_))) {
-                qInfo().noquote() << "同人重复通行已抑制：" << log.personNo;
-                recognitionLabel_->setText("已通过，请勿重复刷脸");
-                preview_->setStateText("已通过，请勿重复刷脸");
+            emit recognitionVerified();
+            const int duplicateSeconds = duplicateRemainingSeconds(log);
+            if (duplicateSeconds > 0) {
+                const QString duplicateText = QStringLiteral(
+                            "请勿重复刷脸，%1秒后再试").arg(duplicateSeconds);
+                qInfo().noquote() << "同人重复通行已抑制："
+                                  << log.personNo << duplicateSeconds;
+                recognitionLabel_->setText(duplicateText);
+                preview_->setState(VerifyState::Cooldown);
+                preview_->setStateText(duplicateText);
+                emit previewStateChanged(VerifyState::Cooldown, duplicateText);
+                emit duplicateRecognitionSuppressed(duplicateText);
+                // 重复人员虽然不再下发权限，仍属于一次已完成的识别活动。
+                emit recognitionFinished();
                 return;
             }
+
             if (faceAccessPending_) {
                 recognitionLabel_->setText(QStringLiteral("正在识别"));
                 preview_->setStateText(QStringLiteral("正在识别"));
@@ -979,9 +994,11 @@ void FaceGateMainWindow::startServices()
             if (enriched.snapshotPath.isEmpty() && !snapshotError.isEmpty()) {
                 qWarning().noquote() << snapshotError;
             }
-            IcEventBridge::instance()->emitFaceUploadRequested(
-                        enriched.personNo, enriched.faceHash,
-                        enriched.snapshotPath, true);
+            if (enriched.personId <= 0) {
+                IcEventBridge::instance()->emitFaceUploadRequested(
+                            enriched.personNo, enriched.faceHash,
+                            enriched.snapshotPath, true);
+            }
 
             faceAccessPending_ = true;
             pendingFaceAccessLog_ = enriched;
@@ -1003,6 +1020,10 @@ void FaceGateMainWindow::startServices()
     connect(faceInferenceWorker_, &FaceInferenceWorker::verificationFailed, this,
         [this](const VerifyLog &log) {
             if (!moduleActive_ || adminModeActive_ || passwordAccessActive_) {
+                return;
+            }
+            if (faceAccessPending_) {
+                qInfo().noquote() << "权限校验期间忽略迟到的人脸识别失败";
                 return;
             }
             VerifyLog enriched = log;
@@ -1073,6 +1094,10 @@ void FaceGateMainWindow::startServices()
         });
 
     connect(IcEventBridge::instance(), &IcEventBridge::faceAccessFinished,
+            this, &FaceGateMainWindow::faceAccessUiFinished, Qt::QueuedConnection);
+    connect(IcEventBridge::instance(), &IcEventBridge::localFaceAccessFinished,
+            this, &FaceGateMainWindow::faceAccessUiFinished, Qt::QueuedConnection);
+    connect(this, &FaceGateMainWindow::faceAccessUiFinished,
             this,
             [this](const QString &personId, const QString &faceHash,
                    const QString &floors,
@@ -1115,9 +1140,7 @@ void FaceGateMainWindow::startServices()
         }
         if (success) {
             if (matchesPending) {
-                lastPassedPersonId_ = completedLog.personId;
-                lastPassedPersonNo_ = completedLog.personNo;
-                lastPassedTimer_.restart();
+                rememberSuccessfulAccess(completedLog);
                 audio_.playPrompt(AudioService::Prompt::VerifyPassed);
                 const QString successText = config_.privacyMode
                         ? QStringLiteral("验证通过  已授权人员")
@@ -1196,6 +1219,10 @@ void FaceGateMainWindow::startServices()
     }, Qt::QueuedConnection);
 
     connect(IcEventBridge::instance(), &IcEventBridge::passwordAccessFinished,
+            this, &FaceGateMainWindow::passwordAccessUiFinished, Qt::QueuedConnection);
+    connect(IcEventBridge::instance(), &IcEventBridge::localPasswordAccessFinished,
+            this, &FaceGateMainWindow::passwordAccessUiFinished, Qt::QueuedConnection);
+    connect(this, &FaceGateMainWindow::passwordAccessUiFinished,
             this,
             [this](const QString &personId, const QString &floors,
                    const QByteArray &rs485Frame, bool success,
@@ -1232,9 +1259,7 @@ void FaceGateMainWindow::startServices()
 
         if (moduleActive_ && !adminModeActive_) {
             if (success) {
-                lastPassedPersonId_ = completedLog.personId;
-                lastPassedPersonNo_ = completedLog.personNo;
-                lastPassedTimer_.restart();
+                rememberSuccessfulAccess(completedLog);
                 audio_.playPrompt(AudioService::Prompt::VerifyPassed);
                 const QString displayName = completedLog.nameSnapshot.isEmpty()
                         ? QStringLiteral("已授权人员") : completedLog.nameSnapshot;
@@ -1331,6 +1356,51 @@ void FaceGateMainWindow::resetFaceVerification(const QString &message)
         "resetVerification",
         Qt::QueuedConnection,
         Q_ARG(QString, message));
+}
+
+/** @return 优先使用业务人员编号，缺失时回退本地主键。 */
+QString FaceGateMainWindow::accessPersonKey(const VerifyLog &log) const
+{
+    const QString personNo = log.personNo.trimmed();
+    if (!personNo.isEmpty()) {
+        return QStringLiteral("no:%1").arg(personNo);
+    }
+    if (log.personId > 0) {
+        return QStringLiteral("id:%1").arg(log.personId);
+    }
+    return QString();
+}
+
+/** @return 已授权人员的重复刷脸限制剩余秒数。 */
+int FaceGateMainWindow::duplicateRemainingSeconds(const VerifyLog &log) const
+{
+    const QString key = accessPersonKey(log);
+    if (key.isEmpty() || config_.sameFaceSuppressMs <= 0) {
+        return 0;
+    }
+    const qint64 passedAtMs = successfulAccessMs_.value(key, 0);
+    if (passedAtMs <= 0) {
+        return 0;
+    }
+    const qint64 elapsedMs = QDateTime::currentMSecsSinceEpoch() - passedAtMs;
+    const qint64 remainingMs = static_cast<qint64>(config_.sameFaceSuppressMs)
+            - elapsedMs;
+    if (remainingMs <= 0) {
+        return 0;
+    }
+    return static_cast<int>((remainingMs + 999) / 1000);
+}
+
+/** @brief 权限成功下发后才开始同一人员的重复刷脸限制。 */
+void FaceGateMainWindow::rememberSuccessfulAccess(const VerifyLog &log)
+{
+    if (log.eventType != QStringLiteral("face_verify")) {
+        return;
+    }
+    const QString key = accessPersonKey(log);
+    if (!key.isEmpty()) {
+        successfulAccessMs_.insert(key, QDateTime::currentMSecsSinceEpoch());
+    }
 }
 
 /**
@@ -1507,6 +1577,14 @@ void FaceGateMainWindow::requestOpenAdminManagement()
 
     if (config_.adminLoginRequired) {
         adminLoginActive_ = true;
+#ifndef FACEGATE_LEGACY_PAGE_MODE
+        // 登录覆盖层显示期间彻底隐藏人脸主页，避免摄像头预览或右侧信息栏
+        // 通过子控件合成空隙出现在密码窗口底层。默认模式退出后由外壳直接
+        // 返回多媒体，因此此处不再恢复已经废弃的人脸整页主页。
+        if (centralWidget()) {
+            centralWidget()->hide();
+        }
+#endif
         int loginResult = QDialog::Rejected;
         {
             // 登录框只包含 QWidget 输入控件；QML InputPanel 由人脸根窗口
@@ -1527,6 +1605,9 @@ void FaceGateMainWindow::requestOpenAdminManagement()
         writeOperatorAudit("管理员登录", "admin", config_.adminUsername,
                            "成功", "进入管理后台");
     }
+    // 只有认证成功（或配置为免登录）后才通知外壳停止多媒体播放器。
+    // 先停播放器再构建并显示管理面板，避免后台初始化期间仍有视频声音。
+    emit adminSessionStarted();
     openAdminPanel();
 }
 
@@ -1636,6 +1717,8 @@ void FaceGateMainWindow::handleAdminPasswordChange(const QString &oldPassword, c
     writeOperatorAudit("修改管理员密码", "admin", config_.adminUsername, saved ? "成功" : "失败", message);
     if (adminPanel_) {
         adminPanel_->setStatusText(message);
+        adminPanel_->showActionToast(saved ? QStringLiteral("密码修改成功")
+                                           : QStringLiteral("密码保存失败"), saved);
     }
     if (!saved) {
         AppMessageDialog::warning(this, "管理员密码修改", message);
@@ -1711,6 +1794,11 @@ void FaceGateMainWindow::openAdminPanel()
     }
 
     qInfo().noquote() << "正在全屏打开管理员面板";
+#ifndef FACEGATE_LEGACY_PAGE_MODE
+    if (centralWidget()) {
+        centralWidget()->hide();
+    }
+#endif
     adminModeActive_ = true;
     adminLivenessPending_ = false;
     adminLivenessLastFrame_ = -1000000;
@@ -1938,35 +2026,80 @@ void FaceGateMainWindow::refreshAdminPassedLogs(const VerifyLogFilter &requested
     }
 }
 
-/** @brief 启动U盘复制、Excel解析和网络人员数据库更新后台任务。 */
-void FaceGateMainWindow::handlePeopleImport()
+/** @brief 启动U盘复制、Excel解析、本地人员和人脸图片导入任务。 */
+void FaceGateMainWindow::handlePeopleImport(const QString &requestToken)
 {
     if (personExportThread_ && personExportThread_->isRunning()) {
-        AppMessageDialog::information(this, QStringLiteral("导入网络人员"),
+        UsbPersonImportSource::endImportRequest(requestToken);
+        AppMessageDialog::information(this, QStringLiteral("导入本地人员"),
                                       QStringLiteral("人员表正在导出，请等待导出结束"));
         return;
     }
     if (personImportThread_ && personImportThread_->isRunning()) {
-        AppMessageDialog::information(this, QStringLiteral("导入网络人员"),
+        UsbPersonImportSource::endImportRequest(requestToken);
+        AppMessageDialog::information(this, QStringLiteral("导入本地人员"),
                                       QStringLiteral("人员表正在导入，请勿重复操作"));
         return;
     }
-    writeOperatorAudit(QStringLiteral("导入网络人员Excel"), QStringLiteral("network_person"),
+    writeOperatorAudit(QStringLiteral("导入本地人员Excel"), QStringLiteral("person"),
                        QStringLiteral("batch"), QStringLiteral("请求"),
                        QStringLiteral("等待U盘人员表"));
     if (adminPanel_) {
-        adminPanel_->setPersonImportBusy(true, QStringLiteral("正在检测U盘…"));
+        adminPanel_->setPersonImportBusy(true, 0);
     }
 
     personImportThread_ = new QThread(this);
-    personImportWorker_ = new PersonImportWorker();
+    personImportWorker_ = new PersonImportWorker(requestToken);
     PersonImportWorker *worker = personImportWorker_;
     QThread *thread = personImportThread_;
     worker->moveToThread(thread);
     connect(thread, &QThread::started, worker, &PersonImportWorker::run);
-    connect(worker, &PersonImportWorker::progress, this, [this](const QString &message) {
-        if (adminPanel_) adminPanel_->setPersonImportBusy(true, message);
+    connect(worker, &PersonImportWorker::progress, this, [this](int percent, const QString &) {
+        if (adminPanel_) adminPanel_->setPersonImportBusy(true, percent);
     });
+    connect(worker, &PersonImportWorker::faceValidationRequested, this,
+            [this, worker](const QString &token, const QJsonArray &faces) {
+        if (!faceInferenceWorker_ || !faceInferenceThread_.isRunning()) {
+            QJsonArray failedFaces;
+            for (const QJsonValue &value : faces) {
+                QJsonObject failed = value.toObject();
+                failed.insert(QStringLiteral("message"), QStringLiteral("人脸识别服务未就绪"));
+                failedFaces.append(failed);
+            }
+            QMetaObject::invokeMethod(
+                        worker,
+                        [worker, token, failedFaces]() {
+                worker->applyFaceValidation(token, QJsonArray(), failedFaces);
+            }, Qt::QueuedConnection);
+            return;
+        }
+        FaceInferenceWorker *inferenceWorker = faceInferenceWorker_;
+        const AppConfig validationConfig = config_;
+        const bool queued = QMetaObject::invokeMethod(
+                    inferenceWorker,
+                    [inferenceWorker, token, faces, validationConfig]() {
+            inferenceWorker->validateLocalImportFaceImages(
+                        token, faces, validationConfig);
+        }, Qt::QueuedConnection);
+        if (!queued) {
+            QJsonArray failedFaces;
+            for (const QJsonValue &value : faces) {
+                QJsonObject failed = value.toObject();
+                failed.insert(QStringLiteral("message"), QStringLiteral("人脸图片校验任务提交失败"));
+                failedFaces.append(failed);
+            }
+            QMetaObject::invokeMethod(
+                        worker,
+                        [worker, token, failedFaces]() {
+                worker->applyFaceValidation(token, QJsonArray(), failedFaces);
+            }, Qt::QueuedConnection);
+        }
+    });
+    if (faceInferenceWorker_) {
+        connect(faceInferenceWorker_, &FaceInferenceWorker::localImportFaceImagesValidated,
+                worker, &PersonImportWorker::applyFaceValidation,
+                Qt::QueuedConnection);
+    }
     connect(worker, &PersonImportWorker::finished, this,
             [this](bool ok,
                    int inserted,
@@ -1979,7 +2112,7 @@ void FaceGateMainWindow::handlePeopleImport()
                    const QString &sourceFileName) {
         if (shutdown_) return;
         const int completed = inserted + updated;
-        QString detail = QStringLiteral("文件：%1\n更新完成：%2 人（新增 %3，修改 %4）\n未做更新：%5 人")
+        QString detail = QStringLiteral("文件：%1\n更新完成：%2 人（新增 %3，覆盖 %4）\n未做更新：%5 人")
                 .arg(sourceFileName.isEmpty() ? QStringLiteral("未找到") : sourceFileName)
                 .arg(completed).arg(inserted).arg(updated).arg(unchanged);
         if (!unchangedNames.isEmpty()) {
@@ -1991,24 +2124,25 @@ void FaceGateMainWindow::handlePeopleImport()
                 detail += QStringLiteral("\n失败人员：") + failedNames.join(QStringLiteral("、"));
             }
         }
-        if (!message.isEmpty()) detail += QStringLiteral("\n\n") + message;
-
-        if (adminPanel_) adminPanel_->setPersonImportBusy(false, message);
-        writeOperatorAudit(QStringLiteral("导入网络人员Excel"), QStringLiteral("network_person"),
+        if (!ok && completed == 0 && unchanged == 0 && failed == 0
+                && !message.trimmed().isEmpty()) {
+            detail = message.trimmed();
+        }
+        if (adminPanel_) adminPanel_->setPersonImportBusy(false);
+        writeOperatorAudit(QStringLiteral("导入本地人员Excel"), QStringLiteral("person"),
                            sourceFileName, ok ? QStringLiteral("成功") : QStringLiteral("部分失败"), detail);
 
         if (completed > 0) {
-            if (adminPanel_) adminPanel_->showNetworkPeoplePage();
             if (databaseWorker_) {
                 QMetaObject::invokeMethod(databaseWorker_, "reloadGallery", Qt::QueuedConnection);
+                QMetaObject::invokeMethod(databaseWorker_, "loadPeople", Qt::QueuedConnection);
                 QMetaObject::invokeMethod(databaseWorker_, "loadStorageStats", Qt::QueuedConnection);
             }
-            FaceImageSyncBridge::instance()->requestPersonnelList();
         }
         if (ok) {
-            AppMessageDialog::information(this, QStringLiteral("导入网络人员"), detail);
+            AppMessageDialog::information(this, QStringLiteral("导入本地人员"), detail);
         } else {
-            AppMessageDialog::warning(this, QStringLiteral("导入网络人员"), detail);
+            AppMessageDialog::warning(this, QStringLiteral("导入本地人员"), detail);
         }
     });
     connect(worker, &PersonImportWorker::finished, thread, &QThread::quit);
@@ -2023,7 +2157,7 @@ void FaceGateMainWindow::handlePeopleImport()
     thread->start();
 }
 
-/** @brief 在后台读取选定人员范围，生成固定XLSX并写入U盘 person 目录。 */
+/** @brief 在后台读取选定人员范围，生成固定XLSX并写入U盘 Ycest/person。 */
 void FaceGateMainWindow::handlePeopleExport(const QString &personnelScope)
 {
     if (personImportThread_ && personImportThread_->isRunning()) {
@@ -2168,6 +2302,8 @@ void FaceGateMainWindow::handleThresholdConfigSave(float faceCosine, float dupli
     writeOperatorAudit("修改阈值", "threshold", "face", saved ? "成功" : "失败", message);
     if (adminPanel_) {
         adminPanel_->setStatusText(message);
+        adminPanel_->showActionToast(saved ? QStringLiteral("阈值保存成功")
+                                           : QStringLiteral("阈值保存失败"), saved);
     }
     if (!saved) {
         AppMessageDialog::warning(this, "设置", message);
@@ -2202,6 +2338,8 @@ void FaceGateMainWindow::handleNetworkConfigSave(bool dhcp, const QString &ip, c
     writeOperatorAudit("修改网络配置", "network", config_.networkDhcp ? "dhcp" : config_.networkStaticIp, saved ? "成功" : "失败", message);
     if (adminPanel_) {
         adminPanel_->setStatusText(message);
+        adminPanel_->showActionToast(saved ? QStringLiteral("网络设置保存成功")
+                                           : QStringLiteral("网络设置保存失败"), saved);
     }
     if (!saved) {
         AppMessageDialog::warning(this, "设置", message);
@@ -2252,6 +2390,8 @@ void FaceGateMainWindow::handleAudioConfigSave(const AppConfig &audioConfig)
     writeOperatorAudit("修改音频设置", "audio", config_.audioEnabled ? "enabled" : "disabled", saved ? "成功" : "失败", message);
     if (adminPanel_) {
         adminPanel_->setStatusText(message);
+        adminPanel_->showActionToast(saved ? QStringLiteral("音频设置保存成功")
+                                           : QStringLiteral("音频设置保存失败"), saved);
     }
     if (!saved) {
         AppMessageDialog::warning(this, "音频设置", message);
@@ -2279,6 +2419,11 @@ void FaceGateMainWindow::handleAccessPhotoDisplayChanged(bool enabled)
                        message);
     if (adminPanel_) {
         adminPanel_->setStatusText(message);
+        adminPanel_->showActionToast(saved
+                                     ? QStringLiteral("显示设置已%1")
+                                       .arg(enabled ? QStringLiteral("开启")
+                                                    : QStringLiteral("关闭"))
+                                     : QStringLiteral("显示设置保存失败"), saved);
     }
     if (!saved) {
         AppMessageDialog::warning(this, QStringLiteral("显示设置"), message);
@@ -2538,8 +2683,8 @@ QString FaceGateMainWindow::stateName(VerifyState state) const
 {
     switch (state) {
     case VerifyState::Idle: return "空闲";
-    case VerifyState::CollectingFrames: return "采集中";
-    case VerifyState::SelectBestFrame: return "选择中";
+    case VerifyState::CollectingFrames: return "识别中";
+    case VerifyState::SelectBestFrame: return "识别中";
     case VerifyState::LivenessChecking: return "活体检测";
     case VerifyState::FeatureMatching: return "匹配中";
     case VerifyState::Passed: return "通过";

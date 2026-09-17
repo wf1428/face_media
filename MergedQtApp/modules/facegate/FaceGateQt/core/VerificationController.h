@@ -73,6 +73,27 @@ private:
     /** @brief 清空候选快照、最佳帧和活体批次计数。 */
     void resetCollection();
 
+    /** @brief 为当前在场人脸启动一个新的限时识别窗口。 */
+    void beginRecognitionAttempt();
+
+    /** @brief 清空当前识别窗口累计的失败证据。 */
+    void clearFailureEvidence();
+
+    /** @brief 保存识别窗口内最有意义的失败结果，供超时时一次性发布。 */
+    void rememberFailure(const VerificationSnapshot &snapshot,
+                         const QString &message,
+                         const QString &result,
+                         int priority);
+
+    /** @brief 放弃当前子流程并在同一个识别窗口内重新采集。 */
+    void retryWithinRecognitionWindow(const QString &message);
+
+    /** @brief 当前识别窗口到期后发布且只发布一次最终失败。 */
+    void finishRecognitionTimeout();
+
+    /** @return 当前 4 秒识别窗口是否已经到期。 */
+    bool recognitionWindowExpired() const;
+
     /** @brief 设置状态并发出 stateChanged()。 */
     void enterState(VerifyState state, const QString &message);
 
@@ -96,6 +117,12 @@ private:
     int nextLivenessIndex_ = 0;          /**< 下一张待活体检测候选索引。 */
     int livenessPassCount_ = 0;          /**< 本轮活体通过帧数。 */
     QElapsedTimer resultTimer_;          /**< 结果保持及冷却计时。 */
+    QElapsedTimer recognitionTimer_;     /**< 当前单次识别窗口计时。 */
+    VerificationSnapshot pendingFailureSnapshot_; /**< 超时失败使用的最佳证据帧。 */
+    QString pendingFailureMessage_;      /**< 超时时发布的失败原因。 */
+    QString pendingFailureResult_;       /**< 超时时发布的稳定失败结果码。 */
+    int pendingFailurePriority_ = 0;     /**< 失败证据优先级，防止坏帧覆盖有效比对。 */
+    bool pendingFailureSnapshotValid_ = false; /**< 是否已经保存失败证据帧。 */
 };
 
 #endif

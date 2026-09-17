@@ -301,8 +301,15 @@ AppConfig AppConfig::load(const QString &iniPath)
 
     cfg.collectFrameCount = s.value("verify/collect_frame_count", cfg.collectFrameCount).toInt();
     cfg.livenessPassRequired = s.value("verify/liveness_pass_required", cfg.livenessPassRequired).toInt();
+    cfg.recognitionWindowMs = qMax(
+                1000,
+                s.value("verify/recognition_window_ms",
+                        cfg.recognitionWindowMs).toInt());
     cfg.resultHoldMs = s.value("verify/result_hold_ms", cfg.resultHoldMs).toInt();
-    cfg.sameFaceSuppressMs = s.value("verify/same_face_suppress_ms", cfg.sameFaceSuppressMs).toInt();
+    cfg.sameFaceSuppressMs = qMax(
+                60000,
+                s.value("verify/same_face_suppress_ms",
+                        cfg.sameFaceSuppressMs).toInt());
     cfg.accessDecisionTimeoutMs = qMax(
                 1000,
                 s.value("verify/access_decision_timeout_ms",
@@ -449,8 +456,11 @@ bool AppConfig::save(const QString &iniPath, QString *errorText) const
 
     s.setValue("verify/collect_frame_count", QString::number(collectFrameCount));
     s.setValue("verify/liveness_pass_required", QString::number(livenessPassRequired));
+    s.setValue("verify/recognition_window_ms",
+               QString::number(qMax(1000, recognitionWindowMs)));
     s.setValue("verify/result_hold_ms", QString::number(resultHoldMs));
-    s.setValue("verify/same_face_suppress_ms", QString::number(sameFaceSuppressMs));
+    s.setValue("verify/same_face_suppress_ms",
+               QString::number(qMax(60000, sameFaceSuppressMs)));
     s.setValue("verify/access_decision_timeout_ms",
                QString::number(accessDecisionTimeoutMs));
     s.setValue("verify/liveness_enabled", boolText(livenessEnabled));

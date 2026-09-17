@@ -26,6 +26,7 @@ class QComboBox;
 class QLabel;
 class QLineEdit;
 class QRadioButton;
+class QProgressBar;
 class QSlider;
 class QTableWidget;
 class QTabWidget;
@@ -108,10 +109,13 @@ public:
 
     /** @brief 更新面板全局状态文本。 */
     void setStatusText(const QString &text);
+
+    /** @brief 在管理界面中央显示轻量操作结果提示。 */
+    void showActionToast(const QString &text, bool success = true);
     void showNetworkSyncStatus(bool ok, const QString &text);
 
-    /** @brief 切换U盘人员导入按钮和状态提示。 */
-    void setPersonImportBusy(bool busy, const QString &message = QString());
+    /** @brief 切换U盘人员导入按钮和动画进度弹窗。 */
+    void setPersonImportBusy(bool busy, int progress = 0);
 
     /** @brief 切换U盘人员导出按钮和状态提示。 */
     void setPersonExportBusy(bool busy, const QString &message = QString());
@@ -142,8 +146,8 @@ signals:
     void peopleRefreshRequested();
     void networkPeopleRefreshRequested();
 
-    /** @brief 从U盘导入网络人员 XLS/XLSX 的请求。 */
-    void peopleImportRequested();
+    /** @brief 从U盘导入本地人员 XLS/XLSX 及人脸图片的请求。 */
+    void peopleImportRequested(const QString &requestToken);
 
     /** @brief 导出人员XLSX；范围为 network、local 或 all。 */
     void peopleExportRequested(const QString &personnelScope);
@@ -224,6 +228,9 @@ private:
 
     /** @brief 将网络同步提示条定位到网络人员页底部中央。 */
     void positionNetworkSyncToast();
+
+    /** @brief 将轻量操作提示定位到管理界面中央。 */
+    void positionActionToast();
 
     /** @return 验证日志查询页面。 */
     QWidget *createLogPage();
@@ -332,10 +339,19 @@ private:
     QWidget *networkPeoplePage_ = nullptr;
     QLabel *networkSyncToast_ = nullptr;
     QTimer *networkSyncToastTimer_ = nullptr;
+    QLabel *actionToast_ = nullptr;
+    QTimer *actionToastTimer_ = nullptr;
+    class QGraphicsOpacityEffect *actionToastOpacity_ = nullptr;
+    class QPropertyAnimation *actionToastAnimation_ = nullptr;
     class QPushButton *networkActiveButton_ = nullptr;
     class QPushButton *networkDeletedButton_ = nullptr;
     class QPushButton *importPeopleButton_ = nullptr;
     class QPushButton *exportPeopleButton_ = nullptr;
+    QWidget *personImportProgressOverlay_ = nullptr;
+    QLabel *personImportSpinnerLabel_ = nullptr;
+    QProgressBar *personImportProgressBar_ = nullptr;
+    QTimer *personImportSpinnerTimer_ = nullptr;
+    int personImportSpinnerAngle_ = 0;
     QJsonArray networkPeopleRecords_;
     bool networkDeletedView_ = false;
     QTableWidget *passedLogTable_ = nullptr;

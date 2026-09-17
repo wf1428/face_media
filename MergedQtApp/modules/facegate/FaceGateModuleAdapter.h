@@ -52,15 +52,24 @@ public:
     /** @return 仅在无人值守的人脸识别主页允许外壳执行在场切换。 */
     bool allowsPresenceSwitch() const override;
 
+    /** @brief 页面阶段切换后重新启动一次干净的识别窗口。 */
+    void restartRecognition(const QString &message);
+
     /** @brief 打开原有管理员认证和管理面板。 */
     void requestOpenAdminManagement();
 
 signals:
+    /** @brief 转发单次人脸窗口的身份验证通过事件。 */
+    void recognitionVerified();
+
     /** @brief 当门禁界面显示识别成功结果时向应用外壳转发。 */
     void recognitionSucceeded();
 
     /** @brief 当门禁界面显示最终人脸识别结果时向应用外壳转发。 */
     void recognitionFinished();
+
+    /** @brief 转发重复刷脸剩余秒数提示。 */
+    void duplicateRecognitionSuppressed(const QString &message);
 
     /** @brief 转发主识别画面中的人脸检测状态。 */
     void facePresenceChanged(bool present);
@@ -70,6 +79,8 @@ signals:
     void previewFacesChanged(const QVector<DetectedFace> &faces);
     void previewStateChanged(VerifyState state, const QString &message);
     void recognitionImageReady(const QImage &image, const QString &name);
+    /** @brief 转发人脸管理面板已经进入的通知。 */
+    void adminSessionStarted();
     void adminSessionFinished();
 
 private:

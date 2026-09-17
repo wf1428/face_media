@@ -92,7 +92,9 @@ void VerificationController::setLivenessEnabled(bool enabled)
 void VerificationController::resetToIdle(const QString &message)
 {
     resetCollection();
+    clearFailureEvidence();
     resultTimer_.invalidate();
+    recognitionTimer_.invalidate();
     enterState(VerifyState::Idle, message);
 }
 
@@ -121,11 +123,6 @@ void VerificationController::onFrame(const CameraFrame &frame)
         state_ == VerifyState::Failed ||
         state_ == VerifyState::Cooldown;
 
-    if (holdingResult && resultTimer_.isValid() && resultTimer_.elapsed() >= config_.resultHoldMs) {
-        resetCollection();
-        enterState(VerifyState::Idle, QStringLiteral("等待人脸"));
-    }
-
     /*
      * 主验证链路必须先做检测/质量评估，再做活体检测，活体通过后才做
      * 特征提取和底库相似度比较。这样非活体人员不会进入“人员未注册”
@@ -134,21 +131,44 @@ void VerificationController::onFrame(const CameraFrame &frame)
     FaceAnalysisResult analysis = engine_->detectFrame(frame);
     emit facesUpdated(analysis.faces);
 
-    if (holdingResult && resultTimer_.isValid() && resultTimer_.elapsed() < config_.resultHoldMs) {
+    if (analysis.faces.isEmpty()) {
+        // 无人脸时静默取消当前窗口；下一次检测到人脸重新获得完整 4 秒。
+        recognitionTimer_.invalidate();
+        clearFailureEvidence();
+        resetCollection();
+
+        if (holdingResult && resultTimer_.isValid()
+                && resultTimer_.elapsed() < config_.resultHoldMs) {
+            return;
+        }
+        if (state_ != VerifyState::Idle) {
+            resetCollection();
+        }
+        enterState(VerifyState::Idle, analysis.message.isEmpty() ? QStringLiteral("等待人脸") : analysis.message);
+        return;
+    }
+
+    if (holdingResult && resultTimer_.isValid()
+            && resultTimer_.elapsed() < config_.resultHoldMs) {
+        return;
+    }
+    if (holdingResult) {
+        resultTimer_.invalidate();
+        resetCollection();
+        enterState(VerifyState::Idle, QStringLiteral("正在识别"));
+    }
+
+    if (!recognitionTimer_.isValid()) {
+        beginRecognitionAttempt();
+    }
+    if (recognitionWindowExpired()) {
+        finishRecognitionTimeout();
         return;
     }
 
     if (state_ == VerifyState::LivenessChecking ||
         state_ == VerifyState::SelectBestFrame ||
         state_ == VerifyState::FeatureMatching) {
-        return;
-    }
-
-    if (analysis.faces.isEmpty()) {
-        if (state_ != VerifyState::Idle) {
-            resetCollection();
-        }
-        enterState(VerifyState::Idle, analysis.message.isEmpty() ? QStringLiteral("等待人脸") : analysis.message);
         return;
     }
 
@@ -176,11 +196,10 @@ void VerificationController::onFrame(const CameraFrame &frame)
         !snapshot.face.qualityValid ||
         snapshot.face.quality < config_.faceQualityThreshold;
     if (faceNotUsable) {
-        resetCollection();
-        best_ = snapshot;
-        best_.face = faceWithOverlay(best_.face, QStringLiteral("failed"), QStringLiteral("验证失败"));
-        emit facesUpdated(singleFaceOverlay(best_.face, QStringLiteral("failed"), QStringLiteral("验证失败")));
-        finishVerification(false, QStringLiteral("验证失败，请正对摄像头"), QStringLiteral("failed"));
+        rememberFailure(snapshot,
+                        QStringLiteral("验证失败，请正对摄像头"),
+                        QStringLiteral("failed"), 1);
+        retryWithinRecognitionWindow(QStringLiteral("正在识别，请正对摄像头"));
         return;
     }
 
@@ -193,18 +212,17 @@ void VerificationController::onFrame(const CameraFrame &frame)
 
     if (state_ == VerifyState::Idle) {
         resetCollection();
-        enterState(VerifyState::CollectingFrames, QStringLiteral("正在采集..."));
+        enterState(VerifyState::CollectingFrames, QStringLiteral("正在识别"));
     }
 
     // 累积多帧检测结果，用于后续挑选最稳定的人脸帧做活体检测。
     collected_.push_back(snapshot);
     if (collected_.size() < config_.collectFrameCount) {
-        enterState(VerifyState::CollectingFrames,
-                   QStringLiteral("正在采集 %1/%2").arg(collected_.size()).arg(config_.collectFrameCount));
+        enterState(VerifyState::CollectingFrames, QStringLiteral("正在识别"));
         return;
     }
 
-    enterState(VerifyState::SelectBestFrame, QStringLiteral("正在选择最佳人脸帧"));
+    enterState(VerifyState::SelectBestFrame, QStringLiteral("正在识别"));
     best_ = *std::max_element(collected_.begin(), collected_.end(),
         [](const VerificationSnapshot &a, const VerificationSnapshot &b) { return a.score() < b.score(); });
 
@@ -219,6 +237,11 @@ void VerificationController::onLivenessResult(const LivenessResult &result)
         return;
     }
 
+    if (recognitionWindowExpired()) {
+        finishRecognitionTimeout();
+        return;
+    }
+
     if (result.valid && result.passed) {
         ++livenessPassCount_;
     }
@@ -230,9 +253,13 @@ void VerificationController::onLivenessResult(const LivenessResult &result)
 
     const bool livePassed = livenessPassCount_ >= config_.livenessPassRequired;
     if (!livePassed) {
-        best_.face = faceWithOverlay(best_.face, QStringLiteral("liveness_failed"), QStringLiteral("活体失败"));
-        emit facesUpdated(singleFaceOverlay(best_.face, QStringLiteral("liveness_failed"), QStringLiteral("活体失败")));
-        finishVerification(false, QStringLiteral("活体检测失败"), QStringLiteral("liveness_failed"));
+        rememberFailure(best_, QStringLiteral("活体检测失败"),
+                        QStringLiteral("liveness_failed"), 2);
+        if (recognitionWindowExpired()) {
+            finishRecognitionTimeout();
+        } else {
+            retryWithinRecognitionWindow(QStringLiteral("正在识别，请保持正对摄像头"));
+        }
         return;
     }
 
@@ -246,6 +273,86 @@ void VerificationController::resetCollection()
     best_ = VerificationSnapshot();
     nextLivenessIndex_ = 0;
     livenessPassCount_ = 0;
+}
+
+/** @brief 为当前在场人脸启动一个新的限时识别窗口。 */
+void VerificationController::beginRecognitionAttempt()
+{
+    resetCollection();
+    clearFailureEvidence();
+    recognitionTimer_.restart();
+    enterState(VerifyState::CollectingFrames, QStringLiteral("正在识别"));
+}
+
+/** @brief 清空当前识别窗口累计的失败证据。 */
+void VerificationController::clearFailureEvidence()
+{
+    pendingFailureSnapshot_ = VerificationSnapshot();
+    pendingFailureMessage_.clear();
+    pendingFailureResult_.clear();
+    pendingFailurePriority_ = 0;
+    pendingFailureSnapshotValid_ = false;
+}
+
+/** @brief 保存窗口内阶段最深的失败，低质量帧不能覆盖有效活体或比对结果。 */
+void VerificationController::rememberFailure(const VerificationSnapshot &snapshot,
+                                               const QString &message,
+                                               const QString &result,
+                                               int priority)
+{
+    if (pendingFailureSnapshotValid_ && priority < pendingFailurePriority_) {
+        return;
+    }
+    pendingFailureSnapshot_ = snapshot;
+    pendingFailureMessage_ = message;
+    pendingFailureResult_ = result;
+    pendingFailurePriority_ = priority;
+    pendingFailureSnapshotValid_ = true;
+}
+
+/** @brief 清空本轮采集，但保留窗口计时和失败证据继续尝试。 */
+void VerificationController::retryWithinRecognitionWindow(const QString &message)
+{
+    resetCollection();
+    enterState(VerifyState::CollectingFrames, message);
+}
+
+/** @brief 识别窗口到期后统一形成一次失败事件。 */
+void VerificationController::finishRecognitionTimeout()
+{
+    const QString result = pendingFailureResult_.isEmpty()
+            ? QStringLiteral("failed") : pendingFailureResult_;
+    const QString message = pendingFailureMessage_.isEmpty()
+            ? QStringLiteral("验证失败，请正对摄像头")
+            : pendingFailureMessage_;
+
+    if (pendingFailureSnapshotValid_) {
+        best_ = pendingFailureSnapshot_;
+    } else if (!collected_.isEmpty()) {
+        best_ = *std::max_element(
+                    collected_.begin(), collected_.end(),
+                    [](const VerificationSnapshot &a,
+                       const VerificationSnapshot &b) {
+            return a.score() < b.score();
+        });
+    }
+
+    QString overlayText = QStringLiteral("验证失败");
+    if (result == QStringLiteral("stranger")) {
+        overlayText = QStringLiteral("未录入人员");
+    } else if (result == QStringLiteral("liveness_failed")) {
+        overlayText = QStringLiteral("活体失败");
+    }
+    best_.face = faceWithOverlay(best_.face, result, overlayText);
+    emit facesUpdated(singleFaceOverlay(best_.face, result, overlayText));
+    finishVerification(false, message, result);
+}
+
+/** @return 当前单次识别窗口达到配置时长时返回 true。 */
+bool VerificationController::recognitionWindowExpired() const
+{
+    return recognitionTimer_.isValid()
+            && recognitionTimer_.elapsed() >= config_.recognitionWindowMs;
 }
 
 /** @brief 设置状态并发出 stateChanged()。 */
@@ -262,13 +369,18 @@ void VerificationController::enterState(VerifyState state, const QString &messag
 void VerificationController::startLivenessBatch()
 {
     if (!livenessEnabled_) {
-        livenessPassCount_ = config_.livenessPassRequired;
-        finishVerification(true, "验证通过");
+        finishIdentityMatching();
         return;
     }
 
     if (!liveness_ || !liveness_->isReady()) {
-        finishVerification(false, QStringLiteral("活体工作线程未就绪"), QStringLiteral("liveness_failed"));
+        rememberFailure(best_, QStringLiteral("活体工作线程未就绪"),
+                        QStringLiteral("liveness_failed"), 2);
+        if (recognitionWindowExpired()) {
+            finishRecognitionTimeout();
+        } else {
+            retryWithinRecognitionWindow(QStringLiteral("正在等待活体检测"));
+        }
         return;
     }
 
@@ -284,7 +396,13 @@ void VerificationController::finishIdentityMatching()
     enterState(VerifyState::FeatureMatching, QStringLiteral("正在识别身份"));
 
     if (!engine_) {
-        finishVerification(false, QStringLiteral("验证失败，请正对摄像头"), QStringLiteral("failed"));
+        rememberFailure(best_, QStringLiteral("验证失败，请正对摄像头"),
+                        QStringLiteral("failed"), 3);
+        if (recognitionWindowExpired()) {
+            finishRecognitionTimeout();
+        } else {
+            retryWithinRecognitionWindow(QStringLiteral("正在识别"));
+        }
         return;
     }
 
@@ -316,16 +434,29 @@ void VerificationController::finishIdentityMatching()
         matchedFace.cosine >= similarButBelowThreshold;
 
     if (faceNotUsable || hasSimilarCandidate) {
-        best_.face = faceWithOverlay(matchedFace, QStringLiteral("failed"), QStringLiteral("验证失败"));
-        emit facesUpdated(singleFaceOverlay(best_.face, QStringLiteral("failed"), QStringLiteral("验证失败")));
-        finishVerification(false, QStringLiteral("验证失败，请正对摄像头"), QStringLiteral("failed"));
+        VerificationSnapshot failedSnapshot = best_;
+        failedSnapshot.face = matchedFace;
+        rememberFailure(failedSnapshot,
+                        QStringLiteral("验证失败，请正对摄像头"),
+                        QStringLiteral("failed"), 3);
+        if (recognitionWindowExpired()) {
+            finishRecognitionTimeout();
+        } else {
+            retryWithinRecognitionWindow(QStringLiteral("正在识别，请正对摄像头"));
+        }
         return;
     }
 
     Q_UNUSED(errorText)
-    best_.face = faceWithOverlay(matchedFace, QStringLiteral("stranger"), QStringLiteral("未录入人员"));
-    emit facesUpdated(singleFaceOverlay(best_.face, QStringLiteral("stranger"), QStringLiteral("未录入人员")));
-    finishVerification(false, QStringLiteral("未录入人员"), QStringLiteral("stranger"));
+    VerificationSnapshot strangerSnapshot = best_;
+    strangerSnapshot.face = matchedFace;
+    rememberFailure(strangerSnapshot, QStringLiteral("未录入人员"),
+                    QStringLiteral("stranger"), 3);
+    if (recognitionWindowExpired()) {
+        finishRecognitionTimeout();
+    } else {
+        retryWithinRecognitionWindow(QStringLiteral("正在识别"));
+    }
 }
 
 /** @brief 生成最终日志、发布结果并进入结果保持状态。 */
@@ -348,6 +479,8 @@ void VerificationController::finishVerification(bool passed, const QString &mess
         }
     }
 
+    recognitionTimer_.invalidate();
+    clearFailureEvidence();
     resultTimer_.restart();
     if (passed) {
         enterState(VerifyState::Passed, message);

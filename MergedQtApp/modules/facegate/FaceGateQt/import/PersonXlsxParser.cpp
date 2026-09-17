@@ -318,27 +318,51 @@ QStringList commaValues(const QString &text)
     return values;
 }
 
-/** @return “剩余/总额”文本解析结果；缺失总额时沿用剩余额。 */
-QPair<double, double> moneyPair(QString text)
+/** @brief 解析完整的“剩余/总额”；空值或格式不完整时保持未配置。 */
+bool parseMoneyPair(QString text, double *remaining, double *total)
 {
     text.remove(QChar(0x00a5));
     const QStringList parts = text.split(QLatin1Char('/'));
+    if (parts.size() != 2) return false;
     bool firstOk = false;
     bool secondOk = false;
     const double first = parts.value(0).trimmed().toDouble(&firstOk);
     const double second = parts.value(1).trimmed().toDouble(&secondOk);
-    return qMakePair(firstOk ? first : 0.0, secondOk ? second : (firstOk ? first : 0.0));
+    if (!firstOk || !secondOk || first < 0.0 || second < 0.0 || first > second) return false;
+    if (remaining) *remaining = first;
+    if (total) *total = second;
+    return true;
 }
 
-/** @return “剩余/总次数”文本解析结果；缺失总次数时沿用剩余次数。 */
-QPair<qlonglong, qlonglong> countPair(const QString &text)
+/** @brief 解析完整的“剩余/总次数”；空值或格式不完整时保持未配置。 */
+bool parseCountPair(const QString &text, qlonglong *remaining, qlonglong *total)
 {
     const QStringList parts = text.split(QLatin1Char('/'));
+    if (parts.size() != 2) return false;
     bool firstOk = false;
     bool secondOk = false;
     const qlonglong first = parts.value(0).trimmed().toLongLong(&firstOk);
     const qlonglong second = parts.value(1).trimmed().toLongLong(&secondOk);
-    return qMakePair(firstOk ? first : 0, secondOk ? second : (firstOk ? first : 0));
+    if (!firstOk || !secondOk || first < 0 || second < 0 || first > second) return false;
+    if (remaining) *remaining = first;
+    if (total) *total = second;
+    return true;
+}
+
+/** @return 权限期限支持的日期时间格式；无法解析时返回无效值。 */
+QDateTime parsePermissionDateTime(const QString &text)
+{
+    const QString normalized = text.trimmed();
+    QDateTime value = QDateTime::fromString(normalized, Qt::ISODateWithMs);
+    if (!value.isValid()) value = QDateTime::fromString(normalized, Qt::ISODate);
+    if (!value.isValid()) {
+        value = QDateTime::fromString(normalized, QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+    }
+    if (!value.isValid()) {
+        const QDate date = QDate::fromString(normalized, QStringLiteral("yyyy-MM-dd"));
+        if (date.isValid()) value = QDateTime(date, QTime(0, 0));
+    }
+    return value;
 }
 
 /** @brief 将“周几 + 起止时间”文本转换为网络人员库的定时规则数组。 */
@@ -361,9 +385,12 @@ QJsonArray parseTimingRules(const QString &text)
         for (const auto &entry : dayMap) {
             if (dayText.contains(entry.first)) days.append(entry.second);
         }
+        const QTime start = QTime::fromString(match.captured(2), QStringLiteral("H:mm"));
+        const QTime end = QTime::fromString(match.captured(3), QStringLiteral("H:mm"));
+        if (days.isEmpty() || !start.isValid() || !end.isValid()) continue;
         QJsonArray range;
-        range.append(match.captured(2) + QStringLiteral(":00"));
-        range.append(match.captured(3) + QStringLiteral(":00"));
+        range.append(start.toString(QStringLiteral("HH:mm:ss")));
+        range.append(end.toString(QStringLiteral("HH:mm:ss")));
         QJsonObject timing;
         timing.insert(QStringLiteral("days"), days);
         timing.insert(QStringLiteral("timeRange"), range);
@@ -460,49 +487,90 @@ QJsonObject makeRecordData(const QStringList &row, const QHash<QString, int> &co
         qrCodes.append(qr);
     }
 
+    const QString duration = cell(row, columns, QStringLiteral("有效期限"));
+    const QStringList durationParts = duration.split(
+                QRegularExpression(QStringLiteral("\\s*[~至]\\s*")));
+    const QString durationStart = durationParts.size() == 2
+            ? durationParts.value(0).trimmed() : QString();
+    const QString durationEnd = durationParts.size() == 2
+            ? durationParts.value(1).trimmed() : QString();
+    const QDateTime durationStartValue = parsePermissionDateTime(durationStart);
+    const QDateTime durationEndValue = parsePermissionDateTime(durationEnd);
+    const bool durationConfigured = durationStartValue.isValid()
+            && durationEndValue.isValid() && durationStartValue <= durationEndValue;
+
+    const QString timingRuleText = cell(row, columns, QStringLiteral("定时规则"));
+    const QJsonArray timingRules = parseTimingRules(timingRuleText);
+    const QString relayText = cell(row, columns, QStringLiteral("继电器"));
+    const QString remoteCallText = cell(row, columns, QStringLiteral("远程呼梯"));
+    const QString controlType = cell(row, columns, QStringLiteral("控梯类型"));
+
     QJsonObject rules;
     auto enabled = [&](const QString &name) { return features.contains(name); };
     rules.insert(QStringLiteral("time"), enabled(QStringLiteral("定时")));
     rules.insert(QStringLiteral("count"), enabled(QStringLiteral("次数")));
-    rules.insert(QStringLiteral("relay"), enabled(QStringLiteral("继电器")));
     rules.insert(QStringLiteral("amount"), enabled(QStringLiteral("金额")));
     rules.insert(QStringLiteral("duration"), enabled(QStringLiteral("期限")));
-    rules.insert(QStringLiteral("remoteCall"), enabled(QStringLiteral("远程呼梯")));
-    rules.insert(QStringLiteral("cardPassword"), enabled(QStringLiteral("密码通行"))
-                 || cell(row, columns, QStringLiteral("密码通行")) == QStringLiteral("是"));
+    rules.insert(QStringLiteral("relay"), enabled(QStringLiteral("继电器")));
     rules.insert(QStringLiteral("controlElevator"), enabled(QStringLiteral("控梯")));
+    rules.insert(QStringLiteral("remoteCall"), enabled(QStringLiteral("远程呼梯")));
+    rules.insert(QStringLiteral("cardPassword"), enabled(QStringLiteral("密码通行")));
 
-    const auto counts = countPair(cell(row, columns, QStringLiteral("剩余次数")));
-    rules.insert(QStringLiteral("countDataRemaining"), double(counts.first));
-    rules.insert(QStringLiteral("countDataTotal"), double(counts.second));
+    qlonglong countRemaining = 0;
+    qlonglong countTotal = 0;
+    const bool countConfigured = parseCountPair(
+                cell(row, columns, QStringLiteral("剩余次数")),
+                &countRemaining, &countTotal);
+    rules.insert(QStringLiteral("countConfigured"), countConfigured);
+    if (countConfigured) {
+        rules.insert(QStringLiteral("countDataRemaining"), double(countRemaining));
+        rules.insert(QStringLiteral("countDataTotal"), double(countTotal));
+    }
     bool countAddOk = false;
     const qlonglong countAdd = cell(row, columns, QStringLiteral("增量次数")).toLongLong(&countAddOk);
-    rules.insert(QStringLiteral("countDataAddCount"), double(countAddOk ? countAdd : 0));
+    if (countAddOk) rules.insert(QStringLiteral("countDataAddCount"), double(countAdd));
 
-    const auto amounts = moneyPair(cell(row, columns, QStringLiteral("剩余金额")));
-    rules.insert(QStringLiteral("amountDataRemaining"), amounts.first);
-    rules.insert(QStringLiteral("amountDataTotal"), amounts.second);
+    double amountRemaining = 0.0;
+    double amountTotal = 0.0;
+    const bool amountPairConfigured = parseMoneyPair(
+                cell(row, columns, QStringLiteral("剩余金额")),
+                &amountRemaining, &amountTotal);
+    if (amountPairConfigured) {
+        rules.insert(QStringLiteral("amountDataRemaining"), amountRemaining);
+        rules.insert(QStringLiteral("amountDataTotal"), amountTotal);
+    }
     bool amountAddOk = false;
     QString amountAddText = cell(row, columns, QStringLiteral("增量金额"));
     amountAddText.remove(QChar(0x00a5));
     const double amountAdd = amountAddText.toDouble(&amountAddOk);
-    rules.insert(QStringLiteral("amountDataAddAmount"), amountAddOk ? amountAdd : 0.0);
+    if (amountAddOk) rules.insert(QStringLiteral("amountDataAddAmount"), amountAdd);
     QString priceText = cell(row, columns, QStringLiteral("单价"));
     priceText.remove(QChar(0x00a5));
     bool priceOk = false;
     const double price = priceText.toDouble(&priceOk);
-    rules.insert(QStringLiteral("amountDataUnitPrice"), priceOk ? price : 0.0);
+    const bool amountConfigured = amountPairConfigured && priceOk && price > 0.0;
+    rules.insert(QStringLiteral("amountConfigured"), amountConfigured);
+    if (priceOk) rules.insert(QStringLiteral("amountDataUnitPrice"), price);
 
-    const QString duration = cell(row, columns, QStringLiteral("有效期限"));
-    const QStringList durationParts = duration.split(QRegularExpression(QStringLiteral("\\s*[~至]\\s*")));
-    rules.insert(QStringLiteral("durationDataStartTime"), durationParts.value(0).trimmed());
-    rules.insert(QStringLiteral("durationDataEndTime"), durationParts.value(1).trimmed());
-    const QString controlType = cell(row, columns, QStringLiteral("控梯类型"));
-    rules.insert(QStringLiteral("controlElevatorDataValueType"), controlType == QStringLiteral("直梯") ? 1 : 0);
-    rules.insert(QStringLiteral("timingRules"), parseTimingRules(cell(row, columns, QStringLiteral("定时规则"))));
-    rules.insert(QStringLiteral("timingRuleText"), cell(row, columns, QStringLiteral("定时规则")));
-    rules.insert(QStringLiteral("remoteCallText"), cell(row, columns, QStringLiteral("远程呼梯")));
-    rules.insert(QStringLiteral("relayText"), cell(row, columns, QStringLiteral("继电器")));
+    rules.insert(QStringLiteral("durationConfigured"), durationConfigured);
+    if (durationConfigured) {
+        rules.insert(QStringLiteral("durationDataStartTime"), durationStart);
+        rules.insert(QStringLiteral("durationDataEndTime"), durationEnd);
+    }
+    rules.insert(QStringLiteral("timeConfigured"), !timingRules.isEmpty());
+    rules.insert(QStringLiteral("timingRules"), timingRules);
+    rules.insert(QStringLiteral("timingRuleText"), timingRuleText);
+    rules.insert(QStringLiteral("remoteCallConfigured"), !remoteCallText.isEmpty());
+    rules.insert(QStringLiteral("remoteCallText"), remoteCallText);
+    rules.insert(QStringLiteral("relayConfigured"), !relayText.isEmpty());
+    rules.insert(QStringLiteral("relayText"), relayText);
+    const bool controlElevatorConfigured = controlType == QStringLiteral("直梯")
+            || controlType == QStringLiteral("门禁");
+    rules.insert(QStringLiteral("controlElevatorConfigured"), controlElevatorConfigured);
+    if (controlElevatorConfigured) {
+        rules.insert(QStringLiteral("controlElevatorDataValueType"),
+                     controlType == QStringLiteral("直梯") ? 1 : 0);
+    }
 
     QJsonObject data;
     data.insert(QStringLiteral("person"), person);

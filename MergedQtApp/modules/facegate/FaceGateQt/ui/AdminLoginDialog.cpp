@@ -10,12 +10,14 @@
 #include "AppMessageDialog.h"
 #include "common/responsive_ui.h"
 
+#include <QColor>
 #include <QEvent>
 #include <QFile>
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPalette>
 #include <QPushButton>
 #include <QShowEvent>
 #include <QSizePolicy>
@@ -27,6 +29,7 @@ AdminLoginDialog::AdminLoginDialog(const AppConfig &config, QWidget *parent)
     : QDialog(parent), config_(config)
 {
     embeddedForWayland_ = ResponsiveUi::isWaylandPlatform() && parentWidget();
+    setObjectName(QStringLiteral("AdminLoginDialog"));
     setWindowTitle(QStringLiteral("管理员登录"));
     setModal(true);
     if (embeddedForWayland_) {
@@ -40,6 +43,11 @@ AdminLoginDialog::AdminLoginDialog(const AppConfig &config, QWidget *parent)
         setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
     }
     setAttribute(Qt::WA_StyledBackground, true);
+    setAutoFillBackground(true);
+    QPalette loginPalette = palette();
+    loginPalette.setColor(QPalette::Window, QColor("#162236"));
+    loginPalette.setColor(QPalette::Base, QColor("#162236"));
+    setPalette(loginPalette);
     if (!embeddedForWayland_) {
         const QSize targetSize = ResponsiveUi::dialogSize(
                     parent, QSize(760, 580), QSize(520, 520));
@@ -59,9 +67,14 @@ AdminLoginDialog::AdminLoginDialog(const AppConfig &config, QWidget *parent)
     passwordEdit_->setInputMethodHints(Qt::ImhNoPredictiveText | Qt::ImhSensitiveData);
 
     userEdit_->setText(config_.adminUsername);
-    auto *hintLabel = new QLabel(QStringLiteral("账号：%1    %2").arg(config_.adminUsername, config_.adminPasswordHint), this);
-    hintLabel->setTextFormat(Qt::PlainText);
-    hintLabel->setWordWrap(true);
+    QLabel *hintLabel = nullptr;
+    if (config_.adminPasswordChangeRequired) {
+        hintLabel = new QLabel(
+                    QStringLiteral("账号：%1    %2")
+                    .arg(config_.adminUsername, config_.adminPasswordHint), this);
+        hintLabel->setTextFormat(Qt::PlainText);
+        hintLabel->setWordWrap(true);
+    }
 
     auto *loginButton = new QPushButton(QStringLiteral("登录"), this);
     loginButton->setObjectName("dialogPrimaryButton");
@@ -90,6 +103,7 @@ AdminLoginDialog::AdminLoginDialog(const AppConfig &config, QWidget *parent)
     form->addRow(QStringLiteral("密码"), passwordEdit_);
 
     auto *formShell = new QWidget(this);
+    formShell->setObjectName(QStringLiteral("loginCard"));
     if (embeddedForWayland_) {
         formShell->setMaximumWidth(760);
         formShell->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
@@ -97,7 +111,9 @@ AdminLoginDialog::AdminLoginDialog(const AppConfig &config, QWidget *parent)
     auto *formShellLayout = new QVBoxLayout(formShell);
     formShellLayout->setContentsMargins(24, 18, 24, 12);
     formShellLayout->setSpacing(14);
-    formShellLayout->addWidget(hintLabel);
+    if (hintLabel) {
+        formShellLayout->addWidget(hintLabel);
+    }
     formShellLayout->addLayout(form);
     formShellLayout->addLayout(buttonRow);
 
@@ -108,11 +124,6 @@ AdminLoginDialog::AdminLoginDialog(const AppConfig &config, QWidget *parent)
         layout->addStretch(1);
         layout->addWidget(formShell, 0, Qt::AlignHCenter);
         layout->addStretch(1);
-        keyboardClearance_ = new QWidget(this);
-        keyboardClearance_->setFixedHeight(
-                    ResponsiveUi::keyboardHeight(height(), 300));
-        keyboardClearance_->setAttribute(Qt::WA_TransparentForMouseEvents);
-        layout->addWidget(keyboardClearance_);
     } else {
         layout->addWidget(formShell);
     }
@@ -131,7 +142,8 @@ AdminLoginDialog::AdminLoginDialog(const AppConfig &config, QWidget *parent)
         style += QString::fromUtf8(dialogStyleFile.readAll());
     }
     style += QStringLiteral(
-        "QDialog{background:#162236;color:#edf5f8;border:1px solid #30445f;border-radius:18px;}"
+        "QDialog#AdminLoginDialog{background:#162236;color:#edf5f8;border:none;}"
+        "QWidget#loginCard{background:#1b2a40;border:1px solid #46617f;border-radius:18px;}"
         "QLabel{color:#d8e5eb;font-size:16px;}"
         "QLineEdit{font-size:18px;min-height:42px;}"
         "QPushButton#dialogPrimaryButton,QPushButton#dialogCancelButton{min-width:132px;}"
@@ -172,10 +184,6 @@ bool AdminLoginDialog::eventFilter(QObject *watched, QEvent *event)
     if (embeddedForWayland_ && watched == parentWidget() &&
         event->type() == QEvent::Resize) {
         setGeometry(parentWidget()->rect());
-        if (keyboardClearance_) {
-            keyboardClearance_->setFixedHeight(
-                        ResponsiveUi::keyboardHeight(height(), 300));
-        }
     }
 
     return QDialog::eventFilter(watched, event);
@@ -186,10 +194,6 @@ void AdminLoginDialog::showEvent(QShowEvent *event)
 {
     if (embeddedForWayland_ && parentWidget()) {
         setGeometry(parentWidget()->rect());
-        if (keyboardClearance_) {
-            keyboardClearance_->setFixedHeight(
-                        ResponsiveUi::keyboardHeight(height(), 300));
-        }
     }
     QDialog::showEvent(event);
     if (embeddedForWayland_) {

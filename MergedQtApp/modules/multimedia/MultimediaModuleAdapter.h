@@ -57,6 +57,7 @@ public:
     void setEmbeddedFaceState(VerifyState state, const QString &message);
     void setEmbeddedFaceUnavailable(const QString &message);
     void showRecognitionImage(const QImage &image, const QString &name, int durationMs);
+    void showStatusMessage(const QString &message, int durationMs = 3000);
 
 signals:
     /** @brief 转发多媒体页面五秒长按管理入口。 */
