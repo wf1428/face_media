@@ -13,6 +13,7 @@
 #include <QJsonParseError>
 #include <QSet>
 #include <QVariantMap>
+#include <algorithm>
 
 namespace {
 
@@ -69,6 +70,126 @@ QString safeFileStem(const QString &value)
                       || ch == QLatin1Char('-') ? ch : QLatin1Char('_'));
     }
     return result.isEmpty() ? QStringLiteral("person") : result;
+}
+
+/** @return 与刷卡鉴权一致的原值、十进制及四字节大小端卡号候选。 */
+QStringList cardCandidates(const QString &input)
+{
+    const QString raw = input.trimmed().toUpper();
+    QStringList values;
+    if (raw.isEmpty()) return values;
+    values.append(raw);
+
+    bool ok = false;
+    const qulonglong hexValue = raw.toULongLong(&ok, 16);
+    if (ok && hexValue <= 0xffffffffULL) {
+        const QString decimal = QString::number(hexValue);
+        if (!values.contains(decimal)) values.append(decimal);
+        if (raw.size() == 8) {
+            QByteArray bytes = QByteArray::fromHex(raw.toLatin1());
+            if (bytes.size() == 4) {
+                std::reverse(bytes.begin(), bytes.end());
+                const QString reversedHex = QString::fromLatin1(bytes.toHex()).toUpper();
+                if (!values.contains(reversedHex)) values.append(reversedHex);
+                const qulonglong reversedValue = reversedHex.toULongLong(&ok, 16);
+                if (ok) {
+                    const QString reversedDecimal = QString::number(reversedValue);
+                    if (!values.contains(reversedDecimal)) values.append(reversedDecimal);
+                }
+            }
+        }
+    }
+
+    const qulonglong decimalValue = raw.toULongLong(&ok, 10);
+    if (ok && decimalValue <= 0xffffffffULL) {
+        const QString hex = QStringLiteral("%1")
+                .arg(decimalValue, 8, 16, QLatin1Char('0')).toUpper();
+        if (!values.contains(hex)) values.append(hex);
+        QByteArray bytes = QByteArray::fromHex(hex.toLatin1());
+        if (bytes.size() == 4) {
+            std::reverse(bytes.begin(), bytes.end());
+            const QString reversedHex = QString::fromLatin1(bytes.toHex()).toUpper();
+            if (!values.contains(reversedHex)) values.append(reversedHex);
+            const qulonglong reversedValue = reversedHex.toULongLong(&ok, 16);
+            const QString reversedDecimal = QString::number(reversedValue);
+            if (ok && !values.contains(reversedDecimal)) values.append(reversedDecimal);
+        }
+    }
+    return values;
+}
+
+struct StoredCardOwner
+{
+    QString key;
+    QString name;
+};
+
+QList<StoredCardOwner> conflictingCardOwners(const QString &cardId,
+                                              qint64 excludedLocalPersonId = 0,
+                                              const QString &excludedNetworkPersonId = QString())
+{
+    QList<StoredCardOwner> owners;
+    const QStringList candidates = cardCandidates(cardId);
+    if (candidates.isEmpty()) return owners;
+
+    QStringList marks;
+    QList<QVariant> cardBinds;
+    for (const QString &candidate : candidates) {
+        marks.append(QStringLiteral("?"));
+        cardBinds.append(candidate);
+    }
+    const QString inClause = marks.join(QLatin1Char(','));
+
+    if (tableExists(QStringLiteral("network_ic_card"))
+            && tableExists(QStringLiteral("network_person"))) {
+        QList<QVariant> binds = cardBinds;
+        QString exclusion;
+        if (!excludedNetworkPersonId.isEmpty()) {
+            exclusion = QStringLiteral(" AND c.person_id<>?");
+            binds.append(excludedNetworkPersonId);
+        }
+        const QList<QVariantMap> rows = DbStore::query(
+                    QStringLiteral("SELECT DISTINCT c.person_id,p.name FROM network_ic_card c "
+                                   "JOIN network_person p ON p.person_id=c.person_id "
+                                   "WHERE UPPER(c.card_id) IN (%1)%2 ORDER BY c.person_id")
+                    .arg(inClause, exclusion), binds);
+        for (const QVariantMap &row : rows) {
+            StoredCardOwner owner;
+            owner.key = QStringLiteral("network:")
+                    + row.value(QStringLiteral("person_id")).toString();
+            owner.name = row.value(QStringLiteral("name")).toString().trimmed();
+            if (owner.name.isEmpty()) {
+                owner.name = row.value(QStringLiteral("person_id")).toString();
+            }
+            owners.append(owner);
+        }
+    }
+
+    if (tableExists(QStringLiteral("local_ic_card"))
+            && tableExists(QStringLiteral("person"))) {
+        QList<QVariant> binds = cardBinds;
+        QString exclusion;
+        if (excludedLocalPersonId > 0) {
+            exclusion = QStringLiteral(" AND c.person_id<>?");
+            binds.append(excludedLocalPersonId);
+        }
+        const QList<QVariantMap> rows = DbStore::query(
+                    QStringLiteral("SELECT DISTINCT c.person_id,p.name FROM local_ic_card c "
+                                   "JOIN person p ON p.id=c.person_id "
+                                   "WHERE UPPER(c.card_id) IN (%1)%2 ORDER BY c.person_id")
+                    .arg(inClause, exclusion), binds);
+        for (const QVariantMap &row : rows) {
+            StoredCardOwner owner;
+            owner.key = QStringLiteral("local:")
+                    + row.value(QStringLiteral("person_id")).toString();
+            owner.name = row.value(QStringLiteral("name")).toString().trimmed();
+            if (owner.name.isEmpty()) {
+                owner.name = row.value(QStringLiteral("person_id")).toString();
+            }
+            owners.append(owner);
+        }
+    }
+    return owners;
 }
 
 } // namespace
@@ -180,10 +301,48 @@ LocalPersonnelImportResult LocalPersonnelStore::importSpreadsheetPersonnel(
         const QString name = person.value(QStringLiteral("name")).toString().trimmed();
         const QString account = person.value(QStringLiteral("account")).toString().trimmed();
         const QString phone = person.value(QStringLiteral("phone")).toString().trimmed();
+        const QJsonArray cards = record.value(QStringLiteral("icCards")).toArray();
         if (name.isEmpty() || account.isEmpty()) {
             ++summary.failed;
             summary.failedNames.append((name.isEmpty() ? QStringLiteral("未命名人员") : name)
                                        + QStringLiteral("（资料不完整）"));
+            continue;
+        }
+
+        const QList<QVariantMap> existing = DbStore::query(
+                    QStringLiteral("SELECT id FROM person WHERE "
+                                   "LOWER(COALESCE(NULLIF(account,''),person_no))=LOWER(?) "
+                                   "OR person_no=? ORDER BY id LIMIT 1"),
+                    {account, account});
+        const bool exists = !existing.isEmpty();
+        qint64 personId = exists
+                ? existing.first().value(QStringLiteral("id")).toLongLong() : 0;
+
+        QStringList ownerKeys;
+        QStringList ownerNames;
+        for (const QJsonValue &value : cards) {
+            const QString cardId = value.toObject().value(
+                        QStringLiteral("cardId")).toString().trimmed();
+            if (cardId.isEmpty()) continue;
+            const QList<StoredCardOwner> owners = conflictingCardOwners(cardId, personId);
+            for (const StoredCardOwner &owner : owners) {
+                if (!ownerKeys.contains(owner.key)) {
+                    ownerKeys.append(owner.key);
+                    ownerNames.append(owner.name);
+                }
+            }
+        }
+        if (!ownerNames.isEmpty()) {
+            QStringList names;
+            names.append(name + QStringLiteral("人员"));
+            for (const QString &ownerName : ownerNames) {
+                names.append(ownerName + QStringLiteral("人员"));
+            }
+            const QString reason = QStringLiteral("卡号冲突：%1")
+                    .arg(names.join(QStringLiteral("和")));
+            ++summary.failed;
+            summary.failedNames.append(reason);
+            if (summary.error.isEmpty()) summary.error = reason;
             continue;
         }
 
@@ -208,15 +367,6 @@ LocalPersonnelImportResult LocalPersonnelStore::importSpreadsheetPersonnel(
             summary.failedNames.append(name + QStringLiteral("（重复人员）"));
             continue;
         }
-
-        const QList<QVariantMap> existing = DbStore::query(
-                    QStringLiteral("SELECT id FROM person WHERE "
-                                   "LOWER(COALESCE(NULLIF(account,''),person_no))=LOWER(?) "
-                                   "OR person_no=? ORDER BY id LIMIT 1"),
-                    {account, account});
-        const bool exists = !existing.isEmpty();
-        qint64 personId = exists
-                ? existing.first().value(QStringLiteral("id")).toLongLong() : 0;
 
         if (!DbStore::transactionBegin()) {
             ++summary.failed;
@@ -270,7 +420,6 @@ LocalPersonnelImportResult LocalPersonnelStore::importSpreadsheetPersonnel(
             }
         }
 
-        const QJsonArray cards = record.value(QStringLiteral("icCards")).toArray();
         const QJsonArray qrs = record.value(QStringLiteral("qrCodes")).toArray();
         const QJsonObject rules = record.value(QStringLiteral("rules")).toObject();
         const QJsonArray floors = record.value(QStringLiteral("floors")).toArray();

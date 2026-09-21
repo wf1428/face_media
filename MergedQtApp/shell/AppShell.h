@@ -7,6 +7,7 @@ class FaceGateModuleAdapter;
 class LedFillLight;
 class ModeController;
 class MultimediaModuleAdapter;
+class QuickUiRuntime;
 class QStackedWidget;
 class QTimer;
 class Sr505PresenceSensor;
@@ -32,6 +33,7 @@ private:
     MultimediaModuleAdapter *multimediaModule_ = nullptr;
     FaceGateModuleAdapter *faceGateModule_ = nullptr;
     ModeController *modeController_ = nullptr;
+    QuickUiRuntime *quickUiRuntime_ = nullptr;
     Sr505PresenceSensor *presenceSensor_ = nullptr;
     LedFillLight *fillLight_ = nullptr;
     QTimer *presenceReconcileTimer_ = nullptr;

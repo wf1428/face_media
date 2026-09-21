@@ -332,7 +332,9 @@ QString databasePath()
 /** @return 音量持久化文件路径。 */
 QString volumeFile()
 {
-    return QDir(configDir()).filePath(QStringLiteral("volume.dat"));
+    const QString audioStateDir = QStringLiteral("/home/cat/face_media");
+    QDir().mkpath(audioStateDir);
+    return QDir(audioStateDir).filePath(QStringLiteral("volume.dat"));
 }
 
 /** @return IC 探针日志文件路径。 */
@@ -426,7 +428,17 @@ QString alsaCard()
 QString alsaDevice()
 {
     const QString env = envValue("QT_YCEST_ALSA_DEVICE");
-    return env.isEmpty() ? settingValue(QStringLiteral("audio/device"), QStringLiteral("default")) : env;
+    const QString configured = env.isEmpty()
+            ? settingValue(QStringLiteral("audio/device"),
+                           QStringLiteral("plughw:CARD=rockchiprk809co,DEV=0"))
+            : env;
+    // 旧部署配置使用 default；当前 RK3568 已确认唯一播放端点为 RK809 card0/dev0。
+    // 将旧值原地兼容为明确设备，避免依赖系统是否提供正确的 default PCM 映射。
+    if (configured.isEmpty() ||
+        configured.compare(QStringLiteral("default"), Qt::CaseInsensitive) == 0) {
+        return QStringLiteral("plughw:CARD=rockchiprk809co,DEV=0");
+    }
+    return configured;
 }
 
 /** @return ALSA 混音器控制项名称。 */

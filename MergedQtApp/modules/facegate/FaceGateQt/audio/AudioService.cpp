@@ -12,12 +12,15 @@
 #include "components/multimedia/vol_ctrl.h"
 
 #include <QDateTime>
+#include <QApplication>
 #include <QDebug>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QSaveFile>
 #include <QStandardPaths>
+#include <QVariantAnimation>
+#include <QEasingCurve>
 
 /** @brief 创建尚未配置的音频服务。 */
 AudioService::AudioService(QObject *parent)
@@ -27,20 +30,47 @@ AudioService::AudioService(QObject *parent)
     // AmpVolumeController 构造时已经读取（或首次创建）volume.dat，并完成
     // RK809 输出路径及硬件音量初始化，这里只同步界面配置值。
     config_.audioVolume = volumeController_->currentVolume();
-
     player_ = new GstPlayerWidget;
     player_->setVideoOutput(nullptr);
     player_->setVolume(1.0f);
     connect(player_, &GstPlayerWidget::videoFinished, this, [this]() {
+        endVoiceFocus();
         emit audioStatus(QStringLiteral("GStreamer 提示音播放完成"));
     });
     connect(player_, &GstPlayerWidget::errorOccured, this, [this](const QString &error) {
+        endVoiceFocus();
         emit audioError(QStringLiteral("GStreamer 提示音播放失败：%1").arg(error));
     });
+    connect(&AudioPromptFocusManager::instance(),
+            &AudioPromptFocusManager::focusReady,
+            this, [this](QObject *owner) {
+        if (owner == this && voiceFocusActive_ && !pendingFileName_.isEmpty()) {
+            playbackStartTimer_.start();
+        }
+    });
+
+    playbackStartTimer_.setSingleShot(true);
+    // 硬件音量切到 230 后短暂稳定；提示音链路已通过 preroll 静音准备。
+    playbackStartTimer_.setInterval(15);
+    connect(&playbackStartTimer_, &QTimer::timeout, this, [this]() {
+        if (!player_ || pendingFileName_.isEmpty()) {
+            endVoiceFocus();
+            return;
+        }
+        player_->play();
+        voiceFocusRestoreTimer_.start(15000);
+        emit audioStatus(QStringLiteral("GStreamer 正在播放：%1")
+                         .arg(pendingFileName_));
+    });
+
+    voiceFocusRestoreTimer_.setSingleShot(true);
+    connect(&voiceFocusRestoreTimer_, &QTimer::timeout,
+            this, &AudioService::endVoiceFocus);
 }
 
 AudioService::~AudioService()
 {
+    restoreVoiceFocusImmediately();
     if (player_) {
         player_->stop();
         delete player_;
@@ -61,6 +91,7 @@ void AudioService::configure(const AppConfig &config)
 void AudioService::setEnabled(bool enabled)
 {
     config_.audioEnabled = enabled;
+    AmpVolumeController::setPromptPlaybackEnabled(enabled);
 }
 
 /** @brief 设置并持久化 0~100 音量，同时更新 RK809 硬件音量。 */
@@ -82,7 +113,7 @@ int AudioService::volume() const
 /** @brief 在提示类型启用且冷却允许时播放对应音频。 */
 void AudioService::playPrompt(Prompt prompt)
 {
-    if (!config_.audioEnabled) {
+    if (!AmpVolumeController::isPromptPlaybackEnabled()) {
         return;
     }
     if (!promptEnabled(prompt)) {
@@ -94,7 +125,8 @@ void AudioService::playPrompt(Prompt prompt)
 /** @brief 按统一通行结果码播放专用失败音，未配置的结果使用通用失败音。 */
 void AudioService::playAccessFailure(int resultCode)
 {
-    if (!config_.audioEnabled || !config_.promptVerifyFailedEnabled) {
+    if (!AmpVolumeController::isPromptPlaybackEnabled() ||
+            !config_.promptVerifyFailedEnabled) {
         return;
     }
 
@@ -127,6 +159,10 @@ void AudioService::playAccessFailure(int resultCode)
 /** @brief 按配置键测试播放指定提示，忽略业务冷却。 */
 void AudioService::testPlay(const QString &promptKey)
 {
+    if (!AmpVolumeController::isPromptPlaybackEnabled()) {
+        emit audioStatus(QStringLiteral("语音播报已关闭"));
+        return;
+    }
     const QString key = promptKey.trimmed().toLower();
     Prompt prompt = Prompt::VerifyPassed;
     if (key == QStringLiteral("verify_passed")) {
@@ -155,9 +191,12 @@ void AudioService::testPlay(const QString &promptKey)
 /** @brief 停止当前 GStreamer 提示音。 */
 void AudioService::stopCurrentPlayback()
 {
+    volumeBoostTimer_.stop();
+    playbackStartTimer_.stop();
     if (player_) {
         player_->stop();
     }
+    endVoiceFocus();
 }
 
 /** @return Prompt 对应的稳定配置键。 */
@@ -301,12 +340,78 @@ bool AudioService::startGstreamer(const QString &path, bool ignoreCooldown, Prom
     }
 
     player_->stop();
+    endVoiceFocus();
     player_->setVideoOutput(nullptr);
     player_->setVolume(1.0f);
     player_->setMedia(info.absoluteFilePath());
     if (!player_->isAvailable()) return false;
-    player_->play();
-
-    emit audioStatus(QStringLiteral("GStreamer 正在播放：%1").arg(info.fileName()));
+    pendingFileName_ = info.fileName();
+    beginVoiceFocus();
     return true;
+}
+
+/** @brief 平滑压低正在播放的视频，并保存播报前的硬件音量。 */
+void AudioService::beginVoiceFocus()
+{
+    voiceFocusRestoreTimer_.stop();
+    if (voiceFocusActive_) {
+        voiceFocusRestoreTimer_.start(15000);
+        return;
+    }
+    voiceFocusActive_ = true;
+    voiceFocusRestoreTimer_.start(15000);
+    AudioPromptFocusManager::instance().acquire(this);
+}
+
+/** @brief 恢复播报前的视频音量与 RK809 原始音量。 */
+void AudioService::endVoiceFocus()
+{
+    volumeBoostTimer_.stop();
+    playbackStartTimer_.stop();
+    voiceFocusRestoreTimer_.stop();
+    if (!voiceFocusActive_) return;
+    voiceFocusActive_ = false;
+    volumeBoostPending_ = false;
+    pendingFileName_.clear();
+    AudioPromptFocusManager::instance().release(this);
+}
+
+/** @brief 硬件音量恢复后平滑淡入视频输入。 */
+void AudioService::startVideoVolumeRestore(qreal startFactor)
+{
+    if (!mutedVideos_.isEmpty() && videoRestoreAnimation_) {
+        videoRestoreAnimation_->stop();
+        videoRestoreAnimation_->setStartValue(startFactor);
+        videoRestoreAnimation_->setEndValue(1.0);
+        videoRestoreAnimation_->start();
+        return;
+    }
+    for (const MutedVideoState &state : mutedVideos_) {
+        if (state.player) state.player->clearAudioDucking(this);
+    }
+    mutedVideos_.clear();
+}
+
+/** @brief 不依赖事件循环，立即恢复播报前保存的全部音量。 */
+void AudioService::restoreVoiceFocusImmediately()
+{
+    if (videoDuckAnimation_) videoDuckAnimation_->stop();
+    if (videoRestoreAnimation_) videoRestoreAnimation_->stop();
+    volumeBoostTimer_.stop();
+    playbackStartTimer_.stop();
+    voiceFocusRestoreTimer_.stop();
+
+    if (voiceFocusActive_) {
+        AudioPromptFocusManager::instance().release(this);
+    }
+    for (const MutedVideoState &state : mutedVideos_) {
+        if (state.player) state.player->clearAudioDucking(this);
+    }
+
+    mutedVideos_.clear();
+    savedRawVolume_ = -1;
+    voiceFocusActive_ = false;
+    volumeBoostPending_ = false;
+    pendingRestoreRaw_ = -1;
+    pendingFileName_.clear();
 }

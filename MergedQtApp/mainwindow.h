@@ -38,6 +38,7 @@
 #include "ic_board/ic_offline_qr.h"
 #include "ic_board/serial_init.h"
 
+class QuickMainMenuWidget;
 
 
 QT_BEGIN_NAMESPACE
@@ -85,6 +86,7 @@ private:
     Ui::MainWindow *ui;                             /**< Qt Designer 生成的界面对象。 */
     QStackedWidget *stack = nullptr;                /**< 菜单、媒体和文件页面的容器。 */
     QWidget *menuPage = nullptr;                    /**< 从原 centralWidget 接管的菜单页。 */
+    QuickMainMenuWidget *quickMainMenu_ = nullptr;  /**< 长期复用的 Quick 控制台菜单。 */
     QWidget *app3Page = nullptr;                    /**< 多媒体播放页面。 */
     UdiskStatusOverlay *udiskOverlay = nullptr;     /**< U 盘及业务消息覆盖层。 */
     FileManagerPage *filePage = nullptr;            /**< 可移动存储文件管理页面。 */
@@ -93,6 +95,7 @@ private:
     KeyService *key = nullptr;                      /**< 设备物理按键服务。 */
 
     SettingsDialog *settingsDialog = nullptr;       /**< 网络、媒体等综合设置窗口。 */
+    FeaturesDialog *featuresDialog = nullptr;       /**< 长期复用的 Quick 功能页面。 */
     bool moduleActive_ = false;                     /**< 外壳记录的多媒体模块活动状态。 */
 
     /** @brief 归一化并保存 [feature] 开关，同时同步 MQTT 协议模式。 */

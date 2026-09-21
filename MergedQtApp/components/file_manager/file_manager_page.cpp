@@ -11,12 +11,14 @@
 #include <QHBoxLayout>
 #include <QVBoxLayout>
 #include "components/dialogs/ui_message_box.h"
+#include "components/quick/QuickPageHeaderWidget.h"
 #include <QHeaderView>
 #include <QFileInfo>
 #include <QResizeEvent>
 #include <QTimer>
 #include <QDir>
 #include <QFile>
+#include <QList>
 #include <QDesktopServices>
 #include <QUrl>
 #include "platform/rk3566_platform.h"
@@ -33,7 +35,9 @@ FileManagerPage::FileManagerPage(QWidget *parent)
     btnRefresh = new QPushButton("刷新", this);
     btnBack = new QPushButton("返回菜单", this);
 
-    auto *topBar = new QHBoxLayout;
+    auto *fallbackToolbar = new QWidget(this);
+    auto *topBar = new QHBoxLayout(fallbackToolbar);
+    topBar->setContentsMargins(0, 0, 0, 0);
     topBar->addWidget(btnBack);
     topBar->addWidget(btnUp);
     topBar->addWidget(btnRefresh);
@@ -75,8 +79,25 @@ FileManagerPage::FileManagerPage(QWidget *parent)
     connect(btnRefresh, &QPushButton::clicked, this, &FileManagerPage::refresh);
     connect(btnBack, &QPushButton::clicked, this, &FileManagerPage::backToMenuRequested);
 
+    quickHeader_ = new QuickPageHeaderWidget(this);
+    quickHeader_->setTitle(QStringLiteral("文件管理"));
+    quickHeader_->setActions({QStringLiteral("返回"),
+                              QStringLiteral("上一级"),
+                              QStringLiteral("刷新")});
+    connect(quickHeader_, &QuickPageHeaderWidget::actionTriggered,
+            this, [this](int index) {
+        const QList<QPushButton *> buttons = {btnBack, btnUp, btnRefresh};
+        if (index >= 0 && index < buttons.size() && buttons.at(index)) {
+            buttons.at(index)->click();
+        }
+    });
+    const bool quickReady = quickHeader_->status() == QQuickWidget::Ready;
+    quickHeader_->setVisible(quickReady);
+    fallbackToolbar->setVisible(!quickReady);
+
     auto *mainLayout = new QVBoxLayout(this);
-    mainLayout->addLayout(topBar);
+    mainLayout->addWidget(quickHeader_);
+    mainLayout->addWidget(fallbackToolbar);
     mainLayout->addWidget(view, 1);
     setLayout(mainLayout);
 
@@ -112,6 +133,7 @@ void FileManagerPage::setRoot(const QString &path)
 {
     currentRoot = path;
     pathEdit->setText(currentRoot);
+    if (quickHeader_) quickHeader_->setDetail(currentRoot);
 
     // setRootPath 返回的 index 才能用于 setRootIndex
     model->setRootPath(currentRoot);

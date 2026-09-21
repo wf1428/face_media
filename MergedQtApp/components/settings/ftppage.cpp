@@ -15,6 +15,7 @@
 #include "components/dialogs/ui_file_dialog.h"
 #include "components/dialogs/ui_message_box.h"
 #include "platform/rk3566_platform.h"
+#include "shell/QuickUiRuntime.h"
 
 
 // url历史记忆保存
@@ -1754,9 +1755,19 @@ void FtpPage::openKeyboardFor(QLineEdit *edit, const QString &title,
 /// @brief 显示顶部短时提示条。
 void FtpPage::showToast(const QString& text, int ms)
 {
+    const QString normalized = text.trimmed();
+    if (normalized.isEmpty()) return;
+
+    const bool success = !normalized.contains(QStringLiteral("失败")) &&
+                         !normalized.contains(QStringLiteral("不足")) &&
+                         !normalized.contains(QStringLiteral("不支持")) &&
+                         !normalized.contains(QStringLiteral("为空"));
+    if (QuickUiRuntime::instance()->showToast(normalized, ms, success)) {
+        return;
+    }
     if (!toastLabel) return;
 
-    toastLabel->setText(text);
+    toastLabel->setText(normalized);
     toastLabel->show();
     toastLabel->raise();
 

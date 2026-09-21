@@ -11,11 +11,15 @@
 
 #include <QObject>
 #include <QHash>
+#include <QPointer>
+#include <QTimer>
+#include <QVector>
 
 #include "AppConfig.h"
 
 class AmpVolumeController;
 class GstPlayerWidget;
+class QVariantAnimation;
 
 /**
  * @brief 使用进程内 GStreamer 播放门禁语音提示。
@@ -79,6 +83,18 @@ signals:
     void audioError(const QString &message);
 
 private:
+    /** @brief 保存并静音正在播放的视频，同时把提示音硬件音量提升到 230。 */
+    void beginVoiceFocus();
+
+    /** @brief 恢复提示音开始前的视频音量和硬件音量。 */
+    void endVoiceFocus();
+
+    /** @brief 停止过渡动画并立即恢复全部音量，用于对象销毁等不可等待场景。 */
+    void restoreVoiceFocusImmediately();
+
+    /** @brief 在硬件原始音量恢复完成后平滑恢复视频软件音量。 */
+    void startVideoVolumeRestore(qreal startFactor);
+
     /** @return 指定提示的独立开关是否启用。 */
     bool promptEnabled(Prompt prompt) const;
 
@@ -95,10 +111,27 @@ private:
     bool startGstreamer(const QString &path, bool ignoreCooldown, Prompt prompt);
 
 private:
+    struct MutedVideoState {
+        QPointer<GstPlayerWidget> player;
+        float volume = 0.0f;
+    };
+
     AppConfig config_;                       /**< 音频开关、设备、目录和提示文件配置。 */
     mutable QHash<int, qint64> lastPromptMs_; /**< 各提示类型最近播放时间，单位 ms。 */
     GstPlayerWidget *player_ = nullptr;       /**< 无视频输出的 GStreamer 提示音播放器。 */
     AmpVolumeController *volumeController_ = nullptr; /**< RK809 音量和持久化控制器。 */
+    QVariantAnimation *videoDuckAnimation_ = nullptr; /**< 播报前平滑压低视频软件音量。 */
+    QVariantAnimation *videoRestoreAnimation_ = nullptr; /**< 播报后平滑恢复视频软件音量。 */
+    QTimer volumeBoostTimer_;                 /**< 视频静音排空后再提升 RK809 音量。 */
+    QTimer playbackStartTimer_;               /**< RK809 音量稳定后再开始播放的短延时。 */
+    QTimer voiceFocusRestoreTimer_;           /**< 播放异常时恢复音量的兜底定时器。 */
+    QVector<MutedVideoState> mutedVideos_;    /**< 本次播报临时压低的视频播放器。 */
+    int savedRawVolume_ = -1;                 /**< 播报前的 RK809 原始音量。 */
+    bool voiceFocusActive_ = false;           /**< 当前是否持有语音焦点。 */
+    bool volumeBoostPending_ = false;         /**< 是否等待异步应用提示音原始音量 230。 */
+    int pendingRestoreRaw_ = -1;              /**< 等待异步恢复的 RK809 原始音量。 */
+    qreal pendingRestoreFactor_ = 0.0;        /**< 硬件恢复后视频淡入的起始比例。 */
+    QString pendingFileName_;                 /**< 延时启动后用于状态日志的文件名。 */
 };
 
 #endif

@@ -43,7 +43,9 @@
 #include "common/responsive_ui.h"
 #include "components/dialogs/ui_message_box.h"
 #include "modules/facegate/FaceGateQt/ui/CameraPreviewWidget.h"
+#include "ic_board/ic_event_bridge.h"
 #include "platform/rk3566_platform.h"
+#include "shell/QuickUiRuntime.h"
 #include "volumepopup.h"
 
 /** @return 字节是可显示的大写字母楼层编码时返回 true。 */
@@ -836,6 +838,11 @@ MultimediaDemo::MultimediaDemo(QWidget *parent) :
     ui->setupUi(static_cast<QWidget*>(this));
     LOG_INIT("UI初始化完成");
 
+    connect(IcEventBridge::instance(), &IcEventBridge::cardReaderHeartbeatWarning,
+            this, [this](const QString &message) {
+        showTransientStatus(message, 3000);
+    }, Qt::QueuedConnection);
+
     // initializeComponents() 早于配置文件读取，先使用与 videoRect 相同的
     // 默认值，避免用未初始化坐标创建 X11 原生视频子窗口。读取配置后会
     // 再把实际区域传给 GstPlayerWidget。
@@ -1008,6 +1015,9 @@ void MultimediaDemo::initPasswordErrorToast()
 /** @brief 显示指定时长的密码错误提示。 */
 void MultimediaDemo::showPasswordErrorToast(const QString &text, int ms)
 {
+    if (QuickUiRuntime::instance()->showToast(text, ms, false)) {
+        return;
+    }
     if (!m_passwordToastLabel) {
         initPasswordErrorToast();
     }
@@ -3617,7 +3627,8 @@ void MultimediaDemo::initializeMovingText()
     m_moveTextLabel->setAttribute(Qt::WA_TransparentForMouseEvents, true);
 
     QFont font = m_moveTextLabel->font();
-    font.setPointSize(qMax(1, MoveTextSize));
+    // 底部通知在原配置字号基础上略放大，颜色、区域和滚动速度保持不变。
+    font.setPointSize(qMax(28, MoveTextSize));
     m_moveTextLabel->setFont(font);
     const QColor textColor(qBound(0, MoveTextColorR, 255),
                            qBound(0, MoveTextColorG, 255),

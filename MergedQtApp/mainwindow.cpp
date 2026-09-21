@@ -14,6 +14,8 @@
 #include <QFileInfo>
 #include "components/dialogs/ui_message_box.h"
 #include "platform/rk3566_platform.h"
+#include "shell/QuickUiRuntime.h"
+#include "components/quick/QuickMainMenuWidget.h"
 
 namespace {
 
@@ -102,6 +104,25 @@ MainWindow::MainWindow(QWidget *parent)
 
     menuPage = this->takeCentralWidget();   // 不会被删除
 
+    // 原 Designer 菜单保留为加载失败兜底；正常运行时由整页 Quick 菜单覆盖，
+    // 所有点击继续转发给原按钮，因此设置、功能、调试、文件和重启逻辑不变。
+    quickMainMenu_ = new QuickMainMenuWidget(menuPage);
+    quickMainMenu_->setGeometry(menuPage->rect());
+    connect(quickMainMenu_, &QuickMainMenuWidget::actionTriggered,
+            this, [this](int index) {
+        const QList<QPushButton *> actions = {
+            ui->appButton1, ui->appButton2, ui->appButton3,
+            ui->appButton4, ui->appButton5, ui->exitButton
+        };
+        if (index >= 0 && index < actions.size() && actions.at(index)) {
+            actions.at(index)->click();
+        }
+    });
+    if (quickMainMenu_->status() == QQuickWidget::Ready) {
+        quickMainMenu_->show();
+        quickMainMenu_->raise();
+    }
+
     // 创建堆栈，并设为新的 centralWidget
     stack = new QStackedWidget(this);
     this->setCentralWidget(stack);
@@ -146,11 +167,17 @@ MainWindow::MainWindow(QWidget *parent)
         if (!mm) return;
 
         if (stack->currentWidget() == app3Page) {
+            QuickUiRuntime::instance()->synchronizeActiveModule(
+                        QuickUiRuntime::moduleId(QuickUiRuntime::MultimediaMainModule));
             QTimer::singleShot(0, mm, [mm]() {
                 // 回到多媒体主页：恢复本地首项，并在仍有 LIVE 目标时继续验证和重试。
                 mm->resumePlaybackAfterModuleSwitch();
             });
         } else {
+            QuickUiRuntime::instance()->synchronizeActiveModule(
+                        stack->currentWidget() == filePage
+                        ? QuickUiRuntime::moduleId(QuickUiRuntime::FileManagerModule)
+                        : QuickUiRuntime::moduleId(QuickUiRuntime::ApplicationShellModule));
             QTimer::singleShot(0, mm, [mm]() {
                 // 进入多媒体管理员或文件页面只暂停播放器，不能清除 LIVE 目标。
                 mm->suspendPlaybackForModuleSwitch();
@@ -169,6 +196,8 @@ MainWindow::MainWindow(QWidget *parent)
     });
 
     settingsDialog = new SettingsDialog(this);
+    featuresDialog = new FeaturesDialog(this);
+    featuresDialog->hide();
 
     cmdDialog = new CommandDialog(this);
     cmdDialog->hide();
@@ -368,9 +397,7 @@ MainWindow::MainWindow(QWidget *parent)
     });
 
     connect(ui->appButton2, &QPushButton::clicked, this, [=]() {
-        FeaturesDialog *featuresDialog = new FeaturesDialog(this);
-        // 设置窗口大小
-        featuresDialog->resize(400, 500);
+        if (!featuresDialog) return;
 
         // 打开时回显上次保存的状态
         FeatureSettings currentSettings = loadFeatureSettings();
@@ -393,8 +420,6 @@ MainWindow::MainWindow(QWidget *parent)
                 }
             }
         }
-        // 对话框关闭后删除
-        delete featuresDialog;
     });
 
     connect(ui->appButton3, &QPushButton::clicked, this, [=]() {
@@ -539,6 +564,7 @@ bool MainWindow::allowsPresenceSwitch() const
         return false;
     }
     if ((settingsDialog && settingsDialog->isVisible()) ||
+        (featuresDialog && featuresDialog->isVisible()) ||
         (cmdDialog && cmdDialog->isVisible())) {
         return false;
     }
@@ -567,6 +593,12 @@ void MainWindow::keyPressEvent(QKeyEvent *event)
 void MainWindow::resizeEvent(QResizeEvent *event)
 {
     QMainWindow::resizeEvent(event);
+    if (quickMainMenu_ && menuPage) {
+        quickMainMenu_->setGeometry(menuPage->rect());
+        if (quickMainMenu_->isVisible()) {
+            quickMainMenu_->raise();
+        }
+    }
     // 覆盖层采用延迟初始化，窗口早期收到 resize 时可能尚不存在。
     if (!udiskOverlay) return;
 

@@ -115,7 +115,7 @@ void AppPasswordDialog::showEvent(QShowEvent *event)
         setGeometry(parentWidget()->rect());
         if (keyboardClearance_) {
             keyboardClearance_->setFixedHeight(
-                        ResponsiveUi::keyboardHeight(height(), 300));
+                        ResponsiveUi::sharedKeyboardHeight(size()));
         }
     }
     QDialog::showEvent(event);
@@ -261,7 +261,7 @@ void AppPasswordDialog::buildUi(const QString &title, const QString &description
         contentLayout->addWidget(card, 0, Qt::AlignHCenter);
         keyboardClearance_ = new QWidget(contentWidget);
         keyboardClearance_->setFixedHeight(
-                    ResponsiveUi::keyboardHeight(height(), 300));
+                    ResponsiveUi::sharedKeyboardHeight(size()));
         keyboardClearance_->setAttribute(Qt::WA_TransparentForMouseEvents);
         contentLayout->addWidget(keyboardClearance_);
     } else {
@@ -370,7 +370,7 @@ bool AppPasswordDialog::eventFilter(QObject *watched, QEvent *event)
         setGeometry(parentWidget()->rect());
         if (keyboardClearance_) {
             keyboardClearance_->setFixedHeight(
-                        ResponsiveUi::keyboardHeight(height(), 300));
+                        ResponsiveUi::sharedKeyboardHeight(size()));
         }
     }
 

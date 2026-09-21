@@ -35,6 +35,8 @@
 class QLineEdit;
 class QPushButton;
 class QPlainTextEdit;
+class QHideEvent;
+class QShowEvent;
 
 /**
  * @brief 设备调试与配置命令对话框。
@@ -66,6 +68,10 @@ signals:
 protected:
     /** @brief 为输入框接入软键盘并处理对话框内的交互事件。 */
     bool eventFilter(QObject *obj, QEvent *event) override;
+    /** @brief 显示时同步统一界面模块路由。 */
+    void showEvent(QShowEvent *event) override;
+    /** @brief 隐藏时恢复进入调试工具前的模块路由。 */
+    void hideEvent(QHideEvent *event) override;
 
 
 private:
@@ -114,6 +120,9 @@ private:
 
     /** 使用可滚动紧凑结构，保证运行中横竖屏切换无需重建编辑器。 */
     bool m_compactLayout = false;
+
+    /** 打开调试工具前的统一模块路由。 */
+    QString previousModuleId_;
 
 
 private slots:

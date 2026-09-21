@@ -82,7 +82,7 @@ void PersonImportWorker::run()
     records.reserve(parsed.records.size());
     for (const PersonSpreadsheetRecord &record : parsed.records) records.append(record.data);
 
-    emit progress(45, QStringLiteral("已解析 %1 人，正在核对网络重复人员并更新本地库…").arg(records.size()));
+    emit progress(45, QStringLiteral("已解析 %1 人，正在核对网络重复人员和卡号并更新本地库…").arg(records.size()));
     const LocalPersonnelImportResult imported = store_.importSpreadsheetPersonnel(records);
     inserted_ = imported.inserted;
     updated_ = imported.updated;

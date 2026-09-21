@@ -30,6 +30,11 @@ void IcEventBridge::updateNetworkAvailability(bool available)
     emit networkAvailabilityChanged(available);
 }
 
+void IcEventBridge::emitCardReaderHeartbeatWarning(const QString &message)
+{
+    emit cardReaderHeartbeatWarning(message);
+}
+
 /** @brief 发布卡片通过信息给 MQTT 网关等订阅者。 */
 void IcEventBridge::emitCardPassed(const QString &cardId, const QString &floor, const QByteArray &rawFrame)
 {

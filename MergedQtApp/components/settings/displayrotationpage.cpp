@@ -80,7 +80,7 @@ DisplayRotationPage::DisplayRotationPage(QWidget *parent)
         queryStarted_ = false;
         if (exitStatus != QProcess::NormalExit || exitCode != 0) {
             currentRotationLabel_->setText(QStringLiteral("当前方向：读取失败"));
-            statusLabel_->setText(QStringLiteral("请检查 /usr/local/sbin/weston-control 是否已正确安装"));
+            statusLabel_->setText(QStringLiteral("请检查 /usr/local/sbin/weston-control 是否已正确安装。"));
             return;
         }
 
@@ -99,7 +99,7 @@ DisplayRotationPage::DisplayRotationPage(QWidget *parent)
         if (error == QProcess::FailedToStart) {
             queryStarted_ = false;
             currentRotationLabel_->setText(QStringLiteral("当前方向：控制脚本不可用"));
-            statusLabel_->setText(QStringLiteral("请先安装 weston-control"));
+            statusLabel_->setText(QStringLiteral("请先安装 weston-control。"));
         }
     });
     connect(applyButton_, &QPushButton::clicked,
@@ -133,7 +133,7 @@ void DisplayRotationPage::refreshCurrentRotation()
     const QString program = controlProgram();
     if (!QFileInfo(program).isExecutable()) {
         currentRotationLabel_->setText(QStringLiteral("当前方向：控制脚本未安装"));
-        statusLabel_->setText(QStringLiteral("缺少 /usr/local/sbin/weston-control"));
+        statusLabel_->setText(QStringLiteral("缺少 /usr/local/sbin/weston-control。"));
         return;
     }
 
@@ -146,13 +146,13 @@ void DisplayRotationPage::requestRotation()
 {
     const int degrees = rotationCombo_->currentData().toInt();
     if (degrees == currentRotation_) {
-        statusLabel_->setText(QStringLiteral("当前已经是所选方向"));
+        statusLabel_->setText(QStringLiteral("当前已经是所选方向，无需重启。"));
         return;
     }
 
     const QString program = controlProgram();
     if (!QFileInfo(program).isExecutable()) {
-        statusLabel_->setText(QStringLiteral("旋转失败：weston-control 未安装或不可执行"));
+        statusLabel_->setText(QStringLiteral("旋转失败：weston-control 未安装或不可执行。"));
         return;
     }
 
@@ -166,24 +166,24 @@ void DisplayRotationPage::requestRotation()
     if (!validationProcess.waitForStarted(1000) ||
         !validationProcess.waitForFinished(2000)) {
         validationProcess.kill();
-        statusLabel_->setText(QStringLiteral("无法读取界面资源方向"));
+        statusLabel_->setText(QStringLiteral("无法读取界面资源方向，旋转请求已忽略。"));
         return;
     }
     if (validationProcess.exitStatus() != QProcess::NormalExit ||
         validationProcess.exitCode() != 0) {
         if (validationProcess.exitCode() == 3) {
             statusLabel_->setText(
-                QStringLiteral("所选方向与界面资源的横竖布局不一致，无法旋转"));
+                QStringLiteral("所选方向与界面资源的横竖布局不一致，旋转请求已忽略。"));
         } else {
             statusLabel_->setText(
-                QStringLiteral("界面资源方向配置无效"));
+                QStringLiteral("界面资源方向配置无效，旋转请求已忽略。"));
         }
         return;
     }
 
     applyButton_->setEnabled(false);
     rotationCombo_->setEnabled(false);
-    statusLabel_->setText(QStringLiteral("正在切换中，稍后将自动重启……"));
+    statusLabel_->setText(QStringLiteral("正在切换显示方向，Qt 程序将自动重启……"));
 
     // 先让提示完成一次绘制，再脱离当前 Qt 进程启动控制脚本。控制脚本会
     // 正常结束本进程，因此不能使用阻塞式 QProcess::execute()。
@@ -194,7 +194,7 @@ void DisplayRotationPage::requestRotation()
         if (!started) {
             applyButton_->setEnabled(true);
             rotationCombo_->setEnabled(true);
-            statusLabel_->setText(QStringLiteral("旋转请求启动失败，请检查脚本权限"));
+            statusLabel_->setText(QStringLiteral("旋转请求启动失败，请检查脚本权限。"));
         }
     });
 }

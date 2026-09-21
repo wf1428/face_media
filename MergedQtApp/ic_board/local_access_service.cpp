@@ -57,6 +57,14 @@ QStringList cardCandidates(const QString &input)
     if (ok && decimalValue <= 0xffffffffULL) {
         const QString hex = QStringLiteral("%1").arg(decimalValue, 8, 16, QLatin1Char('0')).toUpper();
         if (!values.contains(hex)) values.append(hex);
+        QByteArray bytes = QByteArray::fromHex(hex.toLatin1());
+        if (bytes.size() == 4) {
+            std::reverse(bytes.begin(), bytes.end());
+            const QString reverseHex = QString::fromLatin1(bytes.toHex()).toUpper();
+            if (!values.contains(reverseHex)) values.append(reverseHex);
+            const QString reverseDecimal = QString::number(reverseHex.toULongLong(&ok, 16));
+            if (ok && !values.contains(reverseDecimal)) values.append(reverseDecimal);
+        }
     }
     return values;
 }
@@ -87,9 +95,48 @@ bool LocalAccessService::initialize()
 
 NetworkAccessResult LocalAccessService::checkCardFrame(const QByteArray &frame, const QDateTime &now)
 {
-    if (!initialize()) return denied(QStringLiteral("本地权限数据库初始化失败"));
     if (frame.size() < 43) return denied(QStringLiteral("刷卡数据长度不足"));
     const QString readerCard = QString::fromLatin1(frame.mid(35, 8)).trimmed().toUpper();
+    return checkCardId(readerCard, now);
+}
+
+bool LocalAccessService::hasCardId(const QString &cardId)
+{
+    return !cardHolders(cardId).isEmpty();
+}
+
+QList<CardHolderInfo> LocalAccessService::cardHolders(const QString &cardId)
+{
+    QList<CardHolderInfo> holders;
+    if (!initialize()) return holders;
+    const QStringList candidates = cardCandidates(cardId);
+    if (candidates.isEmpty()) return holders;
+
+    QStringList marks;
+    QList<QVariant> binds;
+    for (const QString &candidate : candidates) {
+        marks.append(QStringLiteral("?"));
+        binds.append(candidate);
+    }
+    const QList<QVariantMap> rows = DbStore::query(
+                QStringLiteral("SELECT DISTINCT c.person_id,p.name FROM local_ic_card c "
+                               "JOIN person p ON p.id=c.person_id "
+                               "WHERE UPPER(c.card_id) IN (%1) ORDER BY c.person_id")
+                    .arg(marks.join(QLatin1Char(','))), binds);
+    for (const QVariantMap &row : rows) {
+        CardHolderInfo holder;
+        holder.personId = row.value(QStringLiteral("person_id")).toString();
+        holder.name = row.value(QStringLiteral("name")).toString().trimmed();
+        if (holder.name.isEmpty()) holder.name = holder.personId;
+        holders.append(holder);
+    }
+    return holders;
+}
+
+NetworkAccessResult LocalAccessService::checkCardId(const QString &cardId, const QDateTime &now)
+{
+    if (!initialize()) return denied(QStringLiteral("本地权限数据库初始化失败"));
+    const QString readerCard = cardId.trimmed().toUpper();
     const QStringList candidates = cardCandidates(readerCard);
     QStringList marks;
     QList<QVariant> binds;

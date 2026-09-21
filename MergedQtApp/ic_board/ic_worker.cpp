@@ -9,7 +9,6 @@
 #include "ic_worker.h"
 
 #include "ic_event_bridge.h"
-#include "core_migration_audit/core_network_card_compat.h"
 #include "common/sql/dbstore.h"
 #include "local_access_service.h"
 #include "network_access_service.h"
@@ -22,6 +21,7 @@
 #include <QProcess>
 #include <QSettings>
 #include <QThread>
+#include <QTimer>
 #include "platform/rk3566_platform.h"
 
 namespace {
@@ -119,6 +119,146 @@ IcWorker::IcWorker(const IcSerialConfig &io, QObject *parent)
 IcWorker::~IcWorker()
 {
     stop();
+}
+
+bool IcWorker::handleStoredCard(const QString &cardId, const QByteArray &rawFrame)
+{
+    const QString normalizedCard = cardId.trimmed().toUpper();
+    const QList<CardHolderInfo> networkHolders = networkAccess_
+            ? networkAccess_->cardHolders(normalizedCard) : QList<CardHolderInfo>();
+    const QList<CardHolderInfo> localHolders = localAccess_
+            ? localAccess_->cardHolders(normalizedCard) : QList<CardHolderInfo>();
+    const int holderCount = networkHolders.size() + localHolders.size();
+    if (holderCount == 0) return false;
+
+    if (holderCount > 1) {
+        QString reason;
+        if (holderCount > 2) {
+            reason = QStringLiteral("多个人员卡号冲突");
+        } else {
+            QStringList names;
+            for (const CardHolderInfo &holder : networkHolders) {
+                names.append(holder.name + QStringLiteral("人员"));
+            }
+            for (const CardHolderInfo &holder : localHolders) {
+                names.append(holder.name + QStringLiteral("人员"));
+            }
+            reason = QStringLiteral("卡号冲突：%1")
+                    .arg(names.join(QStringLiteral("和")));
+        }
+        qWarning().noquote() << "[IC-CARD-ROUTE]" << reason;
+        IcEventBridge::instance()->emitToastFailRequested(reason);
+        return true;
+    }
+
+    const bool useNetwork = !networkHolders.isEmpty();
+    qInfo().noquote() << QStringLiteral("[IC-CARD-ROUTE] card=%1 selected=%2")
+                         .arg(normalizedCard)
+                         .arg(useNetwork ? QStringLiteral("network")
+                                         : QStringLiteral("local"));
+
+    const QDateTime now = QDateTime::currentDateTime();
+    if (useNetwork) {
+        finishNetworkCard(networkAccess_->checkCardId(normalizedCard, now), rawFrame);
+    } else {
+        finishLocalCard(localAccess_->checkCardId(normalizedCard, now));
+    }
+    return true;
+}
+
+void IcWorker::finishNetworkCard(const NetworkAccessResult &result,
+                                 const QByteArray &rawFrame)
+{
+    QStringList floorTexts;
+    for (int floor : result.floors) floorTexts.append(QString::number(floor));
+    const QString floors = floorTexts.join(QLatin1Char(','));
+
+    if (!result.pass) {
+        qInfo() << "[NETWORK-PERSON][IC] DENY" << "code=" << result.code << result.reason;
+        IcEventBridge::instance()->emitToastFailRequested(result.reason, result.code);
+        IcEventBridge::instance()->emitCardAccessFinished(
+                    result.personId, result.credential, floors,
+                    result.rs485Frame, false, result.reason);
+        return;
+    }
+
+    const bool sent = rs485_ && rs485_->sendFrame(result.rs485Frame);
+    qInfo() << "[NETWORK-PERSON][IC]" << (sent ? "PASS" : "RS485_FAIL")
+            << "personId=" << result.personId
+            << "cardId=" << result.credential
+            << "floors=" << result.floors
+            << "frame=" << result.rs485Frame.toHex(' ');
+    if (!sent) {
+        const QString reason = QStringLiteral("RS485发送失败");
+        IcEventBridge::instance()->emitToastFailRequested(reason);
+        IcEventBridge::instance()->emitCardAccessFinished(
+                    result.personId, result.credential, floors,
+                    result.rs485Frame, false, reason);
+        return;
+    }
+
+    if (!networkAccess_ || !networkAccess_->recordSuccessfulAccess(result)) {
+        const QString reason = QStringLiteral("刷卡通行次数/金额扣减失败");
+        qWarning().noquote() << "[NETWORK-PERSON][IC] DEDUCT_FAIL"
+                             << "personId=" << result.personId
+                             << "cardId=" << result.credential;
+        IcEventBridge::instance()->emitToastFailRequested(reason);
+        IcEventBridge::instance()->emitCardAccessFinished(
+                    result.personId, result.credential, floors,
+                    result.rs485Frame, false, reason);
+        return;
+    }
+
+    IcEventBridge::instance()->emitToastPassRequested();
+    IcEventBridge::instance()->emitCardAccessFinished(
+                result.personId, result.credential, floors,
+                result.rs485Frame, true, QString());
+    IcEventBridge::instance()->emitCardPassed(result.credential, QString(), rawFrame);
+}
+
+void IcWorker::finishLocalCard(const NetworkAccessResult &result)
+{
+    if (!result.pass) {
+        IcEventBridge::instance()->emitToastFailRequested(result.reason, result.code);
+        return;
+    }
+
+    const bool sent = rs485_ && rs485_->sendFrame(result.rs485Frame);
+    const bool recorded = sent && localAccess_
+            && localAccess_->recordSuccessfulAccess(result);
+    if (recorded) {
+        IcEventBridge::instance()->emitToastPassRequested();
+    } else {
+        IcEventBridge::instance()->emitToastFailRequested(
+                    !sent ? QStringLiteral("RS485发送失败")
+                          : QStringLiteral("本地通行次数/金额扣减失败"));
+    }
+}
+
+void IcWorker::finishEmbeddedPermissionCard(const QByteArray &frame)
+{
+    const DeviceConfig cfg = DeviceConfigSync::cfg();
+    const auto result = OfflineChecker::check(
+                frame, cfg.floorNum, cfg.cardSecret.toLatin1(),
+                QDateTime::currentDateTime());
+    const QString type = result.type == OfflineChecker::CardType::Multi115
+            ? QStringLiteral("MULTI")
+            : result.type == OfflineChecker::CardType::Visitor103
+              ? QStringLiteral("VISITOR") : QStringLiteral("UNKNOWN");
+
+    if (!result.pass) {
+        qInfo().noquote() << QStringLiteral("[%1] DENY source=embedded reason=%2")
+                             .arg(type, result.reason);
+        IcEventBridge::instance()->emitToastFailRequested(result.reason);
+        return;
+    }
+
+    qInfo() << "[" << type << "] PASS source=embedded"
+            << "relayNum=" << result.relayNum
+            << "relayTimes=" << result.relayTimes
+            << "fcbbuf36=" << result.fcbbuf36.toHex(' ');
+    IcEventBridge::instance()->emitToastPassRequested();
+    if (rs485_) rs485_->sendFrame(result.fcbbuf36);
 }
 
 /**
@@ -396,130 +536,57 @@ void IcWorker::start()
                  << "head=" << frame.left(2)
                  << "hex=" << frame.toHex(' ');
 
-        const auto c = DeviceConfigSync::cfg();
-
-        const NetworkAccessResult localResult = localAccess_
-                ? localAccess_->checkCardFrame(frame, QDateTime::currentDateTime())
-                : NetworkAccessResult();
-        if (localResult.pass || !localResult.personId.isEmpty()) {
-            if (!localResult.pass) {
-                IcEventBridge::instance()->emitToastFailRequested(localResult.reason, localResult.code);
-                return;
-            }
-            const bool sent = rs485_ && rs485_->sendFrame(localResult.rs485Frame);
-            const bool recorded = sent && localAccess_
-                    && localAccess_->recordSuccessfulAccess(localResult);
-            if (recorded) IcEventBridge::instance()->emitToastPassRequested();
-            else IcEventBridge::instance()->emitToastFailRequested(
-                        !sent ? QStringLiteral("RS485发送失败")
-                              : QStringLiteral("本地通行次数/金额扣减失败"));
-            return;
-        }
-
-        const RuntimeIcMode runtimeMode = runtimeIcModeFromIni();
-        if (runtimeMode == RuntimeIcMode::OfflineV1) {
-            const auto res = OfflineChecker::check(
-                frame,
-                c.floorNum,
-                c.cardSecret.toLatin1(),
-                QDateTime::currentDateTime()
-            );
-
-            const QString typeStr =
-                (res.type == OfflineChecker::CardType::Multi115) ? "MULTI" :
-                (res.type == OfflineChecker::CardType::Visitor103) ? "VISITOR" : "UNKNOWN";
-
-            if (res.pass) {
-                qDebug() << "[" << typeStr << "] PASS mode=offline"
-                         << "relayNum=" << res.relayNum
-                         << "relayTimes=" << res.relayTimes
-                         << "fcbbuf36=" << res.fcbbuf36.toHex(' ');
-
-                IcEventBridge::instance()->emitToastPassRequested();
-
-                if (rs485_) {
-                    rs485_->sendFrame(res.fcbbuf36);
-                }
-            } else {
-                qDebug() << "[" << typeStr << "] DENY mode=offline reason=" << res.reason;
-                IcEventBridge::instance()->emitToastFailRequested(res.reason);
-            }
-            return;
-        }
-
-        if (runtimeMode == RuntimeIcMode::OnlineV1) {
-            const NetworkAccessResult result = networkAccess_
-                    ? networkAccess_->checkCardFrame(frame, QDateTime::currentDateTime())
-                    : NetworkAccessResult();
-            QStringList floorTexts;
-            for (int floor : result.floors) {
-                floorTexts.append(QString::number(floor));
-            }
-            const QString floors = floorTexts.join(QLatin1Char(','));
-            if (!result.pass) {
-                qInfo() << "[ONLINE-V1][IC] DENY"
-                        << "code=" << result.code << result.reason;
-                IcEventBridge::instance()->emitToastFailRequested(
-                            result.reason, result.code);
-                IcEventBridge::instance()->emitCardAccessFinished(
-                            result.personId, result.credential, floors,
-                            result.rs485Frame, false, result.reason);
-                return;
-            }
-
-            const bool sent = rs485_ && rs485_->sendFrame(result.rs485Frame);
-            qInfo() << "[ONLINE-V1][IC]" << (sent ? "PASS" : "RS485_FAIL")
-                    << "personId=" << result.personId
-                    << "cardId=" << result.credential
-                    << "floors=" << result.floors
-                    << "frame=" << result.rs485Frame.toHex(' ');
-            if (!sent) {
-                IcEventBridge::instance()->emitToastFailRequested(
-                            QStringLiteral("RS485发送失败"));
-                IcEventBridge::instance()->emitCardAccessFinished(
-                            result.personId, result.credential, floors,
-                            result.rs485Frame, false, QStringLiteral("RS485发送失败"));
-                return;
-            }
-            if (!networkAccess_ || !networkAccess_->recordSuccessfulAccess(result)) {
-                const QString reason = QStringLiteral("刷卡通行次数/金额扣减失败");
-                qWarning().noquote() << "[ONLINE-V1][IC] DEDUCT_FAIL"
-                                     << "personId=" << result.personId
-                                     << "cardId=" << result.credential;
-                IcEventBridge::instance()->emitToastFailRequested(reason);
-                IcEventBridge::instance()->emitCardAccessFinished(
-                            result.personId, result.credential, floors,
-                            result.rs485Frame, false, reason);
-                return;
-            }
-            IcEventBridge::instance()->emitToastPassRequested();
-            IcEventBridge::instance()->emitCardAccessFinished(
-                        result.personId, result.credential, floors,
-                        result.rs485Frame, true, QString());
-            IcEventBridge::instance()->emitCardPassed(result.credential, QString(), frame);
-            return;
-        }
-
-        const auto res = CoreNetworkCardCompat::check(frame, QDateTime::currentDateTime());
-        if (res.pass) {
-            qDebug() << "[ONLINE-NET] PASS"
-                     << "cardId=" << res.cardId
-                     << "relayNum=" << res.relayNum
-                     << "relayTimes=" << res.relayTimes
-                     << "fcbbuf36=" << res.fcbbuf36.toHex(' ');
-
-            IcEventBridge::instance()->emitToastPassRequested();
-
-            if (rs485_) {
-                rs485_->sendFrame(res.fcbbuf36);
-            }
-
-            IcEventBridge::instance()->emitCardPassed(res.cardId, QString(), frame);
-        } else {
-            qDebug() << "[ONLINE-NET] DENY reason=" << res.reason;
-            IcEventBridge::instance()->emitToastFailRequested(res.reason);
+        const QString cardId = QString::fromLatin1(frame.mid(35, 8)).trimmed().toUpper();
+        if (!handleStoredCard(cardId, frame)) {
+            finishEmbeddedPermissionCard(frame);
         }
     });
+
+    QObject::connect(reader_, &CardSerial2Reader::uidCardFrame, this,
+                     [this](const QString &cardId, const QByteArray &frame) {
+        qInfo() << "[CARD-UID] RX cardId=" << cardId << "raw=" << frame;
+        if (!handleStoredCard(cardId, frame)) {
+            IcEventBridge::instance()->emitToastFailRequested(
+                        QStringLiteral("空卡：%1").arg(cardId));
+        }
+    });
+
+    readerHeartbeatElapsed_.start();
+    readerHeartbeatWarningElapsed_.invalidate();
+    QObject::connect(reader_, &CardSerial2Reader::heartbeatReceived, this, [this]() {
+        readerHeartbeatElapsed_.restart();
+        readerHeartbeatWarningElapsed_.invalidate();
+        if (readerHeartbeatFault_) {
+            readerHeartbeatFault_ = false;
+            qInfo() << "[CARD-READER] heartbeat recovered";
+        }
+    });
+
+    readerHeartbeatTimer_ = new QTimer(this);
+    readerHeartbeatTimer_->setInterval(1000);
+    QObject::connect(readerHeartbeatTimer_, &QTimer::timeout, this, [this]() {
+        const qint64 elapsed = readerHeartbeatElapsed_.elapsed();
+        if (elapsed < 60000) return;
+        if (readerHeartbeatWarningElapsed_.isValid()
+                && readerHeartbeatWarningElapsed_.elapsed() < 30000) return;
+
+        readerHeartbeatFault_ = true;
+        if (readerHeartbeatWarningElapsed_.isValid()) {
+            readerHeartbeatWarningElapsed_.restart();
+        } else {
+            readerHeartbeatWarningElapsed_.start();
+        }
+        QSettings ini(Rk3566Platform::netConfigPath(), QSettings::IniFormat);
+        ini.setIniCodec("UTF-8");
+        const bool logEnabled = ini.value(
+                    QStringLiteral("card_reader/heartbeat_log_enabled"), true).toBool();
+        if (logEnabled) {
+            qWarning() << "[CARD-READER] heartbeat timeout, elapsedMs=" << elapsed;
+        }
+        IcEventBridge::instance()->emitCardReaderHeartbeatWarning(
+                    QStringLiteral("读头错误，请检查读头是否正常。"));
+    });
+    readerHeartbeatTimer_->start();
 
     QObject::connect(reader_, &CardSerial2Reader::errorOccured, this,
                      [](const QString& err) {
@@ -661,6 +728,9 @@ void IcWorker::start()
  */
 void IcWorker::stop()
 {
+    if (readerHeartbeatTimer_) {
+        readerHeartbeatTimer_->stop();
+    }
     if (reader_) {
         reader_->stop();
     }

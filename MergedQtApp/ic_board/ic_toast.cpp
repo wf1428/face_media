@@ -19,9 +19,11 @@
 #include <QFileInfo>
 #include <QDir>
 #include <QDebug>
-#include <QSettings>
 #include <QSaveFile>
 #include <QStandardPaths>
+#include <QVariantAnimation>
+#include <QEasingCurve>
+#include <QPaintEvent>
 #include "platform/rk3566_platform.h"
 
 IcToast* IcToast::self_ = nullptr;
@@ -53,7 +55,7 @@ IcToast::IcToast(QWidget* mainWindow)
         hide();
     });
 
-    passAnimTimer_.setInterval(16); // 约 60fps，呼吸过渡更平滑
+    passAnimTimer_.setInterval(33); // 约 30fps，降低透明覆盖层的重绘和合成压力
     connect(&passAnimTimer_, &QTimer::timeout, this, &IcToast::updatePassEdgeFlash);
 
     if (main_) main_->installEventFilter(this);
@@ -61,6 +63,19 @@ IcToast::IcToast(QWidget* mainWindow)
     // 覆盖主窗口客户区
     setGeometry(main_->rect());
     hide();
+
+    voiceStartTimer_.setSingleShot(true);
+    // 硬件音量切到 230 后短暂稳定；提示音链路已通过 preroll 静音准备。
+    voiceStartTimer_.setInterval(15);
+    connect(&voiceStartTimer_, &QTimer::timeout, this, [this]() {
+        if (!voicePlayer_ || pendingVoiceFile_.isEmpty()) {
+            endVoiceFocus();
+            return;
+        }
+        voicePlayer_->play();
+        qInfo() << "[IC-TOAST] GStreamer play voice:" << pendingVoiceFile_;
+        voiceFocusRestoreTimer_.start(15000);
+    });
 
     voiceFocusRestoreTimer_.setSingleShot(true);
     connect(&voiceFocusRestoreTimer_, &QTimer::timeout,
@@ -75,12 +90,20 @@ IcToast::IcToast(QWidget* mainWindow)
         qWarning() << "[IC-TOAST] GStreamer voice playback failed:" << error;
         endVoiceFocus();
     });
+    connect(&AudioPromptFocusManager::instance(),
+            &AudioPromptFocusManager::focusReady,
+            this, [this](QObject *owner) {
+        if (owner == this && voiceFocusActive_ && !pendingVoiceFile_.isEmpty()) {
+            voiceStartTimer_.start();
+        }
+    });
 
     // 所有提示音统一从 common/audio 资源目录读取；GStreamer 播放临时文件。
     passVoiceFile_ = materializeResourceToTemp(
                 QStringLiteral(":/common/audio/code_200.mp3"));
     failVoiceFile_ = materializeResourceToTemp(
                 QStringLiteral(":/common/audio/fail.wav"));
+
 }
 
 /**
@@ -126,67 +149,10 @@ bool IcToast::allowTriggerNow(bool isFail)
     return true;
 }
 
-/** @return 外置静态资源优先、qrc 资源回退的提示配置路径。 */
-QString IcToast::resolveToastConfigPath() const
-{
-    return Rk3566Platform::uiConfigPath();
-}
-
-/**
- * @brief 解析兼容历史写法的 INI 布尔值。
- *
- * 先去除分号后的行内注释，再接受 0/1、true/false、yes/no 或其他整数。
- */
-bool IcToast::parseIniBool(const QVariant& v, bool def)
-{
-    if (!v.isValid()) return def;
-
-    QString s = v.toString().trimmed();
-    const int commentPos = s.indexOf(';');
-    if (commentPos >= 0) {
-        s = s.left(commentPos).trimmed();
-    }
-
-    if (s.isEmpty()) return def;
-
-    if (s == "1") return true;
-    if (s == "0") return false;
-
-    if (s.compare("true", Qt::CaseInsensitive) == 0) return true;
-    if (s.compare("false", Qt::CaseInsensitive) == 0) return false;
-    if (s.compare("yes", Qt::CaseInsensitive) == 0) return true;
-    if (s.compare("no", Qt::CaseInsensitive) == 0) return false;
-
-    bool ok = false;
-    const int n = s.toInt(&ok);
-    if (ok) return n != 0;
-
-    return def;
-}
-
-/** @return MusicPlayEn 配置明确启用时返回 true；缺少配置时默认关闭语音。 */
+/** @return MusicPlayEn 为 1 或缺少配置时返回 true。 */
 bool IcToast::isVoicePromptEnabled() const
 {
-    const QString configPath = resolveToastConfigPath();
-    if (configPath.isEmpty()) {
-        qWarning() << "[IC-TOAST] config not found, voice disabled by default";
-        return false;
-    }
-
-    QSettings settings(configPath, QSettings::IniFormat);
-
-#if (QT_VERSION < QT_VERSION_CHECK(6, 0, 0))
-    settings.setIniCodec("UTF-8");
-#endif
-
-    const QVariant v = settings.value("DisplayDirRect/MusicPlayEn", 0);
-    const bool enabled = parseIniBool(v, false);
-
-    qInfo() << "[IC-TOAST] voice config path=" << configPath
-            << "MusicPlayEn=" << v.toString()
-            << "enabled=" << enabled;
-
-    return enabled;
+    return AmpVolumeController::isPromptPlaybackEnabled();
 }
 
 
@@ -203,6 +169,7 @@ void IcToast::showPass(int ms)
 
     // 成功提示要显式切到绿色边框主题
     edgeTheme_ = EdgeSuccessGreen;
+    passEdgeTextureTheme_ = EdgeNone;
     kind_ = PassEdgeFlash;
     text_.clear();
     boxRect_ = QRect();
@@ -221,7 +188,7 @@ void IcToast::showPass(int ms)
     show();
 
     startPassEdgeFlash();
-    update();
+    update(passEdgeDirtyRegion());
 }
 
 /**
@@ -241,6 +208,7 @@ void IcToast::showFail(const QString& reason, int ms, int resultCode)
     }
 
     edgeTheme_ = EdgeFailRed;
+    passEdgeTextureTheme_ = EdgeNone;
     kind_ = Fail;
 
     const QString r = localizeFailReason(reason);
@@ -253,7 +221,7 @@ void IcToast::showFail(const QString& reason, int ms, int resultCode)
 
     // 红框走和绿框一样的脉冲逻辑
     startPassEdgeFlash();
-    update();
+    update(passEdgeDirtyRegion());
 }
 
 /**
@@ -319,7 +287,7 @@ void IcToast::updatePassEdgeFlash() {
         if (kind_ == PassEdgeFlash) {
             hide();
         } else {
-            update();
+            update(passEdgeDirtyRegion());
         }
         return;
     }
@@ -328,17 +296,50 @@ void IcToast::updatePassEdgeFlash() {
     const qreal easeInOut = 0.5 - 0.5 * qCos(2.0 * M_PI * phase); // 0~1~0
     passFlashStrength_ = 0.3 + 0.7 * easeInOut;
 
-    update();
+    update(passEdgeDirtyRegion());
 }
 
 /**
- * @brief 绘制四边线性渐变、四角径向光晕及内侧高光。
+ * @return 当前尺寸下四边光效实际占用的脏区。
+ */
+QRegion IcToast::passEdgeDirtyRegion() const
+{
+    if (width() <= 0 || height() <= 0) return QRegion();
+    const qreal ringWidth = qMin<qreal>(qMin(width(), height()) * 0.45,
+                                       qMax(8.0, qreal(passRingWidthPx_)));
+    const int band = qMin(qMin(width(), height()) / 2,
+                          qCeil(ringWidth * 1.8) + 2);
+    QRegion region(QRect(0, 0, width(), band));
+    region += QRect(0, height() - band, width(), band);
+    region += QRect(0, band, band, qMax(0, height() - 2 * band));
+    region += QRect(width() - band, band, band, qMax(0, height() - 2 * band));
+    return region;
+}
+
+/** @brief 按当前尺寸和主题生成一次最大亮度的边缘纹理。 */
+void IcToast::ensurePassEdgeTexture()
+{
+    if (edgeTheme_ == EdgeNone || size().isEmpty()) return;
+    if (!passEdgeTexture_.isNull() && passEdgeTextureSize_ == size() &&
+            passEdgeTextureTheme_ == edgeTheme_) {
+        return;
+    }
+
+    passEdgeTexture_ = QImage(size(), QImage::Format_ARGB32_Premultiplied);
+    passEdgeTexture_.fill(Qt::transparent);
+    QPainter cachePainter(&passEdgeTexture_);
+    renderPassEdgeTexture(cachePainter);
+    cachePainter.end();
+    passEdgeTextureSize_ = size();
+    passEdgeTextureTheme_ = edgeTheme_;
+}
+
+/**
+ * @brief 将四边线性渐变、四角径向光晕及内侧高光绘制进缓存。
  * @param p 当前窗口绘制器。
  */
-void IcToast::paintPassEdgeFlash(QPainter& p) {
-    const qreal s = qBound<qreal>(0.0, passFlashStrength_, 1.0);
-    if (s <= 0.001) return;
-
+void IcToast::renderPassEdgeTexture(QPainter& p) {
+    const qreal s = 1.0;
     p.setRenderHint(QPainter::Antialiasing, true);
     p.setPen(Qt::NoPen);
 
@@ -473,6 +474,9 @@ bool IcToast::eventFilter(QObject* watched, QEvent* event) {
         if (event->type() == QEvent::Resize || event->type() == QEvent::Move ||
             event->type() == QEvent::WindowStateChange) {
             if (main_) setGeometry(main_->rect());
+            passEdgeTexture_ = QImage();
+            passEdgeTextureSize_ = QSize();
+            passEdgeTextureTheme_ = EdgeNone;
             moveBoxToScreenCenter();
             update();
         }
@@ -485,7 +489,7 @@ bool IcToast::eventFilter(QObject* watched, QEvent* event) {
  */
 void IcToast::resizeToFitText() {
     QFont f = baseFont_;
-    f.setPointSize(f.pointSize() + 8);
+    f.setPointSize(f.pointSize() + 11);
     f.setWeight(QFont::Bold);
     setFont(f);
 
@@ -517,12 +521,24 @@ void IcToast::moveBoxToScreenCenter() {
 /**
  * @brief 绘制边缘主题；非纯成功提示时再绘制圆角文字框。
  */
-void IcToast::paintEvent(QPaintEvent*) {
+void IcToast::paintEvent(QPaintEvent* event) {
     QPainter p(this);
+    p.setCompositionMode(QPainter::CompositionMode_Source);
+    const QVector<QRect> dirtyRects = event->region().rects();
+    for (const QRect &rect : dirtyRects) {
+        p.fillRect(rect, Qt::transparent);
+    }
+    p.setCompositionMode(QPainter::CompositionMode_SourceOver);
     p.setRenderHint(QPainter::Antialiasing, true);
 
     if (edgeTheme_ != EdgeNone) {
-        paintPassEdgeFlash(p);
+        ensurePassEdgeTexture();
+        if (!passEdgeTexture_.isNull() && passFlashStrength_ > 0.001) {
+            p.save();
+            p.setOpacity(qBound<qreal>(0.0, passFlashStrength_, 1.0));
+            p.drawImage(QPoint(0, 0), passEdgeTexture_);
+            p.restore();
+        }
     }
 
     // 成功：四周绿色柔和脉冲，不显示文字
@@ -603,13 +619,35 @@ void IcToast::ensureAmpReady()
 {
     if (!ampCtrl_) {
         ampCtrl_ = new AmpVolumeController(this);
-    }
+        connect(ampCtrl_, &AmpVolumeController::rawVolumeTemporaryApplied,
+                this, [this](int rawValue, bool success) {
+            if (rawValue == boostedToastRawVolume() && volumeBoostPending_) {
+                volumeBoostPending_ = false;
+                if (voiceFocusActive_) {
+                    if (!success) {
+                        qWarning() << "[IC-TOAST] prompt raw volume apply failed;"
+                                      " continue with current hardware volume";
+                    }
+                    voiceStartTimer_.start();
+                }
+                return;
+            }
+            if (pendingRestoreRaw_ >= 0 && rawValue == pendingRestoreRaw_ &&
+                    !voiceFocusActive_) {
+                if (!success) {
+                    qWarning() << "[IC-TOAST] restore raw volume failed raw=" << rawValue;
+                }
+                pendingRestoreRaw_ = -1;
+                startVideoVolumeRestore(pendingRestoreFactor_);
+            }
+        });
 
-    const int volume = ampCtrl_->loadVolumeFromFile();
-    ampCtrl_->setVolume(volume);
+        const int volume = ampCtrl_->loadVolumeFromFile();
+        ampCtrl_->setVolume(volume);
+    }
 }
 
-/** @brief 检查路径、配置和播放器后播放提示音，并建立 2.2 秒语音焦点兜底。 */
+/** @brief 检查路径、配置和播放器后播放提示音，并建立异常恢复兜底。 */
 void IcToast::playVoiceFile(const QString& localFilePath)
 {
     if (localFilePath.trimmed().isEmpty()) {
@@ -626,17 +664,16 @@ void IcToast::playVoiceFile(const QString& localFilePath)
         return;
     }
 
-    ensureAmpReady();
-    beginVoiceFocus();
-
+    voiceBoostTimer_.stop();
+    voiceStartTimer_.stop();
     voicePlayer_->stop();
+    endVoiceFocus();
+    pendingVoiceFile_ = localFilePath;
+
     voicePlayer_->setVideoOutput(nullptr);
     voicePlayer_->setVolume(1.0f);
     voicePlayer_->setMedia(localFilePath);
-    voicePlayer_->play();
-
-    qInfo() << "[IC-TOAST] GStreamer play voice:" << localFilePath;
-    voiceFocusRestoreTimer_.start(2200);
+    beginVoiceFocus();
 }
 
 /** @brief 播放已物化的通过提示音。 */
@@ -680,76 +717,59 @@ void IcToast::playFailVoice(int resultCode)
     playVoiceFile(failVoiceFile_);
 }
 
-/** @return 提示音使用的 RK809 固定原始音量 200。 */
+/** @return 提示音使用的 RK809 固定原始音量 230。 */
 int IcToast::boostedToastRawVolume() const
 {
-    return ampCtrl_ ? 200 : 0;
+    return ampCtrl_ ? 230 : 0;
 }
 
 /**
- * @brief 临时压低宿主中的业务播放器并提升功放音量。
+ * @brief 平滑压低正在播放的视频并保存播报前的功放音量。
  *
  * 重复调用时不覆盖最初保存值，只延长兜底恢复定时器。
  */
 void IcToast::beginVoiceFocus()
 {
-    ensureAmpReady();
     voiceFocusRestoreTimer_.stop();
 
     if (voiceFocusActive_) {
-        voiceFocusRestoreTimer_.start(2200);
+        voiceFocusRestoreTimer_.start(15000);
         return;
     }
 
     voiceFocusActive_ = true;
-    duckedPlayers_.clear();
-
-    // 1) 先压低视频音量
-    if (main_) {
-        const auto players = main_->findChildren<GstPlayerWidget*>();
-        for (GstPlayerWidget* p : players) {
-            if (!p || p == voicePlayer_) continue;
-
-            DuckedPlayerState st;
-            st.player = p;
-            st.volume = p->volume();
-            duckedPlayers_.push_back(st);
-
-            // 压到 12%，提示音更容易听见
-            const float duckV = qMin(st.volume, 0.12f);
-            p->setVolume(duckV);
-        }
-    }
-
-    // 2) 播报期间 RK809 固定使用原始音量 200，结束后恢复用户主音量
-    if (ampCtrl_) {
-        savedAmpRawVolume_ = ampCtrl_->currentRawVolume();
-        ampCtrl_->setRawVolumeTemporary(boostedToastRawVolume());
-    }
-
-    // 3) 兜底恢复
-    voiceFocusRestoreTimer_.start(2200);
+    voiceFocusRestoreTimer_.start(15000);
+    AudioPromptFocusManager::instance().acquire(this);
 }
 
 /** @brief 恢复语音焦点前保存的播放器音量和 RK809 播放音量。 */
 void IcToast::endVoiceFocus()
 {
+    voiceBoostTimer_.stop();
+    voiceStartTimer_.stop();
     voiceFocusRestoreTimer_.stop();
+    if (!voiceFocusActive_) return;
 
-    // 恢复视频音量
-    for (const DuckedPlayerState& st : duckedPlayers_) {
-        if (!st.player) continue;
-        st.player->setVolume(st.volume);
+    voiceFocusActive_ = false;
+    volumeBoostPending_ = false;
+    pendingVoiceFile_.clear();
+    AudioPromptFocusManager::instance().release(this);
+}
+
+/** @brief RK809 原始音量恢复后平滑淡入视频软件音量。 */
+void IcToast::startVideoVolumeRestore(qreal startFactor)
+{
+    if (!duckedPlayers_.isEmpty() && videoRestoreAnimation_) {
+        videoRestoreAnimation_->stop();
+        videoRestoreAnimation_->setStartValue(startFactor);
+        videoRestoreAnimation_->setEndValue(1.0);
+        videoRestoreAnimation_->start();
+        return;
+    }
+    for (const DuckedPlayerState &state : duckedPlayers_) {
+        if (state.player) state.player->clearAudioDucking(this);
     }
     duckedPlayers_.clear();
-
-    // 恢复 RK809 播放音量
-    if (ampCtrl_ && savedAmpRawVolume_ >= 0) {
-        ampCtrl_->setRawVolumeTemporary(savedAmpRawVolume_);
-    }
-
-    savedAmpRawVolume_ = -1;
-    voiceFocusActive_ = false;
 }
 
 /** @return 文本包含 U+4E00~U+9FFF 汉字时返回 true。 */

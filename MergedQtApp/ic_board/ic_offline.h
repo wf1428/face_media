@@ -63,6 +63,12 @@ signals:
     /** @brief 输出以 "#@" 开头的 103 或 115 字节完整卡片帧。 */
     void cardFrame(CardSerial2Reader::CardType type, QByteArray rawFrame);
 
+    /** @brief 输出以 "&C" 开头、CRLF 结尾的八字符 UID 卡号帧。 */
+    void uidCardFrame(QString cardId, QByteArray rawFrame);
+
+    /** @brief 收到完整的 "&B\r\n" 读头心跳帧。 */
+    void heartbeatReceived();
+
     /** @brief 输出拆帧或串口错误。 */
     void errorOccured(QString err);
 
@@ -86,7 +92,7 @@ private:
     /** @brief 从缓冲区循环提取完整帧或进入 115 字节等待状态。 */
     void parseBuffer();
 
-    /** @return 缓冲区内 "#@" 帧头位置，不存在时返回 -1。 */
+    /** @return 缓冲区内最早的 "#@"、"&B" 或 "&C" 帧头位置。 */
     int findHeader() const;
 
     /** @return 根据帧头和精确长度判断的 CardType。 */

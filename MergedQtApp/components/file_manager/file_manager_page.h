@@ -17,6 +17,7 @@
 #include <QMenu>
 
 class QResizeEvent;
+class QuickPageHeaderWidget;
 
 /**
  * @brief 基于 QFileSystemModel 的本地文件浏览和删除页面。
@@ -74,6 +75,7 @@ private:
     QPushButton *btnUp = nullptr;      /**< 返回上级目录按钮。 */
     QPushButton *btnRefresh = nullptr; /**< 刷新按钮。 */
     QPushButton *btnBack = nullptr;    /**< 返回功能菜单按钮。 */
+    QuickPageHeaderWidget *quickHeader_ = nullptr; /**< Quick 标题与导航操作栏。 */
 
     QString currentRoot; /**< 当前允许浏览的根目录。 */
 

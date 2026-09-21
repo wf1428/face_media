@@ -80,6 +80,9 @@ SOURCES += \
     common/workers/signalboard_worker.cpp \
     components/rga/RgaImageProcessor.cpp \
     components/input/InputCursorController.cpp \
+    components/quick/QuickNavigationWidget.cpp \
+    components/quick/QuickMainMenuWidget.cpp \
+    components/quick/QuickPageHeaderWidget.cpp \
     components/dialogs/ui_file_dialog.cpp \
     components/dialogs/ui_message_box.cpp \
     components/cursoroverlay/keyboard_dialog.cpp \
@@ -124,6 +127,7 @@ SOURCES += \
     shell/LedFillLight.cpp \
     shell/Sr505PresenceSensor.cpp \
     shell/ModeController.cpp \
+    shell/QuickUiRuntime.cpp \
     modules/multimedia/MultimediaModuleAdapter.cpp \
     modules/facegate/FaceGateModuleAdapter.cpp \
     modules/facegate/FaceGateQt/config/AppConfig.cpp \
@@ -187,6 +191,9 @@ HEADERS += \
     common/workers/signalboard_worker.h \
     components/rga/RgaImageProcessor.h \
     components/input/InputCursorController.h \
+    components/quick/QuickNavigationWidget.h \
+    components/quick/QuickMainMenuWidget.h \
+    components/quick/QuickPageHeaderWidget.h \
     components/dialogs/ui_file_dialog.h \
     components/dialogs/ui_message_box.h \
     components/cursoroverlay/keyboard_dialog.h \
@@ -233,6 +240,7 @@ HEADERS += \
     shell/IApplicationModule.h \
     shell/IPresenceSensor.h \
     shell/ModeController.h \
+    shell/QuickUiRuntime.h \
     modules/multimedia/MultimediaModuleAdapter.h \
     modules/facegate/FaceGateModuleAdapter.h \
     modules/facegate/FaceGateQt/config/AppConfig.h \
@@ -285,13 +293,13 @@ HEADERS += \
 
 FORMS += \
     mainwindow.ui \
-    components/features/featuresdialog.ui \
     components/multimedia/multimediademo.ui \
     components/settings/networkpage.ui
 
 # 资源文件
 RESOURCES += \
     resources.qrc \
+    quick_ui_resources.qrc \
     common/audio_resources.qrc \
     modules/facegate/FaceGateQt/facegate_resources.qrc
 

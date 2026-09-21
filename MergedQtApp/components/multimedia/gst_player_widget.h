@@ -19,6 +19,7 @@
 #include <QColor>
 #include <QElapsedTimer>
 #include <QImage>
+#include <QHash>
 #include <QMutex>
 #include <QOpenGLFunctions>
 #include <QOpenGLShaderProgram>
@@ -140,11 +141,21 @@ public:
     {
         return !mediaPath_.isEmpty() && (playRequested_ || prepared_ || playing_);
     }
+    /** @return 管线当前处于 PLAYING 状态。 */
+    bool isPlaying() const { return playing_; }
+    /** @return 当前播放器绑定了视频画布，而不是纯音频提示播放器。 */
+    bool hasVideoOutput() const { return !videoWidget_.isNull(); }
 
     /** @brief 设置归一化音量，取值范围为 0.0～1.0。 */
     void setVolume(float value01);
     /** @return 当前归一化音量。 */
     float volume() const { return volume01_; }
+    /** @brief 为一个播报所有者设置临时压低系数；多个播报重叠时自动叠加。 */
+    void setAudioDucking(const QObject *owner, float factor01);
+    /** @brief 释放一个播报所有者的临时压低，不影响其他仍在播报的所有者。 */
+    void clearAudioDucking(const QObject *owner);
+    /** @brief 启用短提示音静音预卷，使共享音频链路在首个语音采样前就绪。 */
+    void setPromptAudioMode(bool on);
 
     /** @brief 设置仅准备不自动播放的预加载模式。 */
     void setPreloadMode(bool on);
@@ -285,6 +296,10 @@ private:
     void resetFrameMailbox();
     /** @brief 新媒体开始前清空长时运行诊断基线。 */
     void resetPlaybackDiagnostics();
+    /** @brief 清除提示音 preroll 引用和本次静音前导状态。 */
+    void resetPromptPrerollState();
+    /** @brief 把业务音量和所有临时压低系数合成为 playbin 的实际音量。 */
+    void applyEffectiveVolume();
 
     /** @brief 在同步总线回调中绑定硬件视频窗口句柄。 */
     static GstBusSyncReply busSyncHandler(GstBus *bus, GstMessage *message, gpointer userData);
@@ -308,6 +323,8 @@ private:
     static GstFlowReturn appSinkNewSample(GstElement *sink, gpointer userData);
     /** @brief 把音频 appsink 样本送入进程内共享混音器。 */
     static GstFlowReturn sharedAudioAppSinkNewSample(GstElement *sink, gpointer userData);
+    /** @brief 用提示音 preroll 的格式向共享混音器预送一段静音。 */
+    static GstFlowReturn sharedAudioAppSinkNewPreroll(GstElement *sink, gpointer userData);
     /** @brief 在 source 创建时配置网络源参数。 */
     static void sourceSetup(GstElement *playbin, GstElement *source, gpointer userData);
     /** @brief 在 element 创建时调整解码器和解析器属性。 */
@@ -348,6 +365,7 @@ private:
     bool invalidRtcpDestinationWarningLogged_ = false;
     std::atomic_bool shuttingDown_ {false}; /**< 析构期间阻止回调继续投递。 */
     float volume01_ = 1.0f;
+    QHash<const QObject *, float> audioDuckingFactors_; /**< 各播报入口独立持有的临时压低系数。 */
     int sourceWidth_ = 0;
     int sourceHeight_ = 0;
     QRect configuredDisplayRect_;
@@ -360,11 +378,15 @@ private:
     QAtomicInt mediaGeneration_ {1};
     QAtomicInt h264AuAlignmentEnabled_ {0};
     QAtomicInt liveRtspMode_ {0};
+    QAtomicInt promptAudioMode_ {0};
+    QAtomicInt promptAudioPrimed_ {0};
+    QAtomicInt promptLeadInQueued_ {0};
     QAtomicInt liveDecoderAuAligned_ {-1};
     QAtomicInt liveDecoderCapsLogged_ {0};
     QAtomicInt liveWaitingForKeyframe_ {0};
     QAtomicInt liveCreditRecoveryPending_ {0};
     QAtomicInt liveCreditOverLimitConsecutiveAus_ {0};
+    GstSample *promptPrerollSample_ = nullptr; /**< 提示音 PAUSED 阶段保留的首个 PCM 样本。 */
     QAtomicInteger<qint64> lastVideoFrameMs_ {0};
     QAtomicInteger<qint64> lastAudioFrameMs_ {0};
     QAtomicInteger<qint64> lastVideoSignalMs_ {0};

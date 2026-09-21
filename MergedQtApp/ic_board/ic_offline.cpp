@@ -117,6 +117,8 @@ bool CardSerial2Reader::isRunning() const
 /** @brief 清空尚未解析的串口接收缓存。 */
 void CardSerial2Reader::reset()
 {
+    m_wait115Timer.stop();
+    m_waitingFor115 = false;
     m_buf.clear();
 }
 
@@ -151,10 +153,18 @@ void CardSerial2Reader::onPortError(QSerialPort::SerialPortError err)
     emit errorOccured(QString("[CardSerial2] serial error: %1").arg(m_port.errorString()));
 }
 
-/** @return 缓冲区内 "#@" 帧头位置，不存在时返回 -1。 */
+/** @return 缓冲区内最早的 "#@"、"&B" 或 "&C" 帧头位置。 */
 int CardSerial2Reader::findHeader() const
 {
-    return m_buf.indexOf("#@"); // 0x23 0x40
+    int first = -1;
+    const QByteArray headers[] = {QByteArrayLiteral("#@"),
+                                  QByteArrayLiteral("&B"),
+                                  QByteArrayLiteral("&C")};
+    for (const QByteArray &header : headers) {
+        const int index = m_buf.indexOf(header);
+        if (index >= 0 && (first < 0 || index < first)) first = index;
+    }
+    return first;
 }
 
 /** @return 根据帧头和精确长度判断的 CardType。 */
@@ -173,12 +183,74 @@ void CardSerial2Reader::parseBuffer()
     while (true) {
         int idx = findHeader();
         if (idx < 0) {
+            // 保留可能是下一帧首字节的 '#' 或 '&'，其余噪声全部丢弃。
             if (m_buf.size() > 1) m_buf = m_buf.right(1);
             return;
         }
         if (idx > 0) m_buf.remove(0, idx);
 
         if (m_buf.size() < 2) return;
+
+        // 新协议文本帧：&B\r\n 心跳，&CXXXXXXXX\r\n 纯 UID 卡号。
+        if (m_buf.startsWith("&B") || m_buf.startsWith("&C")) {
+            const int end = m_buf.indexOf("\r\n");
+            if (end < 0) {
+                // 两种文本帧最长 12 字节；超长仍未见结尾时丢弃当前伪帧头。
+                if (m_buf.size() > 12) {
+                    m_buf.remove(0, 2);
+                    emit errorOccured("[CardSerial2] text frame missing CRLF");
+                    continue;
+                }
+                return;
+            }
+
+            const QByteArray frame = m_buf.left(end + 2);
+            m_buf.remove(0, end + 2);
+            if (frame == QByteArrayLiteral("&B\r\n")) {
+                emit heartbeatReceived();
+                continue;
+            }
+
+            if (frame.size() == 12 && frame.startsWith("&C")) {
+                const QByteArray uid = frame.mid(2, 8).toUpper();
+                bool valid = true;
+                for (char ch : uid) {
+                    if (!((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F'))) {
+                        valid = false;
+                        break;
+                    }
+                }
+                if (valid) {
+                    emit uidCardFrame(QString::fromLatin1(uid), frame);
+                } else {
+                    emit errorOccured("[CardSerial2] UID frame contains non-hex card id");
+                }
+                continue;
+            }
+
+            emit errorOccured("[CardSerial2] unsupported text frame");
+            continue;
+        }
+
+        if (!m_buf.startsWith("#@")) {
+            m_buf.remove(0, 1);
+            continue;
+        }
+
+        // 103 字节帧后已经出现下一帧头时，不再把后续文本误吞为 115 字节帧。
+        if (m_buf.size() >= kLenVisitor + 2
+                && (m_buf.mid(kLenVisitor, 2) == QByteArrayLiteral("#@")
+                    || m_buf.mid(kLenVisitor, 2) == QByteArrayLiteral("&B")
+                    || m_buf.mid(kLenVisitor, 2) == QByteArrayLiteral("&C"))) {
+            if (m_waitingFor115) {
+                m_waitingFor115 = false;
+                m_wait115Timer.stop();
+            }
+            const QByteArray frame = m_buf.left(kLenVisitor);
+            m_buf.remove(0, kLenVisitor);
+            emit cardFrame(CardType::Visitor103, frame);
+            continue;
+        }
 
         // 1) 115：（多层卡）
         if (m_buf.size() >= kLenMulti) {

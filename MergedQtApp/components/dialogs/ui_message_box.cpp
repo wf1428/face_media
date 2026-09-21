@@ -6,6 +6,7 @@
 #include "ui_message_box.h"
 
 #include "common/responsive_ui.h"
+#include "shell/QuickUiRuntime.h"
 
 #include <QApplication>
 #include <QEvent>
@@ -226,6 +227,53 @@ QMessageBox::StandardButton showMessage(QWidget *parent,
                                         QMessageBox::StandardButtons buttons,
                                         QMessageBox::StandardButton defaultButton)
 {
+    QuickUiRuntime *runtime = QuickUiRuntime::instance();
+    if (runtime->canPresentOverlay()) {
+        const QMessageBox::StandardButton order[] = {
+            QMessageBox::Cancel, QMessageBox::No, QMessageBox::Close,
+            QMessageBox::Abort, QMessageBox::Ignore, QMessageBox::Retry,
+            QMessageBox::Save, QMessageBox::Yes, QMessageBox::Ok
+        };
+        auto textForButton = [](QMessageBox::StandardButton button) {
+            switch (button) {
+            case QMessageBox::Ok: return QStringLiteral("确定");
+            case QMessageBox::Save: return QStringLiteral("保存");
+            case QMessageBox::Cancel: return QStringLiteral("取消");
+            case QMessageBox::Close: return QStringLiteral("关闭");
+            case QMessageBox::Yes: return QStringLiteral("是");
+            case QMessageBox::No: return QStringLiteral("否");
+            case QMessageBox::Abort: return QStringLiteral("中止");
+            case QMessageBox::Retry: return QStringLiteral("重试");
+            case QMessageBox::Ignore: return QStringLiteral("忽略");
+            default: return QStringLiteral("确定");
+            }
+        };
+
+        QStringList choices;
+        QList<QMessageBox::StandardButton> mappedButtons;
+        for (QMessageBox::StandardButton button : order) {
+            if (buttons.testFlag(button)) {
+                choices.append(textForButton(button));
+                mappedButtons.append(button);
+            }
+        }
+
+        QString type = QStringLiteral("info");
+        if (icon == QMessageBox::Warning) type = QStringLiteral("warning");
+        else if (icon == QMessageBox::Critical) type = QStringLiteral("error");
+        else if (icon == QMessageBox::Question) type = QStringLiteral("question");
+
+        int selected = -1;
+        const bool accepted = runtime->execDialog(
+                    type, title, text, QString(), QString(), choices, &selected);
+        if (accepted && selected >= 0 && selected < mappedButtons.size()) {
+            return mappedButtons.at(selected);
+        }
+        if (buttons.testFlag(QMessageBox::Cancel)) return QMessageBox::Cancel;
+        if (buttons.testFlag(QMessageBox::No)) return QMessageBox::No;
+        return QMessageBox::NoButton;
+    }
+
     EmbeddedMessageDialog dialog(parent, icon, title, text, buttons, defaultButton);
     dialog.exec();
     return dialog.clickedButton();
@@ -240,7 +288,8 @@ QMessageBox::StandardButton information(QWidget *parent, const QString &title,
                                         QMessageBox::StandardButtons buttons,
                                         QMessageBox::StandardButton defaultButton)
 {
-    if (!ResponsiveUi::isWaylandPlatform()) {
+    if (!QuickUiRuntime::instance()->canPresentOverlay() &&
+            !ResponsiveUi::isWaylandPlatform()) {
         return QMessageBox::information(parent, title, text, buttons, defaultButton);
     }
     return showMessage(parent, QMessageBox::Information, title, text, buttons, defaultButton);
@@ -251,7 +300,8 @@ QMessageBox::StandardButton warning(QWidget *parent, const QString &title,
                                     QMessageBox::StandardButtons buttons,
                                     QMessageBox::StandardButton defaultButton)
 {
-    if (!ResponsiveUi::isWaylandPlatform()) {
+    if (!QuickUiRuntime::instance()->canPresentOverlay() &&
+            !ResponsiveUi::isWaylandPlatform()) {
         return QMessageBox::warning(parent, title, text, buttons, defaultButton);
     }
     return showMessage(parent, QMessageBox::Warning, title, text, buttons, defaultButton);
@@ -262,7 +312,8 @@ QMessageBox::StandardButton critical(QWidget *parent, const QString &title,
                                      QMessageBox::StandardButtons buttons,
                                      QMessageBox::StandardButton defaultButton)
 {
-    if (!ResponsiveUi::isWaylandPlatform()) {
+    if (!QuickUiRuntime::instance()->canPresentOverlay() &&
+            !ResponsiveUi::isWaylandPlatform()) {
         return QMessageBox::critical(parent, title, text, buttons, defaultButton);
     }
     return showMessage(parent, QMessageBox::Critical, title, text, buttons, defaultButton);
@@ -273,7 +324,8 @@ QMessageBox::StandardButton question(QWidget *parent, const QString &title,
                                      QMessageBox::StandardButtons buttons,
                                      QMessageBox::StandardButton defaultButton)
 {
-    if (!ResponsiveUi::isWaylandPlatform()) {
+    if (!QuickUiRuntime::instance()->canPresentOverlay() &&
+            !ResponsiveUi::isWaylandPlatform()) {
         return QMessageBox::question(parent, title, text, buttons, defaultButton);
     }
     return showMessage(parent, QMessageBox::Question, title, text, buttons, defaultButton);

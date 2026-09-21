@@ -403,7 +403,7 @@ void CameraPreviewWidget::paintGL()
         }
 
         QFont instructionFont = p.font();
-        instructionFont.setPointSize(15);
+        instructionFont.setPointSize(18);
         instructionFont.setBold(true);
         p.setFont(instructionFont);
         p.setPen(Qt::white);
@@ -429,7 +429,7 @@ void CameraPreviewWidget::paintGL()
                       5);
     p.setPen(Qt::white);
     QFont f = p.font();
-    f.setPointSize(18);
+    f.setPointSize(22);
     f.setBold(true);
     p.setFont(f);
     p.drawText(panel.adjusted(38, 10, -20, -10),

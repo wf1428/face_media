@@ -12,6 +12,7 @@
 #include <QHBoxLayout>
 #include <QVBoxLayout>
 #include <QIntValidator>
+#include <QSizePolicy>
 
 /** @brief 创建待机和锁屏开关、秒数输入及操作按钮。 */
 StandbyLockPage::StandbyLockPage(QWidget *parent) : QWidget(parent),
@@ -32,40 +33,55 @@ void StandbyLockPage::setupUI()
 {
     // 创建主布局
     QVBoxLayout *mainLayout = new QVBoxLayout(this);
-    mainLayout->setContentsMargins(30, 30, 30, 30);
-    mainLayout->setSpacing(20);
+    mainLayout->setContentsMargins(24, 8, 24, 18);
+    mainLayout->setSpacing(4);
+    mainLayout->setAlignment(Qt::AlignTop);
     
     // 创建标题
     titleLabel = new QLabel("待机和锁屏设置", this);
-    titleLabel->setStyleSheet("font-size: 24px; font-weight: bold; color: #333333;");
-    mainLayout->addWidget(titleLabel);
+    titleLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    titleLabel->setStyleSheet(
+                "font-size: 22px; font-weight: bold; color: #303133; margin-bottom: 2px;");
+    mainLayout->addWidget(titleLabel, 0, Qt::AlignTop);
     
     // 创建主卡片
     QWidget *mainCard = new QWidget(this);
+    mainCard->setObjectName(QStringLiteral("standbyLockCard"));
+    mainCard->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Maximum);
     mainCard->setStyleSheet(R"(
-    QWidget {
+    QWidget#standbyLockCard {
             background-color: white;
             border-radius: 12px;
             border: 1px solid #dddddd;
-            padding: 20px;
     })");
     
     QVBoxLayout *cardLayout = new QVBoxLayout(mainCard);
-    cardLayout->setSpacing(20);
+    cardLayout->setContentsMargins(20, 16, 20, 16);
+    cardLayout->setSpacing(12);
+    cardLayout->setAlignment(Qt::AlignTop);
     
     // 创建待机设置组
     standbyGroup = new QGroupBox("待机设置", this);
+    standbyGroup->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Maximum);
     standbyGroup->setStyleSheet(R"(
     QGroupBox {
         font-size: 16px;
         font-weight: bold;
         color: #333333;
         border: none;
-        margin-bottom: 10px;
+        margin-top: 24px;
+        padding-top: 8px;
+    }
+    QGroupBox::title {
+        subcontrol-origin: margin;
+        subcontrol-position: top left;
+        left: 0px;
+        padding: 0px 4px;
     })");
     
     QGridLayout *standbyLayout = new QGridLayout(standbyGroup);
     standbyLayout->setSpacing(15);
+    standbyLayout->setContentsMargins(0, 8, 0, 0);
     standbyLayout->setColumnStretch(0, 1);
     standbyLayout->setColumnStretch(1, 2);
     
@@ -139,17 +155,26 @@ void StandbyLockPage::setupUI()
     
     // 创建锁屏设置组
     lockGroup = new QGroupBox("锁屏设置", this);
+    lockGroup->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Maximum);
     lockGroup->setStyleSheet(R"(
     QGroupBox {
         font-size: 16px;
         font-weight: bold;
         color: #333333;
         border: none;
-        margin-bottom: 10px;
+        margin-top: 24px;
+        padding-top: 8px;
+    }
+    QGroupBox::title {
+        subcontrol-origin: margin;
+        subcontrol-position: top left;
+        left: 0px;
+        padding: 0px 4px;
     })");
     
     QGridLayout *lockLayout = new QGridLayout(lockGroup);
     lockLayout->setSpacing(15);
+    lockLayout->setContentsMargins(0, 8, 0, 0);
     lockLayout->setColumnStretch(0, 1);
     lockLayout->setColumnStretch(1, 2);
     
@@ -277,7 +302,7 @@ void StandbyLockPage::setupUI()
     cardLayout->addLayout(buttonLayout);
     
     // 添加卡片到主布局
-    mainLayout->addWidget(mainCard);
+    mainLayout->addWidget(mainCard, 0, Qt::AlignTop);
     
     // 连接信号槽
     connect(standbyCheckBox, &QCheckBox::stateChanged, this, &StandbyLockPage::onStandbyCheckBoxStateChanged);

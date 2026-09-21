@@ -22,6 +22,7 @@
 #include "SharedVirtualKeyboard.h"
 #include "common/face_image_sync_bridge.h"
 #include "common/storage_policy.h"
+#include "components/multimedia/vol_ctrl.h"
 #include "ic_board/ic_event_bridge.h"
 #include "platform/rk3566_platform.h"
 
@@ -60,6 +61,8 @@
 FaceGateMainWindow::FaceGateMainWindow(const AppConfig &config, QWidget *parent)
     : QMainWindow(parent), config_(config)
 {
+    // 人脸、刷卡和二维码共用 DisplayDirRect/MusicPlayEn；缺少该项默认开启。
+    config_.audioEnabled = AmpVolumeController::isPromptPlaybackEnabled();
     buildUi();
     startServices();
 }
@@ -394,8 +397,8 @@ void FaceGateMainWindow::buildUi()
         "#dateLabel{font-size:16px;color:#9fb3bf;}"
         "#primaryStatus{font-size:26px;font-weight:700;color:#ffffff;padding:8px 0px;}"
         "#infoChip{background:rgba(255,255,255,34);border:1px solid rgba(255,255,255,46);"
-        "border-radius:6px;padding:8px 10px;color:#dce8ee;font-size:13px;}"
-        "#hintLabel{color:#8ea1ac;font-size:13px;}"
+        "border-radius:6px;padding:8px 10px;color:#dce8ee;font-size:15px;}"
+        "#hintLabel{color:#8ea1ac;font-size:16px;}"
         "#passwordAccessButton{background:rgba(73,209,255,38);color:#eafaff;"
         "border:1px solid rgba(73,209,255,150);text-align:left;padding:10px 14px;"
         "font-size:15px;font-weight:600;}"
@@ -2382,7 +2385,13 @@ void FaceGateMainWindow::handleAudioConfigSave(const AppConfig &audioConfig)
     config_.promptEnrollFailedFile = audioConfig.promptEnrollFailedFile;
 
     QString errorText;
-    const bool saved = config_.save(config_.configPath, &errorText);
+    const bool promptSwitchSaved =
+            AmpVolumeController::setPromptPlaybackEnabled(config_.audioEnabled);
+    const bool saved = config_.save(config_.configPath, &errorText)
+            && promptSwitchSaved;
+    if (!promptSwitchSaved && errorText.isEmpty()) {
+        errorText = QStringLiteral("统一语音播报开关保存失败");
+    }
     audio_.configure(config_);
     audio_.setVolume(config_.audioVolume);
 

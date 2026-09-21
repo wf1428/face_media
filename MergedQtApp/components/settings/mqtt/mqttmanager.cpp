@@ -4423,6 +4423,7 @@ void MqttManager::onIpcConnected()
  */
 void MqttManager::onIpcDisconnected()
 {
+    mqttBrokerConnected_ = false;
     emit ipcStateChanged(false);
     emit mqttStateTextChanged("未知");
     emit subTopicsTextChanged("");
@@ -4442,6 +4443,7 @@ void MqttManager::onIpcDisconnected()
  */
 void MqttManager::onIpcError(const QString &err)
 {
+    mqttBrokerConnected_ = false;
     emit ipcStateChanged(false);
     emit mqttStateTextChanged("未知");
     emit subTopicsTextChanged("");

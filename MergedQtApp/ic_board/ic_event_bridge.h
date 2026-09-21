@@ -111,9 +111,15 @@ public:
     /** @brief 更新进程级网络可用状态；相同状态不会重复发出变化信号。 */
     void updateNetworkAvailability(bool available);
 
+    /** @brief 请求多媒体页底部显示读头心跳异常。 */
+    void emitCardReaderHeartbeatWarning(const QString &message);
+
 signals:
     /** @brief 网络可用状态实际发生变化。 */
     void networkAvailabilityChanged(bool available);
+
+    /** @brief 读头心跳超时，需要在多媒体页底部显示提示。 */
+    void cardReaderHeartbeatWarning(const QString &message);
 
     /** @brief 在线模式卡片通过事件。 */
     void cardPassed(const QString &cardId, const QString &floor, const QByteArray &rawFrame);

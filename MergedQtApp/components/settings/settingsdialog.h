@@ -34,8 +34,10 @@ class DisplayRotationPage;
 class QBoxLayout;
 class QEvent;
 class QGridLayout;
+class QHideEvent;
 class QResizeEvent;
 class QShowEvent;
+class QuickNavigationWidget;
 
 
 /** @brief 网络、蓝牙、MQTT、系统、显示、待机和 FTP 页面容器及信号中转器。 */
@@ -62,6 +64,9 @@ protected:
 
     /** @brief 显示时将窗口几何限制到宿主实际可用区域。 */
     void showEvent(QShowEvent *event) override;
+
+    /** @brief 隐藏时恢复多媒体界面路由标记。 */
+    void hideEvent(QHideEvent *event) override;
 
     /** @brief 窗口尺寸变化时立即重排导航。 */
     void resizeEvent(QResizeEvent *event) override;
@@ -115,7 +120,9 @@ private:
     QBoxLayout *mainLayout_ = nullptr;          /**< 可切换方向的设置窗口根布局。 */
     QGridLayout *navigationLayout_ = nullptr;   /**< 横屏单列/窄屏网格导航。 */
     QWidget *sidebarWidget_ = nullptr;          /**< 导航容器。 */
+    QuickNavigationWidget *quickNavigation_ = nullptr; /**< 共用 Quick 动画导航。 */
     bool topNavigation_ = false;                /**< 当前是否使用顶部导航。 */
+    QString previousModuleId_;                  /**< 打开设置前的统一界面路由。 */
 
     QStackedWidget *contentStack; /**< 设置子页面内容栈。 */
 

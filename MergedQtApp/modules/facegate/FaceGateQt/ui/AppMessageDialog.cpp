@@ -8,6 +8,7 @@
 
 #include "AppMessageDialog.h"
 #include "common/responsive_ui.h"
+#include "shell/QuickUiRuntime.h"
 
 #include <QApplication>
 #include <QColor>
@@ -78,6 +79,12 @@ AppMessageDialog::~AppMessageDialog()
 /** @brief 显示阻塞式信息提示。 */
 void AppMessageDialog::information(QWidget *parent, const QString &title, const QString &message)
 {
+    QuickUiRuntime *runtime = QuickUiRuntime::instance();
+    if (runtime->canPresentOverlay()) {
+        runtime->execDialog(QStringLiteral("info"), title, message,
+                            defaultAcceptText(Type::Info), QString(), QStringList(), nullptr, true);
+        return;
+    }
     AppMessageDialog dialog(Type::Info, title, message, parent);
     dialog.exec();
 }
@@ -85,6 +92,12 @@ void AppMessageDialog::information(QWidget *parent, const QString &title, const 
 /** @brief 显示阻塞式成功提示。 */
 void AppMessageDialog::success(QWidget *parent, const QString &title, const QString &message)
 {
+    QuickUiRuntime *runtime = QuickUiRuntime::instance();
+    if (runtime->canPresentOverlay()) {
+        runtime->execDialog(QStringLiteral("success"), title, message,
+                            defaultAcceptText(Type::Success), QString(), QStringList(), nullptr, true);
+        return;
+    }
     AppMessageDialog dialog(Type::Success, title, message, parent);
     dialog.exec();
 }
@@ -92,6 +105,12 @@ void AppMessageDialog::success(QWidget *parent, const QString &title, const QStr
 /** @brief 显示阻塞式警告提示。 */
 void AppMessageDialog::warning(QWidget *parent, const QString &title, const QString &message)
 {
+    QuickUiRuntime *runtime = QuickUiRuntime::instance();
+    if (runtime->canPresentOverlay()) {
+        runtime->execDialog(QStringLiteral("warning"), title, message,
+                            defaultAcceptText(Type::Warning), QString(), QStringList(), nullptr, true);
+        return;
+    }
     AppMessageDialog dialog(Type::Warning, title, message, parent);
     dialog.exec();
 }
@@ -99,6 +118,12 @@ void AppMessageDialog::warning(QWidget *parent, const QString &title, const QStr
 /** @brief 显示阻塞式错误提示。 */
 void AppMessageDialog::error(QWidget *parent, const QString &title, const QString &message)
 {
+    QuickUiRuntime *runtime = QuickUiRuntime::instance();
+    if (runtime->canPresentOverlay()) {
+        runtime->execDialog(QStringLiteral("error"), title, message,
+                            defaultAcceptText(Type::Error), QString(), QStringList(), nullptr, true);
+        return;
+    }
     AppMessageDialog dialog(Type::Error, title, message, parent);
     dialog.exec();
 }
@@ -110,6 +135,11 @@ bool AppMessageDialog::confirm(QWidget *parent,
                                const QString &confirmText,
                                const QString &cancelText)
 {
+    QuickUiRuntime *runtime = QuickUiRuntime::instance();
+    if (runtime->canPresentOverlay()) {
+        return runtime->execDialog(QStringLiteral("question"), title, message,
+                                   confirmText, cancelText, QStringList(), nullptr, true);
+    }
     AppMessageDialog dialog(Type::Question, title, message, parent, true, confirmText, cancelText);
     return dialog.exec() == QDialog::Accepted;
 }
@@ -121,6 +151,14 @@ int AppMessageDialog::choose(QWidget *parent,
                              const QStringList &choices,
                              const QString &cancelText)
 {
+    QuickUiRuntime *runtime = QuickUiRuntime::instance();
+    if (runtime->canPresentOverlay()) {
+        int selectedChoice = -1;
+        const bool accepted = runtime->execDialog(
+                    QStringLiteral("question"), title, message,
+                    QString(), cancelText, choices, &selectedChoice, true);
+        return accepted ? selectedChoice : -1;
+    }
     // 选项直接位于同一个模态窗口中，避免 QComboBox 创建 Qt::Popup
     // 并抢占 EGLFS 下的软件鼠标事件。
     AppMessageDialog dialog(Type::Question, title, message, parent,

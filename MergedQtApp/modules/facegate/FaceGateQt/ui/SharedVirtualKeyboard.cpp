@@ -9,6 +9,7 @@
 #include "SharedVirtualKeyboard.h"
 
 #include "common/responsive_ui.h"
+#include "shell/QuickUiRuntime.h"
 
 #include <QAbstractSpinBox>
 #include <QApplication>
@@ -21,6 +22,8 @@
 #include <QPlainTextEdit>
 #include <QtQml/QQmlError>
 #include <QQuickWidget>
+#include <QQuickItem>
+#include <QQuickWindow>
 #include <QTimer>
 #include <QTextEdit>
 #include <QUrl>
@@ -29,6 +32,8 @@
 
 namespace {
 constexpr int kSharedKeyboardHeight = 300;
+constexpr qreal kLandscapeKeyboardWidthRatio = 0.84;
+constexpr qreal kKeyboardDesignAspect = 1024.0 / 360.0;
 }
 
 /** @brief 创建唯一 QQuickWidget 并监听人脸窗口内的输入焦点。 */
@@ -39,7 +44,9 @@ SharedVirtualKeyboard::SharedVirtualKeyboard(QWidget *host)
         return;
     }
 
-    keyboard_ = new QQuickWidget(host_);
+    // 与程序其余 Quick 页面共用唯一 QQmlEngine；控件本身也长期复用，
+    // 避免 Qt 5.12 反复创建和销毁 EGL/QML 上下文。
+    keyboard_ = new QQuickWidget(QuickUiRuntime::instance()->engine(), host_);
     keyboard_->setObjectName(QStringLiteral("faceSharedVirtualKeyboard"));
     keyboard_->setAttribute(Qt::WA_AcceptTouchEvents, true);
     keyboard_->setResizeMode(QQuickWidget::SizeRootObjectToView);
@@ -47,6 +54,10 @@ SharedVirtualKeyboard::SharedVirtualKeyboard(QWidget *host)
     keyboard_->setFocusPolicy(Qt::NoFocus);
     keyboard_->setSource(
                 QUrl(QStringLiteral("qrc:/qml/EmbeddedVirtualKeyboard.qml")));
+    if (QQuickWindow *window = keyboard_->quickWindow()) {
+        window->setPersistentOpenGLContext(true);
+        window->setPersistentSceneGraph(true);
+    }
     keyboard_->hide();
 
     qInfo().noquote() << "[FACE-KEYBOARD] shared QML keyboard status="
@@ -122,13 +133,36 @@ void SharedVirtualKeyboard::updateGeometry()
     }
 
     const QRect area = host_->rect();
-    const int height = qMin(
-                area.height(),
-                ResponsiveUi::keyboardHeight(area.height(),
-                                             kSharedKeyboardHeight));
-    keyboard_->setGeometry(0, qMax(0, area.height() - height),
-                           area.width(), height);
-    keyboard_->setFixedHeight(height);
+    const bool landscape = area.width() > area.height();
+    if (QQuickItem *root = keyboard_->rootObject()) {
+        root->setProperty("landscapeHost", landscape);
+    }
+
+    if (landscape) {
+        // 横屏直接缩小 QQuickWidget 自身，而不是用铺满宿主的黑色容器承载
+        // 小键盘。宽度和高度共同参与计算，适配所有不小于 600x600 的尺寸。
+        const int maxHeight = ResponsiveUi::sharedKeyboardHeight(area.size());
+        const int widthByScreen = qMax(1, qRound(area.width()
+                                                * kLandscapeKeyboardWidthRatio));
+        const int widthByHeight = qMax(1, qRound(maxHeight
+                                                * kKeyboardDesignAspect));
+        const int keyboardWidth = qMin(area.width(),
+                                       qMin(widthByScreen, widthByHeight));
+        const int keyboardHeight = qMin(area.height(),
+                qMax(1, qRound(keyboardWidth / kKeyboardDesignAspect)));
+        const int x = qMax(0, (area.width() - keyboardWidth) / 2);
+        const int y = qMax(0, area.height() - keyboardHeight);
+        keyboard_->setFixedSize(keyboardWidth, keyboardHeight);
+        keyboard_->move(x, y);
+    } else {
+        // 竖屏完整保留原有满宽布局。
+        const int height = qMin(
+                    area.height(),
+                    ResponsiveUi::keyboardHeight(area.height(),
+                                                 kSharedKeyboardHeight));
+        keyboard_->setFixedSize(area.width(), height);
+        keyboard_->move(0, qMax(0, area.height() - height));
+    }
     if (keyboard_->isVisible()) {
         keyboard_->raise();
     }

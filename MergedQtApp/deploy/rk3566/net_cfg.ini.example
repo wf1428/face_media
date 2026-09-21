@@ -13,6 +13,10 @@ rtc_device=/dev/rtc0
 # 必须根据 /proc/bus/input/devices 或 /dev/input/by-path 配置
 key_device=
 
+[card_reader]
+# true：读头心跳超时后每30秒打印一次错误；false：关闭该日志，界面提示仍保留
+heartbeat_log_enabled=true
+
 [gstreamer]
 # EGLFS 正式模式由 Qt OpenGL 画布显示视频；保持为空以使用 appsink。
 video_sink=

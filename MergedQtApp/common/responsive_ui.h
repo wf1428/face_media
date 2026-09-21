@@ -147,6 +147,25 @@ inline int keyboardHeight(int availableHeight, int preferredHeight)
     return qMin(preferredHeight, qMax(240, availableHeight * 46 / 100));
 }
 
+/**
+ * @return 共享虚拟键盘在当前横竖屏下可使用的最大高度。
+ *
+ * 竖屏严格保留原来的 300px 策略；横屏按宿主高度的 40% 自适应，
+ * 600px 高度时至少保留 240px，并限制在 420px 以内避免超大屏按键过大。
+ */
+inline int sharedKeyboardHeight(const QSize &hostSize)
+{
+    if (!hostSize.isValid()) {
+        return 300;
+    }
+    if (hostSize.width() <= hostSize.height()) {
+        return keyboardHeight(hostSize.height(), 300);
+    }
+    const int maximum = qMax(1, qMin(420, hostSize.height()));
+    const int minimum = qMin(240, maximum);
+    return qBound(minimum, qRound(hostSize.height() * 0.40), maximum);
+}
+
 } // namespace ResponsiveUi
 
 #endif // RESPONSIVE_UI_H

@@ -54,13 +54,16 @@ SOURCES += \
     ../../../common/storage_policy.cpp \
     ../../../common/sql/dbstore.cpp \
     ../../../common/sql/network_personnel_store.cpp \
+    ../../../common/sql/local_personnel_store.cpp \
     ../../../platform/rk3566_platform.cpp \
+    ../../../shell/QuickUiRuntime.cpp \
     ../../../components/multimedia/gst_player_widget.cpp \
     ../../../components/multimedia/vol_ctrl.cpp \
     config/AppConfig.cpp \
     audio/AudioService.cpp \
     ../../../components/rga/RgaImageProcessor.cpp \
     ../../../components/input/InputCursorController.cpp \
+    ../../../components/quick/QuickNavigationWidget.cpp \
     ../../../components/settings/displayrotationpage.cpp \
     core/CameraCaptureBackend.cpp \
     core/CameraService.cpp \
@@ -96,7 +99,9 @@ HEADERS += \
     ../../../common/storage_policy.h \
     ../../../common/sql/dbstore.h \
     ../../../common/sql/network_personnel_store.h \
+    ../../../common/sql/local_personnel_store.h \
     ../../../platform/rk3566_platform.h \
+    ../../../shell/QuickUiRuntime.h \
     ../../../components/multimedia/gst_player_widget.h \
     ../../../components/multimedia/vol_ctrl.h \
     config/AppConfig.h \
@@ -104,6 +109,7 @@ HEADERS += \
     audio/AudioService.h \
     ../../../components/rga/RgaImageProcessor.h \
     ../../../components/input/InputCursorController.h \
+    ../../../components/quick/QuickNavigationWidget.h \
     ../../../components/settings/displayrotationpage.h \
     core/CameraCaptureBackend.h \
     core/CameraService.h \
@@ -141,6 +147,7 @@ HEADERS += \
 
 RESOURCES += \
     facegate_resources.qrc \
+    ../../../quick_ui_resources.qrc \
     ../../../common/audio_resources.qrc
 
 target.path = /home/cat/FaceGateQt

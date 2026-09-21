@@ -515,13 +515,16 @@ public:
         return mixer;
     }
 
-    GstFlowReturn pushSample(GstPlayerWidget *owner, GstSample *sample)
+    GstFlowReturn pushSample(GstPlayerWidget *owner,
+                             GstSample *sample,
+                             bool promptSource = false,
+                             bool reanchorPromptTimeline = false)
     {
         if (!owner || !sample) return GST_FLOW_ERROR;
 
         QMutexLocker locker(&mutex_);
         QString error;
-        SourceBranch *branch = ensureSourceLocked(owner, &error);
+        SourceBranch *branch = ensureSourceLocked(owner, &error, promptSource);
         if (!branch) {
             qWarning() << "[GStreamer-AUDIO] shared mixer input unavailable:" << error;
             return GST_FLOW_ERROR;
@@ -539,29 +542,147 @@ public:
 
         GstBuffer *copy = gst_buffer_copy(buffer);
         if (!copy) return GST_FLOW_ERROR;
-        GST_BUFFER_PTS(copy) = GST_CLOCK_TIME_NONE;
-        GST_BUFFER_DTS(copy) = GST_CLOCK_TIME_NONE;
+        const GstClockTime previousNextPts = branch->nextPts;
+        if (branch->promptSource) {
+            // 只在一段提示音的前导静音开始时对齐共享管线时钟。真实 PCM
+            // 必须沿同一时间线连续累加；若每个音频包都拿系统时钟追赶，
+            // appsink 回调的正常抖动会被转换成包间静音，听起来就是卡顿。
+            if (reanchorPromptTimeline ||
+                    !GST_CLOCK_TIME_IS_VALID(branch->nextPts)) {
+                GstClockTime now = GST_CLOCK_TIME_NONE;
+                GstClock *clock = pipeline_ ? gst_element_get_clock(pipeline_) : nullptr;
+                if (clock) {
+                    const GstClockTime clockNow = gst_clock_get_time(clock);
+                    const GstClockTime baseTime = gst_element_get_base_time(pipeline_);
+                    if (GST_CLOCK_TIME_IS_VALID(clockNow) &&
+                            GST_CLOCK_TIME_IS_VALID(baseTime) && clockNow >= baseTime) {
+                        now = clockNow - baseTime;
+                    }
+                    gst_object_unref(clock);
+                }
+                branch->nextPts = GST_CLOCK_TIME_IS_VALID(now) ? now : 0;
+            }
+            GstClockTime duration = GST_BUFFER_DURATION(copy);
+            if (!GST_CLOCK_TIME_IS_VALID(duration) || duration == 0) {
+                duration = 20 * GST_MSECOND;
+                GST_BUFFER_DURATION(copy) = duration;
+            }
+            GST_BUFFER_PTS(copy) = branch->nextPts;
+            GST_BUFFER_DTS(copy) = branch->nextPts;
+            branch->nextPts += duration;
+        } else {
+            GST_BUFFER_PTS(copy) = GST_CLOCK_TIME_NONE;
+            GST_BUFFER_DTS(copy) = GST_CLOCK_TIME_NONE;
+        }
         GST_BUFFER_OFFSET(copy) = GST_BUFFER_OFFSET_NONE;
         GST_BUFFER_OFFSET_END(copy) = GST_BUFFER_OFFSET_NONE;
 
         GstFlowReturn flow = GST_FLOW_ERROR;
         g_signal_emit_by_name(branch->appsrc, "push-buffer", copy, &flow);
         gst_buffer_unref(copy);
+        if (flow != GST_FLOW_OK && branch->promptSource) {
+            branch->nextPts = previousNextPts;
+        }
         return flow;
+    }
+
+    /** @brief 按 preroll 的 PCM 格式送入静音，提前启动同一个 mixer/sink。 */
+    GstFlowReturn pushSilentPreroll(GstPlayerWidget *owner,
+                                    GstSample *preroll,
+                                    GstClockTime targetDuration)
+    {
+        if (!owner || !preroll) return GST_FLOW_ERROR;
+        GstCaps *caps = gst_sample_get_caps(preroll);
+        GstBuffer *source = gst_sample_get_buffer(preroll);
+        if (!caps || !source) return GST_FLOW_ERROR;
+
+        const gsize sourceSize = gst_buffer_get_size(source);
+        if (sourceSize == 0) return GST_FLOW_ERROR;
+
+        const GstClockTime sourceDuration = GST_BUFFER_DURATION(source);
+        guint repeatCount = 6;
+        if (GST_CLOCK_TIME_IS_VALID(sourceDuration) && sourceDuration > 0) {
+            repeatCount = static_cast<guint>((targetDuration + sourceDuration - 1)
+                                             / sourceDuration);
+        }
+        repeatCount = qBound<guint>(1, repeatCount, 16);
+        if (sourceSize > G_MAXSIZE / repeatCount) return GST_FLOW_ERROR;
+
+        GstBuffer *silence = gst_buffer_new_allocate(nullptr,
+                                                      sourceSize * repeatCount,
+                                                      nullptr);
+        if (!silence) return GST_FLOW_ERROR;
+        gst_buffer_memset(silence, 0, 0, sourceSize * repeatCount);
+        if (GST_CLOCK_TIME_IS_VALID(sourceDuration)) {
+            GST_BUFFER_DURATION(silence) = sourceDuration * repeatCount;
+        }
+
+        GstSample *silentSample = gst_sample_new(silence, caps, nullptr, nullptr);
+        gst_buffer_unref(silence);
+        if (!silentSample) return GST_FLOW_ERROR;
+        // 前导静音是一段新提示音时间线的唯一校准点；其后的真实 PCM
+        // 不再逐包重新对齐时钟，从而保持连续播放。
+        const GstFlowReturn flow = pushSample(owner, silentSample, true, true);
+        gst_sample_unref(silentSample);
+        return flow;
+    }
+
+    /** @brief 旧解码器停止后释放提示输入；不在运行中的分支上逐元素重启。 */
+    void resetPromptSource(GstPlayerWidget *owner)
+    {
+        removeSource(owner);
+    }
+
+    /** @return 提示分支已排队但尚未到播放时刻的数据时长，附带收尾余量。 */
+    int promptDrainDelayMs(GstPlayerWidget *owner)
+    {
+        if (!owner) return 80;
+        QMutexLocker locker(&mutex_);
+        SourceBranch *branch = sources_.value(owner, nullptr);
+        if (!branch || !branch->promptSource ||
+                !GST_CLOCK_TIME_IS_VALID(branch->nextPts)) {
+            return 80;
+        }
+
+        GstClockTime now = GST_CLOCK_TIME_NONE;
+        GstClock *clock = pipeline_ ? gst_element_get_clock(pipeline_) : nullptr;
+        if (clock) {
+            const GstClockTime clockNow = gst_clock_get_time(clock);
+            const GstClockTime baseTime = gst_element_get_base_time(pipeline_);
+            if (GST_CLOCK_TIME_IS_VALID(clockNow) &&
+                    GST_CLOCK_TIME_IS_VALID(baseTime) && clockNow >= baseTime) {
+                now = clockNow - baseTime;
+            }
+            gst_object_unref(clock);
+        }
+        if (!GST_CLOCK_TIME_IS_VALID(now) || branch->nextPts <= now) return 80;
+
+        const guint64 remainingMs = (branch->nextPts - now) / GST_MSECOND;
+        return static_cast<int>(qBound<guint64>(80, remainingMs + 80, 1000));
     }
 
     void removeSource(GstPlayerWidget *owner)
     {
         if (!owner) return;
-        QMutexLocker locker(&mutex_);
-        SourceBranch *branch = sources_.take(owner);
-        if (!branch) return;
-        destroySourceLocked(branch);
-
-        if (sources_.isEmpty() && pipeline_) {
-            gst_element_set_state(pipeline_, GST_STATE_NULL);
-            gst_element_get_state(pipeline_, nullptr, nullptr, GST_SECOND);
+        SourceBranch *branch = nullptr;
+        bool stopOutput = false;
+        {
+            QMutexLocker locker(&mutex_);
+            branch = sources_.take(owner);
+            stopOutput = branch && sources_.isEmpty();
         }
+        if (!branch) return;
+
+        // 状态切换和动态拆分支绝不能持有 pushSample 使用的共享锁。
+        // 否则 Qt 线程等待 GStreamer 流线程退出时，流线程又可能等待该锁，
+        // 视频 EOS 后就会形成完整死锁。
+        if (stopOutput && pipeline_) {
+            // 最后一个输入已经 EOS/停止时，先停整条共享输出，再拆分支。
+            // 这样不会在运行中的 audiomixer 上动态删除最后一个 request pad。
+            // 只发起状态切换，不再调用 get_state 阻塞 Qt 主线程。
+            gst_element_set_state(pipeline_, GST_STATE_NULL);
+        }
+        destroySourceLocked(branch);
     }
 
 private:
@@ -573,6 +694,8 @@ private:
         GstPad *sourcePad = nullptr;
         GstPad *mixerPad = nullptr;
         GstCaps *caps = nullptr;
+        bool promptSource = false;
+        GstClockTime nextPts = GST_CLOCK_TIME_NONE;
     };
 
     SharedAudioMixer() = default;
@@ -678,13 +801,16 @@ private:
         return true;
     }
 
-    SourceBranch *ensureSourceLocked(GstPlayerWidget *owner, QString *error)
+    SourceBranch *ensureSourceLocked(GstPlayerWidget *owner,
+                                     QString *error,
+                                     bool promptSource)
     {
         auto existing = sources_.constFind(owner);
         if (existing != sources_.constEnd()) return existing.value();
         if (!ensurePipelineLocked(error)) return nullptr;
 
         SourceBranch *branch = new SourceBranch;
+        branch->promptSource = promptSource;
         branch->appsrc = gst_element_factory_make("appsrc", nullptr);
         branch->queue = gst_element_factory_make("queue", nullptr);
         branch->convert = gst_element_factory_make("audioconvert", nullptr);
@@ -702,12 +828,14 @@ private:
         g_object_set(branch->appsrc,
                      "is-live", TRUE,
                      "format", GST_FORMAT_TIME,
-                     "do-timestamp", TRUE,
+                     "do-timestamp", promptSource ? FALSE : TRUE,
+                     // pushSample 持有共享锁，禁止等待队列，否则 stop/释放
+                     // 与其他视频输入可能一起被阻塞。
                      "block", FALSE,
                      nullptr);
         g_object_set(branch->queue,
-                     "leaky", 2,
-                     "max-size-buffers", static_cast<guint>(32),
+                     "leaky", promptSource ? 0 : 2,
+                     "max-size-buffers", static_cast<guint>(promptSource ? 64 : 32),
                      nullptr);
 
         gst_bin_add_many(GST_BIN(pipeline_), branch->appsrc, branch->queue,
@@ -791,11 +919,30 @@ private:
 bool setNullStateAndWait(GstElement *element)
 {
     if (!element) return true;
-    if (gst_element_set_state(element, GST_STATE_NULL) == GST_STATE_CHANGE_FAILURE) {
+
+    GstState current = GST_STATE_NULL;
+    GstState pending = GST_STATE_VOID_PENDING;
+    const GstStateChangeReturn currentResult =
+            gst_element_get_state(element, &current, &pending, 0);
+    if (currentResult != GST_STATE_CHANGE_FAILURE &&
+            current == GST_STATE_NULL && pending == GST_STATE_VOID_PENDING) {
+        return true;
+    }
+
+    // 先唤醒可能正阻塞在 appsink/解码器上的流线程，再请求停止。以前这里
+    // 每次最多同步等待 2 秒；轮播结束时 stop/setMedia 会连续调用，直接让
+    // Qt 事件循环看起来完全卡死。NULL 转换通常同步完成，异常设备只短等
+    // 100 ms，交由上层错误恢复，不再长时间占住界面线程。
+    gst_element_send_event(element, gst_event_new_flush_start());
+    const GstStateChangeReturn setResult =
+            gst_element_set_state(element, GST_STATE_NULL);
+    if (setResult == GST_STATE_CHANGE_FAILURE) {
         return false;
     }
+    if (setResult != GST_STATE_CHANGE_ASYNC) return true;
+
     const GstStateChangeReturn waitResult =
-            gst_element_get_state(element, nullptr, nullptr, 2 * GST_SECOND);
+            gst_element_get_state(element, nullptr, nullptr, 100 * GST_MSECOND);
     return waitResult != GST_STATE_CHANGE_FAILURE && waitResult != GST_STATE_CHANGE_ASYNC;
 }
 
@@ -1336,7 +1483,12 @@ void GstPlayerWidget::setMedia(const QString &path)
                 << "sync=" << !liveRtsp;
     }
 
-    SharedAudioMixer::instance().removeSource(this);
+    resetPromptPrerollState();
+    if (promptAudioMode_.loadAcquire() != 0) {
+        SharedAudioMixer::instance().resetPromptSource(this);
+    } else {
+        SharedAudioMixer::instance().removeSource(this);
+    }
     if (bus_) {
         // 丢弃上一媒体源残留的 EOS/ERROR/STATE_CHANGED，避免切源后误触发。
         gst_bus_set_flushing(bus_, TRUE);
@@ -1375,6 +1527,39 @@ void GstPlayerWidget::play()
     if (!playbin_) return;
 
     playRequested_ = true;
+    if (promptAudioMode_.loadAcquire() != 0) {
+        // PAUSED preroll 尚未把常驻输入分支准备好时保持等待。准备完成的
+        // 回调会回到 GUI 线程继续本次 play 请求，真实首帧不会被提前消费。
+        if (promptAudioPrimed_.loadAcquire() == 0) return;
+
+        if (promptLeadInQueued_.testAndSetOrdered(0, 1)) {
+            GstSample *preroll = nullptr;
+            {
+                QMutexLocker locker(&gstMutex_);
+                if (promptPrerollSample_) {
+                    preroll = gst_sample_ref(promptPrerollSample_);
+                }
+            }
+            if (!preroll) {
+                promptLeadInQueued_.storeRelease(0);
+                return;
+            }
+
+            // 音量提升确认完成后，才在同一个 appsrc 时间线上排入 200ms
+            // 静音；真实首个 PCM 样本随后到达时自然排在静音之后。
+            const GstFlowReturn flow = SharedAudioMixer::instance().pushSilentPreroll(
+                        this, preroll, 200 * GST_MSECOND);
+            gst_sample_unref(preroll);
+            if (flow != GST_FLOW_OK) {
+                promptLeadInQueued_.storeRelease(0);
+                emit errorOccured(QStringLiteral("提示音前导静音写入失败: %1")
+                                  .arg(static_cast<int>(flow)));
+                return;
+            }
+            qInfo() << "[GStreamer-AUDIO] prompt lead-in queued durationMs=200";
+        }
+    }
+
     const GstStateChangeReturn result = gst_element_set_state(playbin_, GST_STATE_PLAYING);
     if (result == GST_STATE_CHANGE_FAILURE) {
         emit errorOccured(QStringLiteral("GStreamer 切换到 PLAYING 失败"));
@@ -1410,9 +1595,20 @@ void GstPlayerWidget::stop()
     if (playbin_) {
         if (!setNullStateAndWait(playbin_)) {
             qWarning() << "[GStreamer] stop: switching playbin to NULL did not complete";
+            // 解码回调仍可能访问输入分支；停止失败时不能继续释放它。
+            if (promptAudioMode_.loadAcquire() != 0) {
+                mediaGeneration_.fetchAndAddOrdered(1);
+                emit errorOccured(QStringLiteral("提示播放器停止未完成，保留音频分支"));
+                return;
+            }
         }
     }
-    SharedAudioMixer::instance().removeSource(this);
+    resetPromptPrerollState();
+    if (promptAudioMode_.loadAcquire() != 0) {
+        SharedAudioMixer::instance().resetPromptSource(this);
+    } else {
+        SharedAudioMixer::instance().removeSource(this);
+    }
 
     mediaGeneration_.fetchAndAddOrdered(1);
     clearVideoCanvas();
@@ -1443,9 +1639,43 @@ void GstPlayerWidget::seekMs(int ms)
 void GstPlayerWidget::setVolume(float value01)
 {
     volume01_ = std::max(0.0f, std::min(1.0f, value01));
+    applyEffectiveVolume();
+}
+
+/** @brief 为一个播报入口设置独立的临时压低系数。 */
+void GstPlayerWidget::setAudioDucking(const QObject *owner, float factor01)
+{
+    if (!owner) return;
+    audioDuckingFactors_.insert(owner,
+                                std::max(0.0f, std::min(1.0f, factor01)));
+    applyEffectiveVolume();
+}
+
+/** @brief 释放一个播报入口持有的临时压低。 */
+void GstPlayerWidget::clearAudioDucking(const QObject *owner)
+{
+    if (!owner || audioDuckingFactors_.remove(owner) <= 0) return;
+    applyEffectiveVolume();
+}
+
+/** @brief 应用业务音量与全部播报压低系数的乘积。 */
+void GstPlayerWidget::applyEffectiveVolume()
+{
     if (!playbin_) return;
-    g_object_set(playbin_, "volume", static_cast<gdouble>(volume01_),
-                 "mute", volume01_ <= 0.0001f, nullptr);
+    float effectiveVolume = volume01_;
+    for (auto it = audioDuckingFactors_.constBegin();
+         it != audioDuckingFactors_.constEnd(); ++it) {
+        effectiveVolume *= it.value();
+    }
+    effectiveVolume = std::max(0.0f, std::min(1.0f, effectiveVolume));
+    g_object_set(playbin_, "volume", static_cast<gdouble>(effectiveVolume),
+                 "mute", effectiveVolume <= 0.0001f, nullptr);
+}
+
+/** @brief 标记本播放器为短提示音播放器，在 PAUSED 阶段执行静音预卷。 */
+void GstPlayerWidget::setPromptAudioMode(bool on)
+{
+    promptAudioMode_.storeRelease(on ? 1 : 0);
 }
 
 /** @brief 设置仅准备不自动播放的预加载模式。 */
@@ -1608,6 +1838,7 @@ void GstPlayerWidget::releasePipeline()
             qWarning() << "[GStreamer] release: switching playbin to NULL did not complete";
         }
     }
+    resetPromptPrerollState();
     SharedAudioMixer::instance().removeSource(this);
 
     removeFrameProbes();
@@ -1779,6 +2010,10 @@ GstElement *GstPlayerWidget::createAudioSink()
                  nullptr);
     g_signal_connect(sink, "new-sample",
                      G_CALLBACK(&GstPlayerWidget::sharedAudioAppSinkNewSample), this);
+    if (promptAudioMode_.loadAcquire() != 0) {
+        g_signal_connect(sink, "new-preroll",
+                         G_CALLBACK(&GstPlayerWidget::sharedAudioAppSinkNewPreroll), this);
+    }
     return sink;
 }
 
@@ -1846,7 +2081,10 @@ void GstPlayerWidget::markPrepared()
     prepared_ = true;
     emit prepared();
 
-    if (playRequested_ && !preloadMode_ && playbin_) {
+    const bool promptReady = promptAudioMode_.loadAcquire() == 0 ||
+            (promptAudioPrimed_.loadAcquire() != 0 &&
+             promptLeadInQueued_.loadAcquire() != 0);
+    if (playRequested_ && !preloadMode_ && playbin_ && promptReady) {
         gst_element_set_state(playbin_, GST_STATE_PLAYING);
     }
 }
@@ -2053,7 +2291,15 @@ void GstPlayerWidget::pollBus()
             prepared_ = false;
             playing_ = false;
             playbackDiagnosticTimer_.stop();
-            SharedAudioMixer::instance().removeSource(this);
+            resetPromptPrerollState();
+            if (promptAudioMode_.loadAcquire() != 0) {
+                playRequested_ = false;
+                mediaGeneration_.fetchAndAddOrdered(1);
+                // 错误通知也不能在解码线程尚未停止时重置共享输入。
+                // stop/setMedia/releasePipeline 负责停止后的实际释放。
+            } else {
+                SharedAudioMixer::instance().removeSource(this);
+            }
             emit errorOccured(detail.isEmpty() ? text : text + QStringLiteral(" | ") + detail);
             break;
         }
@@ -2158,8 +2404,27 @@ void GstPlayerWidget::pollBus()
             playing_ = false;
             positionTimer_.stop();
             playbackDiagnosticTimer_.stop();
-            SharedAudioMixer::instance().removeSource(this);
-            emit videoFinished();
+            if (promptAudioMode_.loadAcquire() != 0) {
+                // playbin EOS 表示解码样本已经全部交给共享 appsrc，但前面
+                // 排入的 200ms 静音使共享输出仍有少量尾部待播放。给它留出
+                // 排空时间后再恢复视频音量，避免截断提示音结尾。
+                const int eosGeneration = mediaGeneration_.loadAcquire();
+                const int drainDelayMs =
+                        SharedAudioMixer::instance().promptDrainDelayMs(this);
+                qInfo() << "[GStreamer-AUDIO] prompt EOS drain delayMs=" << drainDelayMs;
+                QTimer::singleShot(drainDelayMs, this, [this, eosGeneration]() {
+                    if (eosGeneration != mediaGeneration_.loadAcquire()) return;
+                    playRequested_ = false;
+                    resetPromptPrerollState();
+                    // 此处只结束业务通知。下一次 setMedia/stop 已停止
+                    // 解码器后再释放分支，避免在输出线程工作时重启转换器。
+                    emit videoFinished();
+                });
+            } else {
+                resetPromptPrerollState();
+                SharedAudioMixer::instance().removeSource(this);
+                emit videoFinished();
+            }
             break;
         case GST_MESSAGE_ASYNC_DONE:
             markPrepared();
@@ -2290,6 +2555,18 @@ void GstPlayerWidget::resetPlaybackDiagnostics()
     diagnosticLastSinkRendered_ = 0;
     diagnosticLastSinkDropped_ = 0;
     playbackDiagnosticElapsed_.invalidate();
+}
+
+/** @brief 释放旧媒体的提示音 preroll，并清空本次播放门闩。 */
+void GstPlayerWidget::resetPromptPrerollState()
+{
+    promptAudioPrimed_.storeRelease(0);
+    promptLeadInQueued_.storeRelease(0);
+    QMutexLocker locker(&gstMutex_);
+    if (promptPrerollSample_) {
+        gst_sample_unref(promptPrerollSample_);
+        promptPrerollSample_ = nullptr;
+    }
 }
 
 /** @brief 周期输出 RTSP/RTP、解码、RGA 和 GUI 端到端诊断数据。 */
@@ -3476,13 +3753,87 @@ GstFlowReturn GstPlayerWidget::sharedAudioAppSinkNewSample(GstElement *sink, gpo
     g_signal_emit_by_name(sink, "pull-sample", &sample);
     if (!sample) return GST_FLOW_EOS;
 
-    SharedAudioMixer::instance().pushSample(self, sample);
+    const bool promptSource = self->promptAudioMode_.loadAcquire() != 0;
+    GstFlowReturn flow = GST_FLOW_ERROR;
+    const int attempts = promptSource ? 12 : 1;
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        flow = SharedAudioMixer::instance().pushSample(self, sample, promptSource);
+        if (flow != GST_FLOW_FLUSHING) break;
+        // 提示音首批真实 PCM 保留在当前 sample 中等待分支恢复，不能像
+        // 普通连续媒体那样消费后直接丢弃。
+        g_usleep(10 * 1000);
+    }
     gst_sample_unref(sample);
+
+    if (promptSource && flow != GST_FLOW_OK) {
+        qWarning() << "[GStreamer-AUDIO] prompt PCM delivery failed flow=" << flow;
+        QMetaObject::invokeMethod(self, [self, flow]() {
+            if (!self->shuttingDown_.load()) {
+                emit self->errorOccured(
+                            QStringLiteral("提示音 PCM 写入失败: %1")
+                            .arg(static_cast<int>(flow)));
+            }
+        }, Qt::QueuedConnection);
+    }
 
     // 共享输出管线首次启动时可能仍处于异步状态，appsrc 会短暂返回
     // GST_FLOW_FLUSHING。这里已经成功消费了 playbin 的样本，不能把共享
     // 管线的瞬时状态反向传播给 appsink，否则 playbin 会永久停止音频流，
     // 表现为视频画面正常但全程无声。后续样本会在共享管线就绪后继续送入。
+    return GST_FLOW_OK;
+}
+
+/** @brief 在提示音 PAUSED preroll 阶段以同格式静音预热共享 mixer 和唯一 sink。 */
+GstFlowReturn GstPlayerWidget::sharedAudioAppSinkNewPreroll(GstElement *sink,
+                                                            gpointer userData)
+{
+    auto *self = static_cast<GstPlayerWidget *>(userData);
+    if (!self || self->shuttingDown_.load() ||
+            self->promptAudioMode_.loadAcquire() == 0) {
+        return GST_FLOW_OK;
+    }
+
+    GstSample *sample = nullptr;
+    g_signal_emit_by_name(sink, "pull-preroll", &sample);
+    if (!sample) return GST_FLOW_OK;
+
+    GstFlowReturn flow = GST_FLOW_ERROR;
+    // 第一次把动态 appsrc 分支同步到共享 PLAYING 管线时，可能短暂处于
+    // flushing。重试发生在 GStreamer preroll 线程，不阻塞 Qt 界面线程。
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        flow = SharedAudioMixer::instance().pushSilentPreroll(
+                    self, sample, 20 * GST_MSECOND);
+        if (flow != GST_FLOW_FLUSHING) break;
+        g_usleep(10 * 1000);
+    }
+    if (flow != GST_FLOW_OK) {
+        qWarning() << "[GStreamer-AUDIO] prompt silent preroll failed flow=" << flow;
+        QMetaObject::invokeMethod(self, [self, flow]() {
+            if (!self->shuttingDown_.load()) {
+                emit self->errorOccured(
+                            QStringLiteral("提示音分支准备失败: %1")
+                            .arg(static_cast<int>(flow)));
+            }
+        }, Qt::QueuedConnection);
+    } else {
+        {
+            QMutexLocker locker(&self->gstMutex_);
+            if (self->promptPrerollSample_) {
+                gst_sample_unref(self->promptPrerollSample_);
+            }
+            self->promptPrerollSample_ = gst_sample_ref(sample);
+        }
+        self->promptAudioPrimed_.storeRelease(1);
+        qInfo() << "[GStreamer-AUDIO] prompt branch ready; setup silence accepted";
+
+        QMetaObject::invokeMethod(self, [self]() {
+            if (!self->shuttingDown_.load() && self->playRequested_) {
+                self->play();
+            }
+        }, Qt::QueuedConnection);
+    }
+    gst_sample_unref(sample);
+    // preroll 是准备动作，不能把共享输出的瞬时状态反向传播给 playbin。
     return GST_FLOW_OK;
 }
 

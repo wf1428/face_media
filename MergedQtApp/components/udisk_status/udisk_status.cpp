@@ -169,6 +169,7 @@ void UdiskStatusOverlay::updateFromJson(const QByteArray &data)
     const QJsonObject o = doc.object();
     const QString state = o.value("state").toString();
     const QString msg = o.value("message").toString();
+    const QString mountPoint = o.value("mount_point").toString();
     const int progress = o.value("progress").toInt(0);
     const int doneCount = o.value("done_count").toInt(0);
     const int totalCount = o.value("total_count").toInt(0);
@@ -220,6 +221,22 @@ void UdiskStatusOverlay::updateFromJson(const QByteArray &data)
     // 隐藏该遗留状态，等待 watcher 验证启动成功后写入 done，再只显示
     // “U盘已拔出，程序重启完成”。
     if (state == "restarting" && !m_seenInserted) {
+        ++m_hideToken;
+        setVisible(false);
+        m_progress->setVisible(false);
+        m_progress->setValue(0);
+        m_lastState = state;
+        m_lastStatusMessage = msg;
+        m_lastProgress = progress;
+        emit udiskStateChanged(state, progress);
+        return;
+    }
+
+    // UI 资源更新会重启 Qt，watcher 随后把无挂载点的最终状态保留为 done。
+    // 新 Qt 实例没有亲历本轮插入流程时只把它作为状态基线，不能把上一次
+    // 的“U盘已拔出，程序重启完成”重新弹出。带挂载点的 done 仍是当前U盘
+    // “拷贝完成、等待拔出”，按原逻辑正常显示。
+    if (state == "done" && mountPoint.isEmpty() && !m_seenInserted) {
         ++m_hideToken;
         setVisible(false);
         m_progress->setVisible(false);

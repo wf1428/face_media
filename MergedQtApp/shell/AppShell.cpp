@@ -2,6 +2,7 @@
 
 #include "LedFillLight.h"
 #include "ModeController.h"
+#include "QuickUiRuntime.h"
 #include "Sr505PresenceSensor.h"
 #include "modules/facegate/FaceGateModuleAdapter.h"
 #include "modules/multimedia/MultimediaModuleAdapter.h"
@@ -30,6 +31,50 @@ AppShell::AppShell(QWidget *parent)
     stack_ = new QStackedWidget(this);
     stack_->setObjectName(QStringLiteral("moduleStack"));
     layout->addWidget(stack_);
+
+    // 六层界面统一登记在同一个目录中。当前仍依赖 OpenGL 的两个视频层
+    // 明确标记为 NativeOpenGlMode，迁移期间不会被 QQuickWidget 覆盖。
+    quickUiRuntime_ = QuickUiRuntime::instance();
+    quickUiRuntime_->registerModule({QuickUiRuntime::moduleId(QuickUiRuntime::ApplicationShellModule),
+                                     QuickUiRuntime::ApplicationShellLayer,
+                                     QuickUiRuntime::ManagedQuickIslandMode,
+                                     QUrl(), true});
+    quickUiRuntime_->registerModule({QuickUiRuntime::moduleId(QuickUiRuntime::MultimediaMainModule),
+                                     QuickUiRuntime::MultimediaLayer,
+                                     QuickUiRuntime::NativeOpenGlMode,
+                                     QUrl(), true});
+    quickUiRuntime_->registerModule({QuickUiRuntime::moduleId(QuickUiRuntime::FaceRecognitionModule),
+                                     QuickUiRuntime::FaceRecognitionLayer,
+                                     QuickUiRuntime::NativeOpenGlMode,
+                                     QUrl(), true});
+    quickUiRuntime_->registerModule({QuickUiRuntime::moduleId(QuickUiRuntime::FaceAdministrationModule),
+                                     QuickUiRuntime::FaceAdministrationLayer,
+                                     QuickUiRuntime::ManagedQuickIslandMode,
+                                     QUrl(), true});
+    quickUiRuntime_->registerModule({QuickUiRuntime::moduleId(QuickUiRuntime::SystemSettingsModule),
+                                     QuickUiRuntime::SystemSettingsLayer,
+                                     QuickUiRuntime::ManagedQuickIslandMode,
+                                     QUrl(), true});
+    quickUiRuntime_->registerModule({QuickUiRuntime::moduleId(QuickUiRuntime::FeaturePagesModule),
+                                     QuickUiRuntime::FeaturePageLayer,
+                                     QuickUiRuntime::ManagedQuickIslandMode,
+                                     QUrl(), true});
+    quickUiRuntime_->registerModule({QuickUiRuntime::moduleId(QuickUiRuntime::FileManagerModule),
+                                     QuickUiRuntime::FeaturePageLayer,
+                                     QuickUiRuntime::ManagedQuickIslandMode,
+                                     QUrl(), true});
+    quickUiRuntime_->registerModule({QuickUiRuntime::moduleId(QuickUiRuntime::DebugToolsModule),
+                                     QuickUiRuntime::FeaturePageLayer,
+                                     QuickUiRuntime::ManagedQuickIslandMode,
+                                     QUrl(), true});
+    quickUiRuntime_->registerModule({QuickUiRuntime::moduleId(QuickUiRuntime::GlobalOverlayModule),
+                                     QuickUiRuntime::OverlayLayer,
+                                     QuickUiRuntime::QuickOverlayMode,
+                                     QUrl(QStringLiteral("qrc:/qml/QuickSceneHost.qml")),
+                                     true});
+    quickUiRuntime_->synchronizeActiveModule(
+                QuickUiRuntime::moduleId(QuickUiRuntime::ApplicationShellModule));
+    quickUiRuntime_->attachOverlayHost(this);
 }
 
 AppShell::~AppShell()
@@ -149,6 +194,30 @@ bool AppShell::initialize()
     });
     connect(modeController_, &ModeController::stateChanged,
             this, [this](ModeController::AppModeState state) {
+                if (quickUiRuntime_) {
+                    switch (state) {
+                    case ModeController::AppModeState::MultimediaActive:
+                        quickUiRuntime_->synchronizeActiveModule(
+                                    QuickUiRuntime::moduleId(QuickUiRuntime::MultimediaMainModule));
+                        break;
+                    case ModeController::AppModeState::FaceGateActive:
+                        quickUiRuntime_->synchronizeActiveModule(
+                                    QuickUiRuntime::moduleId(QuickUiRuntime::FaceRecognitionModule));
+                        break;
+                    case ModeController::AppModeState::AdminActive:
+                        quickUiRuntime_->synchronizeActiveModule(
+                                    QuickUiRuntime::moduleId(QuickUiRuntime::FaceAdministrationModule));
+                        break;
+                    case ModeController::AppModeState::ShuttingDown:
+                        quickUiRuntime_->synchronizeActiveModule(
+                                    QuickUiRuntime::moduleId(QuickUiRuntime::ApplicationShellModule));
+                        break;
+                    case ModeController::AppModeState::SwitchingToFaceGate:
+                    case ModeController::AppModeState::SwitchingToMultimedia:
+                        // 过渡状态继续保留当前稳定页面，避免 QML 路由提前切换。
+                        break;
+                    }
+                }
                 if (state == ModeController::AppModeState::FaceGateActive
                         || state == ModeController::AppModeState::AdminActive) {
                     if (fillLight_) {
@@ -202,6 +271,11 @@ void AppShell::shutdown()
     }
     if (modeController_) {
         modeController_->shutdown();
+    }
+    if (quickUiRuntime_) {
+        quickUiRuntime_->dismissOverlays();
+        quickUiRuntime_->synchronizeActiveModule(
+                    QuickUiRuntime::moduleId(QuickUiRuntime::ApplicationShellModule));
     }
     initialized_ = false;
     qInfo() << "[SHELL] shutdown complete";

@@ -306,10 +306,8 @@ AppConfig AppConfig::load(const QString &iniPath)
                 s.value("verify/recognition_window_ms",
                         cfg.recognitionWindowMs).toInt());
     cfg.resultHoldMs = s.value("verify/result_hold_ms", cfg.resultHoldMs).toInt();
-    cfg.sameFaceSuppressMs = qMax(
-                60000,
-                s.value("verify/same_face_suppress_ms",
-                        cfg.sameFaceSuppressMs).toInt());
+    // 当前产品策略固定为 20 秒；不继续沿用设备上可能残留的旧 60 秒值。
+    cfg.sameFaceSuppressMs = 20000;
     cfg.accessDecisionTimeoutMs = qMax(
                 1000,
                 s.value("verify/access_decision_timeout_ms",
@@ -460,7 +458,7 @@ bool AppConfig::save(const QString &iniPath, QString *errorText) const
                QString::number(qMax(1000, recognitionWindowMs)));
     s.setValue("verify/result_hold_ms", QString::number(resultHoldMs));
     s.setValue("verify/same_face_suppress_ms",
-               QString::number(qMax(60000, sameFaceSuppressMs)));
+               QString::number(20000));
     s.setValue("verify/access_decision_timeout_ms",
                QString::number(accessDecisionTimeoutMs));
     s.setValue("verify/liveness_enabled", boolText(livenessEnabled));

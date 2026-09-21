@@ -14,13 +14,17 @@
 #include <QDebug>
 #include <QSize>
 #include <QFrame>
+#include <QHideEvent>
 #include <QScreen>
+#include <QShowEvent>
 #include <QStyleFactory>
 #include <QGuiApplication>
 
 #include "command_dialog.h"
 #include "common/responsive_ui.h"
+#include "components/quick/QuickPageHeaderWidget.h"
 #include "platform/rk3566_platform.h"
+#include "shell/QuickUiRuntime.h"
 
 
 /** @brief 按动作键触发与对应按钮相同的业务信号。 */
@@ -91,7 +95,19 @@ CommandDialog::CommandDialog(QWidget *parent)
         root->setSpacing(12);
     }
 
-    root->addWidget(makeHeaderCard(), 0);
+    auto *fallbackHeader = makeHeaderCard();
+    auto *quickHeader = new QuickPageHeaderWidget(this);
+    quickHeader->setTitle(QStringLiteral("设备配置"));
+    quickHeader->setActions({QStringLiteral("关闭")});
+    connect(quickHeader, &QuickPageHeaderWidget::actionTriggered,
+            this, [this](int index) {
+        if (index == 0) close();
+    });
+    const bool quickHeaderReady = quickHeader->status() == QQuickWidget::Ready;
+    quickHeader->setVisible(quickHeaderReady);
+    fallbackHeader->setVisible(!quickHeaderReady);
+    root->addWidget(quickHeader, 0);
+    root->addWidget(fallbackHeader, 0);
     root->addWidget(buildContent(), 1);
 
     auto *bottom = new QHBoxLayout();
@@ -102,6 +118,7 @@ CommandDialog::CommandDialog(QWidget *parent)
     btnExit->setObjectName("btnSecondary");
     btnExit->setCursor(Qt::PointingHandCursor);
     btnExit->setFixedSize(84, 36);
+    btnExit->setVisible(!quickHeaderReady);
     connect(btnExit, &QPushButton::clicked, this, &QDialog::close);
     bottom->addWidget(btnExit);
 
@@ -826,6 +843,27 @@ void CommandDialog::onActionClicked(const QString& action)
     }
 }
 
+
+/** @brief 显示调试工具并同步统一模块路由。 */
+void CommandDialog::showEvent(QShowEvent *event)
+{
+    QuickUiRuntime *runtime = QuickUiRuntime::instance();
+    previousModuleId_ = runtime->activeModuleId();
+    runtime->synchronizeActiveModule(
+                QuickUiRuntime::moduleId(QuickUiRuntime::DebugToolsModule));
+    QDialog::showEvent(event);
+}
+
+/** @brief 隐藏调试工具并恢复进入前的统一模块路由。 */
+void CommandDialog::hideEvent(QHideEvent *event)
+{
+    QDialog::hideEvent(event);
+    QuickUiRuntime::instance()->synchronizeActiveModule(
+                previousModuleId_.isEmpty()
+                ? QuickUiRuntime::moduleId(QuickUiRuntime::ApplicationShellModule)
+                : previousModuleId_);
+    previousModuleId_.clear();
+}
 
 /** @brief 为输入框接入软键盘并处理对话框内的交互事件。 */
 bool CommandDialog::eventFilter(QObject *obj, QEvent *event)

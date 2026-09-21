@@ -1,60 +1,220 @@
 /**
  * @file featuresdialog.cpp
- * @brief 编辑功能开关并约束离线、在线 V1、在线 V2 协议互斥关系。
- *
- * @author Dulin
- * @date 2026-07-25
+ * @brief Qt Quick 功能开关页面及 C++ ViewModel 实现。
  */
 
 #include "featuresdialog.h"
-#include "ui_featuresdialog.h"
-#include "common/responsive_ui.h"
 
-#include <QDebug>
+#include "common/responsive_ui.h"
+#include "shell/QuickUiRuntime.h"
+
+#include <QColor>
 #include <QCheckBox>
-#include <QTimer>
-#include <QSignalBlocker>
 #include <QEvent>
 #include <QHideEvent>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QPushButton>
+#include <QQuickWindow>
+#include <QQuickWidget>
+#include <QQmlContext>
+#include <QSignalBlocker>
 #include <QShowEvent>
+#include <QTimer>
+#include <QVBoxLayout>
 #include <QWidget>
 
-/** @brief 创建功能复选框并建立互斥约束连接。 */
+namespace {
+const char *const kFeatureNames[] = {
+    "离线版梯控系统 V1",
+    "网络版梯控系统 V1",
+    "网络版梯控系统 V2",
+    "电梯空调系统",
+    "多媒体电梯系统",
+    "电梯广播系统",
+    "可视对讲系统"
+};
+}
+
 FeaturesDialog::FeaturesDialog(QWidget *parent)
     : QDialog(parent)
-    , ui(new Ui::FeaturesDialog)
 {
     embeddedForWayland_ = ResponsiveUi::isWaylandPlatform() && parentWidget();
     if (embeddedForWayland_) {
         setWindowFlags(Qt::Widget);
         parentWidget()->installEventFilter(this);
+    } else {
+        setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
     }
-    ui->setupUi(this);
-    if (embeddedForWayland_) {
-        // setupUi() 会应用 .ui 中的 modal=false，Wayland 内嵌后重新恢复模态语义。
-        setModal(true);
-    }
+    setModal(true);
+    setWindowTitle(QStringLiteral("功能选项"));
+    setObjectName(QStringLiteral("QuickFeaturesDialog"));
 
     const QSize targetSize = ResponsiveUi::dialogSize(
-                parent, QSize(450, 560), QSize(400, 480), 16);
+                parent, QSize(500, 620), QSize(420, 500), 16);
     setMinimumSize(qMin(400, targetSize.width()),
                    qMin(480, targetSize.height()));
     resize(targetSize);
 
-    setupConnections();
+    auto *layout = new QVBoxLayout(this);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(0);
 
-    // 防止回车触发关闭
-    if (ui->applyButton) {
-        ui->applyButton->setAutoDefault(false);
-        ui->applyButton->setDefault(false);
+    quickView_ = new QQuickWidget(QuickUiRuntime::instance()->engine(), this);
+    quickView_->setObjectName(QStringLiteral("quickFeaturesPanel"));
+    quickView_->setResizeMode(QQuickWidget::SizeRootObjectToView);
+    quickView_->setClearColor(QColor(QStringLiteral("#ffffff")));
+    quickView_->rootContext()->setContextProperty(
+                QStringLiteral("featuresBridge"), this);
+    quickView_->setSource(QUrl(QStringLiteral("qrc:/qml/QuickFeaturesPanel.qml")));
+    if (QQuickWindow *window = quickView_->quickWindow()) {
+        window->setPersistentOpenGLContext(true);
+        window->setPersistentSceneGraph(true);
     }
+    auto *fallbackPanel = new QWidget(this);
+    fallbackPanel->setObjectName(QStringLiteral("featureFallbackPanel"));
+    fallbackPanel->setStyleSheet(QStringLiteral(
+        "QWidget#featureFallbackPanel{background:#ffffff;color:#303133;}"
+        "QLabel{color:#303133;font-size:22px;font-weight:700;}"
+        "QCheckBox{color:#606266;font-size:17px;spacing:12px;padding:8px;}"
+        "QPushButton{min-width:104px;min-height:46px;border-radius:10px;"
+        "background:#ffffff;color:#606266;border:1px solid #dcdfe6;font-size:17px;}"
+        "QPushButton#featureFallbackApply{background:#409eff;color:#ffffff;"
+        "border-color:#409eff;font-weight:700;}"));
+    auto *fallbackLayout = new QVBoxLayout(fallbackPanel);
+    fallbackLayout->setContentsMargins(24, 22, 24, 22);
+    fallbackLayout->setSpacing(10);
+    fallbackLayout->addWidget(new QLabel(QStringLiteral("功能选项"), fallbackPanel));
+    for (int index = 0; index < 7; ++index) {
+        auto *check = new QCheckBox(QString::fromUtf8(kFeatureNames[index]), fallbackPanel);
+        fallbackChecks_.append(check);
+        fallbackLayout->addWidget(check);
+        connect(check, &QCheckBox::toggled, this, [this, index](bool checked) {
+            setFeatureEnabled(index, checked);
+        });
+    }
+    fallbackLayout->addStretch(1);
+    auto *fallbackButtons = new QHBoxLayout();
+    fallbackButtons->addStretch(1);
+    auto *cancelButton = new QPushButton(QStringLiteral("取消"), fallbackPanel);
+    auto *applyButton = new QPushButton(QStringLiteral("应用"), fallbackPanel);
+    applyButton->setObjectName(QStringLiteral("featureFallbackApply"));
+    connect(cancelButton, &QPushButton::clicked,
+            this, &FeaturesDialog::cancelAndClose);
+    connect(applyButton, &QPushButton::clicked,
+            this, &FeaturesDialog::applyAndClose);
+    fallbackButtons->addWidget(cancelButton);
+    fallbackButtons->addWidget(applyButton);
+    fallbackLayout->addLayout(fallbackButtons);
+
+    layout->addWidget(quickView_);
+    layout->addWidget(fallbackPanel);
+    const auto updatePresentation = [this, fallbackPanel](QQuickWidget::Status status) {
+        const bool useFallback = status == QQuickWidget::Error;
+        quickView_->setVisible(!useFallback);
+        fallbackPanel->setVisible(useFallback);
+        if (useFallback) syncFallbackControls();
+    };
+    connect(quickView_, &QQuickWidget::statusChanged,
+            this, updatePresentation);
+    updatePresentation(quickView_->status());
+
+    statusTimer_ = new QTimer(this);
+    statusTimer_->setSingleShot(true);
+    statusTimer_->setInterval(2000);
+    connect(statusTimer_, &QTimer::timeout, this, [this]() {
+        setStatusText(QString());
+    });
+
+    hide();
 }
 
-/** @brief 释放 Qt Designer 界面对象。 */
 FeaturesDialog::~FeaturesDialog()
 {
+    if (parentWidget()) {
+        parentWidget()->removeEventFilter(this);
+    }
     delete waylandBlocker_;
-    delete ui;
+}
+
+FeatureSettings FeaturesDialog::getFeatureSettings() const
+{
+    FeatureSettings settings;
+    settings.offline_v1 = featureEnabled_[0];
+    settings.online_v1 = featureEnabled_[1];
+    settings.online_v2 = featureEnabled_[2];
+    // 保持原页面既有字段映射，不在界面迁移过程中改变配置语义。
+    settings.air_sys = featureEnabled_[2];
+    settings.media_sys = featureEnabled_[3];
+    settings.broad_sys = featureEnabled_[4];
+    settings.tbk_sys = featureEnabled_[5];
+    return settings;
+}
+
+void FeaturesDialog::setFeatureSettings(const FeatureSettings &settings)
+{
+    featureEnabled_[0] = settings.offline_v1;
+    featureEnabled_[1] = settings.online_v1;
+    featureEnabled_[2] = settings.online_v2;
+    // 原实现随后用 air_sys 覆盖第三项，并未回显第七项；这里保持兼容。
+    featureEnabled_[2] = settings.air_sys;
+    featureEnabled_[3] = settings.media_sys;
+    featureEnabled_[4] = settings.broad_sys;
+    featureEnabled_[5] = settings.tbk_sys;
+    featureEnabled_[6] = false;
+    syncFallbackControls();
+    emit featureItemsChanged();
+}
+
+QVariantList FeaturesDialog::featureItems() const
+{
+    QVariantList result;
+    result.reserve(7);
+    for (int index = 0; index < 7; ++index) {
+        QVariantMap item;
+        item.insert(QStringLiteral("text"),
+                    QString::fromUtf8(kFeatureNames[index]));
+        item.insert(QStringLiteral("enabled"), featureEnabled_[index]);
+        result.append(item);
+    }
+    return result;
+}
+
+QString FeaturesDialog::statusText() const
+{
+    return statusText_;
+}
+
+void FeaturesDialog::setFeatureEnabled(int index, bool enabled)
+{
+    if (index < 0 || index >= 7 || featureEnabled_[index] == enabled) {
+        return;
+    }
+    featureEnabled_[index] = enabled;
+    if (enabled && index < 3) {
+        for (int other = 0; other < 3; ++other) {
+            if (other != index) {
+                featureEnabled_[other] = false;
+            }
+        }
+    }
+    syncFallbackControls();
+    emit featureItemsChanged();
+    setStatusText(QStringLiteral("已%1 %2")
+                  .arg(enabled ? QStringLiteral("启用") : QStringLiteral("禁用"),
+                       QString::fromUtf8(kFeatureNames[index])));
+    statusTimer_->start();
+}
+
+void FeaturesDialog::applyAndClose()
+{
+    setStatusText(QStringLiteral("配置已应用"));
+    accept();
+}
+
+void FeaturesDialog::cancelAndClose()
+{
+    reject();
 }
 
 bool FeaturesDialog::eventFilter(QObject *watched, QEvent *event)
@@ -84,7 +244,10 @@ void FeaturesDialog::showEvent(QShowEvent *event)
         waylandBlocker_->raise();
         centerInHost();
     }
-
+    QuickUiRuntime *runtime = QuickUiRuntime::instance();
+    previousModuleId_ = runtime->activeModuleId();
+    runtime->synchronizeActiveModule(
+                QuickUiRuntime::moduleId(QuickUiRuntime::FeaturePagesModule));
     QDialog::showEvent(event);
     if (embeddedForWayland_) {
         raise();
@@ -97,6 +260,11 @@ void FeaturesDialog::hideEvent(QHideEvent *event)
         waylandBlocker_->hide();
     }
     QDialog::hideEvent(event);
+    QuickUiRuntime::instance()->synchronizeActiveModule(
+                previousModuleId_.isEmpty()
+                ? QuickUiRuntime::moduleId(QuickUiRuntime::MultimediaMainModule)
+                : previousModuleId_);
+    previousModuleId_.clear();
 }
 
 void FeaturesDialog::centerInHost()
@@ -109,91 +277,23 @@ void FeaturesDialog::centerInHost()
          host.y() + qMax(0, (host.height() - height()) / 2));
 }
 
-/** @brief 建立复选框和对话框按钮信号连接。 */
-void FeaturesDialog::setupConnections()
+void FeaturesDialog::setStatusText(const QString &text)
 {
-    // feature checkbox
-    connect(ui->feature1, SIGNAL(stateChanged(int)), this, SLOT(onFeatureChecked(int)));
-    connect(ui->feature2, SIGNAL(stateChanged(int)), this, SLOT(onFeatureChecked(int)));
-    connect(ui->feature3, SIGNAL(stateChanged(int)), this, SLOT(onFeatureChecked(int)));
-    connect(ui->feature4, SIGNAL(stateChanged(int)), this, SLOT(onFeatureChecked(int)));
-    connect(ui->feature5, SIGNAL(stateChanged(int)), this, SLOT(onFeatureChecked(int)));
-    connect(ui->feature6, SIGNAL(stateChanged(int)), this, SLOT(onFeatureChecked(int)));
-    connect(ui->feature7, SIGNAL(stateChanged(int)), this, SLOT(onFeatureChecked(int)));
-
-    // Apply 按钮
-    connect(ui->applyButton, &QPushButton::clicked, this, [this](){
-        ui->statusLabel->setText("配置已应用");
-
-        QTimer::singleShot(2000, this, [this](){
-            ui->statusLabel->clear();
-        });
-
-        accept();   // 关闭对话框
-    });
-}
-
-/** @brief 保证 offline_v1、online_v1、online_v2 最多选中一个。 */
-void FeaturesDialog::onFeatureChecked(int state)
-{
-    QCheckBox *senderBox = qobject_cast<QCheckBox*>(sender());
-    if (!senderBox) return;
-
-    // offline_v1 / online_v1 / online_v2 三者互斥，只能选一个
-    if (state == Qt::Checked) {
-        QList<QCheckBox*> exclusiveBoxes = {
-            ui->feature1,   // offline_v1
-            ui->feature2,   // online_v1
-            ui->feature3    // online_v2
-        };
-
-        for (QCheckBox *box : exclusiveBoxes) {
-            if (!box || box == senderBox) continue;
-            if (box->isChecked()) {
-                QSignalBlocker blocker(box);
-                box->setChecked(false);
-            }
-        }
+    if (statusText_ == text) {
+        return;
     }
-
-    const QString featureName = senderBox->text();
-    const QString statusText =
-            (state == Qt::Checked)
-            ? QString("已启用 %1").arg(featureName)
-            : QString("已禁用 %1").arg(featureName);
-
-    qDebug() << statusText;
-    ui->statusLabel->setText(statusText);
-
-    QTimer::singleShot(2000, this, [this](){
-        ui->statusLabel->clear();
-    });
+    statusText_ = text;
+    emit statusTextChanged();
 }
 
-
-/** @return 当前复选框对应的功能设置。 */
-FeatureSettings FeaturesDialog::getFeatureSettings() const
+/** @brief QML 加载失败时，使备用复选框与同一份功能状态保持一致。 */
+void FeaturesDialog::syncFallbackControls()
 {
-    FeatureSettings settings;
-    settings.offline_v1 = ui->feature1->isChecked();
-    settings.online_v1  = ui->feature2->isChecked();
-    settings.online_v2  = ui->feature3->isChecked();
-    settings.air_sys    = ui->feature3->isChecked();
-    settings.media_sys  = ui->feature4->isChecked();
-    settings.broad_sys  = ui->feature5->isChecked();
-    settings.tbk_sys    = ui->feature6->isChecked();
-    return settings;
-}
-
-
-/** @brief 将功能设置回显到复选框。 */
-void FeaturesDialog::setFeatureSettings(const FeatureSettings &settings)
-{
-    ui->feature1->setChecked(settings.offline_v1);
-    ui->feature2->setChecked(settings.online_v1 );
-    ui->feature3->setChecked(settings.online_v2 );
-    ui->feature3->setChecked(settings.air_sys   );
-    ui->feature4->setChecked(settings.media_sys );
-    ui->feature5->setChecked(settings.broad_sys );
-    ui->feature6->setChecked(settings.tbk_sys   );
+    const int count = qMin(fallbackChecks_.size(), 7);
+    for (int index = 0; index < count; ++index) {
+        QCheckBox *check = fallbackChecks_.at(index);
+        if (!check) continue;
+        const QSignalBlocker blocker(check);
+        check->setChecked(featureEnabled_[index]);
+    }
 }

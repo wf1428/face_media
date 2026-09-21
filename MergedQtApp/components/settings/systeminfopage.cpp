@@ -24,6 +24,7 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QShowEvent>
+#include <QSizePolicy>
 #include <QStorageInfo>
 #include <QSysInfo>
 #include <QTimer>
@@ -335,6 +336,7 @@ QLabel *createFieldLabel(const QString &text, QWidget *parent)
 /** @brief 为系统信息分组框应用统一标题和边框样式。 */
 void styleGroupBox(QGroupBox *groupBox)
 {
+    groupBox->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Maximum);
     groupBox->setStyleSheet(QStringLiteral(
         "QGroupBox {"
         " color: #303133;"
@@ -342,8 +344,8 @@ void styleGroupBox(QGroupBox *groupBox)
         " background-color: #ffffff;"
         " border: 1px solid #dcdfe6;"
         " border-radius: 8px;"
-        " margin-top: 12px;"
-        " padding-top: 12px;"
+        " margin-top: 8px;"
+        " padding-top: 9px;"
         "}"
         "QGroupBox::title {"
         " subcontrol-origin: margin;"
@@ -385,12 +387,14 @@ void SystemInfoPage::setupUI()
 {
     QVBoxLayout *mainLayout = new QVBoxLayout(this);
     mainLayout->setContentsMargins(24, 18, 24, 18);
-    mainLayout->setSpacing(10);
+    mainLayout->setSpacing(4);
+    mainLayout->setAlignment(Qt::AlignTop);
 
     titleLabel = new QLabel(tr("系统信息"), this);
+    titleLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     titleLabel->setStyleSheet(QStringLiteral(
-        "font-size: 22px; font-weight: bold; color: #303133; margin-bottom: 6px;"));
-    mainLayout->addWidget(titleLabel);
+        "font-size: 22px; font-weight: bold; color: #303133; margin-bottom: 2px;"));
+    mainLayout->addWidget(titleLabel, 0, Qt::AlignTop);
 
     hardwareGroupBox = new QGroupBox(tr("硬件信息"), this);
     styleGroupBox(hardwareGroupBox);
@@ -411,7 +415,7 @@ void SystemInfoPage::setupUI()
     hardwareLayout->addRow(createFieldLabel(tr("序列号"), hardwareGroupBox), serialNumberLabel);
     hardwareLayout->addRow(createFieldLabel(tr("运行内存"), hardwareGroupBox), memoryInfoLabel);
     hardwareLayout->addRow(createFieldLabel(tr("存储"), hardwareGroupBox), storageInfoLabel);
-    mainLayout->addWidget(hardwareGroupBox);
+    mainLayout->addWidget(hardwareGroupBox, 0, Qt::AlignTop);
 
     softwareGroupBox = new QGroupBox(tr("软件信息"), this);
     styleGroupBox(softwareGroupBox);
@@ -430,7 +434,7 @@ void SystemInfoPage::setupUI()
     softwareLayout->addRow(createFieldLabel(tr("操作系统"), softwareGroupBox), osVersionLabel);
     softwareLayout->addRow(createFieldLabel(tr("内核版本"), softwareGroupBox),
                            kernelVersionLabel);
-    mainLayout->addWidget(softwareGroupBox);
+    mainLayout->addWidget(softwareGroupBox, 0, Qt::AlignTop);
 
     networkGroupBox = new QGroupBox(tr("网络信息"), this);
     styleGroupBox(networkGroupBox);
@@ -442,7 +446,7 @@ void SystemInfoPage::setupUI()
     ipAddressLabel = new QLabel(networkGroupBox);
     networkLayout->addRow(createFieldLabel(tr("MAC地址"), networkGroupBox), macAddressLabel);
     networkLayout->addRow(createFieldLabel(tr("IP地址"), networkGroupBox), ipAddressLabel);
-    mainLayout->addWidget(networkGroupBox);
+    mainLayout->addWidget(networkGroupBox, 0, Qt::AlignTop);
 
     for (QLabel *label : {cpuInfoLabel, gpuInfoLabel, temperatureLabel,
                           serialNumberLabel, memoryInfoLabel, storageInfoLabel,

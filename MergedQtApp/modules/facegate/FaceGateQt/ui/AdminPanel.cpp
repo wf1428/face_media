@@ -9,6 +9,8 @@
 #include "AdminPanel.h"
 #include "FaceEnrollWidget.h"
 #include "AppMessageDialog.h"
+#include "components/quick/QuickNavigationWidget.h"
+#include "shell/QuickUiRuntime.h"
 #include "AppPasswordDialog.h"
 #include "UsbPersonImportSource.h"
 #include "common/responsive_ui.h"
@@ -403,7 +405,7 @@ void prepareAdminInputDialog(QInputDialog *dialog, QWidget *parent)
     dialog->setFixedSize(width, height);
 
     // 输入时共享键盘占据底部，弹窗固定在键盘上方区域的中央。
-    const int keyboardHeight = ResponsiveUi::keyboardHeight(parent->height(), 300);
+    const int keyboardHeight = ResponsiveUi::sharedKeyboardHeight(parent->size());
     const int availableHeight = qMax(height, parent->height() - keyboardHeight);
     const int x = qMax(0, (parent->width() - width) / 2);
     const int y = qMax(0, (availableHeight - height) / 2);
@@ -989,6 +991,22 @@ AdminPanel::AdminPanel(const AppConfig &config, QWidget *parent)
     contentLayout->setSizeConstraint(QLayout::SetNoConstraint);
     contentLayout->addWidget(stack_, 1);
 
+    // 导航外观和动画由共用 Quick 组件承担；原 QListWidget 继续保存既有
+    // 页面索引和业务触发逻辑，但不再参与绘制。
+    quickNavigation_ = new QuickNavigationWidget(this);
+    quickNavigation_->setFaceTheme(true);
+    quickNavigation_->setItems({QStringLiteral("本机信息"),
+                                QStringLiteral("人员管理"),
+                                QStringLiteral("识别记录"),
+                                QStringLiteral("运维维护"),
+                                QStringLiteral("设置")});
+    quickNavigation_->setHeader(QStringLiteral("管理"), QString());
+    quickNavigation_->setBackVisible(true);
+    quickNavigation_->setCurrentIndex(kDeviceInfoPageIndex);
+    sidebar_->hide();
+
+    rootLayout_->addWidget(quickNavigation_);
+    // QML 加载失败时保留原导航作为运行时兜底；正常情况下该控件始终隐藏。
     rootLayout_->addWidget(sidebar_);
     rootLayout_->addWidget(contentShell_, 1);
 
@@ -1025,7 +1043,18 @@ AdminPanel::AdminPanel(const AppConfig &config, QWidget *parent)
     connect(enrollWidget_, &FaceEnrollWidget::cameraRequirementChanged, this, &AdminPanel::updateCameraRequirement);
     connect(livenessCheck_, &QCheckBox::toggled, this, &AdminPanel::livenessEnabledChanged);
     connect(backButton_, &QPushButton::clicked, this, &AdminPanel::close);
+    connect(quickNavigation_, &QuickNavigationWidget::backRequested,
+            backButton_, &QPushButton::click);
+    connect(quickNavigation_, &QuickNavigationWidget::itemActivated,
+            this, [this](int row) {
+        if (navList_ && row >= 0 && row < navList_->count()) {
+            navList_->setCurrentRow(row);
+        }
+    });
     connect(navList_, &QListWidget::currentRowChanged, this, [this](int row) {
+        if (quickNavigation_) {
+            quickNavigation_->setCurrentIndex(row);
+        }
         stack_->setCurrentIndex(row);
         updateDeviceStatusRefreshState();
         if (row == kDeviceInfoPageIndex) {
@@ -2380,11 +2409,15 @@ void AdminPanel::showNetworkPersonFaces(int row)
 /** @brief 显示网络同步结果提示，并启动自动隐藏计时器。 */
 void AdminPanel::showNetworkSyncStatus(bool ok, const QString &text)
 {
-    if (!networkSyncToast_ || text.trimmed().isEmpty()) {
+    if (text.trimmed().isEmpty()) {
         return;
     }
 
-    Q_UNUSED(ok);
+    if (QuickUiRuntime::instance()->showToast(text.trimmed(), 3000, ok, true)) {
+        return;
+    }
+    if (!networkSyncToast_) return;
+
     networkSyncToast_->setStyleSheet(
                 QStringLiteral(
                     "QLabel#networkSyncToast {"
@@ -2522,9 +2555,14 @@ void AdminPanel::setStatusText(const QString &text)
 /** @brief 在管理界面中央显示安卓风格的轻量操作结果提示。 */
 void AdminPanel::showActionToast(const QString &text, bool success)
 {
-    if (!actionToast_ || text.trimmed().isEmpty()) {
+    if (text.trimmed().isEmpty()) {
         return;
     }
+
+    if (QuickUiRuntime::instance()->showToast(text.trimmed(), 1700, success, true)) {
+        return;
+    }
+    if (!actionToast_) return;
 
     actionToast_->setText(text.trimmed());
     actionToast_->setStyleSheet(QStringLiteral(
@@ -2682,6 +2720,21 @@ void AdminPanel::setPersonImportBusy(bool busy, int progress)
     if (exportPeopleButton_) exportPeopleButton_->setEnabled(!busy);
 
     if (!busy) {
+        QuickUiRuntime::instance()->hideProgress();
+        if (personImportSpinnerTimer_) personImportSpinnerTimer_->stop();
+        if (personImportProgressOverlay_) {
+            personImportProgressOverlay_->hide();
+            personImportProgressOverlay_->deleteLater();
+        }
+        personImportProgressOverlay_ = nullptr;
+        personImportSpinnerLabel_ = nullptr;
+        personImportProgressBar_ = nullptr;
+        personImportSpinnerTimer_ = nullptr;
+        personImportSpinnerAngle_ = 0;
+        return;
+    }
+
+    if (QuickUiRuntime::instance()->showProgress(QStringLiteral("导入中"), progress)) {
         if (personImportSpinnerTimer_) personImportSpinnerTimer_->stop();
         if (personImportProgressOverlay_) {
             personImportProgressOverlay_->hide();
@@ -3225,7 +3278,8 @@ void AdminPanel::resizeEvent(QResizeEvent *event)
 void AdminPanel::applyResponsiveLayout()
 {
     if (!rootLayout_ || !sideLayout_ || !sidebar_ || !navList_ ||
-            !adminTitle_ || !adminSubtitle_ || !livenessCheck_ || !backButton_) {
+            !adminTitle_ || !adminSubtitle_ || !livenessCheck_ || !backButton_ ||
+            !quickNavigation_) {
         return;
     }
 
@@ -3233,69 +3287,33 @@ void AdminPanel::applyResponsiveLayout()
                 ResponsiveUi::layoutReferenceSize(this));
     topNavigation_ = top;
 
-    sideLayout_->removeWidget(adminTitle_);
-    sideLayout_->removeWidget(adminSubtitle_);
-    sideLayout_->removeWidget(navList_);
-    sideLayout_->removeWidget(backButton_);
-
-    if (top) {
-        sidebar_->setStyleSheet(QStringLiteral(
-            "QFrame#sidebar{border-right:none;border-bottom:1px solid #2d3c52;}"));
-        rootLayout_->setDirection(QBoxLayout::TopToBottom);
-        sidebar_->setMinimumWidth(0);
-        sidebar_->setMaximumWidth(QWIDGETSIZE_MAX);
-        sidebar_->setMinimumHeight(100);
-        sidebar_->setMaximumHeight(120);
-        sideLayout_->setContentsMargins(10, 8, 10, 8);
-        sideLayout_->setSpacing(12);
-        sideLayout_->setRowStretch(3, 0);
-        sideLayout_->setColumnStretch(0, 1);
-
-        adminTitle_->hide();
-        adminSubtitle_->hide();
-        navList_->setFlow(QListView::LeftToRight);
-        navList_->setWrapping(false);
-        navList_->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
-        navList_->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-        navList_->setMinimumHeight(76);
-        navList_->setMaximumHeight(96);
-        const int navWidth = qMax(1, width() - backButton_->width() - 44);
-        const int itemWidth = qMax(104, (navWidth - 24) / qMax(1, navList_->count()));
-        for (int index = 0; index < navList_->count(); ++index) {
-            navList_->item(index)->setSizeHint(QSize(itemWidth, 62));
-        }
-        sideLayout_->addWidget(navList_, 0, 0);
-        sideLayout_->addWidget(backButton_, 0, 1, Qt::AlignVCenter);
-    } else {
-        sidebar_->setStyleSheet(QString());
+    const bool quickReady = quickNavigation_->status() == QQuickWidget::Ready;
+    quickNavigation_->setVisible(quickReady);
+    sidebar_->setVisible(!quickReady);
+    if (!quickReady) {
         rootLayout_->setDirection(QBoxLayout::LeftToRight);
-        sidebar_->setMinimumHeight(0);
-        sidebar_->setMaximumHeight(QWIDGETSIZE_MAX);
         sidebar_->setMinimumWidth(kAdminSidebarWidth);
         sidebar_->setMaximumWidth(kAdminSidebarWidth);
-        sideLayout_->setContentsMargins(14, 18, 14, 18);
-        sideLayout_->setSpacing(10);
-        sideLayout_->setRowStretch(3, 1);
-        sideLayout_->setColumnStretch(0, 1);
-
-        adminTitle_->show();
-        adminSubtitle_->show();
-        navList_->setFlow(QListView::TopToBottom);
-        navList_->setWrapping(false);
-        navList_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-        navList_->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
-        navList_->setMinimumHeight(0);
-        navList_->setMaximumHeight(QWIDGETSIZE_MAX);
-        for (int index = 0; index < navList_->count(); ++index) {
-            navList_->item(index)->setSizeHint(QSize(kAdminSidebarWidth - 28, 52));
-        }
-        sideLayout_->addWidget(adminTitle_, 0, 0);
-        sideLayout_->addWidget(adminSubtitle_, 1, 0);
-        sideLayout_->addWidget(navList_, 3, 0);
-        sideLayout_->addWidget(backButton_, 5, 0, Qt::AlignHCenter);
+        rootLayout_->invalidate();
+        return;
     }
 
-    sideLayout_->invalidate();
+    // Quick 导航只占用页面边缘的一块小 FBO；管理后台显示时多媒体已经暂停，
+    // 因而不会形成视频 + QML 的持续叠加。横竖屏只调整同一实例，不重建场景。
+    rootLayout_->setDirection(top ? QBoxLayout::TopToBottom
+                                  : QBoxLayout::LeftToRight);
+    quickNavigation_->setHorizontal(top);
+    if (top) {
+        quickNavigation_->setMinimumWidth(0);
+        quickNavigation_->setMaximumWidth(QWIDGETSIZE_MAX);
+        quickNavigation_->setMinimumHeight(92);
+        quickNavigation_->setMaximumHeight(112);
+    } else {
+        quickNavigation_->setMinimumHeight(0);
+        quickNavigation_->setMaximumHeight(QWIDGETSIZE_MAX);
+        quickNavigation_->setMinimumWidth(kAdminSidebarWidth);
+        quickNavigation_->setMaximumWidth(kAdminSidebarWidth);
+    }
     rootLayout_->invalidate();
 }
 

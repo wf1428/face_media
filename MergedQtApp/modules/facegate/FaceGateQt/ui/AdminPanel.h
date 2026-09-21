@@ -37,6 +37,7 @@ class QResizeEvent;
 class QShowEvent;
 class QBoxLayout;
 class QGridLayout;
+class QuickNavigationWidget;
 
 /** @brief 后台线程采集的一次设备运行状态快照。 */
 struct DeviceStatusSnapshot {
@@ -330,6 +331,7 @@ private:
     QBoxLayout *rootLayout_ = nullptr;
     QGridLayout *sideLayout_ = nullptr;
     QWidget *sidebar_ = nullptr;
+    QuickNavigationWidget *quickNavigation_ = nullptr;
     QLabel *adminTitle_ = nullptr;
     QLabel *adminSubtitle_ = nullptr;
     class QPushButton *backButton_ = nullptr;

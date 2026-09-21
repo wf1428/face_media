@@ -113,6 +113,18 @@ QStringList cardCandidates(const QString &readerValue)
         const QString hex = QStringLiteral("%1")
                 .arg(decimalValue, 8, 16, QLatin1Char('0')).toUpper();
         if (!values.contains(hex)) values.append(hex);
+        QByteArray bytes = QByteArray::fromHex(hex.toLatin1());
+        if (bytes.size() == 4) {
+            std::reverse(bytes.begin(), bytes.end());
+            const QString reversedHex = QString::fromLatin1(bytes.toHex()).toUpper();
+            if (!values.contains(reversedHex)) values.append(reversedHex);
+            bool reversedOk = false;
+            const qulonglong reversedValue = reversedHex.toULongLong(&reversedOk, 16);
+            const QString reversedDecimal = QString::number(reversedValue);
+            if (reversedOk && !values.contains(reversedDecimal)) {
+                values.append(reversedDecimal);
+            }
+        }
     }
     return values;
 }
@@ -163,10 +175,50 @@ bool NetworkAccessService::initialize()
 NetworkAccessResult NetworkAccessService::checkCardFrame(const QByteArray &cardFrame,
                                                          const QDateTime &now)
 {
-    if (!initialize()) return denied(QStringLiteral("网络权限数据库初始化失败"));
     if (cardFrame.size() < 43) return denied(QStringLiteral("刷卡数据长度不足"));
 
     const QString readerCard = QString::fromLatin1(cardFrame.mid(35, 8)).trimmed().toUpper();
+    return checkCardId(readerCard, now);
+}
+
+bool NetworkAccessService::hasCardId(const QString &cardId)
+{
+    return !cardHolders(cardId).isEmpty();
+}
+
+QList<CardHolderInfo> NetworkAccessService::cardHolders(const QString &cardId)
+{
+    QList<CardHolderInfo> holders;
+    if (!initialize()) return holders;
+    const QStringList candidates = cardCandidates(cardId);
+    if (candidates.isEmpty()) return holders;
+
+    QStringList placeholders;
+    QList<QVariant> binds;
+    for (const QString &candidate : candidates) {
+        placeholders.append(QStringLiteral("?"));
+        binds.append(candidate);
+    }
+    const QList<QVariantMap> rows = DbStore::query(
+                QStringLiteral("SELECT DISTINCT c.person_id,p.name FROM network_ic_card c "
+                               "JOIN network_person p ON p.person_id=c.person_id "
+                               "WHERE UPPER(c.card_id) IN (%1) ORDER BY c.person_id")
+                    .arg(placeholders.join(QLatin1Char(','))), binds);
+    for (const QVariantMap &row : rows) {
+        CardHolderInfo holder;
+        holder.personId = row.value(QStringLiteral("person_id")).toString();
+        holder.name = row.value(QStringLiteral("name")).toString().trimmed();
+        if (holder.name.isEmpty()) holder.name = holder.personId;
+        holders.append(holder);
+    }
+    return holders;
+}
+
+NetworkAccessResult NetworkAccessService::checkCardId(const QString &cardId,
+                                                       const QDateTime &now)
+{
+    if (!initialize()) return denied(QStringLiteral("网络权限数据库初始化失败"));
+    const QString readerCard = cardId.trimmed().toUpper();
     const QStringList candidates = cardCandidates(readerCard);
     if (candidates.isEmpty()) return denied(QStringLiteral("未解析到卡号"));
 
