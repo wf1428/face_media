@@ -29,7 +29,7 @@ AudioService::AudioService(QObject *parent)
     volumeController_ = new AmpVolumeController(this);
     // AmpVolumeController 构造时已经读取（或首次创建）volume.dat，并完成
     // RK809 输出路径及硬件音量初始化，这里只同步界面配置值。
-    config_.audioVolume = volumeController_->currentVolume();
+    config_.audioVolume = volumeController_->currentPromptVolume();
     player_ = new GstPlayerWidget;
     player_->setVideoOutput(nullptr);
     player_->setVolume(1.0f);
@@ -50,7 +50,7 @@ AudioService::AudioService(QObject *parent)
     });
 
     playbackStartTimer_.setSingleShot(true);
-    // 硬件音量切到 230 后短暂稳定；提示音链路已通过 preroll 静音准备。
+    // 硬件音量切到独立播报音量后短暂稳定；提示音链路已通过 preroll 静音准备。
     playbackStartTimer_.setInterval(15);
     connect(&playbackStartTimer_, &QTimer::timeout, this, [this]() {
         if (!player_ || pendingFileName_.isEmpty()) {
@@ -83,7 +83,7 @@ void AudioService::configure(const AppConfig &config)
 {
     config_ = config;
     config_.audioVolume = volumeController_
-            ? volumeController_->currentVolume()
+            ? volumeController_->currentPromptVolume()
             : qBound(0, config_.audioVolume, 100);
 }
 
@@ -94,19 +94,19 @@ void AudioService::setEnabled(bool enabled)
     AmpVolumeController::setPromptPlaybackEnabled(enabled);
 }
 
-/** @brief 设置并持久化 0~100 音量，同时更新 RK809 硬件音量。 */
+/** @brief 设置并持久化 0~100 语音播报音量。 */
 void AudioService::setVolume(int volume)
 {
     config_.audioVolume = qBound(0, volume, 100);
     if (volumeController_) {
-        volumeController_->setVolume(config_.audioVolume);
+        volumeController_->setPromptVolume(config_.audioVolume);
     }
 }
 
 int AudioService::volume() const
 {
     return volumeController_
-            ? volumeController_->currentVolume()
+            ? volumeController_->currentPromptVolume()
             : qBound(0, config_.audioVolume, 100);
 }
 

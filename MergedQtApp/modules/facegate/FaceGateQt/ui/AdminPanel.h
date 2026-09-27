@@ -186,7 +186,7 @@ signals:
     /** @brief 人员启用状态修改请求。 */
     void personEnabledChangeRequested(qint64 personId, bool enabled);
 
-    /** @brief 人员软删除请求。 */
+    /** @brief 人员删除请求，具体删除方式由人员来源决定。 */
     void personDeleteRequested(qint64 personId);
 
     /** @brief 页面切换导致摄像头需求变化时发出。 */

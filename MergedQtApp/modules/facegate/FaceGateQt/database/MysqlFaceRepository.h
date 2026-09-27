@@ -72,7 +72,7 @@ public:
     /** @brief 更新人员启用状态。 */
     bool updatePersonEnabled(qint64 personId, bool enabled) override;
 
-    /** @brief 软删除人员。 */
+    /** @brief Excel导入人员彻底删除，手工录入人员保持软删除。 */
     bool deletePerson(qint64 personId) override;
 
     /** @brief 写入验证日志并创建同步任务。 */

@@ -15,6 +15,7 @@
 #include <QFile>
 #include <QFormLayout>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPalette>
@@ -89,6 +90,20 @@ AdminLoginDialog::AdminLoginDialog(const AppConfig &config, QWidget *parent)
     connect(loginButton, &QPushButton::clicked, this, &AdminLoginDialog::verify);
     connect(cancelButton, &QPushButton::clicked, this, &AdminLoginDialog::reject);
 
+    auto *passwordAccessButton = new QPushButton(QStringLiteral("密码通行"), this);
+    passwordAccessButton->setObjectName(QStringLiteral("dialogPasswordAccessButton"));
+    passwordAccessButton->setIcon(QIcon(QStringLiteral(":/icons/action/key.svg")));
+    passwordAccessButton->setIconSize(QSize(20, 20));
+    passwordAccessButton->setCursor(Qt::PointingHandCursor);
+    passwordAccessButton->setMinimumHeight(44);
+    connect(passwordAccessButton, &QPushButton::clicked,
+            this, &AdminLoginDialog::requestPasswordAccess);
+
+    auto *topRow = new QHBoxLayout();
+    topRow->setContentsMargins(0, 0, 0, 2);
+    topRow->addStretch(1);
+    topRow->addWidget(passwordAccessButton);
+
     auto *buttonRow = new QHBoxLayout();
     buttonRow->setContentsMargins(0, 4, 0, 0);
     buttonRow->setSpacing(12);
@@ -111,6 +126,7 @@ AdminLoginDialog::AdminLoginDialog(const AppConfig &config, QWidget *parent)
     auto *formShellLayout = new QVBoxLayout(formShell);
     formShellLayout->setContentsMargins(24, 18, 24, 12);
     formShellLayout->setSpacing(14);
+    formShellLayout->addLayout(topRow);
     if (hintLabel) {
         formShellLayout->addWidget(hintLabel);
     }
@@ -147,6 +163,9 @@ AdminLoginDialog::AdminLoginDialog(const AppConfig &config, QWidget *parent)
         "QLabel{color:#d8e5eb;font-size:16px;}"
         "QLineEdit{font-size:18px;min-height:42px;}"
         "QPushButton#dialogPrimaryButton,QPushButton#dialogCancelButton{min-width:132px;}"
+        "QPushButton#dialogPasswordAccessButton{background:#123b55;color:#eafaff;"
+        "border:1px solid #49d1ff;padding:8px 16px;font-weight:600;}"
+        "QPushButton#dialogPasswordAccessButton:pressed{background:#19516f;}"
     );
     setStyleSheet(style);
 }
@@ -176,6 +195,14 @@ void AdminLoginDialog::verify()
     }
 
     AppMessageDialog::warning(this, QStringLiteral("管理员登录"), QStringLiteral("用户名或密码错误"));
+}
+
+/** @brief 以独立结果码退出，让主窗口复用既有密码通行校验和权限下发。 */
+void AdminLoginDialog::requestPasswordAccess()
+{
+    if (userEdit_) userEdit_->clearFocus();
+    if (passwordEdit_) passwordEdit_->clearFocus();
+    done(PasswordAccessRequested);
 }
 
 /** @brief Wayland 宿主尺寸变化时同步覆盖层几何。 */

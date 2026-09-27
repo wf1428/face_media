@@ -65,7 +65,7 @@ IcToast::IcToast(QWidget* mainWindow)
     hide();
 
     voiceStartTimer_.setSingleShot(true);
-    // 硬件音量切到 230 后短暂稳定；提示音链路已通过 preroll 静音准备。
+    // 硬件音量切到独立播报音量后短暂稳定；提示音链路已通过 preroll 静音准备。
     voiceStartTimer_.setInterval(15);
     connect(&voiceStartTimer_, &QTimer::timeout, this, [this]() {
         if (!voicePlayer_ || pendingVoiceFile_.isEmpty()) {
@@ -717,10 +717,10 @@ void IcToast::playFailVoice(int resultCode)
     playVoiceFile(failVoiceFile_);
 }
 
-/** @return 提示音使用的 RK809 固定原始音量 230。 */
+/** @return volume.dat 中语音播报百分比映射出的 RK809 原始音量。 */
 int IcToast::boostedToastRawVolume() const
 {
-    return ampCtrl_ ? 230 : 0;
+    return ampCtrl_ ? ampCtrl_->currentPromptRawVolume() : 0;
 }
 
 /**

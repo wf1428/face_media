@@ -49,13 +49,6 @@ NetworkStatusMonitor::NetworkStatusMonitor(QWidget *mainWindow,
         setGeometry(main_->rect());
     }
 
-    // 只用 IP，避免“DNS 本身坏了”时把探测卡在域名解析上。
-    // 任意一个目标能 ping 通就认为可上网；不要因为单个公共 DNS 不通误报。
-    // 114.114.114.114 在部分网络会被屏蔽或丢包，因此不作为默认探测目标。
-    pingTargets_ << QStringLiteral("223.5.5.5")
-                 << QStringLiteral("8.8.8.8")
-                 << QStringLiteral("119.29.29.29");
-
     checkTimer_.setInterval(checkIntervalMs_);
     connect(&checkTimer_, &QTimer::timeout,
             this, &NetworkStatusMonitor::checkNetworkStatus);
@@ -300,6 +293,21 @@ void NetworkStatusMonitor::checkNetworkStatus()
 /** @brief 依次异步 ping 配置的外网目标。 */
 void NetworkStatusMonitor::beginInternetProbe()
 {
+    // 保留原有公网探测顺序，并在每轮读取配置中的路由器 DNS 地址。
+    // 只接受 IP，避免将无效配置传给 ping 或触发域名解析。
+    pingTargets_ = QStringList() << QStringLiteral("223.5.5.5")
+                                 << QStringLiteral("8.8.8.8")
+                                 << QStringLiteral("119.29.29.29");
+    QSettings ini(configPath_, QSettings::IniFormat);
+    ini.setIniCodec("UTF-8");
+    const QString configuredDns = ini.value(QStringLiteral("network/dns")).toString().trimmed();
+    QHostAddress dnsAddress;
+    if (dnsAddress.setAddress(configuredDns) &&
+        dnsAddress.protocol() == QAbstractSocket::IPv4Protocol &&
+        !pingTargets_.contains(configuredDns)) {
+        pingTargets_ << configuredDns;
+    }
+
     if (pingTargets_.isEmpty()) {
         finishInternetProbe(false);
         return;

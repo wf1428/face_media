@@ -522,66 +522,84 @@ public:
     {
         if (!owner || !sample) return GST_FLOW_ERROR;
 
-        QMutexLocker locker(&mutex_);
-        QString error;
-        SourceBranch *branch = ensureSourceLocked(owner, &error, promptSource);
-        if (!branch) {
-            qWarning() << "[GStreamer-AUDIO] shared mixer input unavailable:" << error;
-            return GST_FLOW_ERROR;
-        }
-
         GstCaps *caps = gst_sample_get_caps(sample);
         GstBuffer *buffer = gst_sample_get_buffer(sample);
         if (!caps || !buffer) return GST_FLOW_ERROR;
 
-        if (!branch->caps || !gst_caps_is_equal(branch->caps, caps)) {
-            if (branch->caps) gst_caps_unref(branch->caps);
-            branch->caps = gst_caps_copy(caps);
-            g_object_set(branch->appsrc, "caps", caps, nullptr);
-        }
-
         GstBuffer *copy = gst_buffer_copy(buffer);
         if (!copy) return GST_FLOW_ERROR;
-        const GstClockTime previousNextPts = branch->nextPts;
-        if (branch->promptSource) {
-            // 只在一段提示音的前导静音开始时对齐共享管线时钟。真实 PCM
-            // 必须沿同一时间线连续累加；若每个音频包都拿系统时钟追赶，
-            // appsink 回调的正常抖动会被转换成包间静音，听起来就是卡顿。
-            if (reanchorPromptTimeline ||
-                    !GST_CLOCK_TIME_IS_VALID(branch->nextPts)) {
-                GstClockTime now = GST_CLOCK_TIME_NONE;
-                GstClock *clock = pipeline_ ? gst_element_get_clock(pipeline_) : nullptr;
-                if (clock) {
-                    const GstClockTime clockNow = gst_clock_get_time(clock);
-                    const GstClockTime baseTime = gst_element_get_base_time(pipeline_);
-                    if (GST_CLOCK_TIME_IS_VALID(clockNow) &&
-                            GST_CLOCK_TIME_IS_VALID(baseTime) && clockNow >= baseTime) {
-                        now = clockNow - baseTime;
+
+        SourceBranch *branch = nullptr;
+        GstElement *appsrc = nullptr;
+        GstClockTime previousNextPts = GST_CLOCK_TIME_NONE;
+        GstClockTime scheduledNextPts = GST_CLOCK_TIME_NONE;
+        {
+            QMutexLocker locker(&mutex_);
+            QString error;
+            branch = ensureSourceLocked(owner, &error, promptSource);
+            if (!branch) {
+                qWarning() << "[GStreamer-AUDIO] shared mixer input unavailable:" << error;
+                gst_buffer_unref(copy);
+                return GST_FLOW_ERROR;
+            }
+
+            if (!branch->caps || !gst_caps_is_equal(branch->caps, caps)) {
+                if (branch->caps) gst_caps_unref(branch->caps);
+                branch->caps = gst_caps_copy(caps);
+                g_object_set(branch->appsrc, "caps", caps, nullptr);
+            }
+
+            // push-buffer 在解码/音频输出异常时可能等待 GStreamer 内部锁。
+            // 对 appsrc 单独加引用后立即释放共享表锁，避免 Qt 主线程随后在
+            // 提示音停止、EOS 收尾或新一轮播报时等待同一把锁而整体卡死。
+            appsrc = GST_ELEMENT(gst_object_ref(branch->appsrc));
+            previousNextPts = branch->nextPts;
+            if (branch->promptSource) {
+                // 只在一段提示音的前导静音开始时对齐共享管线时钟。真实 PCM
+                // 必须沿同一时间线连续累加；若每个音频包都拿系统时钟追赶，
+                // appsink 回调的正常抖动会被转换成包间静音，听起来就是卡顿。
+                if (reanchorPromptTimeline ||
+                        !GST_CLOCK_TIME_IS_VALID(branch->nextPts)) {
+                    GstClockTime now = GST_CLOCK_TIME_NONE;
+                    GstClock *clock = pipeline_ ? gst_element_get_clock(pipeline_) : nullptr;
+                    if (clock) {
+                        const GstClockTime clockNow = gst_clock_get_time(clock);
+                        const GstClockTime baseTime = gst_element_get_base_time(pipeline_);
+                        if (GST_CLOCK_TIME_IS_VALID(clockNow) &&
+                                GST_CLOCK_TIME_IS_VALID(baseTime) && clockNow >= baseTime) {
+                            now = clockNow - baseTime;
+                        }
+                        gst_object_unref(clock);
                     }
-                    gst_object_unref(clock);
+                    branch->nextPts = GST_CLOCK_TIME_IS_VALID(now) ? now : 0;
                 }
-                branch->nextPts = GST_CLOCK_TIME_IS_VALID(now) ? now : 0;
+                GstClockTime duration = GST_BUFFER_DURATION(copy);
+                if (!GST_CLOCK_TIME_IS_VALID(duration) || duration == 0) {
+                    duration = 20 * GST_MSECOND;
+                    GST_BUFFER_DURATION(copy) = duration;
+                }
+                GST_BUFFER_PTS(copy) = branch->nextPts;
+                GST_BUFFER_DTS(copy) = branch->nextPts;
+                branch->nextPts += duration;
+                scheduledNextPts = branch->nextPts;
+            } else {
+                GST_BUFFER_PTS(copy) = GST_CLOCK_TIME_NONE;
+                GST_BUFFER_DTS(copy) = GST_CLOCK_TIME_NONE;
             }
-            GstClockTime duration = GST_BUFFER_DURATION(copy);
-            if (!GST_CLOCK_TIME_IS_VALID(duration) || duration == 0) {
-                duration = 20 * GST_MSECOND;
-                GST_BUFFER_DURATION(copy) = duration;
-            }
-            GST_BUFFER_PTS(copy) = branch->nextPts;
-            GST_BUFFER_DTS(copy) = branch->nextPts;
-            branch->nextPts += duration;
-        } else {
-            GST_BUFFER_PTS(copy) = GST_CLOCK_TIME_NONE;
-            GST_BUFFER_DTS(copy) = GST_CLOCK_TIME_NONE;
+            GST_BUFFER_OFFSET(copy) = GST_BUFFER_OFFSET_NONE;
+            GST_BUFFER_OFFSET_END(copy) = GST_BUFFER_OFFSET_NONE;
         }
-        GST_BUFFER_OFFSET(copy) = GST_BUFFER_OFFSET_NONE;
-        GST_BUFFER_OFFSET_END(copy) = GST_BUFFER_OFFSET_NONE;
 
         GstFlowReturn flow = GST_FLOW_ERROR;
-        g_signal_emit_by_name(branch->appsrc, "push-buffer", copy, &flow);
+        g_signal_emit_by_name(appsrc, "push-buffer", copy, &flow);
+        gst_object_unref(appsrc);
         gst_buffer_unref(copy);
-        if (flow != GST_FLOW_OK && branch->promptSource) {
-            branch->nextPts = previousNextPts;
+        if (flow != GST_FLOW_OK && promptSource) {
+            QMutexLocker locker(&mutex_);
+            SourceBranch *current = sources_.value(owner, nullptr);
+            if (current == branch && current->nextPts == scheduledNextPts) {
+                current->nextPts = previousNextPts;
+            }
         }
         return flow;
     }
@@ -637,27 +655,39 @@ public:
     int promptDrainDelayMs(GstPlayerWidget *owner)
     {
         if (!owner) return 80;
-        QMutexLocker locker(&mutex_);
+        // 该函数由 Qt 主线程的 bus 定时器调用。音频流线程正好在创建分支
+        // 时宁可采用安全的 80ms 收尾值，也不能让整个界面等待共享音频锁。
+        if (!mutex_.tryLock(5)) {
+            qWarning() << "[GStreamer-AUDIO] prompt drain lock busy; using fallback";
+            return 80;
+        }
         SourceBranch *branch = sources_.value(owner, nullptr);
         if (!branch || !branch->promptSource ||
                 !GST_CLOCK_TIME_IS_VALID(branch->nextPts)) {
+            mutex_.unlock();
             return 80;
         }
 
+        const GstClockTime nextPts = branch->nextPts;
+        GstElement *pipeline = pipeline_
+                ? GST_ELEMENT(gst_object_ref(pipeline_)) : nullptr;
+        mutex_.unlock();
+
         GstClockTime now = GST_CLOCK_TIME_NONE;
-        GstClock *clock = pipeline_ ? gst_element_get_clock(pipeline_) : nullptr;
+        GstClock *clock = pipeline ? gst_element_get_clock(pipeline) : nullptr;
         if (clock) {
             const GstClockTime clockNow = gst_clock_get_time(clock);
-            const GstClockTime baseTime = gst_element_get_base_time(pipeline_);
+            const GstClockTime baseTime = gst_element_get_base_time(pipeline);
             if (GST_CLOCK_TIME_IS_VALID(clockNow) &&
                     GST_CLOCK_TIME_IS_VALID(baseTime) && clockNow >= baseTime) {
                 now = clockNow - baseTime;
             }
             gst_object_unref(clock);
         }
-        if (!GST_CLOCK_TIME_IS_VALID(now) || branch->nextPts <= now) return 80;
+        if (pipeline) gst_object_unref(pipeline);
+        if (!GST_CLOCK_TIME_IS_VALID(now) || nextPts <= now) return 80;
 
-        const guint64 remainingMs = (branch->nextPts - now) / GST_MSECOND;
+        const guint64 remainingMs = (nextPts - now) / GST_MSECOND;
         return static_cast<int>(qBound<guint64>(80, remainingMs + 80, 1000));
     }
 
@@ -674,8 +704,9 @@ public:
         if (!branch) return;
 
         // 状态切换和动态拆分支绝不能持有 pushSample 使用的共享锁。
-        // 否则 Qt 线程等待 GStreamer 流线程退出时，流线程又可能等待该锁，
-        // 视频 EOS 后就会形成完整死锁。
+        // pushSample 已对 appsrc 单独持有引用，并在调用 push-buffer 前释放
+        // 共享锁，因此这里不需要发送 flush-start。共享 mixer 若只收到
+        // flush-start 而没有配对 flush-stop，后续提示音和视频 PCM 都会被丢弃。
         if (stopOutput && pipeline_) {
             // 最后一个输入已经 EOS/停止时，先停整条共享输出，再拆分支。
             // 这样不会在运行中的 audiomixer 上动态删除最后一个 request pad。
@@ -1528,35 +1559,12 @@ void GstPlayerWidget::play()
 
     playRequested_ = true;
     if (promptAudioMode_.loadAcquire() != 0) {
-        // PAUSED preroll 尚未把常驻输入分支准备好时保持等待。准备完成的
-        // 回调会回到 GUI 线程继续本次 play 请求，真实首帧不会被提前消费。
-        if (promptAudioPrimed_.loadAcquire() == 0) return;
-
-        if (promptLeadInQueued_.testAndSetOrdered(0, 1)) {
-            GstSample *preroll = nullptr;
-            {
-                QMutexLocker locker(&gstMutex_);
-                if (promptPrerollSample_) {
-                    preroll = gst_sample_ref(promptPrerollSample_);
-                }
-            }
-            if (!preroll) {
-                promptLeadInQueued_.storeRelease(0);
-                return;
-            }
-
-            // 音量提升确认完成后，才在同一个 appsrc 时间线上排入 200ms
-            // 静音；真实首个 PCM 样本随后到达时自然排在静音之后。
-            const GstFlowReturn flow = SharedAudioMixer::instance().pushSilentPreroll(
-                        this, preroll, 200 * GST_MSECOND);
-            gst_sample_unref(preroll);
-            if (flow != GST_FLOW_OK) {
-                promptLeadInQueued_.storeRelease(0);
-                emit errorOccured(QStringLiteral("提示音前导静音写入失败: %1")
-                                  .arg(static_cast<int>(flow)));
-                return;
-            }
-            qInfo() << "[GStreamer-AUDIO] prompt lead-in queued durationMs=200";
+        // 前导静音由 GStreamer preroll 线程准备。GUI 线程只负责切换到
+        // PLAYING，绝不再同步调用 appsrc push-buffer，避免播报与下载暂停
+        // 视频的音频分支竞争时把 Qt 主事件循环锁住。
+        if (promptAudioPrimed_.loadAcquire() == 0 ||
+                promptLeadInQueued_.loadAcquire() == 0) {
+            return;
         }
     }
 
@@ -1582,6 +1590,11 @@ void GstPlayerWidget::pause()
     playRequested_ = false;
     gst_element_set_state(playbin_, GST_STATE_PAUSED);
     playing_ = false;
+    if (promptAudioMode_.loadAcquire() == 0) {
+        // PAUSED 的视频不会继续产生 PCM。立即退出共享 mixer，避免下载期间
+        // 留下一个不活跃的视频输入，再与人脸提示音组成双分支死锁。
+        SharedAudioMixer::instance().removeSource(this);
+    }
 }
 
 /** @brief 停止播放并清除画布中的最后一帧。 */
@@ -3799,10 +3812,11 @@ GstFlowReturn GstPlayerWidget::sharedAudioAppSinkNewPreroll(GstElement *sink,
 
     GstFlowReturn flow = GST_FLOW_ERROR;
     // 第一次把动态 appsrc 分支同步到共享 PLAYING 管线时，可能短暂处于
-    // flushing。重试发生在 GStreamer preroll 线程，不阻塞 Qt 界面线程。
+    // flushing。完整的 200ms 前导静音在 GStreamer preroll 线程准备，
+    // Qt 主线程不再直接调用 appsrc push-buffer。
     for (int attempt = 0; attempt < 20; ++attempt) {
         flow = SharedAudioMixer::instance().pushSilentPreroll(
-                    self, sample, 20 * GST_MSECOND);
+                    self, sample, 200 * GST_MSECOND);
         if (flow != GST_FLOW_FLUSHING) break;
         g_usleep(10 * 1000);
     }
@@ -3823,8 +3837,9 @@ GstFlowReturn GstPlayerWidget::sharedAudioAppSinkNewPreroll(GstElement *sink,
             }
             self->promptPrerollSample_ = gst_sample_ref(sample);
         }
+        self->promptLeadInQueued_.storeRelease(1);
         self->promptAudioPrimed_.storeRelease(1);
-        qInfo() << "[GStreamer-AUDIO] prompt branch ready; setup silence accepted";
+        qInfo() << "[GStreamer-AUDIO] prompt branch ready; lead-in silence accepted";
 
         QMetaObject::invokeMethod(self, [self]() {
             if (!self->shuttingDown_.load() && self->playRequested_) {

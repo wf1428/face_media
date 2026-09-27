@@ -22,8 +22,9 @@ class GstPlayerWidget;
 /**
  * @brief RK3566 功放开关、ALSA 混音器和音量持久化控制器。
  *
- * 用户音量使用 0~100，并线性映射到 RK809 Playback Volume 的 60~200；
- * 普通 setVolume() 经防抖后持久化，临时硬件调整不改变保存的用户音量。
+ * 系统音量使用 0~100，并线性映射到 RK809 Playback Volume 的 60~200；
+ * 语音播报音量独立使用 0~100，并线性映射到原始值 200~250。
+ * 两个百分比共同保存在 volume.dat 中，临时硬件调整不改变持久化值。
  */
 class AmpVolumeController : public QObject
 {
@@ -32,7 +33,7 @@ public:
     /** @brief 解析平台路径并初始化音量防抖定时器。 */
     explicit AmpVolumeController(QObject *parent = nullptr);
 
-    /** @return 从持久化文件读取的 0~100 音量；文件不存在时创建为 50%。 */
+    /** @return 从持久化文件读取系统音量；首次创建时系统为50%、播报为60%（原始值230）。 */
     int loadVolumeFromFile();
 
     /** @return 持久化文件记录的功放启用标志。 */
@@ -43,6 +44,12 @@ public:
 
     /** @return 当前用户音量映射的 60~200 RK809 原始值，不反映临时覆盖。 */
     int currentRawVolume() const { return volumePercentToRaw(m_volume); }
+
+    /** @return 当前保存的语音播报音量，范围 0~100。 */
+    int currentPromptVolume() const { return m_promptVolume; }
+
+    /** @return 语音播报百分比映射的 200~250 RK809 原始值。 */
+    int currentPromptRawVolume() const { return promptVolumePercentToRaw(m_promptVolume); }
 
     /** @return DisplayDirRect/MusicPlayEn；缺少配置时按启用处理。 */
     static bool isPromptPlaybackEnabled();
@@ -61,6 +68,9 @@ public slots:
     /** @brief 将用户音量限制到 0~100，并防抖应用和保存。 */
     void setVolume(int value);
 
+    /** @brief 保存 0~100 语音播报音量；不立即改变正常媒体硬件音量。 */
+    void setPromptVolume(int value);
+
     /** @brief 立即设置 0~255 RK809 原始值，用于提示音等临时增益。 */
     void setRawVolumeTemporary(int rawValue);
 
@@ -70,6 +80,9 @@ public slots:
 private:
     /** @return 0~100 线性映射并限制到 60~200 的 RK809 原始值。 */
     static int volumePercentToRaw(int value);
+
+    /** @return 0~100 线性映射并限制到 200~250 的 RK809 原始值。 */
+    static int promptVolumePercentToRaw(int value);
 
     /** @brief 打开功放控制设备。 */
     bool amplifierOpen();
@@ -92,8 +105,11 @@ private:
     /** @brief 按音量决定功放开关和 RK809 播放音量，并发出结果信号。 */
     void applyNow(int value);
 
-    /** @brief 将用户音量和功放标志写入持久化文件。 */
+    /** @brief 更新系统音量和功放标志，同时保留文件中的语音播报音量。 */
     void writeVolumeFile(int volume, bool ampFlag);
+
+    /** @brief 更新语音播报音量，同时保留文件中的系统音量和功放标志。 */
+    void writePromptVolumeFile(int promptVolume);
 
     /** @brief 首次使用时初始化功放和 ALSA 音频路径。 */
     void initAudioPathOnce();
@@ -103,6 +119,7 @@ private:
     QString ampDevice_;
     QString alsaCard_;
     int m_volume = 50;
+    int m_promptVolume = 60;       /**< 60% 对应旧版固定原始播报音量 230。 */
     bool m_ampFlag = true;
     QTimer m_debounce;
     int m_pendingVolume = -1;
@@ -151,6 +168,7 @@ private:
     AmpVolumeController *volumeController_ = nullptr;
     QTimer boostDelayTimer_;
     int savedAmpRawVolume_ = -1;
+    int requestedBoostRaw_ = -1;   /**< 本轮根据播报百分比映射出的 200~250 原始值。 */
     bool boostReady_ = false;
 };
 

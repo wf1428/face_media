@@ -96,7 +96,7 @@ private:
     /** @brief 按 MQTT 结果码播放对应失败提示音，未配置时使用通用失败音。 */
     void playFailVoice(int resultCode);
 
-    /** @return 提示音使用的 RK809 固定原始音量 230。 */
+    /** @return volume.dat 中语音播报百分比映射出的 RK809 原始音量。 */
     int boostedToastRawVolume() const;
 
     /** @brief 保存并静音正在播放的视频，同时临时提升 RK809 播放音量。 */
@@ -156,7 +156,7 @@ private:
     QString failVoiceFile_;                  /**< common/audio/fail.wav 的临时播放路径。 */
     AmpVolumeController* ampCtrl_ = nullptr; /**< 延迟创建的功放音量控制器。 */
     bool voiceFocusActive_ = false;          /**< 是否已保存并调整业务音量。 */
-    bool volumeBoostPending_ = false;        /**< 是否等待异步应用提示音原始音量 230。 */
+    bool volumeBoostPending_ = false;        /**< 是否等待异步应用提示音原始音量。 */
     int savedAmpRawVolume_ = -1;             /**< 语音焦点前 RK809 原始音量；-1 表示未保存。 */
     int pendingRestoreRaw_ = -1;             /**< 等待异步恢复的 RK809 原始音量。 */
     qreal pendingRestoreFactor_ = 0.0;        /**< 硬件恢复后视频淡入的起始比例。 */

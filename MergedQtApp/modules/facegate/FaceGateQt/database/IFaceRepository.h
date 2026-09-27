@@ -58,7 +58,7 @@ public:
     /** @brief 启用或停用指定人员。 */
     virtual bool updatePersonEnabled(qint64 personId, bool enabled) = 0;
 
-    /** @brief 软删除指定人员及其验证资格。 */
+    /** @brief 按人员来源彻底删除或软删除指定人员。 */
     virtual bool deletePerson(qint64 personId) = 0;
 
     /** @brief 写入一条验证日志。 */

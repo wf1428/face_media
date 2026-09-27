@@ -31,6 +31,8 @@ public:
     bool recordSuccessfulAccess(const NetworkAccessResult &result);
 
 private:
+    /** @brief 跨天时把远程呼梯当天剩余次数重置为每日额度，不累计。 */
+    bool refreshRemoteCallDailyQuota(qint64 personId, const QDate &date);
     NetworkAccessResult evaluatePerson(qint64 personId, const QString &credential,
                                        const QString &credentialType, const QDateTime &now);
     LocalPersonnelStore personnelStore_;

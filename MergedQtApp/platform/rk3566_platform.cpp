@@ -352,7 +352,7 @@ QString heartbeatFile()
         return env;
     }
 
-    const QString runDir = QStringLiteral("/run/qt_ycest");
+    const QString runDir = QStringLiteral("/run/face-media");
     if (QDir().mkpath(runDir)) {
         return QDir(runDir).filePath(QStringLiteral("heartbeat"));
     }

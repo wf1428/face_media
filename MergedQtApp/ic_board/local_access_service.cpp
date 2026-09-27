@@ -90,7 +90,15 @@ bool timeMatches(const QVariantMap &row, const QDateTime &now)
 
 bool LocalAccessService::initialize()
 {
-    return personnelStore_.initialize();
+    if (!personnelStore_.initialize()) return false;
+    const QString today = QDate::currentDate().toString(Qt::ISODate);
+    return DbStore::execute(
+                QStringLiteral("UPDATE local_access_rule SET "
+                               "remote_call_current_day_count=remote_call_every_day_count,"
+                               "remote_call_used_count=0,remote_call_refresh_date=? "
+                               "WHERE remote_call_enabled=1 "
+                               "AND COALESCE(remote_call_refresh_date,'')<>?"),
+                {today, today});
 }
 
 NetworkAccessResult LocalAccessService::checkCardFrame(const QByteArray &frame, const QDateTime &now)
@@ -203,9 +211,28 @@ NetworkAccessResult LocalAccessService::checkFacePerson(qint64 personId, const Q
     return evaluatePerson(personId, QString::number(personId), QStringLiteral("FACE"), now);
 }
 
+/** @brief 日期变化后直接恢复每日额度并清零当日用量，不把前一天余额累加。 */
+bool LocalAccessService::refreshRemoteCallDailyQuota(qint64 personId,
+                                                      const QDate &date)
+{
+    if (personId <= 0 || !date.isValid()) return true;
+    const QString currentDate = date.toString(Qt::ISODate);
+    return DbStore::execute(
+                QStringLiteral("UPDATE local_access_rule SET "
+                               "remote_call_current_day_count=remote_call_every_day_count,"
+                               "remote_call_used_count=0,remote_call_refresh_date=? "
+                               "WHERE person_id=? AND remote_call_enabled=1 "
+                               "AND COALESCE(remote_call_refresh_date,'')<>?"),
+                {currentDate, personId, currentDate});
+}
+
 NetworkAccessResult LocalAccessService::evaluatePerson(qint64 personId, const QString &credential,
                                                         const QString &credentialType, const QDateTime &now)
 {
+    if (!refreshRemoteCallDailyQuota(personId, now.date())) {
+        return denied(QStringLiteral("远程呼梯每日次数刷新失败"),
+                      QString::number(personId), credential, credentialType);
+    }
     const QList<QVariantMap> people = DbStore::query(
                 QStringLiteral("SELECT person_no FROM person WHERE id=? LIMIT 1"), {personId});
     const QString id = people.isEmpty() ? QString::number(personId)

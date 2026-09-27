@@ -785,8 +785,8 @@ void FaceGateMainWindow::startServices()
         writeSystemEvent("audio", "warning", "音频播报错误", message);
     });
     audio_.configure(config_);
-    // 全部模块共用 /home/cat/face_media/volume.dat；首次缺失时为 50%。
-    // 人脸配置中的旧 audio/volume 仅保留兼容读取，不覆盖统一持久化音量。
+    // 语音播报百分比独立保存在 /home/cat/face_media/volume.dat；旧文件缺少
+    // prompt_volume 时按 60%（对应旧版固定原始值 230）补齐并在开机时读取。
     config_.audioVolume = audio_.volume();
     livenessEnabled_ = config_.livenessEnabled;
     if (livenessLabel_) {
@@ -890,7 +890,7 @@ void FaceGateMainWindow::startServices()
             adminLastLivenessResult_ = result;
             adminLastLivenessTimer_.restart();
         } else {
-            // 活体失败结果只用于本次界面提示和语音播报，不能保留为录入状态。
+            // 活体失败结果只用于本次界面提示，不能保留为录入状态。
             // 否则自动采集下一轮即使活体通过，也可能被上一轮失败结果污染。
             adminLastLivenessValid_ = false;
             adminLastLivenessResult_ = LivenessResult();
@@ -906,9 +906,6 @@ void FaceGateMainWindow::startServices()
             : result.message;
         adminPanel_->setEnrollLivenessResult(livenessEnabled_, result, text);
 
-        if (result.valid && !livePassed) {
-            audio_.playPrompt(AudioService::Prompt::LivenessFailed);
-        }
     });
 
     connect(faceInferenceWorker_, &FaceInferenceWorker::frameProcessed, this, [this]() {
@@ -927,9 +924,20 @@ void FaceGateMainWindow::startServices()
                 return;
             }
             preview_->setState(state);
-            const QString displayMessage = message.isEmpty() ? stateName(state) : message;
+            const bool recognitionInProgress =
+                    state == VerifyState::CollectingFrames
+                    || state == VerifyState::SelectBestFrame
+                    || state == VerifyState::LivenessChecking
+                    || state == VerifyState::FeatureMatching;
+            // 4 秒识别窗口内保持固定文案，避免采集、活体和比对阶段切换时
+            // 摄像头区域下方的提示文字来回跳动；最终成功/失败仍显示原结果。
+            const QString displayMessage = recognitionInProgress
+                    ? QStringLiteral("正在识别")
+                    : (message.isEmpty() ? stateName(state) : message);
             preview_->setStateText(displayMessage);
-            recognitionLabel_->setText(stateName(state).toUpper());
+            recognitionLabel_->setText(recognitionInProgress
+                                       ? QStringLiteral("正在识别")
+                                       : stateName(state).toUpper());
             emit previewStateChanged(state, displayMessage);
         });
 
@@ -1313,6 +1321,17 @@ void FaceGateMainWindow::startServices()
         }
 
         qInfo().noquote() << "[PASSWORD-ACCESS] completed" << detail;
+        if (passwordAccessFromAdminEntry_) {
+            passwordAccessFromAdminEntry_ = false;
+            passwordAccessActive_ = false;
+            if (passwordAccessButton_) {
+                passwordAccessButton_->setEnabled(true);
+            }
+            // 五秒长按入口以多媒体为主界面。密码校验一结束便关闭临时
+            // FaceGate 会话，不展示隐藏在密码框后的原人脸主页。
+            emit adminSessionFinished();
+            return;
+        }
         const quint64 completedGeneration = passwordAccessGeneration_;
         QTimer::singleShot(1500, this, [this, completedGeneration]() {
             if (completedGeneration != passwordAccessGeneration_) {
@@ -1512,10 +1531,8 @@ void FaceGateMainWindow::startDatabaseThread()
     connect(databaseWorker_, &DatabaseWorker::enrollFinished, this, [this](bool ok, const QString &message) {
         if (ok) {
             qInfo().noquote() << "录入完成：" << message;
-            audio_.playPrompt(AudioService::Prompt::EnrollSuccess);
         } else {
             qWarning().noquote() << "录入失败：" << message;
-            audio_.playPrompt(AudioService::Prompt::EnrollFailed);
         }
         if (adminPanel_) {
             adminPanel_->setStatusText(message);
@@ -1598,6 +1615,11 @@ void FaceGateMainWindow::requestOpenAdminManagement()
         qInfo() << "[ADMIN] login dialog finished"
                 << "accepted=" << (loginResult == QDialog::Accepted);
         adminLoginActive_ = false;
+        if (loginResult == AdminLoginDialog::PasswordAccessRequested) {
+            passwordAccessFromAdminEntry_ = true;
+            handlePasswordAccess();
+            return;
+        }
         if (loginResult != QDialog::Accepted) {
             qInfo().noquote() << "管理员登录已取消或失败";
             writeOperatorAudit("管理员登录", "admin", config_.adminUsername,
@@ -1629,7 +1651,11 @@ void FaceGateMainWindow::handlePasswordAccess()
         preview_->setStateText(QStringLiteral("密码验证正在处理中"));
         return;
     }
-    if (faceAccessPending_) {
+    if (faceAccessPending_ && passwordAccessFromAdminEntry_) {
+        faceAccessTimeoutTimer_.stop();
+        faceAccessPending_ = false;
+        pendingFaceAccessLog_ = VerifyLog();
+    } else if (faceAccessPending_) {
         recognitionLabel_->setText(QStringLiteral("人脸权限正在校验，请稍候"));
         preview_->setStateText(QStringLiteral("人脸权限正在校验，请稍候"));
         return;
@@ -1649,9 +1675,14 @@ void FaceGateMainWindow::handlePasswordAccess()
         if (passwordAccessButton_) {
             passwordAccessButton_->setEnabled(true);
         }
-        recognitionLabel_->setText(QStringLiteral("正在识别"));
-        preview_->setStateText(QStringLiteral("正在识别"));
-        resetFaceVerification(QStringLiteral("正在识别"));
+        if (passwordAccessFromAdminEntry_) {
+            passwordAccessFromAdminEntry_ = false;
+            emit adminSessionFinished();
+        } else {
+            recognitionLabel_->setText(QStringLiteral("正在识别"));
+            preview_->setStateText(QStringLiteral("正在识别"));
+            resetFaceVerification(QStringLiteral("正在识别"));
+        }
         return;
     }
 
@@ -2474,10 +2505,10 @@ void FaceGateMainWindow::handlePersonEnabledChange(qint64 personId, bool enabled
     }
 }
 
-/** @brief 请求数据库软删除人员并写审计日志。 */
+/** @brief 请求数据库按人员来源删除并写审计日志。 */
 void FaceGateMainWindow::handlePersonDelete(qint64 personId)
 {
-    writeOperatorAudit("删除人员", "person", QString::number(personId), "请求", "软删除");
+    writeOperatorAudit("删除人员", "person", QString::number(personId), "请求", "按人员来源删除");
     if (databaseWorker_) {
         QMetaObject::invokeMethod(
             databaseWorker_,
@@ -2531,7 +2562,6 @@ void FaceGateMainWindow::handleEnrollRequest(const PersonInfo &person, const QIm
         if (adminPanel_) {
             adminPanel_->setStatusText("没有可用画面");
         }
-        audio_.playPrompt(AudioService::Prompt::EnrollFailed);
         return;
     }
 
@@ -2542,7 +2572,6 @@ void FaceGateMainWindow::handleEnrollRequest(const PersonInfo &person, const QIm
             adminPanel_->setStatusText(message);
         }
         AppMessageDialog::warning(this, "录入", message);
-        audio_.playPrompt(AudioService::Prompt::EnrollFailed);
         return;
     }
 
@@ -2569,7 +2598,6 @@ void FaceGateMainWindow::handleEnrollRequest(const PersonInfo &person, const QIm
                 adminPanel_->setStatusText(message);
             }
             AppMessageDialog::warning(this, QStringLiteral("录入"), message);
-            audio_.playPrompt(AudioService::Prompt::LivenessFailed);
             return;
         }
     }
@@ -2606,7 +2634,6 @@ void FaceGateMainWindow::handleEnrollRequest(const PersonInfo &person, const QIm
             adminPanel_->setStatusText(message);
         }
         AppMessageDialog::warning(this, "录入", message);
-        audio_.playPrompt(AudioService::Prompt::EnrollFailed);
         return;
     }
 
@@ -2626,7 +2653,6 @@ void FaceGateMainWindow::handleEnrollRequest(const PersonInfo &person, const QIm
             adminPanel_->setStatusText(message);
         }
         AppMessageDialog::warning(this, QStringLiteral("录入"), message);
-        audio_.playPrompt(AudioService::Prompt::EnrollFailed);
         QFile::remove(imagePath);
     }
 }
@@ -2652,7 +2678,6 @@ void FaceGateMainWindow::handleEnrollmentFeature(const PersonInfo &person,
             adminPanel_->setStatusText(message);
         }
         AppMessageDialog::warning(this, QStringLiteral("录入"), message);
-        audio_.playPrompt(AudioService::Prompt::EnrollFailed);
         QFile::remove(imagePath);
         return;
     }
@@ -2671,7 +2696,6 @@ void FaceGateMainWindow::handleEnrollmentFeature(const PersonInfo &person,
             adminPanel_->setStatusText(message);
         }
         AppMessageDialog::warning(this, QStringLiteral("录入"), message);
-        audio_.playPrompt(AudioService::Prompt::EnrollFailed);
         QFile::remove(imagePath);
         return;
     }

@@ -55,11 +55,17 @@ bool tableExists(const QString &table)
                 {table}).isEmpty();
 }
 
+bool ensureTableColumn(const QString &table, const QString &name,
+                       const QString &definition)
+{
+    return tableHasColumn(table, name)
+            || DbStore::exec(QStringLiteral("ALTER TABLE %1 ADD COLUMN %2 %3")
+                             .arg(table, name, definition));
+}
+
 bool ensureColumn(const QString &name, const QString &definition)
 {
-    return tableHasColumn(QStringLiteral("person"), name)
-            || DbStore::exec(QStringLiteral("ALTER TABLE person ADD COLUMN %1 %2")
-                             .arg(name, definition));
+    return ensureTableColumn(QStringLiteral("person"), name, definition);
 }
 
 QString safeFileStem(const QString &value)
@@ -192,6 +198,64 @@ QList<StoredCardOwner> conflictingCardOwners(const QString &cardId,
     return owners;
 }
 
+/** @return 已启用相同通行密码的网络及其他本地人员。 */
+QList<StoredCardOwner> conflictingPasswordOwners(const QString &password,
+                                                  qint64 excludedLocalPersonId = 0)
+{
+    QList<StoredCardOwner> owners;
+    const QString value = password.trimmed();
+    if (value.isEmpty()) return owners;
+
+    if (tableExists(QStringLiteral("network_access_rule"))
+            && tableExists(QStringLiteral("network_person"))) {
+        const QList<QVariantMap> rows = DbStore::query(
+                    QStringLiteral("SELECT DISTINCT r.person_id,p.name "
+                                   "FROM network_access_rule r "
+                                   "JOIN network_person p ON p.person_id=r.person_id "
+                                   "WHERE r.card_password_enabled=1 AND r.card_password=? "
+                                   "AND p.active=1 AND p.deleted=0 ORDER BY r.person_id"),
+                    {value});
+        for (const QVariantMap &row : rows) {
+            StoredCardOwner owner;
+            owner.key = QStringLiteral("network:")
+                    + row.value(QStringLiteral("person_id")).toString();
+            owner.name = row.value(QStringLiteral("name")).toString().trimmed();
+            if (owner.name.isEmpty()) {
+                owner.name = row.value(QStringLiteral("person_id")).toString();
+            }
+            owners.append(owner);
+        }
+    }
+
+    if (tableExists(QStringLiteral("local_access_rule"))
+            && tableExists(QStringLiteral("person"))) {
+        QList<QVariant> binds{value};
+        QString exclusion;
+        if (excludedLocalPersonId > 0) {
+            exclusion = QStringLiteral(" AND r.person_id<>?");
+            binds.append(excludedLocalPersonId);
+        }
+        const QList<QVariantMap> rows = DbStore::query(
+                    QStringLiteral("SELECT DISTINCT r.person_id,p.name "
+                                   "FROM local_access_rule r "
+                                   "JOIN person p ON p.id=r.person_id "
+                                   "WHERE r.card_password_enabled=1 AND r.card_password=? "
+                                   "AND p.deleted=0%1 ORDER BY r.person_id")
+                    .arg(exclusion), binds);
+        for (const QVariantMap &row : rows) {
+            StoredCardOwner owner;
+            owner.key = QStringLiteral("local:")
+                    + row.value(QStringLiteral("person_id")).toString();
+            owner.name = row.value(QStringLiteral("name")).toString().trimmed();
+            if (owner.name.isEmpty()) {
+                owner.name = row.value(QStringLiteral("person_id")).toString();
+            }
+            owners.append(owner);
+        }
+    }
+    return owners;
+}
+
 } // namespace
 
 bool LocalPersonnelStore::initialize()
@@ -203,7 +267,8 @@ bool LocalPersonnelStore::initialize()
             "CREATE TABLE IF NOT EXISTS person ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT,person_no TEXT NOT NULL UNIQUE,"
             "name TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,"
-            "deleted INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)"),
+            "deleted INTEGER NOT NULL DEFAULT 0,person_source TEXT NOT NULL DEFAULT 'manual',"
+            "created_at TEXT NOT NULL,updated_at TEXT NOT NULL)"),
         QStringLiteral(
             "CREATE TABLE IF NOT EXISTS face_feature ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT,person_id INTEGER NOT NULL,image_path TEXT NOT NULL,"
@@ -227,6 +292,8 @@ bool LocalPersonnelStore::initialize()
             "amount_enabled INTEGER NOT NULL DEFAULT 0,duration_enabled INTEGER NOT NULL DEFAULT 0,"
             "remote_call_enabled INTEGER NOT NULL DEFAULT 0,card_password_enabled INTEGER NOT NULL DEFAULT 0,"
             "card_password TEXT,control_elevator INTEGER NOT NULL DEFAULT 0,"
+            "remote_call_current_day_count INTEGER,remote_call_every_day_count INTEGER,"
+            "remote_call_used_count INTEGER NOT NULL DEFAULT 0,remote_call_refresh_date TEXT,"
             "count_total INTEGER,count_add_count INTEGER,amount_total REAL,amount_add_amount REAL,"
             "amount_unit_price REAL,duration_start TEXT,duration_end TEXT,elevator_value_type INTEGER,"
             "raw_json TEXT,FOREIGN KEY(person_id) REFERENCES person(id) ON DELETE CASCADE)"),
@@ -272,10 +339,29 @@ bool LocalPersonnelStore::initialize()
         {QStringLiteral("relay_text"), QStringLiteral("TEXT")},
         {QStringLiteral("remote_call_text"), QStringLiteral("TEXT")},
         {QStringLiteral("face_file_list"), QStringLiteral("TEXT")},
-        {QStringLiteral("person_json"), QStringLiteral("TEXT")}
+        {QStringLiteral("person_json"), QStringLiteral("TEXT")},
+        {QStringLiteral("person_source"), QStringLiteral("TEXT NOT NULL DEFAULT 'manual'")}
     };
     for (const auto &column : columns) {
         if (!ensureColumn(column.first, column.second)) return false;
+    }
+    // 兼容升级前已经由Excel导入的本地人员。手工录入人员没有person_json，
+    // 因而不会被误标；后续导入会显式写入excel来源。
+    if (!DbStore::execute(
+                QStringLiteral("UPDATE person SET person_source='excel' "
+                               "WHERE COALESCE(TRIM(person_json),'')<>'' "
+                               "AND COALESCE(TRIM(person_source),'manual')<>'excel'"))) {
+        return false;
+    }
+    const QList<QPair<QString, QString>> localRuleColumns = {
+        {QStringLiteral("remote_call_current_day_count"), QStringLiteral("INTEGER")},
+        {QStringLiteral("remote_call_every_day_count"), QStringLiteral("INTEGER")},
+        {QStringLiteral("remote_call_used_count"), QStringLiteral("INTEGER NOT NULL DEFAULT 0")},
+        {QStringLiteral("remote_call_refresh_date"), QStringLiteral("TEXT")}
+    };
+    for (const auto &column : localRuleColumns) {
+        if (!ensureTableColumn(QStringLiteral("local_access_rule"),
+                               column.first, column.second)) return false;
     }
     return true;
 }
@@ -302,6 +388,7 @@ LocalPersonnelImportResult LocalPersonnelStore::importSpreadsheetPersonnel(
         const QString account = person.value(QStringLiteral("account")).toString().trimmed();
         const QString phone = person.value(QStringLiteral("phone")).toString().trimmed();
         const QJsonArray cards = record.value(QStringLiteral("icCards")).toArray();
+        const QJsonObject rules = record.value(QStringLiteral("rules")).toObject();
         if (name.isEmpty() || account.isEmpty()) {
             ++summary.failed;
             summary.failedNames.append((name.isEmpty() ? QStringLiteral("未命名人员") : name)
@@ -344,6 +431,29 @@ LocalPersonnelImportResult LocalPersonnelStore::importSpreadsheetPersonnel(
             summary.failedNames.append(reason);
             if (summary.error.isEmpty()) summary.error = reason;
             continue;
+        }
+
+        if (rules.value(QStringLiteral("cardPassword")).toBool()) {
+            const QString password = rules.value(
+                        QStringLiteral("cardPasswordDataPassword")).toString().trimmed();
+            const QList<StoredCardOwner> passwordOwners =
+                    conflictingPasswordOwners(password, personId);
+            if (!passwordOwners.isEmpty()) {
+                QStringList names;
+                names.append(name + QStringLiteral("人员"));
+                QStringList ownerKeys;
+                for (const StoredCardOwner &owner : passwordOwners) {
+                    if (ownerKeys.contains(owner.key)) continue;
+                    ownerKeys.append(owner.key);
+                    names.append(owner.name + QStringLiteral("人员"));
+                }
+                const QString reason = QStringLiteral("密码冲突：%1")
+                        .arg(names.join(QStringLiteral("和")));
+                ++summary.failed;
+                summary.failedNames.append(reason);
+                if (summary.error.isEmpty()) summary.error = reason;
+                continue;
+            }
         }
 
         bool networkDuplicate = false;
@@ -400,7 +510,7 @@ LocalPersonnelImportResult LocalPersonnelStore::importSpreadsheetPersonnel(
                                        "phone=?,id_card=?,hire_date_ms=?,person_type=?,account=?,initial_password=?,"
                                        "group_name=?,access_template_name=?,rule_template_name=?,enabled_features_text=?,"
                                        "control_type_text=?,relay_text=?,remote_call_text=?,person_json=?,"
-                                       "enabled=1,deleted=0,updated_at=? WHERE id=?"), binds);
+                                       "person_source='excel',enabled=1,deleted=0,updated_at=? WHERE id=?"), binds);
         } else {
             QList<QVariant> binds = values;
             binds.append(now);
@@ -408,8 +518,8 @@ LocalPersonnelImportResult LocalPersonnelStore::importSpreadsheetPersonnel(
                         QStringLiteral("INSERT INTO person(person_no,name,employee_no,department,position,phone,id_card,"
                                        "hire_date_ms,person_type,account,initial_password,group_name,access_template_name,"
                                        "rule_template_name,enabled_features_text,control_type_text,relay_text,remote_call_text,"
-                                       "person_json,updated_at,created_at,enabled,deleted,has_face,face_file_list) "
-                                       "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,0,0,'')"), binds);
+                                       "person_json,updated_at,created_at,enabled,deleted,has_face,face_file_list,person_source) "
+                                       "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,0,0,'','excel')"), binds);
             if (writeOk) {
                 const QList<QVariantMap> ids = DbStore::query(
                             QStringLiteral("SELECT id FROM person WHERE person_no=? LIMIT 1"),
@@ -421,7 +531,6 @@ LocalPersonnelImportResult LocalPersonnelStore::importSpreadsheetPersonnel(
         }
 
         const QJsonArray qrs = record.value(QStringLiteral("qrCodes")).toArray();
-        const QJsonObject rules = record.value(QStringLiteral("rules")).toObject();
         const QJsonArray floors = record.value(QStringLiteral("floors")).toArray();
         const QJsonArray timings = rules.value(QStringLiteral("timingRules")).toArray();
         const auto configured = [&](const QString &key, bool fallback) {
@@ -448,7 +557,8 @@ LocalPersonnelImportResult LocalPersonnelStore::importSpreadsheetPersonnel(
                     !rules.value(QStringLiteral("relayText")).toString().trimmed().isEmpty());
         const bool remoteCallConfigured = configured(
                     QStringLiteral("remoteCallConfigured"),
-                    !rules.value(QStringLiteral("remoteCallText")).toString().trimmed().isEmpty());
+                    rules.value(QStringLiteral("remoteCallDataCurrentDayCallCount")).isDouble()
+                    && rules.value(QStringLiteral("remoteCallDataEveryDayUpdateCallCount")).isDouble());
         const bool controlElevatorConfigured = configured(
                     QStringLiteral("controlElevatorConfigured"),
                     rules.value(QStringLiteral("controlElevatorDataValueType")).isDouble());
@@ -465,6 +575,27 @@ LocalPersonnelImportResult LocalPersonnelStore::importSpreadsheetPersonnel(
                 && !cardPassword.isEmpty();
         const bool controlElevatorEnabled = rules.value(QStringLiteral("controlElevator")).toBool()
                 && controlElevatorConfigured;
+        const qlonglong remoteCallRemaining = rules.value(
+                    QStringLiteral("remoteCallDataCurrentDayCallCount")).toVariant().toLongLong();
+        const qlonglong remoteCallDailyTotal = rules.value(
+                    QStringLiteral("remoteCallDataEveryDayUpdateCallCount")).toVariant().toLongLong();
+        const qlonglong remoteCallUsed = remoteCallEnabled
+                ? qMax<qlonglong>(0, remoteCallDailyTotal - remoteCallRemaining) : 0;
+
+        QVariant remainingCount = countEnabled
+                ? rules.value(QStringLiteral("countDataRemaining")).toVariant() : QVariant();
+        QVariant remainingAmount = amountEnabled
+                ? rules.value(QStringLiteral("amountDataRemaining")).toVariant() : QVariant();
+        if (exists && countEnabled
+                && rules.value(QStringLiteral("countDataAddCount")).isDouble()) {
+            remainingCount = remainingCount.toLongLong()
+                    + rules.value(QStringLiteral("countDataAddCount")).toVariant().toLongLong();
+        }
+        if (exists && amountEnabled
+                && rules.value(QStringLiteral("amountDataAddAmount")).isDouble()) {
+            remainingAmount = remainingAmount.toDouble()
+                    + rules.value(QStringLiteral("amountDataAddAmount")).toDouble();
+        }
         if (writeOk) {
             writeOk = DbStore::execute(QStringLiteral("DELETE FROM local_ic_card WHERE person_id=?"), {personId})
                     && DbStore::execute(QStringLiteral("DELETE FROM local_qr_code WHERE person_id=?"), {personId})
@@ -506,18 +637,24 @@ LocalPersonnelImportResult LocalPersonnelStore::importSpreadsheetPersonnel(
         if (writeOk) {
             writeOk = DbStore::execute(
                         QStringLiteral("INSERT INTO local_access_rule(person_id,time_enabled,count_enabled,relay_enabled,"
-                                       "amount_enabled,duration_enabled,remote_call_enabled,card_password_enabled,card_password,"
-                                       "control_elevator,count_total,count_add_count,amount_total,amount_add_amount,amount_unit_price,"
+                                       "amount_enabled,duration_enabled,remote_call_enabled,remote_call_current_day_count,"
+                                       "remote_call_every_day_count,remote_call_used_count,remote_call_refresh_date,"
+                                       "card_password_enabled,card_password,control_elevator,count_total,count_add_count,"
+                                       "amount_total,amount_add_amount,amount_unit_price,"
                                        "duration_start,duration_end,elevator_value_type,raw_json) "
-                                       "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"),
+                                       "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"),
                         {personId, timeEnabled ? 1 : 0,
                          countEnabled ? 1 : 0,
                          relayEnabled ? 1 : 0,
                          amountEnabled ? 1 : 0,
                          durationEnabled ? 1 : 0,
                          remoteCallEnabled ? 1 : 0,
+                         remoteCallEnabled ? QVariant(remoteCallRemaining) : QVariant(),
+                         remoteCallEnabled ? QVariant(remoteCallDailyTotal) : QVariant(),
+                         remoteCallUsed,
+                         remoteCallEnabled ? QDate::currentDate().toString(Qt::ISODate) : QString(),
                          cardPasswordEnabled ? 1 : 0,
-                         cardPassword,
+                         cardPasswordEnabled ? cardPassword : QString(),
                          controlElevatorEnabled ? 1 : 0,
                          rules.value(QStringLiteral("countDataTotal")).toVariant(),
                          rules.value(QStringLiteral("countDataAddCount")).toVariant(),
@@ -554,8 +691,7 @@ LocalPersonnelImportResult LocalPersonnelStore::importSpreadsheetPersonnel(
             writeOk = DbStore::execute(
                         QStringLiteral("INSERT INTO local_access_usage(person_id,remaining_count,access_count,"
                                        "remaining_amount,used_amount,updated_at) VALUES(?,?,0,?,0,?)"),
-                        {personId, rules.value(QStringLiteral("countDataRemaining")).toVariant(),
-                         rules.value(QStringLiteral("amountDataRemaining")).toVariant(), now});
+                        {personId, remainingCount, remainingAmount, now});
         }
 
         if (!writeOk || !DbStore::transactionCommit()) {

@@ -318,6 +318,24 @@ QStringList commaValues(const QString &text)
     return values;
 }
 
+/** @return 移除空白干扰后的手机号；除空白外的符号保留给格式校验拒绝。 */
+QString normalizedPhone(QString text)
+{
+    QString result;
+    result.reserve(text.size());
+    for (const QChar ch : text) {
+        if (!ch.isSpace()) result.append(ch);
+    }
+    return result;
+}
+
+/** @return 手机号严格为 11 位 ASCII 数字时返回 true。 */
+bool isValidPhone(const QString &text)
+{
+    static const QRegularExpression expression(QStringLiteral("^[0-9]{11}$"));
+    return expression.match(text).hasMatch();
+}
+
 /** @brief 解析完整的“剩余/总额”；空值或格式不完整时保持未配置。 */
 bool parseMoneyPair(QString text, double *remaining, double *total)
 {
@@ -444,7 +462,8 @@ QJsonObject makeRecordData(const QStringList &row, const QHash<QString, int> &co
     person.insert(QStringLiteral("employeeNo"), cell(row, columns, QStringLiteral("工号")));
     person.insert(QStringLiteral("department"), cell(row, columns, QStringLiteral("部门")));
     person.insert(QStringLiteral("position"), cell(row, columns, QStringLiteral("职位")));
-    person.insert(QStringLiteral("phone"), cell(row, columns, QStringLiteral("手机号")));
+    person.insert(QStringLiteral("phone"), normalizedPhone(
+                      cell(row, columns, QStringLiteral("手机号"))));
     person.insert(QStringLiteral("idCard"), cell(row, columns, QStringLiteral("身份证号")));
     const QDate hireDate = QDate::fromString(cell(row, columns, QStringLiteral("入职日期")), QStringLiteral("yyyy-MM-dd"));
     person.insert(QStringLiteral("hireDate"), hireDate.isValid()
@@ -504,6 +523,7 @@ QJsonObject makeRecordData(const QStringList &row, const QHash<QString, int> &co
     const QString relayText = cell(row, columns, QStringLiteral("继电器"));
     const QString remoteCallText = cell(row, columns, QStringLiteral("远程呼梯"));
     const QString controlType = cell(row, columns, QStringLiteral("控梯类型"));
+    const QString cardPasswordText = cell(row, columns, QStringLiteral("规则密码"));
 
     QJsonObject rules;
     auto enabled = [&](const QString &name) { return features.contains(name); };
@@ -514,7 +534,11 @@ QJsonObject makeRecordData(const QStringList &row, const QHash<QString, int> &co
     rules.insert(QStringLiteral("relay"), enabled(QStringLiteral("继电器")));
     rules.insert(QStringLiteral("controlElevator"), enabled(QStringLiteral("控梯")));
     rules.insert(QStringLiteral("remoteCall"), enabled(QStringLiteral("远程呼梯")));
-    rules.insert(QStringLiteral("cardPassword"), enabled(QStringLiteral("密码通行")));
+    const bool cardPasswordRequested = enabled(QStringLiteral("密码通行"));
+    rules.insert(QStringLiteral("cardPassword"), cardPasswordRequested);
+    if (cardPasswordRequested) {
+        rules.insert(QStringLiteral("cardPasswordDataPassword"), cardPasswordText);
+    }
 
     qlonglong countRemaining = 0;
     qlonglong countTotal = 0;
@@ -528,7 +552,9 @@ QJsonObject makeRecordData(const QStringList &row, const QHash<QString, int> &co
     }
     bool countAddOk = false;
     const qlonglong countAdd = cell(row, columns, QStringLiteral("增量次数")).toLongLong(&countAddOk);
-    if (countAddOk) rules.insert(QStringLiteral("countDataAddCount"), double(countAdd));
+    if (countAddOk && countAdd >= 0) {
+        rules.insert(QStringLiteral("countDataAddCount"), double(countAdd));
+    }
 
     double amountRemaining = 0.0;
     double amountTotal = 0.0;
@@ -543,7 +569,9 @@ QJsonObject makeRecordData(const QStringList &row, const QHash<QString, int> &co
     QString amountAddText = cell(row, columns, QStringLiteral("增量金额"));
     amountAddText.remove(QChar(0x00a5));
     const double amountAdd = amountAddText.toDouble(&amountAddOk);
-    if (amountAddOk) rules.insert(QStringLiteral("amountDataAddAmount"), amountAdd);
+    if (amountAddOk && amountAdd >= 0.0) {
+        rules.insert(QStringLiteral("amountDataAddAmount"), amountAdd);
+    }
     QString priceText = cell(row, columns, QStringLiteral("单价"));
     priceText.remove(QChar(0x00a5));
     bool priceOk = false;
@@ -560,16 +588,28 @@ QJsonObject makeRecordData(const QStringList &row, const QHash<QString, int> &co
     rules.insert(QStringLiteral("timeConfigured"), !timingRules.isEmpty());
     rules.insert(QStringLiteral("timingRules"), timingRules);
     rules.insert(QStringLiteral("timingRuleText"), timingRuleText);
-    rules.insert(QStringLiteral("remoteCallConfigured"), !remoteCallText.isEmpty());
+    qlonglong remoteCallRemaining = 0;
+    qlonglong remoteCallDailyTotal = 0;
+    const bool remoteCallConfigured = parseCountPair(
+                remoteCallText, &remoteCallRemaining, &remoteCallDailyTotal);
+    rules.insert(QStringLiteral("remoteCallConfigured"), remoteCallConfigured);
     rules.insert(QStringLiteral("remoteCallText"), remoteCallText);
+    if (remoteCallConfigured) {
+        rules.insert(QStringLiteral("remoteCallDataCurrentDayCallCount"),
+                     double(remoteCallRemaining));
+        rules.insert(QStringLiteral("remoteCallDataEveryDayUpdateCallCount"),
+                     double(remoteCallDailyTotal));
+    }
     rules.insert(QStringLiteral("relayConfigured"), !relayText.isEmpty());
     rules.insert(QStringLiteral("relayText"), relayText);
     const bool controlElevatorConfigured = controlType == QStringLiteral("直梯")
-            || controlType == QStringLiteral("门禁");
+            || controlType == QStringLiteral("门禁")
+            || controlType == QStringLiteral("电梯维修箱");
     rules.insert(QStringLiteral("controlElevatorConfigured"), controlElevatorConfigured);
     if (controlElevatorConfigured) {
         rules.insert(QStringLiteral("controlElevatorDataValueType"),
-                     controlType == QStringLiteral("直梯") ? 1 : 0);
+                     controlType == QStringLiteral("直梯") ? 1
+                     : (controlType == QStringLiteral("门禁") ? 0 : 2));
     }
 
     QJsonObject data;
@@ -651,6 +691,23 @@ PersonXlsxParseResult PersonXlsxParser::parseRows(const QVector<QStringList> &ro
         if (name.isEmpty() && account.isEmpty()) continue;
         if (name.isEmpty() || account.isEmpty()) {
             result.warnings.append(QStringLiteral("第 %1 行缺少姓名或账号，已跳过").arg(rowIndex + 1));
+            continue;
+        }
+        const QString phone = normalizedPhone(
+                    cell(row, columns, QStringLiteral("手机号")));
+        if (!isValidPhone(phone)) {
+            result.warnings.append(
+                        QStringLiteral("第 %1 行人员“%2”的手机号必须为11位数字，已跳过")
+                        .arg(rowIndex + 1).arg(name));
+            continue;
+        }
+        const QStringList enabledFeatures = commaValues(
+                    cell(row, columns, QStringLiteral("启用功能")));
+        if (enabledFeatures.contains(QStringLiteral("密码通行"))
+                && cell(row, columns, QStringLiteral("规则密码")).isEmpty()) {
+            result.warnings.append(
+                        QStringLiteral("第 %1 行人员“%2”已启用密码通行但未填写规则密码，已跳过")
+                        .arg(rowIndex + 1).arg(name));
             continue;
         }
         const QString normalizedAccount = account.toCaseFolded();

@@ -17,6 +17,7 @@
 #include <QApplication>
 #include <QTimer>
 #include <QFile>
+#include <QSaveFile>
 #include <QDateTime>
 #include <QTextStream>
 #include <QSurfaceFormat>
@@ -190,7 +191,7 @@ static void myUtf8MessageHandler(QtMsgType type,
 
 
 /**
- * @brief 创建应用存活心跳文件，并每 8 秒以当前 Unix 时间戳覆盖更新。
+ * @brief 创建应用存活心跳文件，并每 10 秒原子更新一次。
  *
  * 定时器以 app 为父对象，随应用生命周期自动释放；首次启动时立即写入一次，
  * 避免监控端必须等待第一个定时周期。
@@ -198,14 +199,19 @@ static void myUtf8MessageHandler(QtMsgType type,
 static void setupQtHeartbeat(QCoreApplication *app)
 {
     const QString heartbeatFile = Rk3566Platform::heartbeatFile();
+    const qint64 processId = QCoreApplication::applicationPid();
 
-    auto updateHeartbeat = [heartbeatFile]() {
-        QFile file(heartbeatFile);
-        if (file.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
-            QTextStream out(&file);
-            out << QDateTime::currentSecsSinceEpoch() << "\n";
-            file.flush();
-            file.close();
+    auto updateHeartbeat = [heartbeatFile, processId, sequence = quint64(0)]() mutable {
+        QSaveFile file(heartbeatFile);
+        if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            {
+                QTextStream out(&file);
+                out << processId << ' '
+                    << ++sequence << ' '
+                    << QDateTime::currentSecsSinceEpoch() << "\n";
+                out.flush();
+            }
+            file.commit();
         }
     };
 
@@ -213,7 +219,7 @@ static void setupQtHeartbeat(QCoreApplication *app)
 
     QTimer *heartbeatTimer = new QTimer(app);
     QObject::connect(heartbeatTimer, &QTimer::timeout, app, updateHeartbeat);
-    heartbeatTimer->start(8000);   // 每 8 秒更新一次
+    heartbeatTimer->start(10000);   // 每 10 秒更新一次
 }
 
 

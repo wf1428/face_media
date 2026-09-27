@@ -11,6 +11,15 @@ WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}
 STATE_DIR=${FACE_MEDIA_STATE_DIR:-/run/face-media}
 APP_PID_FILE=${FACE_MEDIA_APP_PID_FILE:-$STATE_DIR/app.pid}
 MAINTENANCE_FILE=${FACE_MEDIA_MAINTENANCE_FILE:-$STATE_DIR/maintenance}
+NET_CONFIG_FILE=${FACE_MEDIA_NET_CONFIG_FILE:-/mnt/UDISK/res/static/demoResources/images/logo/net_cfg.ini}
+HEARTBEAT_FILE=${FACE_MEDIA_HEARTBEAT_FILE:-$STATE_DIR/heartbeat}
+WATCHDOG_RESTART_HISTORY=${FACE_MEDIA_WATCHDOG_RESTART_HISTORY:-$STATE_DIR/watchdog-restarts}
+HARDWARE_WATCHDOG_DEVICE=${FACE_MEDIA_HARDWARE_WATCHDOG_DEVICE:-/dev/watchdog}
+WATCHDOG_CHECK_INTERVAL_SECONDS=10
+WATCHDOG_START_GRACE_SECONDS=60
+WATCHDOG_MISSED_LIMIT=6
+WATCHDOG_RESTART_WINDOW_SECONDS=300
+WATCHDOG_RESTART_LIMIT=3
 LOG_DIR=/var/log/face-media
 LOG_FILE=$LOG_DIR/face_media.log
 LOG_DATE_FILE=$LOG_DIR/.active_date
@@ -25,6 +34,12 @@ LOGGER_PID=""
 LOG_MAINTENANCE_PID=""
 LOG_PIPE_OPEN=0
 LOG_CAPTURE_MODE=none
+WATCHDOG_TIMEOUT_RESTART=0
+WATCHDOG_RESTART_ATTEMPT=0
+WATCHDOG_RECOVERY_PENDING=0
+WATCHDOG_CONSECUTIVE_FAILURES=0
+APP_LAUNCH_HEALTHY=0
+APP_LAUNCH_FAILURE_RECORDED=0
 
 log()
 {
@@ -347,6 +362,293 @@ pid_is_running()
     [ "$state" != "Z" ]
 }
 
+pid_is_managed_qt()
+{
+    candidate_pid=${1:-}
+    pid_is_running "$candidate_pid" || return 1
+
+    process_name=$(sed -n '1p' "/proc/$candidate_pid/comm" 2>/dev/null || true)
+    [ "$process_name" = "MergedQtApp" ] || return 1
+
+    process_exe=$(readlink "/proc/$candidate_pid/exe" 2>/dev/null || true)
+    case "$process_exe" in
+        "$APP_DIR/MergedQtApp"|"$APP_DIR/MergedQtApp (deleted)") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+qt_watchdog_enabled()
+{
+    # 配置文件缺失或配置值无效时默认启用，确保正式部署仍具备卡死恢复能力。
+    [ -r "$NET_CONFIG_FILE" ] || return 0
+
+    watchdog_value=$(awk '
+        function trim(value) {
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            return value
+        }
+        /^[[:space:]]*\[/ {
+            section=tolower($0)
+            gsub(/[[:space:]]/, "", section)
+            in_watchdog=(section == "[qt_watchdog]")
+            next
+        }
+        in_watchdog && index($0, "=") > 0 {
+            line=$0
+            sub(/\r$/, "", line)
+            key=tolower(trim(substr(line, 1, index(line, "=") - 1)))
+            if (key != "enabled") next
+            value=substr(line, index(line, "=") + 1)
+            sub(/[;#].*$/, "", value)
+            print tolower(trim(value))
+            exit
+        }
+    ' "$NET_CONFIG_FILE" 2>/dev/null || true)
+
+    case "$watchdog_value" in
+        false|0|no|off) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+read_qt_heartbeat()
+{
+    [ -r "$HEARTBEAT_FILE" ] || return 1
+    heartbeat_line=$(sed -n '1p' "$HEARTBEAT_FILE" 2>/dev/null || true)
+    [ -n "$heartbeat_line" ] || return 1
+
+    # 新格式为“PID 序号 Unix时间”。兼容升级过程中的旧版单时间戳格式，
+    # 但只接受新格式中 PID 与当前受管 Qt 一致的心跳，拒绝残留实例干扰。
+    set -- $heartbeat_line
+    if [ "$#" -ge 3 ] && [ "$1" != "$APP_PID" ]; then
+        return 1
+    fi
+    printf '%s\n' "$heartbeat_line"
+}
+
+register_watchdog_restart()
+{
+    restart_now=$(date '+%s')
+    restart_cutoff=$((restart_now - WATCHDOG_RESTART_WINDOW_SECONDS))
+    restart_tmp="$WATCHDOG_RESTART_HISTORY.$$"
+
+    if [ -r "$WATCHDOG_RESTART_HISTORY" ]; then
+        awk -v cutoff="$restart_cutoff" '
+            $1 ~ /^[0-9]+$/ && $1 >= cutoff { print $1 }
+        ' "$WATCHDOG_RESTART_HISTORY" > "$restart_tmp"
+    else
+        : > "$restart_tmp"
+    fi
+
+    restart_count=$(wc -l < "$restart_tmp" 2>/dev/null | tr -d ' ')
+    WATCHDOG_RESTART_ATTEMPT=$((restart_count + 1))
+    if [ "${restart_count:-0}" -ge "$WATCHDOG_RESTART_LIMIT" ]; then
+        rm -f "$restart_tmp" 2>/dev/null || true
+        return 1
+    fi
+
+    printf '%s\n' "$restart_now" >> "$restart_tmp"
+    mv -f "$restart_tmp" "$WATCHDOG_RESTART_HISTORY"
+    return 0
+}
+
+record_failed_watchdog_recovery()
+{
+    [ "$WATCHDOG_RECOVERY_PENDING" -eq 1 ] || return 0
+    [ "$APP_LAUNCH_HEALTHY" -eq 0 ] || return 0
+    [ "$APP_LAUNCH_FAILURE_RECORDED" -eq 0 ] || return 0
+
+    APP_LAUNCH_FAILURE_RECORDED=1
+    WATCHDOG_CONSECUTIVE_FAILURES=$((WATCHDOG_CONSECUTIVE_FAILURES + 1))
+    if [ "$WATCHDOG_CONSECUTIVE_FAILURES" -ge "$WATCHDOG_RESTART_LIMIT" ]; then
+        trigger_system_recovery
+    fi
+}
+
+arm_hardware_watchdog()
+{
+    [ -c "$HARDWARE_WATCHDOG_DEVICE" ] || return 1
+    [ -w "$HARDWARE_WATCHDOG_DEVICE" ] || return 1
+
+    # 打开后保持描述符且不再喂狗。若常规系统重启路径失效，硬件看门狗
+    # 会在其板级超时时间到达后完成最终复位。
+    exec 9> "$HARDWARE_WATCHDOG_DEVICE" 2>/dev/null
+}
+
+trigger_system_recovery()
+{
+    arm_hardware_watchdog || true
+    sync
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl reboot >/dev/null 2>&1 || true
+        sleep 20
+    fi
+    if command -v reboot >/dev/null 2>&1; then
+        reboot -f >/dev/null 2>&1 || true
+        sleep 20
+    fi
+    if [ -w /proc/sysrq-trigger ]; then
+        printf 'b\n' > /proc/sysrq-trigger 2>/dev/null || true
+    fi
+
+    # 不退出监督进程，避免关闭 /dev/watchdog 描述符而取消硬件复位。
+    while true; do
+        sleep 60
+    done
+}
+
+stop_qt_for_watchdog()
+{
+    watchdog_pid=$1
+    pid_is_managed_qt "$watchdog_pid" || return 1
+
+    kill -TERM "$watchdog_pid" 2>/dev/null || true
+    stop_attempts=0
+    while pid_is_managed_qt "$watchdog_pid" && [ "$stop_attempts" -lt 50 ]; do
+        sleep 0.1
+        stop_attempts=$((stop_attempts + 1))
+    done
+    if ! pid_is_managed_qt "$watchdog_pid"; then
+        return 0
+    fi
+
+    kill -KILL "$watchdog_pid" 2>/dev/null || true
+    stop_attempts=0
+    while pid_is_managed_qt "$watchdog_pid" && [ "$stop_attempts" -lt 30 ]; do
+        sleep 0.1
+        stop_attempts=$((stop_attempts + 1))
+    done
+    ! pid_is_managed_qt "$watchdog_pid"
+}
+
+monitor_qt_process()
+{
+    WATCHDOG_TIMEOUT_RESTART=0
+    APP_LAUNCH_HEALTHY=0
+    APP_LAUNCH_FAILURE_RECORDED=0
+    heartbeat_started_at=$(date '+%s')
+    heartbeat_next_check=$((heartbeat_started_at + WATCHDOG_CHECK_INTERVAL_SECONDS))
+    heartbeat_config_next_check=$((heartbeat_started_at + WATCHDOG_CHECK_INTERVAL_SECONDS))
+    heartbeat_missed=0
+    heartbeat_updates=0
+    heartbeat_last=""
+    heartbeat_maintenance_seen=0
+    if qt_watchdog_enabled; then
+        heartbeat_enabled=1
+    else
+        heartbeat_enabled=0
+    fi
+
+    while pid_is_running "$APP_PID"; do
+        heartbeat_now=$(date '+%s')
+
+        # 旋转屏幕、U盘更新等维护事务拥有最高优先级。维护期间不累计漏失，
+        # 维护结束后重新给予60秒宽限，杜绝维护操作触发误杀。
+        if [ -e "$MAINTENANCE_FILE" ]; then
+            heartbeat_maintenance_seen=1
+            heartbeat_missed=0
+            heartbeat_updates=0
+            heartbeat_last=""
+            sleep 1
+            continue
+        fi
+        if [ "$heartbeat_maintenance_seen" -eq 1 ]; then
+            heartbeat_maintenance_seen=0
+            heartbeat_started_at=$heartbeat_now
+            heartbeat_next_check=$((heartbeat_now + WATCHDOG_CHECK_INTERVAL_SECONDS))
+            heartbeat_config_next_check=$heartbeat_now
+            heartbeat_missed=0
+            heartbeat_last=""
+        fi
+
+        # 配置开关允许运行中修改，但最多每10秒读取一次，避免常驻脚本
+        # 每秒启动awk读取配置文件。
+        if [ "$heartbeat_now" -ge "$heartbeat_config_next_check" ]; then
+            heartbeat_config_next_check=$((heartbeat_now + WATCHDOG_CHECK_INTERVAL_SECONDS))
+            if qt_watchdog_enabled; then
+                if [ "$heartbeat_enabled" -eq 0 ]; then
+                    heartbeat_enabled=1
+                    heartbeat_started_at=$heartbeat_now
+                    heartbeat_next_check=$((heartbeat_now + WATCHDOG_CHECK_INTERVAL_SECONDS))
+                    heartbeat_missed=0
+                    heartbeat_updates=0
+                    heartbeat_last=""
+                fi
+            else
+                heartbeat_enabled=0
+                heartbeat_missed=0
+                heartbeat_updates=0
+                heartbeat_last=""
+                WATCHDOG_RECOVERY_PENDING=0
+                WATCHDOG_CONSECUTIVE_FAILURES=0
+                rm -f "$WATCHDOG_RESTART_HISTORY" 2>/dev/null || true
+            fi
+        fi
+        if [ "$heartbeat_enabled" -eq 0 ]; then
+            sleep 1
+            continue
+        fi
+
+        # 启动后的首次心跳只建立基线，不计作一次检查。
+        if [ -z "$heartbeat_last" ]; then
+            heartbeat_candidate=$(read_qt_heartbeat || true)
+            if [ -n "$heartbeat_candidate" ]; then
+                heartbeat_last=$heartbeat_candidate
+            fi
+        fi
+
+        if [ "$heartbeat_now" -lt "$heartbeat_next_check" ]; then
+            sleep 1
+            continue
+        fi
+        heartbeat_next_check=$((heartbeat_now + WATCHDOG_CHECK_INTERVAL_SECONDS))
+        heartbeat_current=$(read_qt_heartbeat || true)
+
+        if [ -n "$heartbeat_current" ] && [ "$heartbeat_current" != "$heartbeat_last" ]; then
+            heartbeat_last=$heartbeat_current
+            heartbeat_missed=0
+            heartbeat_updates=$((heartbeat_updates + 1))
+        else
+            heartbeat_missed=$((heartbeat_missed + 1))
+        fi
+
+        heartbeat_elapsed=$((heartbeat_now - heartbeat_started_at))
+        if [ "$APP_LAUNCH_HEALTHY" -eq 0 ] \
+                && [ "$heartbeat_elapsed" -ge "$WATCHDOG_START_GRACE_SECONDS" ] \
+                && [ "$heartbeat_updates" -gt 0 ]; then
+            APP_LAUNCH_HEALTHY=1
+            WATCHDOG_RECOVERY_PENDING=0
+            WATCHDOG_CONSECUTIVE_FAILURES=0
+        fi
+
+        if [ "$heartbeat_elapsed" -ge "$WATCHDOG_START_GRACE_SECONDS" ] \
+                && [ "$heartbeat_missed" -ge "$WATCHDOG_MISSED_LIMIT" ]; then
+            record_failed_watchdog_recovery
+            watchdog_process_state=$(awk '{print $3}' "/proc/$APP_PID/stat" 2>/dev/null || true)
+            watchdog_stale_seconds=$((heartbeat_missed * WATCHDOG_CHECK_INTERVAL_SECONDS))
+
+            # 5分钟内已经执行3次恢复时，仅停止继续重启；这不是触发系统
+            # 重启的条件。窗口释放后才能再次尝试Qt恢复。
+            if register_watchdog_restart; then
+                WATCHDOG_TIMEOUT_RESTART=1
+                WATCHDOG_RECOVERY_PENDING=1
+                append_supervisor_log "Qt heartbeat timeout; restarting MergedQtApp: pid=$APP_PID state=${watchdog_process_state:-unknown} stale=${watchdog_stale_seconds}s missed=$heartbeat_missed/$WATCHDOG_MISSED_LIMIT restart=$WATCHDOG_RESTART_ATTEMPT/$WATCHDOG_RESTART_LIMIT"
+            else
+                heartbeat_started_at=$heartbeat_now
+                heartbeat_next_check=$((heartbeat_now + WATCHDOG_CHECK_INTERVAL_SECONDS))
+                heartbeat_missed=0
+                continue
+            fi
+            stop_qt_for_watchdog "$APP_PID" || trigger_system_recovery
+            return 0
+        fi
+
+        sleep 1
+    done
+}
+
 wait_for_weston()
 {
     attempts=0
@@ -412,6 +714,7 @@ cleanup()
     fi
     finish_qt_log_writer
     rm -f "$APP_PID_FILE" 2>/dev/null || true
+    rm -f "$HEARTBEAT_FILE" 2>/dev/null || true
 
     if pid_is_running "$MQTT_PID"; then
         kill "$MQTT_PID" 2>/dev/null || true
@@ -486,6 +789,7 @@ ensure_runtime_environment()
     export QT_WAYLAND_SHELL_INTEGRATION QT_WAYLAND_DISABLE_WINDOWDECORATION
     export LD_PRELOAD QT_PLUGIN_PATH QML2_IMPORT_PATH
     export QT_QPA_PLATFORM_PLUGIN_PATH LD_LIBRARY_PATH
+    export QT_YCEST_HEARTBEAT_FILE="$HEARTBEAT_FILE"
 }
 
 load_driver()
@@ -511,8 +815,6 @@ if [ "$(id -u)" -ne 0 ]; then
     log "this script must run as root"
     exit 1
 fi
-
-cp /usr/lib/aarch64-linux-gnu/librknnrt.so /usr/lib/
 
 ensure_runtime_environment
 
@@ -594,6 +896,9 @@ while true; do
         continue
     fi
 
+    # 每次启动前删除上一个实例的心跳，禁止旧文件被当成新进程存活证据。
+    rm -f "$HEARTBEAT_FILE" 2>/dev/null || true
+
     if [ "$LOG_CAPTURE_MODE" = "pipe" ]; then
         ./MergedQtApp >&3 2>&1 &
     else
@@ -613,17 +918,59 @@ while true; do
     printf '%s\n' "$APP_PID" > "$APP_PID_FILE"
     log "MergedQtApp started: pid=$APP_PID"
 
+    # 同一个监督循环同时观察Qt退出和主线程心跳；配置关闭时仅保留原有
+    # wait/restart行为，不执行心跳判定、限频或系统级兜底。
     set +e
+    monitor_qt_process
     wait "$APP_PID"
     app_status=$?
     set -e
     finish_qt_log_writer
     rm -f "$APP_PID_FILE" 2>/dev/null || true
+    rm -f "$HEARTBEAT_FILE" 2>/dev/null || true
     APP_PID=""
 
     if [ -e "$MAINTENANCE_FILE" ]; then
         log "MergedQtApp stopped for planned maintenance"
         continue
+    fi
+
+    if [ "$WATCHDOG_TIMEOUT_RESTART" -eq 1 ]; then
+        sleep "$APP_RESTART_DELAY_SECONDS"
+        continue
+    fi
+
+    if qt_watchdog_enabled; then
+        record_failed_watchdog_recovery
+
+        # Qt 已退出但5分钟窗口内已有3次重启时，保持停止状态并等待窗口
+        # 释放；限频本身绝不触发系统重启或硬件看门狗。
+        restart_registered=0
+        while qt_watchdog_enabled; do
+            if [ -e "$MAINTENANCE_FILE" ]; then
+                break
+            fi
+            if register_watchdog_restart; then
+                restart_registered=1
+                WATCHDOG_RECOVERY_PENDING=1
+                break
+            fi
+            sleep "$WATCHDOG_CHECK_INTERVAL_SECONDS"
+        done
+
+        if [ -e "$MAINTENANCE_FILE" ]; then
+            continue
+        fi
+        if [ "$restart_registered" -eq 0 ]; then
+            # 等待期间配置被关闭，立即恢复原有无限自动拉起行为。
+            WATCHDOG_RECOVERY_PENDING=0
+            WATCHDOG_CONSECUTIVE_FAILURES=0
+            rm -f "$WATCHDOG_RESTART_HISTORY" 2>/dev/null || true
+        fi
+    else
+        WATCHDOG_RECOVERY_PENDING=0
+        WATCHDOG_CONSECUTIVE_FAILURES=0
+        rm -f "$WATCHDOG_RESTART_HISTORY" 2>/dev/null || true
     fi
 
     append_supervisor_log "MergedQtApp exited unexpectedly: status=$app_status; restarting in ${APP_RESTART_DELAY_SECONDS}s"

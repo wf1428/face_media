@@ -28,8 +28,58 @@ constexpr int kPlaybackPathNumId = 1;
 constexpr int kPlaybackVolumeNumId = 3;
 constexpr int kMinimumPlaybackRaw = 60;
 constexpr int kMaximumUserPlaybackRaw = 200;
+constexpr int kMinimumPromptPlaybackRaw = 200;
+constexpr int kMaximumPromptPlaybackRaw = 250;
+constexpr int kDefaultPromptVolumePercent = 60; // 对应旧版固定原始值 230。
 constexpr int kMaximumHardwarePlaybackRaw = 255;
 const char kVolumeStatePath[] = "/home/cat/face_media/volume.dat";
+
+struct PersistedVolumeState {
+    int volume = 50;
+    int promptVolume = kDefaultPromptVolumePercent;
+    bool ampFlag = true;
+    bool fileExists = false;
+    bool promptVolumeExists = false;
+};
+
+PersistedVolumeState readPersistedVolumeState(const QString &path)
+{
+    PersistedVolumeState state;
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) return state;
+
+    state.fileExists = true;
+    const QString content = QString::fromUtf8(file.readAll());
+    QRegExp volumeRx(QStringLiteral("(^|\\n)volume:(\\d+)"));
+    QRegExp promptRx(QStringLiteral("(^|\\n)prompt_volume:(\\d+)"));
+    QRegExp ampRx(QStringLiteral("(^|\\n)amp_flag:(\\d+)"));
+    if (volumeRx.indexIn(content) >= 0) state.volume = volumeRx.cap(2).toInt();
+    if (promptRx.indexIn(content) >= 0) {
+        state.promptVolume = promptRx.cap(2).toInt();
+        state.promptVolumeExists = true;
+    }
+    if (ampRx.indexIn(content) >= 0) state.ampFlag = ampRx.cap(2).toInt() != 0;
+    state.volume = qBound(0, state.volume, 100);
+    state.promptVolume = qBound(0, state.promptVolume, 100);
+    return state;
+}
+
+bool writePersistedVolumeState(const QString &path, const PersistedVolumeState &state)
+{
+    QFileInfo info(path);
+    QDir().mkpath(info.absolutePath());
+
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+        qWarning() << "[audio] open volume file failed:" << path << file.errorString();
+        return false;
+    }
+    QTextStream stream(&file);
+    stream << "volume:" << qBound(0, state.volume, 100) << "\n"
+           << "prompt_volume:" << qBound(0, state.promptVolume, 100) << "\n"
+           << "amp_flag:" << (state.ampFlag ? 1 : 0) << "\n";
+    return stream.status() == QTextStream::Ok;
+}
 }
 
 /** @brief 解析平台路径并初始化音量防抖定时器。 */
@@ -92,7 +142,10 @@ AmpVolumeController::AmpVolumeController(QObject *parent)
     // 先读取（或按 50% 首次创建）持久化值，再初始化硬件，避免每次创建
     // 控制器时短暂把已保存音量覆盖为默认值。
     loadVolumeFromFile();
-    qInfo() << "[audio] volume file=" << dataFile_ << "percent=" << m_volume;
+    qInfo() << "[audio] volume file=" << dataFile_
+            << "systemPercent=" << m_volume
+            << "promptPercent=" << m_promptVolume
+            << "promptRaw=" << currentPromptRawVolume();
     initAudioPathOnce();
 }
 
@@ -102,6 +155,14 @@ int AmpVolumeController::volumePercentToRaw(int value)
     value = qBound(0, value, 100);
     return qRound(kMinimumPlaybackRaw
                   + value * (kMaximumUserPlaybackRaw - kMinimumPlaybackRaw) / 100.0);
+}
+
+/** @return 0~100 线性映射并限制到 200~250 的 RK809 原始值。 */
+int AmpVolumeController::promptVolumePercentToRaw(int value)
+{
+    value = qBound(0, value, 100);
+    return qRound(kMinimumPromptPlaybackRaw
+                  + value * (kMaximumPromptPlaybackRaw - kMinimumPromptPlaybackRaw) / 100.0);
 }
 
 /** @return 统一播报总开关；配置缺失、文件缺失或值为空时默认开启。 */
@@ -240,47 +301,42 @@ void AmpVolumeController::initAudioPathOnce()
     }
 }
 
-/** @brief 将用户音量和功放标志写入持久化文件。 */
+/** @brief 更新系统音量和功放标志，同时保留独立语音播报音量。 */
 void AmpVolumeController::writeVolumeFile(int volume, bool ampFlag)
 {
-    QFileInfo info(dataFile_);
-    QDir().mkpath(info.absolutePath());
-
-    QFile file(dataFile_);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
-        qWarning() << "[audio] open volume file failed:" << dataFile_ << file.errorString();
-        return;
-    }
-
-    QTextStream stream(&file);
-    stream << "volume:" << volume << "\n"
-           << "amp_flag:" << (ampFlag ? 1 : 0) << "\n";
+    PersistedVolumeState state = readPersistedVolumeState(dataFile_);
+    state.volume = qBound(0, volume, 100);
+    state.ampFlag = ampFlag;
+    m_promptVolume = state.promptVolume;
+    writePersistedVolumeState(dataFile_, state);
 }
 
-/** @return 从持久化文件读取的 0~100 音量；文件不存在时创建为 50%。 */
+/** @brief 更新语音播报音量，同时保留系统音量和功放标志。 */
+void AmpVolumeController::writePromptVolumeFile(int promptVolume)
+{
+    PersistedVolumeState state = readPersistedVolumeState(dataFile_);
+    state.promptVolume = qBound(0, promptVolume, 100);
+    state.promptVolumeExists = true;
+    m_promptVolume = state.promptVolume;
+    writePersistedVolumeState(dataFile_, state);
+}
+
+/** @return 读取系统与播报音量；旧文件自动补充默认播报值60%（原始值230）。 */
 int AmpVolumeController::loadVolumeFromFile()
 {
-    int volume = 50;
-    bool ampFlag = true;
-
-    QFile file(dataFile_);
-    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        writeVolumeFile(volume, ampFlag);
-        m_volume = volume;
-        m_ampFlag = ampFlag;
-        return m_volume;
-    }
-
-    const QString content = QString::fromUtf8(file.readAll());
-    QRegExp volumeRx(QStringLiteral("volume:(\\d+)"));
-    QRegExp ampRx(QStringLiteral("amp_flag:(\\d+)"));
-    if (volumeRx.indexIn(content) >= 0) volume = volumeRx.cap(1).toInt();
-    if (ampRx.indexIn(content) >= 0) ampFlag = ampRx.cap(1).toInt() != 0;
-
-    m_volume = qBound(0, volume, 100);
-    Q_UNUSED(ampFlag);
+    const PersistedVolumeState state = readPersistedVolumeState(dataFile_);
+    m_volume = state.volume;
+    m_promptVolume = state.promptVolume;
     // 新标尺的 0% 对应原始值 60，是最低可听音量而非静音。
     m_ampFlag = true;
+    if (!state.fileExists || !state.promptVolumeExists) {
+        PersistedVolumeState migrated = state;
+        migrated.volume = m_volume;
+        migrated.promptVolume = m_promptVolume;
+        migrated.promptVolumeExists = true;
+        migrated.ampFlag = m_ampFlag;
+        writePersistedVolumeState(dataFile_, migrated);
+    }
     return m_volume;
 }
 
@@ -300,6 +356,13 @@ void AmpVolumeController::setVolume(int value)
     m_volume = m_pendingVolume;
     m_ampFlag = true;
     m_debounce.start();
+}
+
+/** @brief 保存语音播报百分比，正常媒体音量保持不变。 */
+void AmpVolumeController::setPromptVolume(int value)
+{
+    m_promptVolume = qBound(0, value, 100);
+    writePromptVolumeFile(m_promptVolume);
 }
 
 /** @brief 按百分比设置功放和 RK809 原始音量，并发出结果信号。 */
@@ -428,7 +491,7 @@ AudioPromptFocusManager::AudioPromptFocusManager(QObject *parent)
     volumeController_ = new AmpVolumeController(this);
     connect(volumeController_, &AmpVolumeController::rawVolumeTemporaryApplied,
             this, [this](int rawValue, bool success) {
-        if (rawValue == 230 && !owners_.isEmpty()) {
+        if (rawValue == requestedBoostRaw_ && !owners_.isEmpty()) {
             boostReady_ = true;
             if (!success) {
                 qWarning() << "[audio-focus] prompt volume boost failed; continuing";
@@ -503,11 +566,14 @@ void AudioPromptFocusManager::requestBoost()
 {
     if (owners_.isEmpty()) return;
     if (!volumeController_) return;
+    // 每次播报前重新读取同一 volume.dat，确保管理界面刚保存的播报百分比
+    // 无需重启即可生效；系统音量的恢复快照仍只在首个持有者进入时保存。
+    volumeController_->loadVolumeFromFile();
     if (savedAmpRawVolume_ < 0) {
-        volumeController_->loadVolumeFromFile();
         savedAmpRawVolume_ = volumeController_->currentRawVolume();
     }
-    volumeController_->setRawVolumeTemporaryAsync(230);
+    requestedBoostRaw_ = volumeController_->currentPromptRawVolume();
+    volumeController_->setRawVolumeTemporaryAsync(requestedBoostRaw_);
 }
 
 /** @brief 获取可重叠的播报焦点。 */
@@ -547,6 +613,7 @@ void AudioPromptFocusManager::release(QObject *owner)
 
     boostDelayTimer_.stop();
     boostReady_ = false;
+    requestedBoostRaw_ = -1;
     if (volumeController_ && savedAmpRawVolume_ >= 0) {
         volumeController_->setRawVolumeTemporaryAsync(savedAmpRawVolume_);
     } else {

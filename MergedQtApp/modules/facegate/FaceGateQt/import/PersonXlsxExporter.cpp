@@ -124,7 +124,7 @@ QString headersRow(int index)
         QStringLiteral("启用功能"), QStringLiteral("定时规则"), QStringLiteral("剩余次数"),
         QStringLiteral("剩余金额"), QStringLiteral("单价"), QStringLiteral("有效期限"),
         QStringLiteral("远程呼梯"), QStringLiteral("控梯类型"), QStringLiteral("继电器"),
-        QStringLiteral("密码通行"), QStringLiteral("人脸文件列表"), QStringLiteral("增量次数"),
+        QStringLiteral("规则密码"), QStringLiteral("人脸文件列表"), QStringLiteral("增量次数"),
         QStringLiteral("增量金额")
     };
     return headers.value(index);
@@ -151,11 +151,11 @@ QStringList instructionRow()
         QStringLiteral("选填，多个用英文逗号分隔"), QStringLiteral("选填，多个用英文逗号分隔"),
         QStringLiteral("选填，是/否，默认否"), QStringLiteral("选填，已存在的模板名称"),
         QStringLiteral("选填，已存在的模板名称"), QStringLiteral("选填，格式：设备名:楼层1,楼层2"),
-        QStringLiteral("选填，导出只读"), QStringLiteral("选填，导出只读"),
-        QStringLiteral("选填，导出只读"), QStringLiteral("选填，导出只读"),
-        QStringLiteral("选填，导出只读"), QStringLiteral("选填，导出只读"),
-        QStringLiteral("选填，导出只读"), QStringLiteral("选填，导出只读"),
-        QStringLiteral("选填，导出只读"), QStringLiteral("选填，导出只读"),
+        QStringLiteral("选填，按启用功能解析"), QStringLiteral("选填，按启用功能解析"),
+        QStringLiteral("选填，格式：剩余/总次数"), QStringLiteral("选填，格式：剩余/总金额"),
+        QStringLiteral("选填，金额功能单价"), QStringLiteral("选填，开始日期~结束日期"),
+        QStringLiteral("选填，格式：当天剩余/每日额度"), QStringLiteral("选填：直梯、门禁或电梯维修箱"),
+        QStringLiteral("选填，继电器规则"), QStringLiteral("启用密码通行时规则密码必填，且人员间不可重复"),
         QStringLiteral("导出列，导入时忽略"),
         QStringLiteral("选填，导出只读；模板应用时记录的增量次数"),
         QStringLiteral("选填，导出只读；模板应用时记录的增量金额")
@@ -172,12 +172,12 @@ QStringList exampleRow()
         QStringLiteral("员工"), QStringLiteral("zhangsan"), QStringLiteral("123456"),
         QStringLiteral("研发一组"), QStringLiteral("10001,10002"), QStringLiteral("QR-001"),
         QStringLiteral("否"), QStringLiteral("标准通行模板"), QStringLiteral("规则模板A"),
-        QStringLiteral("测试1:3,8"), QStringLiteral("定时,远程呼梯"),
+        QStringLiteral("测试1:3,8"), QStringLiteral("定时,远程呼梯,控梯,密码通行"),
         QStringLiteral("周三18:00-18:07"), QStringLiteral("80/100"),
         QStringLiteral("¥50.00/¥100.00"), QStringLiteral("¥0.50"),
-        QStringLiteral("2026-01-01 ~ 2026-12-31"), QStringLiteral("日15次/每日更新10次"),
-        QStringLiteral("直梯"), QStringLiteral("通道1,2 导通5s"), QStringLiteral("否"),
-        QStringLiteral("zhangsan.jpg"), QStringLiteral("8"), QStringLiteral("7")
+        QStringLiteral("2026-01-01 ~ 2026-12-31"), QStringLiteral("10/20"),
+        QStringLiteral("直梯"), QStringLiteral("通道1,2 导通5s"), QStringLiteral("246810"),
+        QStringLiteral("zhangsan_1.jpg"), QStringLiteral("8"), QStringLiteral("7")
     };
 }
 
@@ -447,12 +447,32 @@ QStringList networkPersonRow(const QVariantMap &row, int sequence, bool local = 
             || mapNumber(ruleRow, QStringLiteral("elevator_value_type"), &controlValueType);
     if (controlType.isEmpty() && hasControlValueType) {
         controlType = int(controlValueType) == 1
-                ? QStringLiteral("直梯") : QStringLiteral("门禁");
+                ? QStringLiteral("直梯")
+                : (int(controlValueType) == 2
+                   ? QStringLiteral("电梯维修箱") : QStringLiteral("门禁"));
     }
-    QString password = QStringLiteral("否");
+    QString password;
     if (rules.value(QStringLiteral("cardPassword")).toBool()
             || ruleRow.value(QStringLiteral("card_password_enabled")).toInt() != 0) {
-        password = QStringLiteral("是");
+        password = jsonText(rules, QStringLiteral("cardPasswordDataPassword"));
+        if (password.isEmpty()) {
+            password = ruleRow.value(QStringLiteral("card_password")).toString();
+        }
+    }
+
+    QString remoteCall = jsonText(person, QStringLiteral("remoteCallText"));
+    if (remoteCall.isEmpty()) remoteCall = jsonText(rules, QStringLiteral("remoteCallText"));
+    if (remoteCall.isEmpty()
+            && ruleRow.value(QStringLiteral("remote_call_enabled")).toInt() != 0) {
+        bool currentOk = false;
+        bool dailyOk = false;
+        const qlonglong current = ruleRow.value(
+                    QStringLiteral("remote_call_current_day_count")).toLongLong(&currentOk);
+        const qlonglong daily = ruleRow.value(
+                    QStringLiteral("remote_call_every_day_count")).toLongLong(&dailyOk);
+        if (currentOk && dailyOk) {
+            remoteCall = QString::number(current) + QLatin1Char('/') + QString::number(daily);
+        }
     }
 
     const QList<QVariantMap> faceCountRows = DbStore::query(
@@ -502,9 +522,7 @@ QStringList networkPersonRow(const QVariantMap &row, int sequence, bool local = 
         timingText(personId, rules, local), counts, amounts,
         hasUnitPrice ? QStringLiteral("¥") + compactNumber(unitPrice) : QString(),
         duration,
-        !jsonText(person, QStringLiteral("remoteCallText")).isEmpty()
-            ? jsonText(person, QStringLiteral("remoteCallText"))
-            : jsonText(rules, QStringLiteral("remoteCallText")),
+        remoteCall,
         controlType,
         !jsonText(person, QStringLiteral("relayText")).isEmpty()
             ? jsonText(person, QStringLiteral("relayText"))

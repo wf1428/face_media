@@ -103,7 +103,7 @@ public:
     QString audioPlayer = QStringLiteral("gstreamer"); /**< 进程内提示音播放后端。 */
     QString audioDevice = QStringLiteral("plughw:CARD=rockchiprk809co,DEV=0"); /**< ALSA 输出设备。 */
     QString audioDir = QStringLiteral("./common/audio"); /**< 统一提示音资源目录。 */
-    int audioVolume = 50;                     /**< 逻辑播放音量，范围 0~100。 */
+    int audioVolume = 60;                     /**< 语音播报音量百分比；0~100 映射 RK809 原始值 200~250。 */
     QString audioMixerControl = QStringLiteral("numid=3"); /**< RK809 播放音量控制项。 */
     int audioCooldownMs = 1500;               /**< 同类语音提示冷却时间，单位 ms。 */
 

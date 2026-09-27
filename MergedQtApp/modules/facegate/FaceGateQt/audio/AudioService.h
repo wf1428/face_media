@@ -54,10 +54,10 @@ public:
     /** @brief 启用或关闭语音提示总开关。 */
     void setEnabled(bool enabled);
 
-    /** @brief 设置并持久化 0~100 音量，同时更新 RK809 硬件音量。 */
+    /** @brief 设置并持久化 0~100 语音播报音量，播放时映射到 RK809 200~250。 */
     void setVolume(int volume);
 
-    /** @return volume.dat 中当前生效的音量百分比。 */
+    /** @return volume.dat 中当前语音播报音量百分比。 */
     int volume() const;
 
     /** @brief 在提示类型启用且冷却允许时播放对应音频。 */
@@ -83,7 +83,7 @@ signals:
     void audioError(const QString &message);
 
 private:
-    /** @brief 保存并静音正在播放的视频，同时把提示音硬件音量提升到 230。 */
+    /** @brief 保存并静音正在播放的视频，同时应用独立的语音播报音量。 */
     void beginVoiceFocus();
 
     /** @brief 恢复提示音开始前的视频音量和硬件音量。 */
@@ -128,7 +128,7 @@ private:
     QVector<MutedVideoState> mutedVideos_;    /**< 本次播报临时压低的视频播放器。 */
     int savedRawVolume_ = -1;                 /**< 播报前的 RK809 原始音量。 */
     bool voiceFocusActive_ = false;           /**< 当前是否持有语音焦点。 */
-    bool volumeBoostPending_ = false;         /**< 是否等待异步应用提示音原始音量 230。 */
+    bool volumeBoostPending_ = false;         /**< 是否等待异步应用提示音原始音量。 */
     int pendingRestoreRaw_ = -1;              /**< 等待异步恢复的 RK809 原始音量。 */
     qreal pendingRestoreFactor_ = 0.0;        /**< 硬件恢复后视频淡入的起始比例。 */
     QString pendingFileName_;                 /**< 延时启动后用于状态日志的文件名。 */

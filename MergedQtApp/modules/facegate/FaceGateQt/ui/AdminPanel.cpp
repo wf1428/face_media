@@ -1836,7 +1836,7 @@ QWidget *AdminPanel::createSettingsPage()
         }
     });
 
-    auto *audioVolumeNameLabel = new QLabel(QStringLiteral("音量"), audioBasicGroup);
+    auto *audioVolumeNameLabel = new QLabel(QStringLiteral("语音播报音量"), audioBasicGroup);
     audioVolumeNameLabel->setObjectName("metricName");
     audioVolumeNameLabel->setMinimumHeight(34);
 
@@ -2662,7 +2662,7 @@ void AdminPanel::requestDeleteSelectedPerson()
     const bool confirmed = AppMessageDialog::confirm(
         this,
         "删除人员",
-        QString("确定将人员 %1 标记为已删除吗？该人员不会再进入识别底库。").arg(personNo),
+        QString("确定删除人员 %1 吗？Excel导入人员将彻底清除，手工录入人员将标记为已删除。").arg(personNo),
         "删除",
         "取消");
     if (!confirmed) {

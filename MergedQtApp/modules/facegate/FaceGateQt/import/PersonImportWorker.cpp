@@ -65,6 +65,10 @@ void PersonImportWorker::run()
             : PersonXlsxParser::parse(source.temporaryPath);
     if (!parsed.ok) {
         QString message = parsed.error;
+        if (!parsed.warnings.isEmpty()) {
+            message += QStringLiteral("\n文件提示：")
+                    + parsed.warnings.join(QStringLiteral("；"));
+        }
         const QString cleanupError = cleanupResources();
         if (!cleanupError.isEmpty()) message += QStringLiteral("\n") + cleanupError;
         emit finished(false, 0, 0, 0, 0, {}, {}, message, source.sourceFileName);
@@ -93,18 +97,19 @@ void PersonImportWorker::run()
     parserWarnings_ = parsed.warnings;
     importError_ = imported.error;
 
-    QHash<QString, LocalImportedPerson> peopleByPhone;
-    QHash<QString, QStringList> namesByPhone;
-    QSet<QString> ambiguousPhones;
+    QHash<QString, LocalImportedPerson> peopleByAccount;
+    QHash<QString, QStringList> namesByAccount;
+    QSet<QString> ambiguousAccounts;
     for (const LocalImportedPerson &person : imported.importedPeople) {
-        const QString phone = person.phone.trimmed();
-        if (phone.isEmpty()) continue;
-        namesByPhone[phone].append(person.name);
-        if (peopleByPhone.contains(phone)) ambiguousPhones.insert(phone);
-        else peopleByPhone.insert(phone, person);
+        const QString account = person.personNo.trimmed();
+        if (account.isEmpty()) continue;
+        const QString accountKey = account.toCaseFolded();
+        namesByAccount[accountKey].append(person.name);
+        if (peopleByAccount.contains(accountKey)) ambiguousAccounts.insert(accountKey);
+        else peopleByAccount.insert(accountKey, person);
     }
-    for (const QString &phone : ambiguousPhones) {
-        peopleByPhone.remove(phone);
+    for (const QString &account : ambiguousAccounts) {
+        peopleByAccount.remove(account);
     }
 
     QJsonArray faceCandidates;
@@ -114,28 +119,29 @@ void PersonImportWorker::run()
             ? imageDirectory.entryInfoList(QDir::Files | QDir::Readable, QDir::Name)
             : QFileInfoList();
     const QRegularExpression naming(QStringLiteral("^(.+)_([0-9]+)$"));
-    QSet<QString> reportedAmbiguousPhones;
+    QSet<QString> reportedAmbiguousAccounts;
     for (const QFileInfo &image : images) {
         const QRegularExpressionMatch match = naming.match(image.completeBaseName());
         if (!match.hasMatch()) continue;
-        const QString phone = match.captured(1).trimmed();
-        if (ambiguousPhones.contains(phone)) {
-            if (!reportedAmbiguousPhones.contains(phone)) {
-                reportedAmbiguousPhones.insert(phone);
-                for (const QString &name : namesByPhone.value(phone)) {
+        const QString account = match.captured(1).trimmed();
+        const QString accountKey = account.toCaseFolded();
+        if (ambiguousAccounts.contains(accountKey)) {
+            if (!reportedAmbiguousAccounts.contains(accountKey)) {
+                reportedAmbiguousAccounts.insert(accountKey);
+                for (const QString &name : namesByAccount.value(accountKey)) {
                     ++failed_;
-                    failedNames_.append(name + QStringLiteral("（人脸图片手机号无法唯一匹配）"));
+                    failedNames_.append(name + QStringLiteral("（人脸图片账号无法唯一匹配）"));
                 }
             }
             continue;
         }
-        if (!peopleByPhone.contains(phone)) continue;
-        const LocalImportedPerson person = peopleByPhone.value(phone);
+        if (!peopleByAccount.contains(accountKey)) continue;
+        const LocalImportedPerson person = peopleByAccount.value(accountKey);
         QJsonObject face;
         face.insert(QStringLiteral("localPersonId"), QString::number(person.personId));
         face.insert(QStringLiteral("personNo"), person.personNo);
         face.insert(QStringLiteral("personName"), person.name);
-        face.insert(QStringLiteral("phone"), phone);
+        face.insert(QStringLiteral("phone"), person.phone);
         face.insert(QStringLiteral("imagePath"), image.absoluteFilePath());
         face.insert(QStringLiteral("sourceFileName"), image.fileName());
         faceCandidates.append(face);

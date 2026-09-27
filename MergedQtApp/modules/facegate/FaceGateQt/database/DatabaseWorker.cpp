@@ -308,7 +308,7 @@ void DatabaseWorker::updatePersonEnabled(qint64 personId, bool enabled)
 }
 
 /**
- * @brief 删除一名人员及其人脸模板，然后刷新运行时和管理员数据。
+ * @brief 按人员来源删除一名人员，然后刷新运行时和管理员数据。
  */
 void DatabaseWorker::deletePerson(qint64 personId)
 {
@@ -322,6 +322,7 @@ void DatabaseWorker::deletePerson(qint64 personId)
     if (ok) {
         reloadGallery();
         loadPeople();
+        loadPassedVerifyLogs();
         loadStorageStats();
     }
 }

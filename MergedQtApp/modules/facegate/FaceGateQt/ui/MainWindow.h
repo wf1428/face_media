@@ -185,7 +185,7 @@ private:
     /** @brief 请求数据库切换人员启用状态并写审计日志。 */
     void handlePersonEnabledChange(qint64 personId, bool enabled);
 
-    /** @brief 请求数据库软删除人员并写审计日志。 */
+    /** @brief 请求数据库按人员来源删除并写审计日志。 */
     void handlePersonDelete(qint64 personId);
 
     /** @brief 请求刷新管理员人员列表。 */
@@ -295,6 +295,7 @@ private:
     QHash<QString, qint64> successfulAccessMs_; /**< 各人员最近一次权限下发时间。 */
     bool livenessEnabled_ = true;        /**< 当前活体开关。 */
     bool adminLoginActive_ = false;      /**< 管理员密码登录弹窗是否正在处理输入。 */
+    bool passwordAccessFromAdminEntry_ = false; /**< 密码通行是否由五秒长按登录框发起。 */
     bool adminModeActive_ = false;       /**< 管理面板是否打开。 */
     bool adminLivenessPending_ = false;  /**< 是否等待管理员录入活体结果。 */
     int adminLivenessLastFrame_ = -1000000; /**< 最近提交活体的帧序号。 */

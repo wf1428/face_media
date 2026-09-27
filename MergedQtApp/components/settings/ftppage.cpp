@@ -23,6 +23,54 @@ static const char* kStreamUrlHistoryKey = "stream/url_history";
 static const int kMaxUrlHistory = 8;
 
 
+/**
+ * @brief 以较低的 CPU/I/O 调度优先级启动下载子进程。
+ *
+ * RK3566 同时进行摄像头采集、人脸推理和媒体落盘时，普通优先级的 curl
+ * 容易持续占用存储与内存带宽。优先使用 ionice 的 idle 类，并叠加 nice；
+ * 系统缺少这些工具时仍按原方式直接启动，不改变下载兼容性。
+ */
+static void startBackgroundTransfer(QProcess *process,
+                                    const QString &program,
+                                    const QStringList &arguments)
+{
+    if (!process) return;
+
+#ifdef Q_OS_LINUX
+    const QString ionicePath = QFileInfo(QStringLiteral("/usr/bin/ionice")).isExecutable()
+            ? QStringLiteral("/usr/bin/ionice")
+            : (QFileInfo(QStringLiteral("/bin/ionice")).isExecutable()
+               ? QStringLiteral("/bin/ionice") : QString());
+    const QString nicePath = QFileInfo(QStringLiteral("/usr/bin/nice")).isExecutable()
+            ? QStringLiteral("/usr/bin/nice")
+            : (QFileInfo(QStringLiteral("/bin/nice")).isExecutable()
+               ? QStringLiteral("/bin/nice") : QString());
+
+    if (!ionicePath.isEmpty()) {
+        QStringList wrappedArguments;
+        wrappedArguments << QStringLiteral("-c") << QStringLiteral("3");
+        if (!nicePath.isEmpty()) {
+            wrappedArguments << nicePath << QStringLiteral("-n") << QStringLiteral("10");
+        }
+        wrappedArguments << program;
+        wrappedArguments << arguments;
+        process->start(ionicePath, wrappedArguments);
+        return;
+    }
+
+    if (!nicePath.isEmpty()) {
+        QStringList wrappedArguments;
+        wrappedArguments << QStringLiteral("-n") << QStringLiteral("10") << program;
+        wrappedArguments << arguments;
+        process->start(nicePath, wrappedArguments);
+        return;
+    }
+#endif
+
+    process->start(program, arguments);
+}
+
+
 /** @return FTP 路径含非 ASCII 或保留字符、需要逐段编码时返回 true。 */
 static bool needEncodeFtpPath(const QString& path)
 {
@@ -805,7 +853,7 @@ void FtpPage::startFtpListDirByProcess(const QString &host, int port,
     setStatusText(QStringLiteral("正在列目录..."));
     appendLog(QStringLiteral("列目录：%1 %2").arg(curlPath, args.join(' ')));
 
-    ftpProc->start(curlPath, args);
+    startBackgroundTransfer(ftpProc, curlPath, args);
 }
 
 /** @brief 顺序启动目录队列中的下一文件，避免并发写盘。 */
@@ -939,7 +987,7 @@ void FtpPage::startFtpDownloadByProcess(const QString &host, int port,
 
     emit ftpDownloadStarted(QFileInfo(localPath).fileName());
     emit ftpDownloadProgress(QFileInfo(localPath).fileName(), 0);
-    ftpProc->start(curlPath, args);
+    startBackgroundTransfer(ftpProc, curlPath, args);
 }
 
 /** @brief 使用短 TCP 连接测试 FTP 主机和端口。 */
@@ -1100,13 +1148,27 @@ void FtpPage::onDownloadClicked()
     appendLog(QStringLiteral("提交下载：ftp://%1:%2 remote='%3' -> local='%4'")
               .arg(host).arg(port).arg(remotePath, finalLocalPath));
 
-    // 下载前空间校验
+    // 下载前的远端大小和空间检查必须异步执行，不能在 Qt 主线程中
+    // waitForFinished；否则网络响应慢时会连同摄像头预览一起冻结最多 20 秒。
     const QString displayName = QFileInfo(finalLocalPath).fileName();
-    if (!checkDownloadSpaceOrReport(host, port, user, pass, remotePath, finalLocalPath, displayName)) {
+    if (autoDownloadInProgress_ ||
+            (ftpPreflightProc_ && ftpPreflightProc_->state() != QProcess::NotRunning) ||
+            (ftpProc && ftpProc->state() != QProcess::NotRunning)) {
+        const QString reason = QStringLiteral("已有 FTP 下载或预检查任务正在执行");
+        setStatusText(reason);
+        appendLog(reason);
+        emit ftpDownloadRequestRejected(displayName, reason);
         return;
     }
 
-    startFtpDownloadByProcess(host, port, user, pass, remotePath, finalLocalPath);
+    autoDownloadInProgress_ = true;
+    const QString taskKey = QStringLiteral("manual|%1|%2|%3|%4")
+            .arg(host)
+            .arg(port)
+            .arg(remotePath)
+            .arg(finalLocalPath);
+    startAutoDownloadPreflight(host, port, user, pass, remotePath,
+                               finalLocalPath, displayName, taskKey);
 }
 
 
@@ -1954,7 +2016,7 @@ void FtpPage::startHttpMp4DownloadByProcess(const QString& urlStr, const QString
     emit ftpDownloadProgress(QFileInfo(localFile).fileName(), 0);
 
     // 8) 开始
-    httpProc->start(curlPath, args);
+    startBackgroundTransfer(httpProc, curlPath, args);
 }
 
 /** @brief 从设置中加载最近使用的流地址。 */
@@ -2153,7 +2215,7 @@ void FtpPage::failAutoDownloadPreflight(const QString &reason)
             : reason.trimmed();
 
     setStatusText(QStringLiteral("FTP下载前检查失败"));
-    appendLog(QStringLiteral("自动下载预检查失败：%1").arg(finalReason));
+    appendLog(QStringLiteral("FTP下载预检查失败：%1").arg(finalReason));
     showToast(QStringLiteral("FTP连接失败，继续本地播放"), 3000);
     clearAutoDownloadState();
     emit ftpDownloadFailed(fileName, finalReason);
@@ -2212,7 +2274,7 @@ void FtpPage::startAutoDownloadPreflight(const QString &host, int port,
          << "--max-time" << "20"
          << url;
 
-    appendLog(QStringLiteral("自动下载异步预检查：ftp://%1:%2 remote='%3'")
+    appendLog(QStringLiteral("FTP下载异步预检查：ftp://%1:%2 remote='%3'")
               .arg(host).arg(port).arg(remotePath));
     ftpPreflightProc_->start(curlPath, args);
 }
@@ -2327,7 +2389,7 @@ void FtpPage::handleAutoDownloadPreflightFinished(int exitCode, QProcess::ExitSt
         return;
     }
 
-    appendLog(QStringLiteral("自动下载预检查通过：远端大小=%1 bytes，可用空间=%2 bytes")
+    appendLog(QStringLiteral("FTP下载预检查通过：远端大小=%1 bytes，可用空间=%2 bytes")
               .arg(remoteSize)
               .arg(availableBytes));
 

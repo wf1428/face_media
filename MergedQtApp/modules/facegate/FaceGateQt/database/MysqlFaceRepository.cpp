@@ -9,6 +9,7 @@
 #include "MysqlFaceRepository.h"
 
 #include "common/storage_policy.h"
+#include "platform/rk3566_platform.h"
 
 #include <QCoreApplication>
 #include <QDataStream>
@@ -19,7 +20,10 @@
 #include <QFile>
 #include <QHash>
 #include <QIODevice>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QSaveFile>
+#include <QSet>
 #include <QSqlDatabase>
 #include <QSqlError>
 #include <QSqlQuery>
@@ -730,7 +734,7 @@ bool MysqlFaceRepository::updatePersonEnabled(qint64 personId, bool enabled)
 }
 
 /**
- * @brief 删除一名人员及其全部已录入人脸模板。
+ * @brief 按人员来源删除：Excel导入人员彻底清理，手工录入人员保持软删除。
  */
 bool MysqlFaceRepository::deletePerson(qint64 personId)
 {
@@ -749,19 +753,211 @@ bool MysqlFaceRepository::deletePerson(qint64 personId)
         return false;
     }
 
-    QSqlQuery delPerson(db_);
-    delPerson.prepare("UPDATE person SET deleted=1, enabled=0, updated_at=? WHERE id=?");
-    delPerson.addBindValue(nowString());
-    delPerson.addBindValue(personId);
-    if (!delPerson.exec()) {
-        lastError_ = "软删除人员失败：" + delPerson.lastError().text();
+    const bool hasPersonJson = tableHasColumn(QStringLiteral("person"),
+                                              QStringLiteral("person_json"));
+    const bool hasFaceFileList = tableHasColumn(QStringLiteral("person"),
+                                                QStringLiteral("face_file_list"));
+    const bool hasPersonSource = tableHasColumn(QStringLiteral("person"),
+                                                QStringLiteral("person_source"));
+    QSqlQuery personQuery(db_);
+    personQuery.prepare(QStringLiteral(
+                            "SELECT person_no,%1,%2,%3 FROM person WHERE id=?")
+                        .arg(hasPersonJson ? QStringLiteral("COALESCE(person_json,'')")
+                                           : QStringLiteral("''"),
+                             hasFaceFileList ? QStringLiteral("COALESCE(face_file_list,'')")
+                                             : QStringLiteral("''"),
+                             hasPersonSource ? QStringLiteral("COALESCE(person_source,'manual')")
+                                             : QStringLiteral("'manual'")));
+    personQuery.addBindValue(personId);
+    if (!personQuery.exec()) {
+        lastError_ = "查询人员来源失败：" + personQuery.lastError().text();
         qWarning().noquote() << lastError_;
         return false;
     }
-    if (delPerson.numRowsAffected() <= 0) {
+    if (!personQuery.next()) {
         lastError_ = "未找到人员";
         qWarning().noquote() << lastError_;
         return false;
+    }
+
+    const QString personNo = personQuery.value(0).toString();
+    const QString personJson = personQuery.value(1).toString().trimmed();
+    const QString faceFileList = personQuery.value(2).toString();
+    const QString personSource = personQuery.value(3).toString().trimmed().toLower();
+    const bool spreadsheetImported = personSource == QStringLiteral("excel")
+            || !personJson.isEmpty();
+
+    if (!spreadsheetImported) {
+        QSqlQuery delPerson(db_);
+        delPerson.prepare("UPDATE person SET deleted=1, enabled=0, updated_at=? WHERE id=?");
+        delPerson.addBindValue(nowString());
+        delPerson.addBindValue(personId);
+        if (!delPerson.exec()) {
+            lastError_ = "软删除人员失败：" + delPerson.lastError().text();
+            qWarning().noquote() << lastError_;
+            return false;
+        }
+        if (delPerson.numRowsAffected() <= 0) {
+            lastError_ = "未找到人员";
+            qWarning().noquote() << lastError_;
+            return false;
+        }
+        return true;
+    }
+
+    const QStringList tables = db_.tables();
+    const auto tableExists = [&tables](const QString &name) {
+        for (const QString &table : tables) {
+            if (table.compare(name, Qt::CaseInsensitive) == 0) return true;
+        }
+        return false;
+    };
+
+    QSet<QString> storedFiles;
+    for (const QString &path : faceFileList.split(QLatin1Char(','), QString::SkipEmptyParts)) {
+        if (!path.trimmed().isEmpty()) storedFiles.insert(path.trimmed());
+    }
+    QSqlQuery faceFiles(db_);
+    faceFiles.prepare("SELECT image_path FROM face_feature WHERE person_id=?");
+    faceFiles.addBindValue(personId);
+    if (!faceFiles.exec()) {
+        lastError_ = "查询人员人脸文件失败：" + faceFiles.lastError().text();
+        qWarning().noquote() << lastError_;
+        return false;
+    }
+    while (faceFiles.next()) {
+        const QString path = faceFiles.value(0).toString().trimmed();
+        if (!path.isEmpty()) storedFiles.insert(path);
+    }
+
+    QSet<qint64> verifyLogIds;
+    if (tableExists(QStringLiteral("verify_log"))) {
+        QSqlQuery verifyFiles(db_);
+        verifyFiles.prepare("SELECT id,snapshot_path FROM verify_log WHERE person_id=? OR person_no=?");
+        verifyFiles.addBindValue(personId);
+        verifyFiles.addBindValue(personNo);
+        if (!verifyFiles.exec()) {
+            lastError_ = "查询人员通行记录失败：" + verifyFiles.lastError().text();
+            qWarning().noquote() << lastError_;
+            return false;
+        }
+        while (verifyFiles.next()) {
+            verifyLogIds.insert(verifyFiles.value(0).toLongLong());
+            const QString path = verifyFiles.value(1).toString().trimmed();
+            if (!path.isEmpty()) storedFiles.insert(path);
+        }
+    }
+
+    QList<qint64> syncTaskIds;
+    if (tableExists(QStringLiteral("sync_task"))) {
+        QSqlQuery syncTasks(db_);
+        if (!syncTasks.exec("SELECT id,payload_json FROM sync_task")) {
+            lastError_ = "查询人员关联待同步任务失败：" + syncTasks.lastError().text();
+            qWarning().noquote() << lastError_;
+            return false;
+        }
+        while (syncTasks.next()) {
+            const QJsonDocument payload = QJsonDocument::fromJson(
+                        syncTasks.value(1).toString().toUtf8());
+            if (!payload.isObject()) continue;
+            const QJsonObject object = payload.object();
+            const qint64 logId = object.value(QStringLiteral("log_id")).toVariant().toLongLong();
+            if (object.value(QStringLiteral("person_no")).toString() == personNo
+                    || verifyLogIds.contains(logId)) {
+                syncTaskIds.append(syncTasks.value(0).toLongLong());
+            }
+        }
+    }
+
+    if (!db_.transaction()) {
+        lastError_ = "启动彻底删除事务失败：" + db_.lastError().text();
+        qWarning().noquote() << lastError_;
+        return false;
+    }
+    const auto executeDelete = [this](const QString &sql,
+                                      const QList<QVariant> &binds) {
+        QSqlQuery query(db_);
+        query.prepare(sql);
+        for (const QVariant &bind : binds) query.addBindValue(bind);
+        if (query.exec()) return true;
+        lastError_ = "彻底删除人员数据失败：" + query.lastError().text();
+        return false;
+    };
+
+    bool deleteOk = true;
+    for (qint64 taskId : syncTaskIds) {
+        if (deleteOk) {
+            deleteOk = executeDelete(QStringLiteral("DELETE FROM sync_task WHERE id=?"),
+                                     {taskId});
+        }
+    }
+    const QStringList localTables = {
+        QStringLiteral("local_access_usage"),
+        QStringLiteral("local_floor"),
+        QStringLiteral("local_timing_rule"),
+        QStringLiteral("local_access_rule"),
+        QStringLiteral("local_qr_code"),
+        QStringLiteral("local_ic_card")
+    };
+    for (const QString &table : localTables) {
+        if (deleteOk && tableExists(table)) {
+            deleteOk = executeDelete(
+                        QStringLiteral("DELETE FROM %1 WHERE person_id=?").arg(table),
+                        {personId});
+        }
+    }
+    if (deleteOk && tableExists(QStringLiteral("attendance_daily"))) {
+        deleteOk = executeDelete(
+                    QStringLiteral("DELETE FROM attendance_daily WHERE person_id=? OR person_no=?"),
+                    {personId, personNo});
+    }
+    if (deleteOk && tableExists(QStringLiteral("verify_log"))) {
+        deleteOk = executeDelete(
+                    QStringLiteral("DELETE FROM verify_log WHERE person_id=? OR person_no=?"),
+                    {personId, personNo});
+    }
+    if (deleteOk) {
+        deleteOk = executeDelete(QStringLiteral("DELETE FROM face_feature WHERE person_id=?"),
+                                 {personId});
+    }
+    if (deleteOk) {
+        deleteOk = executeDelete(QStringLiteral("DELETE FROM person WHERE id=?"),
+                                 {personId});
+    }
+    if (!deleteOk || !db_.commit()) {
+        if (deleteOk) lastError_ = "提交彻底删除事务失败：" + db_.lastError().text();
+        db_.rollback();
+        qWarning().noquote() << lastError_;
+        return false;
+    }
+
+    const QString appRoot = QDir::cleanPath(Rk3566Platform::applicationRoot());
+    const QString enrollmentRoot = QDir(appRoot).absoluteFilePath(QStringLiteral("enrollments"));
+    const QString configuredSnapshotRoot = config_.snapshotDir.trimmed().isEmpty()
+            ? QStringLiteral("./data/snapshots") : config_.snapshotDir.trimmed();
+    const QString snapshotRoot = QFileInfo(configuredSnapshotRoot).isAbsolute()
+            ? QDir::cleanPath(configuredSnapshotRoot)
+            : QDir(appRoot).absoluteFilePath(configuredSnapshotRoot);
+    const auto controlledPath = [&appRoot, &enrollmentRoot, &snapshotRoot](const QString &path) {
+        const QString absolute = QFileInfo(path).isAbsolute()
+                ? QDir::cleanPath(path) : QDir(appRoot).absoluteFilePath(path);
+        const auto inside = [&absolute](const QString &root) {
+            const QString cleanRoot = QDir::cleanPath(root);
+            return absolute == cleanRoot
+                    || absolute.startsWith(cleanRoot + QDir::separator());
+        };
+        return (inside(enrollmentRoot) || inside(snapshotRoot)) ? absolute : QString();
+    };
+    for (const QString &storedPath : storedFiles) {
+        const QString path = controlledPath(storedPath);
+        if (path.isEmpty()) {
+            qWarning().noquote() << "跳过不在受控目录内的人员文件：" << storedPath;
+            continue;
+        }
+        const QFileInfo info(path);
+        if ((info.isFile() || info.isSymLink()) && !QFile::remove(path)) {
+            qWarning().noquote() << "人员数据库数据已删除，但文件删除失败：" << path;
+        }
     }
 
     return true;
@@ -2182,6 +2378,7 @@ bool MysqlFaceRepository::ensureSchema()
             "name TEXT NOT NULL,"
             "enabled INTEGER NOT NULL DEFAULT 1,"
             "deleted INTEGER NOT NULL DEFAULT 0,"
+            "person_source TEXT NOT NULL DEFAULT 'manual',"
             "created_at TEXT NOT NULL,"
             "updated_at TEXT NOT NULL)",
 
@@ -2263,6 +2460,7 @@ bool MysqlFaceRepository::ensureSchema()
             "name VARCHAR(128) NOT NULL,"
             "enabled TINYINT NOT NULL DEFAULT 1,"
             "deleted TINYINT NOT NULL DEFAULT 0,"
+            "person_source VARCHAR(16) NOT NULL DEFAULT 'manual',"
             "created_at DATETIME NOT NULL,"
             "updated_at DATETIME NOT NULL)",
 
@@ -2344,6 +2542,11 @@ bool MysqlFaceRepository::ensureSchema()
     if (!ensureColumn("person", "deleted",
                       "ALTER TABLE person ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
                       "ALTER TABLE person ADD COLUMN deleted TINYINT NOT NULL DEFAULT 0")) {
+        return false;
+    }
+    if (!ensureColumn("person", "person_source",
+                      "ALTER TABLE person ADD COLUMN person_source TEXT NOT NULL DEFAULT 'manual'",
+                      "ALTER TABLE person ADD COLUMN person_source VARCHAR(16) NOT NULL DEFAULT 'manual'")) {
         return false;
     }
     if (!ensureColumn("verify_log", "name_snapshot",

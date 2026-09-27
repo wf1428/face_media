@@ -1119,6 +1119,12 @@ void MultimediaDemo::resumePlaybackAfterModuleSwitch()
         return;
     }
 
+    if (m_downloadPauseActive) {
+        m_localPlaybackEnabled = false;
+        LOG_VIDEO("模块切换返回时下载仍在进行，继续保持播放器暂停");
+        return;
+    }
+
     m_localPlaybackEnabled = true;
 
     // LIVE 目标本身是权威状态。即使目标是在页面暂停期间由 MQTT 新下发，
@@ -2290,10 +2296,20 @@ void MultimediaDemo::pauseLocalPlaybackForDownload()
     stopLiveWatchdog();
     isPreloading = false;
 
+    // 多媒体模块已因人脸前台切换而释放播放器时，只记录下载状态。
+    // 下载回调不能把隐藏的 GStreamer 管线重新拉到 PAUSED/PLAYING。
+    if (m_modulePlaybackSuspended) {
+        LOG_VIDEO("下载开始时多媒体模块已暂停，仅记录下载状态");
+        return;
+    }
+
     if (nextVideoPlayer) {
         disconnect(nextVideoPlayer, &GstPlayerWidget::videoFinished,
                    this, &MultimediaDemo::playNextVideo);
-        nextVideoPlayer->stop();
+        // 下载开始发生在 Qt 主线程。这里只暂停预加载管线，避免此时执行
+        // 硬件解码器 NULL 拆管线并与摄像头/人脸推理争用资源；下载结束后
+        // 原有恢复路径仍会统一 stop 并切换到目标视频。
+        nextVideoPlayer->pause();
         nextVideoPlayer->setVideoOutput(nullptr);
         nextVideoPlayer->setPreloadMode(true);
     }
@@ -2342,8 +2358,13 @@ void MultimediaDemo::resumeLocalPlaybackAfterDownload()
     }
 
     m_downloadPauseActive = false;
-    m_localPlaybackEnabled = true;
+    m_localPlaybackEnabled = !m_modulePlaybackSuspended;
     invalidatePendingLocalPlaybackStarts();
+
+    if (m_modulePlaybackSuspended) {
+        LOG_VIDEO("下载结束时多媒体模块仍暂停，等待模块返回后恢复播放");
+        return;
+    }
 
     if (!m_downloadResumeLocalAfterFinish) {
         return;
@@ -2417,13 +2438,18 @@ void MultimediaDemo::onDownloadFinished(const QString& filePath)
 
         const bool wasPaused = m_downloadPauseActive;
         m_downloadPauseActive = false;
-        m_localPlaybackEnabled = true;
+        m_localPlaybackEnabled = !m_modulePlaybackSuspended;
 
         // 下载结束后清空下载态截图缓存
         m_lastSnapshotMs = 0;
         m_lastSnapshotBase64.clear();
 
         invalidatePendingLocalPlaybackStarts();
+
+        if (m_modulePlaybackSuspended) {
+            LOG_VIDEO("下载完成时多媒体模块仍暂停，延后到模块返回后刷新并播放");
+            return;
+        }
 
         if (!wasPaused) {
             playDownloadedVideoNow(absPath);
@@ -7048,6 +7074,10 @@ void MultimediaDemo::switchToRecordedMode()
         return;
     }
 
+    // LIVE 会禁用本地播放；切回 RECORDED 时恢复许可，并保留现有暂停/可见性门控。
+    m_localPlaybackEnabled = m_startupPlaybackReleased &&
+                             !m_modulePlaybackSuspended &&
+                             !m_downloadPauseActive && isVisible();
     stopCurrentLivePlaybackOnly();
     resumeLocalPlaylistFromStart();
 }

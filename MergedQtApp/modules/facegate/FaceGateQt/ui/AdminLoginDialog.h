@@ -22,6 +22,10 @@ class AdminLoginDialog : public QDialog {
     Q_OBJECT
 
 public:
+    enum ResultCode {
+        PasswordAccessRequested = QDialog::Accepted + 1
+    };
+
     /** @brief 按配置创建用户名、密码输入和登录界面。 */
     explicit AdminLoginDialog(const AppConfig &config, QWidget *parent = nullptr);
 
@@ -41,6 +45,9 @@ protected:
 private:
     /** @brief 使用 AppConfig 校验管理员凭据并接受或提示失败。 */
     void verify();
+
+    /** @brief 关闭管理员登录并切换到原有人员密码通行流程。 */
+    void requestPasswordAccess();
 
 private:
     AppConfig config_;                 /**< 管理员用户名和密码散列配置。 */
