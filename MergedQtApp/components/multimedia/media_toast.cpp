@@ -136,12 +136,14 @@ void DownloadProgressToast::showProgress(const QString &titleText, int percent, 
     m_titleLabel->setText(titleText);
     m_detailLabel->setText(detailText);
     const int boundedPercent = qBound(0, percent, 100);
-    m_progressBar->setRange(0, 100);
 
-    // 进度条内部的百分比
-    m_progressBar->setValue(boundedPercent);
+    // 先同步百分比文字，避免进度条立即重绘时显示上一轮数值。
     m_percentLabel->setText(QString::number(boundedPercent) + "%");
+    m_progressBar->setRange(0, 100);
+    m_progressBar->setValue(boundedPercent);
     updatePercentLabelGeometry();
+    // 百分比子控件会触发局部重绘，显式更新整个进度条以同步填充区域。
+    m_progressBar->update();
     show();
     raise();
 }
