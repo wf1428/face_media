@@ -1,0 +1,118 @@
+QDialog#AppMessageDialog {
+    background: transparent;
+    color: #f8fafc;
+    font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+}
+
+QFrame#dialogCard {
+    background: #0f172a;
+    border: 1px solid rgba(148, 163, 184, 0.28);
+    border-radius: 18px;
+}
+
+QLabel#dialogTitle {
+    color: #f8fafc;
+    font-size: 22px;
+    font-weight: 700;
+}
+
+QLabel#dialogMessage {
+    color: #cbd5e1;
+    font-size: 17px;
+}
+
+QLabel#dialogIcon {
+    background: rgba(148, 163, 184, 0.12);
+    border: 1px solid rgba(148, 163, 184, 0.24);
+    border-radius: 14px;
+}
+
+QLabel#dialogIcon[dialogType="success"] {
+    background: rgba(34, 197, 94, 0.14);
+    border-color: rgba(34, 197, 94, 0.34);
+}
+
+QLabel#dialogIcon[dialogType="warning"] {
+    background: rgba(245, 158, 11, 0.15);
+    border-color: rgba(245, 158, 11, 0.36);
+}
+
+QLabel#dialogIcon[dialogType="error"] {
+    background: rgba(244, 63, 94, 0.14);
+    border-color: rgba(244, 63, 94, 0.36);
+}
+
+QLabel#dialogIcon[dialogType="question"] {
+    background: rgba(59, 130, 246, 0.14);
+    border-color: rgba(59, 130, 246, 0.36);
+}
+
+QPushButton#dialogCloseButton {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    padding: 0;
+}
+
+QPushButton#dialogCloseButton:hover,
+QPushButton#dialogCloseButton:pressed {
+    background: rgba(148, 163, 184, 0.12);
+    border-color: rgba(148, 163, 184, 0.20);
+}
+
+QPushButton#dialogPrimaryButton,
+QPushButton#dialogDangerButton,
+QPushButton#dialogCancelButton {
+    min-height: 46px;
+    padding: 0 18px;
+    border-radius: 12px;
+    font-size: 17px;
+    font-weight: 650;
+}
+
+QPushButton#dialogPrimaryButton {
+    color: #031712;
+    background: #5eead4;
+    border: 1px solid rgba(94, 234, 212, 0.82);
+}
+
+QPushButton#dialogPrimaryButton:hover {
+    background: #2dd4bf;
+    border-color: #2dd4bf;
+}
+
+QPushButton#dialogPrimaryButton:pressed {
+    background: #14b8a6;
+    border-color: #14b8a6;
+}
+
+QPushButton#dialogDangerButton {
+    color: #ffffff;
+    background: #ef4444;
+    border: 1px solid #f87171;
+}
+
+QPushButton#dialogDangerButton:hover {
+    background: #dc2626;
+    border-color: #ef4444;
+}
+
+QPushButton#dialogDangerButton:pressed {
+    background: #b91c1c;
+    border-color: #dc2626;
+}
+
+QPushButton#dialogCancelButton {
+    color: #e2e8f0;
+    background: rgba(15, 23, 42, 0.72);
+    border: 1px solid rgba(148, 163, 184, 0.32);
+}
+
+QPushButton#dialogCancelButton:hover {
+    background: rgba(30, 41, 59, 0.92);
+    border-color: rgba(203, 213, 225, 0.42);
+}
+
+QPushButton#dialogCancelButton:pressed {
+    background: rgba(51, 65, 85, 0.92);
+}

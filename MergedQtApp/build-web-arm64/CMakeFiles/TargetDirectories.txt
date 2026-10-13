@@ -1,0 +1,8 @@
+/home/lubancat/face_media/MergedQtApp/build-web-arm64/CMakeFiles/deviceweb_core.dir
+/home/lubancat/face_media/MergedQtApp/build-web-arm64/CMakeFiles/device-webd.dir
+/home/lubancat/face_media/MergedQtApp/build-web-arm64/CMakeFiles/edit_cache.dir
+/home/lubancat/face_media/MergedQtApp/build-web-arm64/CMakeFiles/rebuild_cache.dir
+/home/lubancat/face_media/MergedQtApp/build-web-arm64/CMakeFiles/list_install_components.dir
+/home/lubancat/face_media/MergedQtApp/build-web-arm64/CMakeFiles/install.dir
+/home/lubancat/face_media/MergedQtApp/build-web-arm64/CMakeFiles/install/local.dir
+/home/lubancat/face_media/MergedQtApp/build-web-arm64/CMakeFiles/install/strip.dir

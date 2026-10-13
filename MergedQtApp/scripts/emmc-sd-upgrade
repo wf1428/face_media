@@ -1,0 +1,12 @@
+# 第一次测试保持 0：只检测，不真正写盘
+# 验证日志全部正确以后改成 1
+AUTO_APPLY=1
+
+# 升级完成后自动关机
+AUTO_POWEROFF=1
+
+#升级界面
+UPGRADE_UI=1
+UPGRADE_UI_FONT=auto
+UPGRADE_UI_SUCCESS_HOLD=10
+

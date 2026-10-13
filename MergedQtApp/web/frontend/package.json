@@ -1,0 +1,27 @@
+{
+  "_comment": "@file package.json | @brief 原界面语言或固定依赖清单；不包含控制业务 | @author Du lin | @date 2026-10-09",
+  "name": "yc-linux-qt-web-http",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "设备离线门户（独立 C++ device-webd 托管的静态 H5）",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "pinia": "^2.2.4",
+    "qrcode": "^1.5.4",
+    "vant": "^4.9.4",
+    "vue": "^3.5.12",
+    "vue-i18n": "^9.14.0",
+    "vue-router": "^4.4.5"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.1.4",
+    "sass": "^1.80.3",
+    "vite": "^5.4.9"
+  }
+}

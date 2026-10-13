@@ -339,8 +339,8 @@ require_commands()
 {
     local cmd
     for cmd in \
-        awk blkid blockdev cmp dd e2fsck findmnt flock \
-        lsblk mount mv parted readlink rsync sync systemctl umount; do
+        awk blkid blockdev chmod chown cmp dd e2fsck findmnt flock \
+        lsblk mktemp mount mv parted readlink rsync sync systemctl umount; do
         command -v "$cmd" >/dev/null 2>&1 ||
             die "Required command not found: $cmd"
     done
@@ -478,6 +478,44 @@ rsync_rootfs()
         "$src" "$dst"
 }
 
+# 修复目标 eMMC 的 /etc/fstab 中 /boot 的自动挂载项。
+# rootfs 来自 SD，复制后可能留下 /dev/mmcblk1p2 等 SD 专用项，
+# 或同时存在多条 /boot 项，导致 eMMC 启动后 boot.mount 依赖失败。
+# 动态读取目标 eMMC p2 的 PARTUUID，避免写死 /dev/mmcblk0p2。
+# 注意：/boot 位于独立的 p2，仍通过后续 dd 完整更新；rsync 的排除规则不得移除。
+fix_emmc_boot_fstab()
+{
+    local fstab="$TARGET_MNT/etc/fstab"
+    local tmp partuuid
+
+    [ -f "$fstab" ] || die "目标 eMMC 缺少 /etc/fstab"
+
+    partuuid=$(blkid -s PARTUUID -o value "$EMMC_BOOT" 2>/dev/null) || \
+        die "无法读取目标 eMMC Boot 分区 PARTUUID：$EMMC_BOOT"
+    [ -n "$partuuid" ] || die "目标 eMMC Boot 分区 PARTUUID 为空：$EMMC_BOOT"
+
+    # 在目标 rootfs 的 /etc 内创建临时文件，最后以重命名方式替换。
+    tmp=$(mktemp "$TARGET_MNT/etc/.fstab.XXXXXX") || \
+        die "无法创建 eMMC fstab 临时文件"
+
+    # 保留原有其他挂载项和注释，仅删除所有已有的 /boot 挂载项。
+    # 无论原来使用设备节点、UUID 还是 PARTUUID，都只保留最终新增的一条。
+    awk '
+        /^[[:space:]]*#/ { print; next }
+        $2 == "/boot" { next }
+        { print }
+    ' "$fstab" > "$tmp"
+
+    printf 'PARTUUID=%s  /boot  ext2  defaults  0  2\n' "$partuuid" >> "$tmp"
+
+    # fstab 可能具有定制的属主及权限，替换后应与原文件保持一致。
+    chown --reference="$fstab" "$tmp"
+    chmod --reference="$fstab" "$tmp"
+    mv -f -- "$tmp" "$fstab"
+
+    log "已修复目标 eMMC /boot 自动挂载项：PARTUUID=$partuuid"
+}
+
 # 不执行 rootfs 逐文件 checksum 全量校验：
 # 当前 / 是正在运行的 SD 系统，系统服务可能持续修改其中的文件。
 # 改为依赖 rsync 的退出状态，以及对目标 ext4 和必要系统文件的快速检查。
@@ -599,6 +637,8 @@ flash_rootfs()
     # 当前系统根目录 / 来自 SD 卡的 p3 分区。
     rsync_rootfs / "$TARGET_MNT/"
     ensure_mountpoints "$TARGET_MNT"
+    # 修复同步过来的 SD fstab，保证新 eMMC 系统启动后能自动挂载自身 p2。
+    fix_emmc_boot_fstab
     sync
     umount "$TARGET_MNT"
     log "rootfs synchronization finished; pending final verification"

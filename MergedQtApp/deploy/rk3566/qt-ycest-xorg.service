@@ -1,0 +1,27 @@
+[Unit]
+Description=qt_ycest minimal Xorg kiosk
+After=network.target systemd-user-sessions.service
+Conflicts=display-manager.service
+
+[Service]
+Type=simple
+Environment=QT_YCEST_DISPLAY_MODE=xorg
+Environment=QT_YCEST_XORG_BYPASS_ROOT=0
+Environment=QT_YCEST_SHOW_SYSTEM_CURSOR=0
+Environment=QT_YCEST_APP_ROOT=/opt/qt_ycest/bin
+Environment=QT_YCEST_CONFIG_DIR=/var/lib/qt_ycest
+ExecStart=/opt/qt_ycest/deploy/rk3566/run_qt_ycest.sh
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=10
+SendSIGKILL=no
+StandardInput=tty
+TTYPath=/dev/tty7
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+{
+  "_comment": "Factory PBKDF2-SHA256 credential; no plaintext password. Used only when web_accounts is empty.",
+  "username": "admin",
+  "salt_hex": "cdd95a7874dc7e594fc8db0712c179a8bd29e10ebb0a39c5fa04a84d80723c71",
+  "hash_hex": "991d65c7c0345f46ea2a5224e63b77b8652a71f7b95c70c14114669a042975ee",
+  "iterations": 210000
+}

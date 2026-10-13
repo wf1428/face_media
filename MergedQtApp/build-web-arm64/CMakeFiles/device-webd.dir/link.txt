@@ -1,0 +1,1 @@
+/usr/bin/aarch64-linux-gnu-g++ --sysroot=/opt/sysroot_ubuntu20 -O3 -DNDEBUG "CMakeFiles/device-webd.dir/src/main.cpp.o" -o device-webd  libdeviceweb_core.a /home/lubancat/.local/openssl3-arm64-stage/opt/device-web/openssl3/lib/libssl.a /home/lubancat/.local/openssl3-arm64-stage/opt/device-web/openssl3/lib/libcrypto.a -lpthread -ldl

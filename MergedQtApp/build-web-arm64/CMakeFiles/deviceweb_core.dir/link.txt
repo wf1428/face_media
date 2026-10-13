@@ -1,0 +1,2 @@
+/usr/bin/aarch64-linux-gnu-ar qc libdeviceweb_core.a CMakeFiles/deviceweb_core.dir/src/rpc_client.cpp.o CMakeFiles/deviceweb_core.dir/src/session_store.cpp.o CMakeFiles/deviceweb_core.dir/src/web_server.cpp.o
+/usr/bin/aarch64-linux-gnu-ranlib libdeviceweb_core.a

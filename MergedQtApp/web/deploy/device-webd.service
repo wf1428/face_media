@@ -1,0 +1,35 @@
+# @file device-webd.service
+# @brief 非 Qt HTTP/HTTPS 服务，限制目录访问，不依赖或启动 MQTT。
+# @author Du lin
+# @date 2026-10-09
+[Unit]
+Description=Device local HTTPS file and personnel portal
+After=device-hotspot.service
+Wants=device-hotspot.service
+
+[Service]
+Type=simple
+User=cat
+Group=cat
+ExecStart=/home/cat/web-stage/device-webd /home/cat/web-stage/web.json
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=45
+KillSignal=SIGTERM
+UMask=0027
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/cat/web-stage/imports /mnt/UDISK/res/static/demoResources/images/video
+ReadOnlyPaths=/run/mergedqt /home/cat/web-stage/dist /home/cat/web-stage/web.json /home/cat/web-stage/tls
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LimitNOFILE=128
+# 仅对新 daemon 设置资源上限；Qt 原识别/播放服务不受此值影响。
+MemoryMax=128M
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target

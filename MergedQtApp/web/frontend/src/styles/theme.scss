@@ -1,0 +1,83 @@
+/**
+ * @file theme.scss
+ * @brief 保留参考界面的颜色、字号和间距主题。
+ * @author Du lin
+ * @date 2026-10-09
+ */
+// 米家风格 Design Token + Vant 组件样式覆写（对应设计文档 §11.2）
+
+:root {
+  // 配色
+  --bg: #f6f7f9;
+  --card: #ffffff;
+  --primary: #00b368;
+  --info: #0a84ff;
+  --accent: #ff9500;
+  --danger: #ff3b30;
+  --off: #b8bcc4;
+  --text-1: #1f1f1f;
+  --text-2: #5f646e;
+  --text-3: #8a8f99;
+  --text-4: #c0c4cc;
+
+  // 圆角 / 阴影 / 间距
+  --radius-card: 16px;
+  --radius-panel: 20px;
+  --radius-sm: 12px;
+  --radius-pill: 999px;
+  --shadow-card: 0 2px 8px rgba(0, 0, 0, 0.04);
+  --shadow-popup: 0 12px 32px rgba(0, 0, 0, 0.12);
+  --gap: 12px;
+  --page-pad: 16px;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text-1);
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  min-height: 100vh;
+}
+
+// ---------- Vant 变量覆写（米家化） ----------
+:root {
+  --van-primary-color: var(--primary);
+  --van-success-color: var(--primary);
+  --van-danger-color: var(--danger);
+  --van-warning-color: var(--accent);
+  --van-text-color: var(--text-1);
+  --van-text-color-2: var(--text-2);
+  --van-text-color-3: var(--text-3);
+  --van-border-radius-md: var(--radius-sm);
+  --van-border-radius-lg: var(--radius-card);
+  --van-padding-md: var(--gap);
+}
+
+// 开关：胶囊、放大、开启绿/关闭灰
+.van-switch {
+  transform: scale(1.1);
+}
+.van-switch--on {
+  background: var(--primary);
+}
+
+// 主按钮：大圆角实底
+.van-button--primary {
+  border: none;
+  border-radius: var(--radius-pill);
+}
+
+// 卡片 cell：白底圆角
+.van-cell-group--inset {
+  margin: var(--gap) var(--page-pad);
+  border-radius: var(--radius-card);
+  overflow: hidden;
+  box-shadow: var(--shadow-card);
+}
