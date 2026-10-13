@@ -1,0 +1,19 @@
+将vp0作为hdmi，vp1作为lvds，
+VP0：
+Smart0  → Primary
+Esmart0 → Hardware Cursor
+VP1：
+Smart1  → Primary
+
+Qt 只渲染一份画面到 VP0/Smart0，内核利用 Smart1 的 mirror 特性把同一份 framebuffer 同步到 VP1/LVDS；设置hwcursor=false，Qt 不再把鼠标作为独立 DRM Cursor Plane 提交，而是通过 OpenGL 把光标直接合成进 Smart0 的主 framebuffer。若设置hwcursor=true，会出现另一个屏光标带64*64区域的透明颜色背景。
+
+Smart1 实际跟着 Smart0 的 framebuffer 地址走。
+实际上是上面的这样，但是内核里是将VP0的内容抽出来和VP1来共享，这样就是实际qt输出到LVDS，HDMI共享其framebuffer，
+若还是按照VP1走HDMI，以HDMI的内容给VP0-LVDS共享，这样会导致两边出现位置异常显示的情况，
+因为HDMI输出的画布尺寸与 Qt 页面尺寸不匹配，并且HDMI 插拔会导致 Weston 改变窗口位置和全屏状态。
+
+目前双显：
+
+1、修改kernel/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c文件，打开mirror window同步到VP1显示
+2、修改设备树
+3、修改了main.cpp支持weston输出hdmi为全屏缩放

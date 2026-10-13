@@ -1,0 +1,147 @@
+将vp0作为hdmi，vp1作为lvds，
+VP0：
+Smart0  → Primary
+Esmart0 → Hardware Cursor
+VP1：
+Smart1  → Primary
+
+Qt 只渲染一份画面到 VP0/Smart0，内核利用 Smart1 的 mirror 特性把同一份 framebuffer 同步到 VP1/LVDS；设置hwcursor=false，Qt 不再把鼠标作为独立 DRM Cursor Plane 提交，而是通过 OpenGL 把光标直接合成进 Smart0 的主 framebuffer。若设置hwcursor=true，会出现另一个屏光标带64*64区域的透明颜色背景。
+
+Smart1 实际跟着 Smart0 的 framebuffer 地址走。
+
+目前双显：
+
+修改kernel/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c文件，打开mirror window同步到VP1显示
+1、vop2_crtc_atomic_flush函数
+static void vop2_crtc_atomic_flush(struct drm_crtc *crtc, struct drm_crtc_state *old_cstate)
+{
+        struct rockchip_crtc_state *vcstate = to_rockchip_crtc_state(crtc->state);
+        struct drm_atomic_state *old_state = old_cstate->state;
+        struct vop2_video_port *vp = to_vop2_video_port(crtc);
+        struct drm_plane_state *old_pstate;
+        struct vop2 *vop2 = vp->vop2;
+        struct drm_plane *plane;
+        unsigned long flags;
+        int i, ret;
+
++++
+/*
+         * RK3566 Smart0 -> Smart1 hardware mirror synchronization.
+         *
+         * VP0 / Smart0 : source
+         * VP1 / Smart1 : mirror
+         *
+         * Qt EGLFS only commits VP0. When Smart0 switches framebuffer,
+         * VP1 normally does not receive CFG_DONE, so Smart1 can remain
+         * on the old fbcon frame.
+         */
+        struct drm_crtc *mirror_crtc = NULL;
+        struct drm_plane_state *src_old_pstate = NULL;
+        struct drm_plane_state *src_new_pstate = NULL;
+        bool mirror_sync = false;
+
+        if (soc_is_rk3566() &&
+            vp->id == 0 &&
+            vp->primary_plane_phy_id == ROCKCHIP_VOP2_SMART0 &&
+            crtc->primary) {
+
+                /*
+                 * During atomic_flush(), crtc->primary->state is already
+                 * the new state.
+                 */
+                src_new_pstate = crtc->primary->state;
+
+                /*
+                 * Get the old Smart0 state from this atomic transaction.
+                 */
+                src_old_pstate =
+                        drm_atomic_get_old_plane_state(old_state,
+                                                       crtc->primary);
+
+                /*
+                 * Only synchronize on a real primary framebuffer switch.
+                 *
+                 * This intentionally ignores cursor-only updates on
+                 * Esmart0.
+                 */
+                if (src_new_pstate &&
+                    src_new_pstate->fb &&
+                    (!src_old_pstate ||
+                     src_old_pstate->fb != src_new_pstate->fb)) {
+
+                        /*
+                         * Find the CRTC which owns Smart1.
+                         * With our DTS this should resolve to VP1.
+                         */
+                        mirror_crtc =
+                                vop2_find_crtc_by_plane_mask(
+                                        vop2,
+                                        ROCKCHIP_VOP2_SMART1);
+
+                        if (mirror_crtc &&
+                            mirror_crtc != crtc &&
+                            mirror_crtc->state &&
+                            mirror_crtc->state->active) {
+                                mirror_sync = true;
+                        }
+                }
+        }
++++
+
+        vop2_cfg_update(crtc, old_cstate);
+...
+
+2、spin_unlock_irqrestore(&vop2->irq_lock, flags);上面
+
+
+spin_lock_irqsave(&vop2->irq_lock, flags);
+vop2_wb_commit(crtc);
+vop2_cfg_done(crtc);
+
+/*
+ * RK3566 Smart0 -> Smart1 mirror.
+ *
+ * Smart1 does not have an independent framebuffer address.
+ * When Smart0 gets a new buffer, latch VP1 in the same update
+ * cycle so the mirror window can follow the new Smart0 source.
+ */
+if (mirror_sync) {
+        vop2_cfg_done(mirror_crtc);
+
+        pr_info_ratelimited(
+                "[rk3566-mirror] Smart0 FB %u -> %u, sync VP0 -> VP1\n",
+                src_old_pstate && src_old_pstate->fb ?
+                        src_old_pstate->fb->base.id : 0,
+                src_new_pstate && src_new_pstate->fb ?
+                        src_new_pstate->fb->base.id : 0);
+}
+
+spin_unlock_irqrestore(&vop2->irq_lock, flags);
+
+等等
+
+2、设备树
+
+
+3、加上kms配置文件
+
+cat > /home/cat/face_media/kms_single.json <<'EOF'
+{
+    "device": "/dev/dri/card0",
+    "hwcursor": false,
+    "outputs": [ 
+        {
+            "name": "HDMI1",
+            "mode": "current",
+            "primary": true
+        }
+    ]
+}
+EOF
+
+
+4、环境变量
+强制Qt管理HDMI，即vp0输出
+export QT_QPA_EGLFS_KMS_CONNECTOR_INDEX=0
+	
+export QT_QPA_EGLFS_KMS_CONFIG=/home/cat/face_media/kms_signal.json
