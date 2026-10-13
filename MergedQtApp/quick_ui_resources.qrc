@@ -1,9 +1,0 @@
-<RCC version="1.0">
-    <qresource prefix="/qml">
-        <file alias="QuickSceneHost.qml">shell/qml/QuickSceneHost.qml</file>
-        <file alias="QuickNavigationRail.qml">shell/qml/QuickNavigationRail.qml</file>
-        <file alias="QuickFeaturesPanel.qml">shell/qml/QuickFeaturesPanel.qml</file>
-        <file alias="QuickMainMenu.qml">shell/qml/QuickMainMenu.qml</file>
-        <file alias="QuickPageHeader.qml">shell/qml/QuickPageHeader.qml</file>
-    </qresource>
-</RCC>
