@@ -64,3 +64,7 @@
 /MergedQtApp/**/*.tmp
 /MergedQtApp/**/*.part
 /MergedQtApp/**/*~
+
+# Handwritten dialog headers must be tracked
+!/MergedQtApp/components/dialogs/ui_file_dialog.h
+!/MergedQtApp/components/dialogs/ui_message_box.h
