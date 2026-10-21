@@ -20,6 +20,8 @@
 
 #include "AppConfig.h"
 #include "MainWindow.h"
+#include "UsbPersonExportTarget.h"
+#include "UsbPersonImportSource.h"
 #include "components/input/InputCursorController.h"
 
 namespace {
@@ -77,6 +79,8 @@ int main(int argc, char *argv[])
 
     // 创建 QApplication 后安装输入法焦点过滤器。
     QApplication app(argc, argv);
+    UsbPersonImportSource::clearImportRequestOnStartup();
+    UsbPersonExportTarget::clearExportRequestOnStartup();
     app.setProperty("appStartMsecsSinceEpoch", QDateTime::currentMSecsSinceEpoch());
     VirtualKeyboardFocusFilter keyboardFilter(&app);
     app.installEventFilter(&keyboardFilter);

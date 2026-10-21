@@ -104,6 +104,7 @@ class MultimediaDemo;
 
 class CameraPreviewWidget;
 class VolumePanel;
+class QMovie;
 
 /**
  * @brief 电梯多媒体主页面，协调信号板 UI、本地轮播、直播、音量和 MQTT 状态。
@@ -147,6 +148,11 @@ public:
     /** @return false while password/time-setting UI is handling input. */
     bool allowsPresenceSwitch() const;
 
+    /** @brief 为本地 Web 读取实际播放器和音量状态。 */
+    QJsonObject localWebPlaybackState() const;
+
+    /** @brief 通过既有入口应用本地播放设置，不经过 MQTT handler。 */
+    void applyLocalWebPlayback(const QJsonObject &request);
 
 public slots:
     /** @brief 启动页结束后放行首次媒体播放；重复调用保持幂等。 */
@@ -386,12 +392,14 @@ private:
     DirectionStatus dir_status;
     StateStatus state_status;
     bool RunMode; /**< false 为正常运行，true 为演示运行。 */
-    QTimer *m_elevatorDemoTimer = nullptr; /**< 演示模式下每秒推进一次楼层。 */
+    QTimer *m_elevatorDemoTimer = nullptr; /**< 演示模式下每秒推进楼层和状态标志。 */
     int m_demoFloor = -8;                  /**< 当前演示楼层，范围 -8～32。 */
     DirectionStatus m_demoDirection = UP;  /**< 当前演示运行方向。 */
+    int m_demoModeAscii = 0x31;            /**< 演示状态：满载、超载、消防、检修循环。 */
 
     // UI组件
     QLabel *label_direction;
+    QMovie *m_directionMovie = nullptr; /**< 当前方向 GIF，切换方向或停止时释放。 */
     QLabel *label_ten;
     QLabel *label_one;
     QLabel *label_state;
@@ -404,7 +412,7 @@ private:
     QLabel *label_logo2;
     QLabel *label_logo3;
     QLabel *label_logo4;
-    QWidget *m_moveTextViewport = nullptr; /**< moveTextRect 限定的黑色滚动区域。 */
+    QWidget *m_moveTextViewport = nullptr; /**< moveTextRect 限定的透明滚动区域。 */
     QLabel *m_moveTextLabel = nullptr;     /**< notice.txt 单行滚动文字。 */
     QTimer *m_moveTextTimer = nullptr;     /**< 滚动文字平移动画定时器。 */
     int m_moveTextOffsetX = 0;             /**< 文字当前在区域内的横坐标。 */
@@ -738,6 +746,12 @@ private:
     QPixmap cachedSignalUiPixmap(const QString &imagePath);
     /** @brief 启动时预加载楼层、方向和状态图片，降低串口更新抖动。 */
     void preloadSignalUiPixmaps();
+    /** @brief 优先播放方向 GIF，不可用时回退到原 PNG。 */
+    void showDirectionImage(DirectionStatus direction);
+    /** @brief 停止并解除当前方向动画与标签的关联。 */
+    void clearDirectionMovie();
+    /** @brief 显示方向 PNG；图片不可用时隐藏标签。 */
+    void showDirectionPng(DirectionStatus direction);
 
     /** @brief 按配置区域缩放并显示楼层图片。 */
     void showFloor(const QPixmap &pixmap, QLabel *label, int x, int y, int width, int height);
@@ -755,7 +769,7 @@ private:
     void initializeConfiguration();
     /** @brief 初始化信号板接收缓冲及电梯演示状态。 */
     void simulateBufferData();
-    /** @brief 演示模式下每秒推进楼层，并在端点反向循环。 */
+    /** @brief 演示模式下每秒推进楼层、轮换四种标志，并在楼层端点反向。 */
     void onElevatorDemoTimeout();
     /** @brief 从设备配置文件加载显示、媒体和功能参数。 */
     void readConfigurationFromFile();

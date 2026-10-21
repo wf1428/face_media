@@ -4,6 +4,7 @@
  * @author Du lin
  * @date 2026-10-09
  */
+
 import QRCode from 'qrcode'
 
 /**
@@ -17,6 +18,6 @@ export function generateQrDataUrl(text, options = {}) {
     margin: 2,
     width: 240,
     errorCorrectionLevel: 'M',
-    ...options
+    ...options,
   })
 }

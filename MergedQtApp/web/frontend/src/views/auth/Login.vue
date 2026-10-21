@@ -4,6 +4,7 @@
  @author Du lin
  @date 2026-10-09
 -->
+
 <template>
   <div class="login">
     <div class="lang-entry">
@@ -12,35 +13,69 @@
 
     <div class="brand">
       <div class="brand-name">{{ $t('login.title') }}</div>
-      <div class="brand-sub">{{ deviceName || (deviceId ? $t('login.deviceX', { id: deviceId }) : $t('login.offlineDevice')) }}</div>
+      <div class="brand-sub">
+        {{
+          deviceName ||
+          (deviceId ? $t('login.deviceX', { id: deviceId }) : $t('login.offlineDevice'))
+        }}
+      </div>
     </div>
 
-    <div class="card">
-      <van-cell-group :border="false">
-        <van-field :label="$t('login.deviceId')" :model-value="deviceId || '—'" readonly />
-        <van-field v-if="deviceName" :label="$t('login.deviceName')" :model-value="deviceName" readonly />
-        <van-field v-model="username" label="用户名" placeholder="输入出厂设置的网页用户名" autocomplete="username" clearable />
-        <van-field
-          v-model="password"
-          type="password"
-          :label="$t('login.password')"
-          :placeholder="$t('login.passwordPlaceholder')"
-          clearable
-        />
-      </van-cell-group>
-    </div>
+    <form method="post" :autocomplete="rememberPassword ? 'on' : 'off'" @submit.prevent="onLogin">
+      <div class="card">
+        <van-cell-group :border="false">
+          <van-field :label="$t('login.deviceId')" :model-value="deviceId || '—'" readonly />
+          <van-field
+            v-if="deviceName"
+            :label="$t('login.deviceName')"
+            :model-value="deviceName"
+            readonly
+          />
+          <van-field
+            v-model="username"
+            name="username"
+            label="用户名"
+            placeholder="输入出厂设置的网页用户名"
+            :autocomplete="rememberPassword ? 'username' : 'off'"
+            clearable
+          />
+          <van-field
+            v-model="password"
+            name="password"
+            :type="showPassword ? 'text' : 'password'"
+            :autocomplete="rememberPassword ? 'current-password' : 'off'"
+            :label="$t('login.password')"
+            :placeholder="$t('login.passwordPlaceholder')"
+            clearable
+          >
+            <template #right-icon>
+              <button
+                type="button"
+                class="password-toggle"
+                :aria-label="showPassword ? t('login.hidePassword') : t('login.showPassword')"
+                :aria-pressed="showPassword"
+                @click="showPassword = !showPassword"
+              >
+                <van-icon :name="showPassword ? 'closed-eye' : 'eye-o'" />
+              </button>
+            </template>
+          </van-field>
+        </van-cell-group>
+      </div>
 
-    <van-button
-      class="submit"
-      type="primary"
-      block
-      round
-      :loading="loading"
-      @click="onLogin"
-    >
-      {{ $t('login.enter') }}
-    </van-button>
-
+      <div class="remember">
+        <van-checkbox
+          v-model="rememberPassword"
+          :aria-label="t('login.rememberPassword')"
+          @update:model-value="setRememberPassword"
+        >
+          {{ t('login.rememberPassword') }}
+        </van-checkbox>
+      </div>
+      <van-button class="submit" native-type="submit" type="primary" block round :loading="loading">
+        {{ $t('login.enter') }}
+      </van-button>
+    </form>
   </div>
 </template>
 
@@ -52,6 +87,12 @@ import { showToast } from 'vant'
 import { api } from '../../api'
 import { useAppStore } from '../../store'
 import LangSwitch from '../../components/LangSwitch.vue'
+import {
+  remembersPassword,
+  setRememberPassword,
+  recalledPassword,
+  saveBrowserPassword,
+} from '../../utils/loginCredentials'
 
 const router = useRouter()
 const store = useAppStore()
@@ -62,6 +103,24 @@ const deviceName = ref('')
 const password = ref('')
 const username = ref('')
 const loading = ref(false)
+const showPassword = ref(false)
+const rememberPassword = ref(remembersPassword())
+
+// 与设备信息读取并行；异步返回时不覆盖用户已经输入的内容。
+onMounted(() => {
+  recalledPassword().then((credential) => {
+    if (
+      credential &&
+      rememberPassword.value &&
+      !loading.value &&
+      !username.value &&
+      !password.value
+    ) {
+      username.value = credential.id
+      password.value = credential.password
+    }
+  })
+})
 
 onMounted(async () => {
   try {
@@ -74,16 +133,22 @@ onMounted(async () => {
   }
 })
 
+/** @brief 提交账号密码并在登录成功后进入设备页面。 */
 async function onLogin() {
+  if (loading.value) return
   if (!password.value) {
     showToast(t('login.enterPassword'))
     return
   }
   loading.value = true
   try {
-    const info = await api.verifyPassword({ username: username.value.trim(), password: password.value })
+    const info = await api.verifyPassword({
+      username: username.value.trim(),
+      password: password.value,
+    })
     store.setSession(info)
-    password.value = ''
+    setRememberPassword(rememberPassword.value)
+    if (rememberPassword.value) saveBrowserPassword(username.value.trim(), password.value)
     showToast({ type: 'success', message: t('login.loginSuccess') })
     router.replace('/home/preview')
   } catch (e) {
@@ -128,6 +193,16 @@ async function onLogin() {
 }
 .submit {
   margin-top: 24px;
+}
+.remember {
+  margin: 18px 4px 0;
+}
+.password-toggle {
+  padding: 0 4px;
+  border: 0;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 20px;
 }
 .mock-tip {
   margin-top: 20px;

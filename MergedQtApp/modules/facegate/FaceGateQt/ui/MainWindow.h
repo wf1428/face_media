@@ -201,7 +201,7 @@ private:
     void handlePeopleImport(const QString &requestToken);
 
     /** @brief 将网络、本地或全部人员以固定XLSX格式导出到U盘。 */
-    void handlePeopleExport(const QString &personnelScope);
+    void handlePeopleExport(const QString &personnelScope, const QString &requestToken);
 
     /** @brief 投递 SQLite 备份维护任务。 */
     void handleMaintenanceBackup();

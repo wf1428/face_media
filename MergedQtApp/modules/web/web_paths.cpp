@@ -1,9 +1,10 @@
 /**
  * @file web_paths.cpp
- * @brief Web 受控路径与文件校验实现，平台挂载检查仅在 Linux 生效。
+ * @brief Web 受控路径、媒体目录可用性和文件校验实现。
  * @author Du lin
  * @date 2026-10-09
  */
+
 #include "web_paths.h"
 #include "common/sql/web/web_sql.h"
 #include <QDir>
@@ -17,94 +18,160 @@
 #include <unistd.h>
 #endif
 
-QString WebPaths::filename(const QString &name) {
-    if (name.isEmpty() || name.size() > 180 || name.startsWith('.') || name != name.trimmed() || name.contains('/') || name.contains('\\') || name.contains(':'))
-        throw WebError(400,QStringLiteral("文件名无效，不能包含目录"));
-    for (QChar c : name) if (c.unicode() < 32 || c.unicode() == 127) throw WebError(400,QStringLiteral("文件名含控制字符"));
+/** @brief 校验上传文件名并阻止路径穿越。 */
+QString WebPaths::filename(const QString &name)
+{
+    if (name.isEmpty() || name.size() > 180 || name.startsWith('.') || name != name.trimmed() ||
+        name.contains('/') || name.contains('\\') || name.contains(':'))
+        throw WebError(400, QStringLiteral("文件名无效，不能包含目录"));
+    for (QChar c : name)
+        if (c.unicode() < 32 || c.unicode() == 127)
+            throw WebError(400, QStringLiteral("文件名含控制字符"));
     return name;
 }
-bool WebPaths::accepts(const QString &kind, const QString &name) {
+
+/** @brief 核对上传类别与允许的文件扩展名。 */
+bool WebPaths::accepts(const QString &kind, const QString &name)
+{
     const QString suffix = QFileInfo(name).suffix().toLower();
-    if (kind == "video") return QStringList({"mp4","avi","mov","mkv","m4v","ts","webm"}).contains(suffix);
-    if (kind == "person_excel") return suffix == "xls" || suffix == "xlsx";
-    if (kind == "person_face") return QStringList({"jpg","jpeg","png","bmp"}).contains(suffix);
+    if (kind == "video")
+        return QStringList({"mp4", "avi", "mov", "mkv", "m4v", "ts", "webm"}).contains(suffix);
+    if (kind == "person_excel")
+        return suffix == "xls" || suffix == "xlsx";
+    if (kind == "person_face")
+        return QStringList({"jpg", "jpeg", "png", "bmp"}).contains(suffix);
+    if (kind == "resource_package")
+        return QStringList({"zip", "tar", "gz", "tgz", "rar"}).contains(suffix);
     return false;
 }
-void WebPaths::inside(const QString &path, const QString &root, bool mustExist) {
+
+/** @brief 验证目标路径位于受控根目录内。 */
+void WebPaths::inside(const QString &path, const QString &root, bool mustExist)
+{
     const QFileInfo rootInfo(root), file(path);
     const QString canonicalRoot = rootInfo.canonicalFilePath();
     const QString absolute = QDir::cleanPath(file.absoluteFilePath());
     const QString absoluteRoot = QDir::cleanPath(rootInfo.absoluteFilePath());
-    if (canonicalRoot.isEmpty() || rootInfo.isSymLink() || canonicalRoot != absoluteRoot || !absolute.startsWith(absoluteRoot + '/'))
-        throw WebError(400,QStringLiteral("文件路径越过受控目录"));
+    if (canonicalRoot.isEmpty() || rootInfo.isSymLink() || canonicalRoot != absoluteRoot ||
+        !absolute.startsWith(absoluteRoot + '/'))
+        throw WebError(400, QStringLiteral("文件路径越过受控目录"));
     const QString parent = QFileInfo(file.absolutePath()).canonicalFilePath();
-    if (file.isSymLink() || (mustExist && !file.isFile()) || (parent != canonicalRoot && !parent.startsWith(canonicalRoot + '/')))
-        throw WebError(400,QStringLiteral("文件目录不可用或存在符号链接"));
-    if (file.exists() && !file.canonicalFilePath().startsWith(canonicalRoot + '/')) throw WebError(400,QStringLiteral("文件路径无效"));
+    if (file.isSymLink() || (mustExist && !file.isFile()) ||
+        (parent != canonicalRoot && !parent.startsWith(canonicalRoot + '/')))
+        throw WebError(400, QStringLiteral("文件目录不可用或存在符号链接"));
+    if (file.exists() && !file.canonicalFilePath().startsWith(canonicalRoot + '/'))
+        throw WebError(400, QStringLiteral("文件路径无效"));
 }
-void WebPaths::mounted(const QString &root, const QString &mountRoot) {
+
+/** @brief 确认媒体目录可读写；允许直接使用 eMMC 上的普通目录。 */
+void WebPaths::mounted(const QString &root, const QString &mountRoot)
+{
+    // 保留旧参数以兼容已有部署配置，不再要求独立挂载点。
+    Q_UNUSED(mountRoot);
+    const QFileInfo directory(root);
+    if (!directory.isDir())
+        throw WebError(503, QStringLiteral("视频目录不存在或不是目录"));
+    if (directory.isSymLink() ||
+        directory.canonicalFilePath() != QDir::cleanPath(directory.absoluteFilePath()))
+        throw WebError(503, QStringLiteral("视频目录路径无效或存在符号链接"));
+
     QStorageInfo storage(root);
     storage.refresh();
-    if (!QFileInfo(root).isDir() || !storage.isValid() || !storage.isReady() || storage.isReadOnly())
-        throw WebError(503,QStringLiteral("视频存储未就绪"));
-#ifdef Q_OS_LINUX
-    if (QDir::cleanPath(storage.rootPath()) != QDir::cleanPath(mountRoot))
-        throw WebError(503,QStringLiteral("视频存储未挂载，已阻止写入系统分区"));
-#else
-    Q_UNUSED(mountRoot);
-#endif
+    if (!storage.isValid() || !storage.isReady())
+        throw WebError(503, QStringLiteral("视频存储未就绪"));
+    if (storage.isReadOnly())
+        throw WebError(503, QStringLiteral("视频所在文件系统为只读"));
+    if (!directory.isReadable() || !directory.isWritable())
+        throw WebError(503, QStringLiteral("视频目录没有读写权限"));
 }
-void WebPaths::uploadDirectory(const QString &path) {
+
+/** @brief 创建受控上传目录并校验其文件类型。 */
+void WebPaths::uploadDirectory(const QString &path)
+{
     const QFileInfo directory(path);
-    if (!directory.isDir() || directory.isSymLink()) throw WebError(503,QStringLiteral("上传缓存目录不可用"));
+    if (!directory.isDir() || directory.isSymLink())
+        throw WebError(503, QStringLiteral("上传缓存目录不可用"));
 #ifdef Q_OS_UNIX
     // Qt 可由现有 root 服务启动，daemon 使用 cat；新缓存目录需让继承的共享组写入。
-    const auto permissions=QFile::ReadOwner|QFile::WriteOwner|QFile::ExeOwner|QFile::ReadGroup|QFile::WriteGroup|QFile::ExeGroup;
-    if (!QFile::setPermissions(path,permissions)) throw WebError(503,QStringLiteral("上传缓存目录共享权限设置失败"));
+    const auto permissions = QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner |
+                             QFile::ReadGroup | QFile::WriteGroup | QFile::ExeGroup;
+    if (!QFile::setPermissions(path, permissions))
+        throw WebError(503, QStringLiteral("上传缓存目录共享权限设置失败"));
 #endif
 }
-void WebPaths::sync(const QString &path, bool directory) {
+
+/** @brief 同步文件或目录以保证提交后的持久性。 */
+void WebPaths::sync(const QString &path, bool directory)
+{
 #ifdef Q_OS_UNIX
-    const int fd = ::open(QFile::encodeName(path).constData(), O_RDONLY | O_NOFOLLOW | (directory ? O_DIRECTORY : 0));
-    if (fd < 0) throw WebError(503,QStringLiteral("无法打开文件进行同步"));
+    const int fd = ::open(QFile::encodeName(path).constData(),
+                          O_RDONLY | O_NOFOLLOW | (directory ? O_DIRECTORY : 0));
+    if (fd < 0)
+        throw WebError(503, QStringLiteral("无法打开文件进行同步"));
     const bool ok = ::fsync(fd) == 0;
     ::close(fd);
-    if (!ok) throw WebError(503,QStringLiteral("文件同步失败"));
+    if (!ok)
+        throw WebError(503, QStringLiteral("文件同步失败"));
 #else
-    Q_UNUSED(path); Q_UNUSED(directory);
+    Q_UNUSED(path);
+    Q_UNUSED(directory);
 #endif
 }
-qint64 WebPaths::usage(const QString &root) {
+
+/** @brief 统计受控目录当前占用的文件字节数。 */
+qint64 WebPaths::usage(const QString &root)
+{
     qint64 bytes = 0;
-    QDirIterator files(root,QDir::Files | QDir::NoSymLinks | QDir::Hidden,QDirIterator::Subdirectories);
-    while (files.hasNext()) { files.next(); bytes += files.fileInfo().size(); }
+    QDirIterator files(root,
+                       QDir::Files | QDir::NoSymLinks | QDir::Hidden,
+                       QDirIterator::Subdirectories);
+    while (files.hasNext()) {
+        files.next();
+        bytes += files.fileInfo().size();
+    }
     return bytes;
 }
-void WebPaths::validateExcel(const QString &path) {
+
+/** @brief 校验 Excel 文件结构并沿用原导入格式要求。 */
+void WebPaths::validateExcel(const QString &path)
+{
     QFile file(path);
-    if (!file.open(QIODevice::ReadOnly) || file.size() > 20LL*1024*1024) throw WebError(400,QStringLiteral("Excel 无效或超过 20 MiB"));
+    if (!file.open(QIODevice::ReadOnly) || file.size() > 20LL * 1024 * 1024)
+        throw WebError(400, QStringLiteral("Excel 无效或超过 20 MiB"));
     const QByteArray data = file.readAll();
-    if (path.endsWith(".xls",Qt::CaseInsensitive)) {
-        if (!data.startsWith(QByteArray::fromHex("d0cf11e0a1b11ae1"))) throw WebError(400,QStringLiteral("不是有效 XLS 文件"));
+    if (path.endsWith(".xls", Qt::CaseInsensitive)) {
+        if (!data.startsWith(QByteArray::fromHex("d0cf11e0a1b11ae1")))
+            throw WebError(400, QStringLiteral("不是有效 XLS 文件"));
         return;
     }
+
     // 预检所有中央目录项，限制旧解析器按声明大小分配内存的预算。
     const int end = data.lastIndexOf(QByteArray::fromHex("504b0506"));
-    if (end < 0 || end + 22 > data.size()) throw WebError(400,QStringLiteral("XLSX ZIP 目录无效"));
-    const auto u16 = [&data](int i) { return qFromLittleEndian<quint16>(reinterpret_cast<const uchar *>(data.constData()+i)); };
-    const auto u32 = [&data](int i) { return qFromLittleEndian<quint32>(reinterpret_cast<const uchar *>(data.constData()+i)); };
-    const int count = u16(end+10);
-    quint64 offset = u32(end+16), budget = 0;
-    if (count == 0 || count > 2048) throw WebError(400,QStringLiteral("XLSX 目录项过多或为空"));
-    for (int i=0; i<count; ++i) {
-        if (offset+46 > quint64(data.size()) || u32(int(offset)) != 0x02014b50) throw WebError(400,QStringLiteral("XLSX 目录损坏"));
+    if (end < 0 || end + 22 > data.size())
+        throw WebError(400, QStringLiteral("XLSX ZIP 目录无效"));
+    const auto u16 = [&data](int i) {
+        return qFromLittleEndian<quint16>(reinterpret_cast<const uchar *>(data.constData() + i));
+    };
+    const auto u32 = [&data](int i) {
+        return qFromLittleEndian<quint32>(reinterpret_cast<const uchar *>(data.constData() + i));
+    };
+    const int count = u16(end + 10);
+    quint64 offset = u32(end + 16), budget = 0;
+    if (count == 0 || count > 2048)
+        throw WebError(400, QStringLiteral("XLSX 目录项过多或为空"));
+    for (int i = 0; i < count; ++i) {
+        if (offset + 46 > quint64(data.size()) || u32(int(offset)) != 0x02014b50)
+            throw WebError(400, QStringLiteral("XLSX 目录损坏"));
         const int at = int(offset);
-        const quint32 expanded = u32(at+24), compressed = u32(at+20), local = u32(at+42);
+        const quint32 expanded = u32(at + 24), compressed = u32(at + 20), local = u32(at + 42);
         budget += expanded;
-        if (expanded > 8*1024*1024 || budget > 32*1024*1024 || compressed > quint32(data.size()) || quint64(local)+30 > quint64(data.size()) || u32(int(local)) != 0x04034b50 || (u16(at+8)&1))
-            throw WebError(400,QStringLiteral("XLSX 解压预算超限或文件加密"));
-        const quint64 payload = quint64(local)+30+u16(int(local)+26)+u16(int(local)+28);
-        if (payload+compressed > quint64(data.size())) throw WebError(400,QStringLiteral("XLSX 内容越界"));
-        offset += 46+u16(at+28)+u16(at+30)+u16(at+32);
+        if (expanded > 8 * 1024 * 1024 || budget > 32 * 1024 * 1024 ||
+            compressed > quint32(data.size()) || quint64(local) + 30 > quint64(data.size()) ||
+            u32(int(local)) != 0x04034b50 || (u16(at + 8) & 1))
+            throw WebError(400, QStringLiteral("XLSX 解压预算超限或文件加密"));
+        const quint64 payload = quint64(local) + 30 + u16(int(local) + 26) + u16(int(local) + 28);
+        if (payload + compressed > quint64(data.size()))
+            throw WebError(400, QStringLiteral("XLSX 内容越界"));
+        offset += 46 + u16(at + 28) + u16(at + 30) + u16(at + 32);
     }
 }

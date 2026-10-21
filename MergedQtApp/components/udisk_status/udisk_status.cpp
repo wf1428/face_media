@@ -15,6 +15,7 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QEvent>
 
 static const char* kStatusPath = "/tmp/udisk_status.json";
 
@@ -23,6 +24,7 @@ UdiskStatusOverlay::UdiskStatusOverlay(QWidget *hostWindow, QObject *parent)
     : QObject(parent), m_host(hostWindow)
 {
     initUi();
+    if (m_host) m_host->installEventFilter(this);
     //layoutUi();
     setVisible(false); // ✅ 默认不显示（符合“平时不显示”）
 }
@@ -121,7 +123,7 @@ void UdiskStatusOverlay::layoutUi()
 void UdiskStatusOverlay::pollOnce()
 {
     // 其他消息保护
-    if (QDateTime::currentMSecsSinceEpoch() < m_manualMessageUntilMs) {
+    if (m_resourceActive || QDateTime::currentMSecsSinceEpoch() < m_manualMessageUntilMs) {
         return;
     }
 
@@ -421,4 +423,35 @@ void UdiskStatusOverlay::showMessage(const QString &text, int durationMs)
             setVisible(false);
         });
     }
+}
+
+/** @brief 资源任务使用现有标签、进度条和样式，不触发 udiskStateChanged。 */
+void UdiskStatusOverlay::showResourceProgress(const QString &token, const QString &message,
+                                             int percent, bool finished)
+{
+    if (token.isEmpty() || !m_overlay || !m_label || !m_progress) return;
+    if (finished && !m_resourceToken.isEmpty() && token != m_resourceToken) return;
+    m_resourceToken = token;
+    m_resourceActive = true;
+    const int hideToken = ++m_hideToken;
+    layoutUi();
+    m_label->setText(message);
+    m_progress->setVisible(true);
+    m_progress->setValue(qBound(0, percent, 100));
+    setVisible(true);
+    if (finished) {
+        QTimer::singleShot(percent == 100 ? 3000 : 8000, this, [this, token, hideToken]() {
+            if (hideToken != m_hideToken || token != m_resourceToken) return;
+            m_resourceActive = false;
+            m_resourceToken.clear();
+            setVisible(false);
+        });
+    }
+}
+
+/** @brief 两种进度来源共用原控件布局，窗口切换或调整尺寸时不遮挡内容。 */
+bool UdiskStatusOverlay::eventFilter(QObject *watched, QEvent *event)
+{
+    if (watched == m_host && event->type() == QEvent::Resize) layoutUi();
+    return QObject::eventFilter(watched, event);
 }

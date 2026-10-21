@@ -48,7 +48,7 @@
     "deviceX": "设备 {id}",
     "offlineDevice": "离线设备",
     "deviceId": "设备号",
-    "deviceName": "设备名",
+    "deviceName": "WiFi SSID",
     "password": "密码",
     "passwordPlaceholder": "请输入设备密码",
     "enter": "进入",
@@ -56,17 +56,21 @@
     "enterPassword": "请输入密码",
     "loginSuccess": "登录成功",
     "loginFailed": "登录失败",
-    "pwdWrong": "密码错误"
+    "pwdWrong": "密码错误",
+    "rememberPassword": "记住密码",
+    "showPassword": "显示密码",
+    "hidePassword": "隐藏密码"
   },
   "tab": {
-    "preview": "设备预览",
+    "preview": "多媒体",
     "person": "人员",
     "elevator": "电梯",
     "air": "空调",
-    "video": "视频"
+    "video": "视频",
+    "device": "设置"
   },
   "preview": {
-    "title": "设备预览",
+    "title": "多媒体",
     "wifiHotspot": "WIFI 热点",
     "overview": "设备概览",
     "personCount": "人员注册",
@@ -79,17 +83,17 @@
     "screenshotFailed": "截图失败"
   },
   "settings": {
-    "title": "设备设置",
+    "title": "设置",
     "deviceInfo": "设备信息",
     "deviceId": "设备号",
-    "deviceName": "设备名称",
+    "deviceName": "WiFi SSID",
     "deviceNamePlaceholder": "请输入设备名称",
     "wifi": "WIFI 热点",
-    "wifiTip": "手机连接该热点后，在浏览器输入设备 IP 访问本页面",
+    "wifiTip": "设备名与热点名称一致；可修改名称和密码，密码留空则保持原密码。",
     "hotspotName": "热点名称",
     "hotspotNamePlaceholder": "请输入热点名称",
     "hotspotPassword": "热点密码",
-    "hotspotPasswordPlaceholder": "请输入热点密码",
+    "hotspotPasswordPlaceholder": "留空保持原密码",
     "loginPassword": "登录密码",
     "loginPasswordTip": "修改后下次进入操作台需使用新密码",
     "oldPassword": "原密码",
@@ -98,21 +102,35 @@
     "newPasswordPlaceholder": "至少 4 位",
     "confirmPassword": "确认密码",
     "confirmPasswordPlaceholder": "再次输入新密码",
-    "pkgImport": "配置包导入（ycest）",
-    "pkgTip": "上传文件名含 ycest 的压缩包，由设备解压处理，用于配置设备与 UI 界面",
+    "pkgImport": "资源包导入（Ycest）",
     "selectPkg": "选择配置压缩包",
-    "pkgHint": "文件名需包含 ycest（如 ycest.zip）",
+    "pkgHint": "支持 ZIP、TAR、TAR.GZ、TGZ、RAR，最大 512 MiB；根目录为 Ycest",
     "saveSettings": "保存设置",
     "readFailed": "读取设备设置失败",
     "enterDeviceName": "请输入设备名称",
     "enterOldPassword": "请输入原密码",
     "enterNewPassword": "请输入新密码",
     "passwordMismatch": "两次新密码不一致",
-    "ycestRequired": "文件名需包含 ycest",
+    "ycestRequired": "文件名需包含 Ycest",
     "selectPkgFirst": "请先选择配置压缩包",
     "oldPasswordWrong": "原密码错误",
     "newPasswordTooShort": "新密码至少 4 位",
-    "pkgNameYcest": "配置包文件名必须包含 ycest"
+    "pkgNameYcest": "配置包文件名必须包含 Ycest",
+    "wifiRestartWarning": "保存后热点将重新激活，手机会断开连接。请使用新热点名称和密码重新连接。",
+    "wifiSavedReconnect": "热点设置已保存，热点将在 3 秒后重新激活，手机会断开连接。请使用「{ssid}」和新密码（如已修改）重新连接。",
+    "wifiInvalid": "SSID 需为 1–32 字节，首尾不能有空白，不能包含控制字符。",
+    "hotspotPasswordHint": "新密码为 8–63 位英文、数字或符号，或 64 位十六进制密钥；不显示原密码。",
+    "hotspotPasswordInvalid": "热点密码需为 8–63 位英文、数字或符号，或 64 位十六进制密钥",
+    "pkgInvalid": "请选择不超过 512 MiB 的 ZIP/TAR/TAR.GZ/TGZ/RAR 资源包",
+    "pkgUploading": "正在上传资源包",
+    "pkgApplying": "正在校验、解压并更新资源，请稍候",
+    "pkgDone": "更新完成！",
+    "pkgQuery": "查询更新结果",
+    "pkgCancel": "取消未完成任务",
+    "pkgIncomplete": "资源包尚未上传完成，请取消后重新选择文件",
+    "pkgRestarting": "设备即将重启，请稍候",
+    "pkgRestartFailed": "资源已更新，但设备未刷新，请检查设备服务。",
+    "pkgConfirm": "点击确认后，设备即将更新"
   },
   "air": {
     "title": "空调控制",
@@ -191,7 +209,8 @@
     "floorPlaceholder": "如 3,5,7",
     "confirmOpen": "确认（默认开放）",
     "scheduleSummary": "{action} {time} {weeks} 楼层[{floors}]",
-    "setFailed": "设置失败"
+    "setFailed": "设置失败",
+    "floorSelectionHint": "选中圆点表示开放，未选中表示限行"
   },
   "person": {
     "title": "人员列表",
@@ -273,7 +292,11 @@
     "deletePersonWarn": "确认删除「{name}」？此操作不可恢复。",
     "selectWeekday": "请选择星期",
     "enterName": "请输入姓名",
-    "notFound": "人员不存在"
+    "notFound": "人员不存在",
+    "closeCreate": "关闭新建账户",
+    "viewNfcImage": "查看 NFC 读卡二维码",
+    "nfcImage": "NFC 读卡二维码",
+    "saveNfcImage": "保存到本地"
   },
   "video": {
     "title": "视频管理",
@@ -300,5 +323,27 @@
     "selectVideoFirst": "请先选择视频文件",
     "uploadSuccess": "视频上传完成并已保存",
     "deleteVideo": "删除视频"
+  },
+  "network": {
+    "title": "IP设置",
+    "tip": "这里设置有线网口的 IPv4 地址，WiFi 热点地址保持不变。",
+    "iface": "网卡",
+    "mode": "获取方式",
+    "dhcp": "动态 DHCP",
+    "static": "静态 IP",
+    "ip": "IP地址",
+    "netmask": "子网掩码",
+    "gateway": "默认网关",
+    "dns": "DNS",
+    "dnsHint": "多个 DNS 用空格分隔",
+    "dhcpHint": "DHCP 自动分配地址；下方显示配置文件中最近保存的网络参数。",
+    "staticHint": "填写静态 IP 和子网掩码；网关与 DNS 可选。",
+    "apply": "应用 IP 设置",
+    "applying": "正在应用网络设置，请稍候…",
+    "saved": "网络设置已应用并保存",
+    "waiting": "DHCP 已启动并保存配置，正在等待分配地址，请稍后刷新。",
+    "invalid": "请检查 IPv4 地址、连续子网掩码、网关和 DNS 的格式",
+    "readFailed": "读取网络配置失败",
+    "saveFailed": "网络配置应用失败"
   }
 }

@@ -19,6 +19,7 @@
 #include "PersonExportWorker.h"
 #include "PersonImportWorker.h"
 #include "UsbPersonImportSource.h"
+#include "UsbPersonExportTarget.h"
 #include "SnapshotService.h"
 #include "SharedVirtualKeyboard.h"
 #include "common/face_image_sync_bridge.h"
@@ -2222,14 +2223,17 @@ void FaceGateMainWindow::handlePeopleImport(const QString &requestToken)
 }
 
 /** @brief 在后台读取选定人员范围，生成固定XLSX并写入U盘 Ycest/person。 */
-void FaceGateMainWindow::handlePeopleExport(const QString &personnelScope)
+void FaceGateMainWindow::handlePeopleExport(const QString &personnelScope,
+                                          const QString &requestToken)
 {
     if (personImportThread_ && personImportThread_->isRunning()) {
+        UsbPersonExportTarget::endExportRequest(requestToken);
         AppMessageDialog::information(this, QStringLiteral("导出人员"),
                                       QStringLiteral("人员表正在导入，请等待导入结束"));
         return;
     }
     if (personExportThread_ && personExportThread_->isRunning()) {
+        UsbPersonExportTarget::endExportRequest(requestToken);
         AppMessageDialog::information(this, QStringLiteral("导出人员"),
                                       QStringLiteral("人员表正在导出，请勿重复操作"));
         return;
@@ -2255,7 +2259,7 @@ void FaceGateMainWindow::handlePeopleExport(const QString &personnelScope)
     }
 
     personExportThread_ = new QThread(this);
-    personExportWorker_ = new PersonExportWorker(kind);
+    personExportWorker_ = new PersonExportWorker(kind, requestToken);
     PersonExportWorker *worker = personExportWorker_;
     QThread *thread = personExportThread_;
     worker->moveToThread(thread);

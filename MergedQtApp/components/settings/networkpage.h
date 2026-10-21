@@ -17,6 +17,10 @@
 #include <QMouseEvent>
 #include <QLineEdit>
 #include <QTimer>
+#include <QJsonObject>
+#include <atomic>
+#include <functional>
+#include <memory>
 #include "platform/rk3566_platform.h"
 
 /** Qt Designer 生成的页面类型。 */
@@ -25,6 +29,8 @@ class NetworkPage;
 }
 
 class QLineEdit;
+class QThread;
+struct NetworkRuntimeState;
 
 /** DHCP 自动恢复节流，避免短周期状态同步反复重启客户端。 */
 static const qint64 kDhcpAutoRetryIntervalMs = 15000; /**< DHCP 自动恢复最小间隔，单位 ms。 */
@@ -53,11 +59,18 @@ public:
     /** @brief 更新功能开关并决定网络功能是否可用。 */
     void setFeatureSettings(const FeatureSettings &settings);
 
+    /** @brief Web 显式配置有线网络，复用本页工作线程，不弹出设备端对话框。 */
+    void applyWebNetworkConfig(const QString &token, const QJsonObject &config);
+
 signals:
     /** @brief 用户取消网络设置并请求返回。 */
     void cancelRequested();
     /** @brief 网络配置已成功应用。 */
     void networkAppliedSuccessfully();
+
+    /** @brief 返回 Web 网络设置的真实应用和配置保存结果。 */
+    void webNetworkFinished(const QString &token, const QJsonObject &result,
+                            int code, const QString &message);
 
 private slots:
     /** @brief DHCP/静态模式切换时更新输入框状态。 */
@@ -88,7 +101,7 @@ private:
     /** @brief 执行 DHCP 或静态网络命令，并按需显示结果。 */
     bool applyNetworkConfig(bool showMessage);
 
-    /** @return 任一在线功能开关要求网络时返回 true。 */
+    /** @return 在线功能或显式 Web 网络配置要求联网时返回 true。 */
     bool isNetworkFeatureEnabled() const;
 
     /** @brief 清除配置文件中的静态 IP 字段。 */
@@ -99,6 +112,14 @@ private:
 
     /** @brief 按重试节流请求 DHCP 续租或强制重启客户端。 */
     void requestAutoDhcpRenew(const QString &reason, bool forceRestart = false);
+    /** @brief 串行执行后台网络任务，仅在主线程回传仍有效的结果。 */
+    void runNetworkTask(std::function<void()> work, std::function<void()> completed);
+    /** @brief 后台读取系统网络参数，再回显到当前页面。 */
+    void refreshUiFromSystem(const QString &iface, std::function<void()> completed = {});
+    /** @brief 使用后台采集结果执行原 DHCP 状态同步和重试判断。 */
+    void applyDhcpRuntimeState(const QString &iface, const NetworkRuntimeState &state);
+    /** @brief 后台执行启动/手动申请 DHCP 的命令及原有地址等待。 */
+    void applyDhcpNetworkConfig(const QString &iface, bool showMessage);
 
 private:
     Ui::NetworkPage *ui; /**< Qt Designer 页面对象。 */
@@ -110,6 +131,15 @@ private:
     FeatureSettings featureSettings_;
 
     QTimer* dhcpSyncTimer_ = nullptr;
+    QThread *networkThread_ = nullptr;
+    QObject *networkWorker_ = nullptr;
+    bool networkTaskPending_ = false;
+    bool networkRefreshPending_ = false;
+    bool webNetworkEnabled_ = false; /**< 显式 Web 设置允许联网，不改变 MQTT 功能开关。 */
+    QString webNetworkToken_; /**< 正在本页共享网络线程执行的 Web 操作。 */
+    std::function<void()> deferredNetworkAction_;
+    std::shared_ptr<std::atomic<quint64>> networkGeneration_ =
+            std::make_shared<std::atomic<quint64>>(0); /**< 模式/配置变化使旧任务失效。 */
 
     QString lastIp_;
     QString lastMask_;

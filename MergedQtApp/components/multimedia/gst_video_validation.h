@@ -4,22 +4,19 @@
  * @author Du lin
  * @date 2026-10-09
  */
+
 #ifndef GST_VIDEO_VALIDATION_H
 #define GST_VIDEO_VALIDATION_H
 
 #include <QString>
 
 /** @brief 区分文件无效与板端 GStreamer 组件缺失，供上传接口映射状态码。 */
-enum class GstVideoValidationStatus {
-    Valid,
-    Invalid,
-    Unavailable
-};
+enum class GstVideoValidationStatus { Valid, Invalid, Unavailable };
 
 /** @brief 本地视频内容检查结果；不修改原播放器的任何状态。 */
 struct GstVideoValidationResult {
     GstVideoValidationStatus status; /**< 内容有效、无效或检测环境不可用。 */
-    QString message; /**< 可直接展示给上传用户的简短原因。 */
+    QString message;                 /**< 可直接展示给上传用户的简短原因。 */
 };
 
 /**

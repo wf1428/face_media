@@ -17,6 +17,7 @@ class QWidget;
 class QLabel;
 class QProgressBar;
 class QTimer;
+class QEvent;
 
 /** @brief 轮询 U 盘状态 JSON 并在宿主底部显示状态/进度的覆盖层。 */
 class UdiskStatusOverlay : public QObject
@@ -40,6 +41,13 @@ public:
 
     /** @brief 临时显示媒体业务消息，并在 durationMs 后恢复自动状态。 */
     void showMessage(const QString &text, int durationMs);
+
+    /** @brief Web 资源更新直接复用同一覆盖层，不读写或发送 U 盘状态。 */
+    void showResourceProgress(const QString &token, const QString &message, int percent, bool finished);
+
+protected:
+    /** @brief 宿主尺寸变化时保持进度条贴底布局。 */
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
 signals:
     /** @brief U 盘状态或进度变化时通知外部。 */
@@ -76,6 +84,8 @@ private:
     int m_lastProgress = -1;
 
     qint64 m_manualMessageUntilMs = 0;
+    bool m_resourceActive = false; /**< 当前外部资源任务保护，防止状态轮询覆盖进度。 */
+    QString m_resourceToken;
 
 public slots:
     /** @brief 宿主尺寸变化后重新执行贴底布局。 */

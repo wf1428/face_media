@@ -19,6 +19,7 @@
 #include <QPalette>
 #include <QTimer>
 #include <QImageReader>
+#include <QMovie>
 #include <QPainter>
 #include <QPainterPath>
 #include <QSettings>
@@ -2583,6 +2584,8 @@ void MultimediaDemo::applyVideoQualitySettings()
 /** @brief 停止播放器和工作线程后释放页面资源。 */
 MultimediaDemo::~MultimediaDemo()
 {
+    clearDirectionMovie();
+
     if (m_snapshotThread) {
         m_snapshotThread->quit();
         m_snapshotThread->wait();
@@ -3627,7 +3630,7 @@ void MultimediaDemo::initializeConfiguration()
     // 动态新增控件也容易遗漏。
 }
 
-/** @brief 创建黑色裁剪区域，并只读取 U 盘静态目录中的 notice.txt。 */
+/** @brief 创建透明裁剪区域，并只读取 U 盘静态目录中的 notice.txt。 */
 void MultimediaDemo::initializeMovingText()
 {
     if (!MoveTextDisplay_en) {
@@ -3645,7 +3648,7 @@ void MultimediaDemo::initializeMovingText()
                                     MoveTextDisplay_x_Size, MoveTextDisplay_y_Size);
     m_moveTextViewport->setAttribute(Qt::WA_TransparentForMouseEvents, true);
     m_moveTextViewport->setStyleSheet(
-                QStringLiteral("#moveTextViewport{background:#000000;}"));
+                QStringLiteral("#moveTextViewport{background:transparent;}"));
 
     m_moveTextLabel = new QLabel(m_moveTextViewport);
     m_moveTextLabel->setTextFormat(Qt::PlainText);
@@ -3746,7 +3749,7 @@ void MultimediaDemo::initializeTimers()
         connect(m_elevatorDemoTimer, &QTimer::timeout,
                 this, &MultimediaDemo::onElevatorDemoTimeout);
         m_elevatorDemoTimer->start();
-        LOG_INIT("电梯运行演示定时器已启动，楼层范围 -8～32，间隔: 1000ms");
+        LOG_INIT("电梯运行演示定时器已启动，楼层范围 -8～32，满载/超载/消防/检修循环，间隔: 1000ms");
     }
 
 #ifndef FACEGATE_LEGACY_PAGE_MODE
@@ -3818,11 +3821,12 @@ void MultimediaDemo::simulateBufferData()
     m_signalBoardFrameReceived = false;
     m_demoFloor = -8;
     m_demoDirection = UP;
+    m_demoModeAscii = 0x31;
 
     LOG_BUFFER("数据缓冲区初始化完成，所有值设置为0");
 }
 
-/** @brief 在 -8～32 层之间往返运行，并同步刷新上下方向箭头。 */
+/** @brief 在 -8～32 层之间往返运行，同步刷新箭头并轮换四种状态标志。 */
 void MultimediaDemo::onElevatorDemoTimeout()
 {
     if (!RunMode) {
@@ -3847,6 +3851,8 @@ void MultimediaDemo::onElevatorDemoTimeout()
         }
     }
 
+    // 与楼层共用 1 秒节拍：满载 -> 超载 -> 消防 -> 检修 -> 满载。
+    m_demoModeAscii = m_demoModeAscii >= 0x34 ? 0x31 : m_demoModeAscii + 1;
     onTimeout();
 }
 
@@ -3866,7 +3872,7 @@ void MultimediaDemo::onTimeout()
     const int displayDirectionAscii = RunMode
             ? (m_demoDirection == UP ? 0x31 : 0x33)
             : my_buf[1];
-    const int displayModeAscii = RunMode ? 0 : my_buf[2];
+    const int displayModeAscii = RunMode ? m_demoModeAscii : my_buf[2];
     const int demoFloorMagnitude = qAbs(m_demoFloor);
     const int displayFloorTen = RunMode ? demoFloorMagnitude / 10 : my_buf[3];
     const int displayFloorOne = RunMode ? demoFloorMagnitude % 10 : my_buf[4];
@@ -3887,34 +3893,21 @@ void MultimediaDemo::onTimeout()
 
         if (targetDirection != dir_status) {
             dir_status = targetDirection;
+            showDirectionImage(targetDirection);
 
             if (targetDirection == UP || targetDirection == DN) {
-                const QString imagePath = targetDirection == UP
-                        ? QStringLiteral(":/static/demoResources/images/tl/up.png")
-                        : QStringLiteral(":/static/demoResources/images/tl/down.png");
-                const QPixmap pixmap = cachedSignalUiPixmap(imagePath);
-
-                if (!pixmap.isNull()) {
-                    label_direction->setPixmap(pixmap);
-                    label_direction->show();
-                    label_direction->raise();
-                    if (targetDirection == UP) {
-                        LOG_SYSTEM("方向状态: 向上");
-                    } else {
-                        LOG_SYSTEM("方向状态: 向下");
-                    }
+                if (targetDirection == UP) {
+                    LOG_SYSTEM("方向状态: 向上");
                 } else {
-                    label_direction->hide();
-                    LOG_SYSTEM("方向图片加载失败，方向标签已隐藏: " << imagePath);
+                    LOG_SYSTEM("方向状态: 向下");
                 }
             } else {
-                label_direction->hide();
                 LOG_SYSTEM("方向状态: 停止");
             }
         }
-    } else if (label_direction->isVisible()) {
+    } else if (dir_status != LE || m_directionMovie || !label_direction->isHidden()) {
         dir_status = LE;
-        label_direction->hide();
+        showDirectionImage(LE);
     }
 
     // 2) 楼层显示：生成稳定键值，只在楼层内容变化时重绘。
@@ -4798,6 +4791,100 @@ QPixmap MultimediaDemo::cachedSignalUiPixmap(const QString &imagePath)
     return pixmap;
 }
 
+/** @brief 停止动画并清除标签，延迟释放以兼容动画信号回调。 */
+void MultimediaDemo::clearDirectionMovie()
+{
+    if (!m_directionMovie) {
+        return;
+    }
+    QMovie *movie = m_directionMovie;
+    m_directionMovie = nullptr;
+    disconnect(movie, nullptr, this, nullptr);
+    movie->stop();
+    label_direction->clear();
+    movie->deleteLater();
+}
+
+/** @brief 保留原有外部 PNG 优先、内置 PNG 兜底的静态显示。 */
+void MultimediaDemo::showDirectionPng(DirectionStatus direction)
+{
+    const QString path = direction == UP
+            ? QStringLiteral(":/static/demoResources/images/tl/up.png")
+            : QStringLiteral(":/static/demoResources/images/tl/down.png");
+    const QPixmap pixmap = cachedSignalUiPixmap(path);
+    if (pixmap.isNull()) {
+        label_direction->hide();
+        LOG_SYSTEM("方向图片加载失败，方向标签已隐藏: " << path);
+        return;
+    }
+    label_direction->setPixmap(pixmap);
+    label_direction->show();
+    label_direction->raise();
+}
+
+/** @brief GIF 优先于 PNG，同格式仍优先使用外部资源。 */
+void MultimediaDemo::showDirectionImage(DirectionStatus direction)
+{
+    clearDirectionMovie();
+    if (direction != UP && direction != DN) {
+        label_direction->hide();
+        return;
+    }
+
+    const QString relativePath = direction == UP
+            ? QStringLiteral("demoResources/images/tl/up.gif")
+            : QStringLiteral("demoResources/images/tl/down.gif");
+    const QStringList candidates = {
+        QDir(extRoot).filePath(relativePath),
+        QDir(qrcRoot).filePath(relativePath)
+    };
+    for (const QString &path : candidates) {
+        const QFileInfo info(path);
+        if (!info.exists() || !info.isFile() || !info.isReadable()) {
+            continue;
+        }
+        // 先解码首帧，避免损坏 GIF 或设备缺少解码器时覆盖可用 PNG。
+        // 使用独立读取器验证，避免预先推进 QMovie 而跳过动画首帧。
+        QImageReader reader(path, QByteArrayLiteral("gif"));
+        if (reader.read().isNull()) {
+            LOG_DEBUG("方向 GIF 不可用，尝试回退: " << path
+                      << reader.errorString());
+            continue;
+        }
+
+        auto *movie = new QMovie(path, QByteArrayLiteral("gif"), this);
+        movie->setScaledSize(label_direction->size());
+        m_directionMovie = movie;
+        label_direction->setMovie(movie);
+        // 即使素材只设置了有限次循环，也持续播放到方向变化。
+        connect(movie, &QMovie::finished, this, [this, movie]() {
+            if (m_directionMovie == movie) {
+                movie->start();
+                movie->setPaused(!isVisible());
+            }
+        }, Qt::QueuedConnection);
+        // 排队处理，避免在 QMovie 解码调用栈中清理正在使用的动画。
+        connect(movie, &QMovie::error, this,
+                [this, movie, direction](QImageReader::ImageReaderError) {
+            QTimer::singleShot(0, this, [this, movie, direction]() {
+                if (m_directionMovie != movie) {
+                    return;
+                }
+                LOG_DEBUG("方向 GIF 播放失败，回退 PNG: " << movie->fileName()
+                          << movie->lastErrorString());
+                clearDirectionMovie();
+                showDirectionPng(direction);
+            });
+        });
+        movie->start();
+        movie->setPaused(!isVisible());
+        label_direction->show();
+        label_direction->raise();
+        return;
+    }
+    showDirectionPng(direction);
+}
+
 /** @brief 启动时预加载楼层、方向和状态图片，降低串口更新抖动。 */
 void MultimediaDemo::preloadSignalUiPixmaps()
 {
@@ -5024,6 +5111,9 @@ void MultimediaDemo::playNextPicture()
 void MultimediaDemo::showEvent(QShowEvent *e)
 {
     QWidget::showEvent(e);
+    if (m_directionMovie) {
+        m_directionMovie->setPaused(false);
+    }
 
     if (!m_initialCursorStateApplied) {
         // 系统首次进入多媒体页时直接隐藏光标；不启动八秒定时器，只有实际
@@ -5053,6 +5143,9 @@ void MultimediaDemo::showEvent(QShowEvent *e)
 /** @brief 页面隐藏时暂停不应在后台运行的交互状态。 */
 void MultimediaDemo::hideEvent(QHideEvent *e)
 {
+    if (m_directionMovie) {
+        m_directionMovie->setPaused(true);
+    }
     cancelAdminLongPress();
     m_localPlaybackEnabled = false;
     stopEmptyVideoListWatch();
@@ -7174,6 +7267,76 @@ void MultimediaDemo::stopAllPlayback()
     LOG_VIDEO("当前直播和本地播放均已停止");
 }
 
+/** @brief 从实际播放器采集本地 Web 状态。 */
+QJsonObject MultimediaDemo::localWebPlaybackState() const
+{
+    const bool active = mediaPlayer && mediaPlayer->hasActiveMedia();
+    const bool image = m_currentVideoRectIsImage && !m_currentVideoRectMediaPath.isEmpty();
+    const QString type =
+        m_isLiveMode
+            ? "LIVE"
+            : (active || image ||
+                       (m_modulePlaybackSuspended && !m_currentVideoRectMediaPath.isEmpty())
+                   ? "RECORDED"
+                   : "NONE");
+    const QString file =
+        type == "RECORDED" ? QFileInfo(m_currentVideoRectMediaPath).fileName() : QString();
+    const QString state = type == "NONE"                            ? "STOPPED"
+                          : m_downloadPauseActive                   ? "DOWNLOAD_PAUSED"
+                          : m_modulePlaybackSuspended               ? "SUSPENDED"
+                          : mediaPlayer && mediaPlayer->isPlaying() ? "PLAYING"
+                          : image                                   ? "PLAYING"
+                          : active                                  ? "PREPARING"
+                                                                    : "STOPPED";
+    return {{"videoType", type},
+            {"videoPath", file},
+            {"videoUrl", type == "LIVE" ? m_desiredLiveUrl : QString()},
+            {"name", type == "LIVE" ? m_desiredLiveUrl : file},
+            {"videoVolume",
+             m_ampCtrl ? QJsonValue(m_ampCtrl->currentVolume()) : QJsonValue(QJsonValue::Null)},
+            {"playbackState", state},
+            {"deviceLog", state},
+            {"desiredVideoType", m_liveDesired ? "LIVE" : type},
+            {"canStartLocalPlayback", m_startupPlaybackReleased && !m_modulePlaybackSuspended &&
+                                      !m_downloadPauseActive && isVisible()}};
+}
+
+/** @brief 通过既有播放器入口执行本地 Web 设置，不经过 MQTT 消息处理。 */
+void MultimediaDemo::applyLocalWebPlayback(const QJsonObject &request)
+{
+    if (request.contains("videoVolume")) {
+        const int volume = qBound(0, request.value("videoVolume").toInt(), 100);
+        if (m_ampCtrl)
+            m_ampCtrl->setVolume(volume);
+        if (m_volPanel)
+            m_volPanel->setCurrentVolume(volume);
+        emit currentPlayVolumeChanged(volume);
+    }
+    const QString type = request.value("videoType").toString();
+    if (type == "NONE")
+        stopAllPlayback();
+    else if (type == "RECORDED") {
+        switchToRecordedMode();
+        const auto file = request.value("videoPath").toString();
+        if (!file.isEmpty()) {
+            // 模式切换可能排队从首项开播；指定上传文件时取消旧启动回调，
+            // 再沿用 FTP 完成入口停止旧主/预加载管线并播放新文件。
+            invalidatePendingLocalPlaybackStarts();
+            playDownloadedVideoNow(QDir(Rk3566Platform::videoDir()).filePath(file));
+        }
+    } else if (type == "LIVE") {
+        const QString url = request.value("videoUrl").toString();
+        const QString lower = url.toLower();
+        const QString kind = lower.startsWith("rtsp:")  ? "rtsp"
+                             : lower.startsWith("rtmp") ? "rtmp"
+                             : lower.startsWith("srt:") ? "srt"
+                             : lower.startsWith("udp:") ? "udp"
+                             : lower.contains(".m3u8")  ? "hls"
+                                                        : "http-ts";
+        setStreamUrl(url, kind);
+        probeLiveStream(url);
+    }
+}
 
 /** @brief 应用 MQTT 下发音量并回报执行结果。 */
 void MultimediaDemo::onMqttVolumeChanged(int volume)

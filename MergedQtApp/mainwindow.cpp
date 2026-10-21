@@ -14,6 +14,7 @@
 #include <QFileInfo>
 #include "components/dialogs/ui_message_box.h"
 #include "platform/rk3566_platform.h"
+#include "modules/web/web_local_runtime.h"
 #include "shell/QuickUiRuntime.h"
 #include "components/quick/QuickMainMenuWidget.h"
 
@@ -154,6 +155,22 @@ MainWindow::MainWindow(QWidget *parent)
 
     // 密码正确后返回菜单
     auto *cast = qobject_cast<MultimediaDemo*>(app3Page);
+    // Web 只绑定实际播放器的读取、控制和截图源，不改动原消息连接。
+    if (cast && qgetenv("MERGEDQT_WEB_ENABLE") == "1") {
+        auto *local = WebLocalRuntime::instance();
+        local->bindMedia(
+            cast,
+            [cast]() {
+                return cast->localWebPlaybackState();
+            },
+            [cast](const QJsonObject &args) {
+                cast->applyLocalWebPlayback(args);
+            });
+        connect(cast,
+                &MultimediaDemo::currentPlayImageChanged,
+                local,
+                &WebLocalRuntime::encodedImage);
+    }
     if (cast) {
         connect(cast, &MultimediaDemo::backToMenuRequested, this, [=]() {
             stack->setCurrentWidget(menuPage);

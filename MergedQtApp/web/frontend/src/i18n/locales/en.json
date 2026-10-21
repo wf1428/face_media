@@ -48,7 +48,7 @@
     "deviceX": "Device {id}",
     "offlineDevice": "Offline device",
     "deviceId": "Device ID",
-    "deviceName": "Device name",
+    "deviceName": "WiFi SSID",
     "password": "Password",
     "passwordPlaceholder": "Enter device password",
     "enter": "Enter",
@@ -56,17 +56,21 @@
     "enterPassword": "Please enter the password",
     "loginSuccess": "Signed in",
     "loginFailed": "Sign-in failed",
-    "pwdWrong": "Incorrect password"
+    "pwdWrong": "Incorrect password",
+    "rememberPassword": "Remember password",
+    "showPassword": "Show password",
+    "hidePassword": "Hide password"
   },
   "tab": {
-    "preview": "Device",
+    "preview": "Multimedia",
     "person": "People",
     "elevator": "Elevator",
     "air": "Air Con",
-    "video": "Video"
+    "video": "Video",
+    "device": "Settings"
   },
   "preview": {
-    "title": "Device preview",
+    "title": "Multimedia",
     "wifiHotspot": "Wi-Fi hotspot",
     "overview": "Device overview",
     "personCount": "Registered people",
@@ -79,17 +83,17 @@
     "screenshotFailed": "Screenshot failed"
   },
   "settings": {
-    "title": "Device settings",
+    "title": "Settings",
     "deviceInfo": "Device info",
     "deviceId": "Device ID",
-    "deviceName": "Device name",
+    "deviceName": "WiFi SSID",
     "deviceNamePlaceholder": "Enter device name",
     "wifi": "Wi-Fi hotspot",
-    "wifiTip": "After connecting your phone to this hotspot, open the device IP in a browser to access this page",
+    "wifiTip": "Device name follows the hotspot name. Edit its name or password; leave the password blank to keep it.",
     "hotspotName": "Hotspot name",
     "hotspotNamePlaceholder": "Enter hotspot name",
     "hotspotPassword": "Hotspot password",
-    "hotspotPasswordPlaceholder": "Enter hotspot password",
+    "hotspotPasswordPlaceholder": "Leave blank to keep current password",
     "loginPassword": "Login password",
     "loginPasswordTip": "After changing, use the new password the next time you open the console",
     "oldPassword": "Current password",
@@ -98,21 +102,35 @@
     "newPasswordPlaceholder": "At least 4 characters",
     "confirmPassword": "Confirm password",
     "confirmPasswordPlaceholder": "Re-enter new password",
-    "pkgImport": "Config package import (ycest)",
-    "pkgTip": "Upload an archive whose filename contains ycest; the device extracts it to configure the device and UI",
+    "pkgImport": "Ycest resource package",
     "selectPkg": "Select config archive",
-    "pkgHint": "Filename must contain ycest (e.g. ycest.zip)",
+    "pkgHint": "ZIP, TAR, TAR.GZ, TGZ or RAR; up to 512 MiB; root folder: Ycest",
     "saveSettings": "Save settings",
     "readFailed": "Failed to read device settings",
     "enterDeviceName": "Please enter the device name",
     "enterOldPassword": "Please enter the current password",
     "enterNewPassword": "Please enter the new password",
     "passwordMismatch": "The two new passwords do not match",
-    "ycestRequired": "Filename must contain ycest",
+    "ycestRequired": "Filename must contain Ycest",
     "selectPkgFirst": "Please select a config archive first",
     "oldPasswordWrong": "Incorrect current password",
     "newPasswordTooShort": "New password must be at least 4 characters",
-    "pkgNameYcest": "The config package filename must contain ycest"
+    "pkgNameYcest": "The config package filename must contain Ycest",
+    "wifiRestartWarning": "Saving reactivates the hotspot and disconnects this phone. Reconnect with the new hotspot name and password.",
+    "wifiSavedReconnect": "Settings saved. The hotspot reactivates in 3 seconds and disconnects this phone. Reconnect to “{ssid}” with the new password if changed.",
+    "wifiInvalid": "SSID must be 1–32 bytes, with no leading/trailing whitespace or control characters.",
+    "hotspotPasswordHint": "Use 8–63 ASCII characters or a 64-digit hexadecimal key. The current password is not displayed.",
+    "hotspotPasswordInvalid": "Use 8–63 ASCII characters or a 64-digit hexadecimal key",
+    "pkgInvalid": "Select a ZIP/TAR/TAR.GZ/TGZ/RAR package up to 512 MiB",
+    "pkgUploading": "Uploading resource package",
+    "pkgApplying": "Validating, extracting and replacing resources",
+    "pkgDone": "Update complete!",
+    "pkgQuery": "Check update result",
+    "pkgCancel": "Cancel unfinished task",
+    "pkgIncomplete": "Upload incomplete. Cancel and select the file again.",
+    "pkgRestarting": "The device will restart shortly. Please wait.",
+    "pkgRestartFailed": "Resources updated, but the device display has not refreshed. Check device services.",
+    "pkgConfirm": "After confirming, the device will begin updating."
   },
   "air": {
     "title": "Air conditioning",
@@ -191,7 +209,8 @@
     "floorPlaceholder": "e.g. 3,5,7",
     "confirmOpen": "OK (open by default)",
     "scheduleSummary": "{action} {time} {weeks} Floors[{floors}]",
-    "setFailed": "Failed to apply settings"
+    "setFailed": "Failed to apply settings",
+    "floorSelectionHint": "Selected: open; unselected: restricted"
   },
   "person": {
     "title": "People",
@@ -273,7 +292,11 @@
     "deletePersonWarn": "Delete \"{name}\"? This cannot be undone.",
     "selectWeekday": "Please select weekdays",
     "enterName": "Please enter a name",
-    "notFound": "Person not found"
+    "notFound": "Person not found",
+    "closeCreate": "Close new account",
+    "viewNfcImage": "View NFC reader code",
+    "nfcImage": "NFC reader code",
+    "saveNfcImage": "Save image"
   },
   "video": {
     "title": "Video management",
@@ -300,5 +323,27 @@
     "selectVideoFirst": "Please select a video file first",
     "uploadSuccess": "Video uploaded and saved",
     "deleteVideo": "Delete video"
+  },
+  "network": {
+    "title": "IP settings",
+    "tip": "Configure the wired IPv4 address. The WiFi hotspot address stays unchanged.",
+    "iface": "Interface",
+    "mode": "Address mode",
+    "dhcp": "Automatic DHCP",
+    "static": "Static IP",
+    "ip": "IP address",
+    "netmask": "Subnet mask",
+    "gateway": "Gateway",
+    "dns": "DNS",
+    "dnsHint": "Separate DNS servers with spaces",
+    "dhcpHint": "DHCP assigns an address automatically. Fields show the last values saved on the device.",
+    "staticHint": "Enter a static IP and subnet mask. Gateway and DNS are optional.",
+    "apply": "Apply IP settings",
+    "applying": "Applying network settings…",
+    "saved": "Network settings applied and saved",
+    "waiting": "DHCP started and settings saved. Waiting for an address; refresh shortly.",
+    "invalid": "Check the IPv4 address, contiguous subnet mask, gateway and DNS",
+    "readFailed": "Unable to read network settings",
+    "saveFailed": "Unable to apply network settings"
   }
 }

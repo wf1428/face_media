@@ -1,13 +1,13 @@
 <!--
  @file DevicePreview.vue
- @brief 设备基础标识展示；实时预览、截图和轮询未接入。
+ @brief 设备基础标识展示；本机实时预览、截图与概览。
  @author Du lin
  @date 2026-10-09
 -->
+
 <template>
   <div class="page">
     <div class="header">
-      <div class="title">{{ $t('preview.title') }}</div>
       <div class="actions">
         <LangSwitch :size="20" />
         <div class="chips">
@@ -16,13 +16,14 @@
             :key="s"
             class="chip"
             :class="{ active: s === interval }"
-            aria-disabled="true"
+            @click="changeInterval(s)"
           >
             {{ s }}s
           </span>
         </div>
-        <van-button size="small" round type="primary" disabled>{{ $t('common.refresh') }}</van-button>
-        <van-icon name="setting-o" class="settings" @click="goSettings" />
+        <van-button size="small" round type="primary" :loading="refreshing" @click="refresh">{{
+          $t('common.refresh')
+        }}</van-button>
       </div>
     </div>
 
@@ -40,7 +41,6 @@
       </div>
     </div>
 
-    <UnsupportedPanel>
     <div class="overview-card">
       <div class="ov-head">
         <span class="ov-title">{{ $t('preview.overview') }}</span>
@@ -67,7 +67,10 @@
       <div class="ov-storage">
         <div class="ov-storage-head">
           <span class="ov-label">{{ $t('preview.storage') }}</span>
-          <span class="ov-storage-text">{{ overview.storage?.used ?? '--' }} / {{ overview.storage?.total ?? '--' }} GB</span>
+          <span class="ov-storage-text"
+            >{{ storageNumber(overview.storage?.used) }} /
+            {{ storageNumber(overview.storage?.total) }} GiB</span
+          >
         </div>
         <van-progress
           :percentage="overview.storage?.usedPercent ?? 0"
@@ -83,28 +86,32 @@
       <img v-if="image" :src="image" class="screen" :alt="$t('preview.screenAlt')" />
       <van-empty v-else :description="$t('preview.noScreenshot')" />
     </div>
-  </UnsupportedPanel>
   </div>
 </template>
 
 <script setup>
 import { ref, onMounted, onBeforeUnmount } from 'vue'
-import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { showToast } from 'vant'
 import { api } from '../../api'
 import { PREVIEW_INTERVALS } from '../../config'
 import LangSwitch from '../../components/LangSwitch.vue'
 
-const router = useRouter()
 const { t } = useI18n()
 const image = ref('')
-const interval = ref(10)
+const interval = ref(5)
 const overview = ref({})
 const devInfo = ref({})
 let timer = null
+let stopped = false
+const refreshing = ref(false)
 
-/** 加载设备信息（设备名称/设备号/WIFI 热点） */
+/** @brief 容量只保留两位小数，缺失或非有限值继续显示未知。 */
+function storageNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(2) : '--'
+}
+
+/** @brief 加载设备信息（设备名称/设备号/WIFI 热点） */
 async function loadDeviceInfo() {
   try {
     devInfo.value = await api.getDeviceInfo()
@@ -113,26 +120,55 @@ async function loadDeviceInfo() {
   }
 }
 
-/** 加载设备概览（IP/人员/人脸/IC/二维码/存储） */
-async function loadOverview() { /* 原控件保留，本版本不执行该业务。 */ }
-
-/** 立即刷新一次截图 */
-async function refresh() { /* 原控件保留，本版本不执行该业务。 */ }
-
-/** 切换轮询间隔 */
-function changeInterval(s) { /* 原控件保留，本版本不执行该业务。 */ }
-
-function goSettings() {
-  router.push('/device/settings')
+/** @brief 加载设备概览（IP/人员/人脸/IC/二维码/存储） */
+async function loadOverview() {
+  try {
+    const data = await api.deviceOverview()
+    if (!stopped) overview.value = data
+  } catch (error) {
+    if (!stopped) showToast(error.message)
+  }
 }
 
-function restart() { /* 原控件保留，本版本不执行该业务。 */ }
+/** @brief 立即刷新一次截图 */
+async function refresh() {
+  if (stopped || refreshing.value) return
+  refreshing.value = true
+  try {
+    const result = await api.screenshot()
+    if (!stopped) image.value = result.base64Image || ''
+  } catch (error) {
+    if (!stopped) showToast(error.message || t('preview.screenshotFailed'))
+  } finally {
+    refreshing.value = false
+  }
+}
 
-onMounted(loadDeviceInfo)
+/** @brief 切换轮询间隔 */
+function changeInterval(s) {
+  interval.value = s
+  restart()
+}
 
+/** @brief 按所选间隔刷新概览与当前界面截图。 */
+function restart() {
+  if (timer) clearInterval(timer)
+  timer = window.setInterval(() => {
+    refresh()
+    loadOverview()
+  }, interval.value * 1000)
+}
 
-
-import UnsupportedPanel from '../../components/UnsupportedPanel.vue'
+onMounted(() => {
+  loadDeviceInfo()
+  loadOverview()
+  refresh()
+  restart()
+})
+onBeforeUnmount(() => {
+  stopped = true
+  if (timer) clearInterval(timer)
+})
 </script>
 
 <style scoped>
@@ -142,12 +178,8 @@ import UnsupportedPanel from '../../components/UnsupportedPanel.vue'
 .header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   margin-bottom: var(--gap);
-}
-.title {
-  font-size: 20px;
-  font-weight: 600;
 }
 .actions {
   display: flex;
@@ -168,10 +200,6 @@ import UnsupportedPanel from '../../components/UnsupportedPanel.vue'
 .chip.active {
   color: #fff;
   background: var(--primary);
-}
-.settings {
-  font-size: 22px;
-  color: var(--text-2);
 }
 .info-card {
   background: linear-gradient(135deg, #00b368, #00c76e);

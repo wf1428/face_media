@@ -1,9 +1,10 @@
 /**
  * @file index.js
- * @brief 沿用原界面路由、语言或展示配置，真实业务限于 V1 接口。
+ * @brief 注册设备管理页面路由，并通过现有会话入口恢复登录状态。
  * @author Du lin
  * @date 2026-10-09
  */
+
 import { createRouter, createWebHashHistory } from 'vue-router'
 import { useAppStore } from '../store'
 
@@ -12,64 +13,92 @@ const routes = [
   {
     path: '/login',
     name: 'Login',
-    component: () => import('../views/auth/Login.vue')
+
+    /** @brief 按需加载该路由对应的页面组件。 */
+    component: () => import('../views/auth/Login.vue'),
   },
   {
     path: '/home',
+
+    /** @brief 按需加载该路由对应的页面组件。 */
     component: () => import('../views/Layout.vue'),
     redirect: '/home/preview',
     children: [
       {
+        path: 'network',
+        name: 'IPSettings',
+        /** @brief 从设置菜单进入有线 IPv4 配置页面。 */
+        component: () => import('../views/device/IPSettings.vue'),
+      },
+      {
+        path: 'device',
+        name: 'DeviceSettings',
+
+        /** @brief 按路由按需加载设备设置页面组件。 */
+        component: () => import('../views/device/DeviceSettings.vue'),
+      },
+      {
         path: 'preview',
         name: 'DevicePreview',
-        component: () => import('../views/device/DevicePreview.vue')
+
+        /** @brief 按需加载该路由对应的页面组件。 */
+        component: () => import('../views/device/DevicePreview.vue'),
       },
       {
         path: 'person',
         name: 'PersonList',
-        component: () => import('../views/person/PersonList.vue')
+
+        /** @brief 按需加载该路由对应的页面组件。 */
+        component: () => import('../views/person/PersonList.vue'),
       },
       {
         path: 'elevator',
         name: 'ElevatorControl',
-        component: () => import('../views/elevator/ElevatorControl.vue')
+
+        /** @brief 按需加载该路由对应的页面组件。 */
+        component: () => import('../views/elevator/ElevatorControl.vue'),
       },
       {
         path: 'air',
         name: 'AirControl',
-        component: () => import('../views/device/AirControl.vue')
+
+        /** @brief 按需加载该路由对应的页面组件。 */
+        component: () => import('../views/device/AirControl.vue'),
       },
       {
         path: 'video',
         name: 'VideoManage',
-        component: () => import('../views/video/VideoManage.vue')
-      }
-    ]
+
+        /** @brief 按需加载该路由对应的页面组件。 */
+        component: () => import('../views/video/VideoManage.vue'),
+      },
+    ],
   },
   {
     // 人员详情独立路由（不展示底部 Tabbar）
     path: '/person/:id',
     name: 'PersonDetail',
-    component: () => import('../views/person/PersonDetail.vue')
+
+    /** @brief 按需加载该路由对应的页面组件。 */
+    component: () => import('../views/person/PersonDetail.vue'),
   },
   {
-    // 设备设置独立路由（不展示底部 Tabbar）
+    // 保留原入口，统一进入底部设备菜单。
     path: '/device/settings',
-    name: 'DeviceSettings',
-    component: () => import('../views/device/DeviceSettings.vue')
+    redirect: '/home/device',
   },
-  { path: '/:pathMatch(.*)*', redirect: '/login' }
+  { path: '/:pathMatch(.*)*', redirect: '/login' },
 ]
 
 const router = createRouter({
   history: createWebHashHistory(),
-  routes
+  routes,
 })
 
 // 全局守卫：未登录跳转登录页
 router.beforeEach(async (to) => {
   const store = useAppStore()
-  if (to.name !== 'Login' && !store.authenticated && !await store.restore()) {
+  if (to.name !== 'Login' && !store.authenticated && !(await store.restore())) {
     return { name: 'Login' }
   }
   return true

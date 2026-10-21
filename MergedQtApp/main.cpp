@@ -16,9 +16,6 @@
 #include <QDebug>
 #include <QApplication>
 #include <QTimer>
-#include <QFile>
-#include <QDir>
-#include <QtEndian>
 #include <QSaveFile>
 #include <QDateTime>
 #include <QTextStream>
@@ -33,13 +30,17 @@
 #include <QInputMethod>
 #include <QRect>
 
-#ifdef QT_YCEST_FIXED_WL_SHELL_OUTPUT
-#include <qpa/qplatformnativeinterface.h>
-#include <wayland-client-protocol.h>
-#endif
+#include "platform/wayland_display_manager.h"
 
 #include "shell/AppShell.h"
+#include "components/udisk_status/udisk_status.h"
+#include "modules/facegate/FaceGateQt/import/UsbPersonExportTarget.h"
+#include "modules/facegate/FaceGateQt/import/UsbPersonImportSource.h"
 #include "modules/web/web_bridge_server.h"
+#include "modules/web/web_local_runtime.h"
+#include "modules/web/web_upload_presenter.h"
+#include "components/settings/networkpage.h"
+#include "ic_board/ic_event_bridge.h"
 #include "components/input/InputCursorController.h"
 #include "components/multimedia/multimediademo.h"
 #include "components/splash/splashscreen.h"
@@ -232,266 +233,6 @@ static void setupQtHeartbeat(QCoreApplication *app)
     heartbeatTimer->start(10000);   // 每 10 秒更新一次
 }
 
-/** @return 显式输出名称，或启用 RK3568 LVDS 镜像时的固定源输出。 */
-static QString preferredOutputName()
-{
-    const QString configured = QString::fromUtf8(qgetenv("QT_YCEST_OUTPUT_NAME")).trimmed();
-    if (!configured.isEmpty()) {
-        return configured;
-    }
-    if (!QGuiApplication::platformName().contains(QStringLiteral("wayland"))) {
-        return QString();
-    }
-    QFile compatible(QStringLiteral("/proc/device-tree/compatible"));
-    if (compatible.open(QIODevice::ReadOnly) &&
-        compatible.readAll().split('\0').contains(QByteArrayLiteral("rockchip,rk3568")) &&
-        QFile::exists(QStringLiteral("/proc/device-tree/vop@fe040000/rockchip,lvds-hdmi-mirror"))) {
-        return QStringLiteral("DSI-1");
-    }
-    return QString();
-}
-
-/** @return 设备树中的单值或 min/typ/max 属性的典型值。 */
-static quint32 displayDeviceTreeCell(const QString &path)
-{
-    QFile property(path);
-    if (!property.open(QIODevice::ReadOnly)) {
-        return 0;
-    }
-    const QByteArray bytes = property.readAll();
-    if (bytes.size() != 4 && bytes.size() != 12) {
-        return 0;
-    }
-    const int offset = bytes.size() == 12 ? 4 : 0;
-    return qFromBigEndian<quint32>(reinterpret_cast<const uchar *>(bytes.constData() + offset));
-}
-
-/** Qt 旧版 Wayland 可能只提供 Screen17 等名称，用固定面板信息消除歧义。 */
-static QScreen *findRk3568PanelScreen()
-{
-    const QString panelPath = QStringLiteral("/proc/device-tree/dsi@fe060000/panel@0");
-    if (!QDir(panelPath).exists()) {
-        return nullptr;
-    }
-    const quint32 panelWidth = displayDeviceTreeCell(panelPath + QStringLiteral("/size,width"));
-    const quint32 panelHeight = displayDeviceTreeCell(panelPath + QStringLiteral("/size,height"));
-    QList<QScreen *> physicalMatches;
-    for (QScreen *candidate : QGuiApplication::screens()) {
-        const QSizeF physical = candidate->physicalSize();
-        if (panelWidth && panelHeight &&
-            ((qAbs(physical.width() - panelWidth) <= 1 &&
-              qAbs(physical.height() - panelHeight) <= 1) ||
-             (qAbs(physical.width() - panelHeight) <= 1 &&
-              qAbs(physical.height() - panelWidth) <= 1))) {
-            physicalMatches.append(candidate);
-        }
-    }
-    if (physicalMatches.size() == 1) {
-        qInfo() << "[DISPLAY] DSI-1 mapped by panel physical size to"
-                << physicalMatches.first()->name();
-        return physicalMatches.first();
-    }
-
-    // 尺寸未传给 Wayland 或多个屏幕尺寸相同时，再比较面板的原生时序。
-    // 不能仅凭排列顺序/相同分辨率猜测，也不能固定使用 Screen18。
-    const QDir timings(panelPath + QStringLiteral("/display-timings"));
-    const QStringList entries = timings.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
-    const quint32 nativeMode = displayDeviceTreeCell(timings.filePath(QStringLiteral("native-mode")));
-    QString timingPath;
-    for (const QString &entry : entries) {
-        const QString path = timings.filePath(entry);
-        if (entries.size() == 1 ||
-            (nativeMode &&
-             (displayDeviceTreeCell(path + QStringLiteral("/phandle")) == nativeMode ||
-              displayDeviceTreeCell(path + QStringLiteral("/linux,phandle")) == nativeMode))) {
-            timingPath = path;
-            break;
-        }
-    }
-    if (timingPath.isEmpty()) {
-        return nullptr;
-    }
-    const auto cell = [&timingPath](const char *name) {
-        return displayDeviceTreeCell(timingPath + QLatin1Char('/') + QString::fromLatin1(name));
-    };
-    const quint32 width = cell("hactive");
-    const quint32 height = cell("vactive");
-    const quint64 htotal = quint64(width) + cell("hsync-len") + cell("hback-porch") + cell("hfront-porch");
-    const quint64 vtotal = quint64(height) + cell("vsync-len") + cell("vback-porch") + cell("vfront-porch");
-    const quint32 clock = cell("clock-frequency");
-    if (!width || !height || !clock || !htotal || !vtotal) {
-        return nullptr;
-    }
-    const qreal refresh = qreal(clock) / qreal(htotal * vtotal);
-    QList<QScreen *> modeMatches;
-    const QList<QScreen *> candidates = physicalMatches.isEmpty()
-            ? QGuiApplication::screens() : physicalMatches;
-    for (QScreen *candidate : candidates) {
-        const QSize pixels = candidate->size() * candidate->devicePixelRatio();
-        if (((pixels.width() == int(width) && pixels.height() == int(height)) ||
-             (pixels.width() == int(height) && pixels.height() == int(width))) &&
-            qAbs(candidate->refreshRate() - refresh) <= 1.0) {
-            modeMatches.append(candidate);
-        }
-    }
-    if (modeMatches.size() == 1) {
-        qInfo() << "[DISPLAY] DSI-1 mapped by panel timing to" << modeMatches.first()->name()
-                << "native mode=" << QSize(int(width), int(height)) << "refresh=" << refresh;
-        return modeMatches.first();
-    }
-    qWarning() << "[DISPLAY] DSI-1 mapping is unavailable or ambiguous;"
-                  " set QT_YCEST_OUTPUT_NAME to the verified Qt screen name";
-    return nullptr;
-}
-
-/** @return 指定连接器对应的 Qt 屏幕，兼容 card 前缀及旧版 Wayland 的名称。 */
-static QScreen *findOutputScreen(const QString &outputName)
-{
-    for (QScreen *candidate : QGuiApplication::screens()) {
-        if (candidate->name() == outputName ||
-            candidate->name().endsWith(QStringLiteral("-") + outputName)) {
-            return candidate;
-        }
-    }
-    if (outputName == QStringLiteral("DSI-1") &&
-        QGuiApplication::platformName().contains(QStringLiteral("wayland"))) {
-        QFile compatible(QStringLiteral("/proc/device-tree/compatible"));
-        if (compatible.open(QIODevice::ReadOnly) &&
-            compatible.readAll().split('\0').contains(QByteArrayLiteral("rockchip,rk3568"))) {
-            return findRk3568PanelScreen();
-        }
-    }
-    return nullptr;
-}
-
-/** Qt 5.12 wl-shell 的 showFullScreen 不指定输出，补发带目标 wl_output 的请求。 */
-static bool requestFixedWaylandFullscreen(QWindow *window, QScreen *screen)
-{
-    if (!QGuiApplication::platformName().contains(QStringLiteral("wayland"))) {
-        return true;
-    }
-#ifdef QT_YCEST_FIXED_WL_SHELL_OUTPUT
-    QPlatformNativeInterface *native = QGuiApplication::platformNativeInterface();
-    if (!native || !window || !screen) {
-        qCritical() << "[DISPLAY] native fullscreen request has no window, screen or interface";
-        return false;
-    }
-    // 使用 Qt 同一条 Wayland 连接上的对象；不另建 surface，不改变窗口角色。
-    auto *surface = static_cast<wl_shell_surface *>(native->nativeResourceForWindow(
-                QByteArrayLiteral("wl_shell_surface"), window));
-    auto *output = static_cast<wl_output *>(native->nativeResourceForScreen(
-                QByteArrayLiteral("output"), screen));
-    if (!surface || !output) {
-        qCritical() << "[DISPLAY] fixed fullscreen requires QT_WAYLAND_SHELL_INTEGRATION=wl-shell"
-                    << "shell-surface=" << static_cast<void *>(surface)
-                    << "output=" << static_cast<void *>(output);
-        return false;
-    }
-    wl_shell_surface_set_fullscreen(surface, WL_SHELL_SURFACE_FULLSCREEN_METHOD_DEFAULT,
-                                    0, output);
-    // Qt 的正常事件循环会 flush 这条请求，无须阻塞 roundtrip。
-    qInfo() << "[DISPLAY] native wl-shell fullscreen requested on" << screen->name();
-    return true;
-#else
-    Q_UNUSED(window);
-    Q_UNUSED(screen);
-    qCritical() << "[DISPLAY] fixed Wayland fullscreen support was not compiled";
-    return false;
-#endif
-}
-
-/** 保持固定源输出和全屏状态，HDMI 插拔时不将应用迁移到镜像目标。 */
-class FixedOutputController final : public QObject
-{
-public:
-    FixedOutputController(QWidget *window, const QString &outputName)
-        : QObject(window), window_(window), outputName_(outputName)
-    {
-        connect(qApp, &QGuiApplication::screenAdded, this,
-                [this](QScreen *) { schedule(true); });
-        connect(qApp, &QGuiApplication::screenRemoved, this,
-                [this](QScreen *) { schedule(true); });
-        connect(window_->windowHandle(), &QWindow::screenChanged, this,
-                [this](QScreen *screen) {
-                    qInfo() << "[DISPLAY] server reported screen"
-                            << (screen ? screen->name() : QStringLiteral("<none>"));
-                    if (target_ && screen != target_) {
-                        // 迟到的 HDMI enter 通知只重发带输出的请求，不反复切换窗口状态。
-                        schedule(false);
-                    }
-                });
-        // 首次显示已经指定源屏，不立即 showNormal/showFullScreen 再切换一次。
-        schedule(false);
-    }
-
-private:
-    void schedule(bool reassertFullscreen)
-    {
-        if (applying_) {
-            return;
-        }
-        reassertFullscreen_ |= reassertFullscreen;
-        if (queued_) {
-            return;
-        }
-        queued_ = true;
-        QTimer::singleShot(0, this, [this]() {
-            queued_ = false;
-            const bool reassert = reassertFullscreen_;
-            reassertFullscreen_ = false;
-            apply(reassert);
-        });
-    }
-
-    void apply(bool reassertFullscreen)
-    {
-        QScreen *target = findOutputScreen(outputName_);
-        if (!target) {
-            qWarning() << "[DISPLAY] waiting for fixed source output" << outputName_;
-            return;
-        }
-        if (target_ != target) {
-            QObject::disconnect(geometryConnection_);
-            target_ = target;
-            geometryConnection_ = connect(target, &QScreen::geometryChanged, this,
-                                          [this](const QRect &) { schedule(true); });
-        }
-        QWindow *handle = window_->windowHandle();
-        if (!handle) {
-            return;
-        }
-        const bool changeScreen = handle->screen() != target;
-        if (!reassertFullscreen && !changeScreen && window_->isFullScreen()) {
-            return;
-        }
-        applying_ = true;
-        // wl-shell 下服务端可能取消全屏而不更新 Qt 的状态；热插拔后主动重发。
-        if (reassertFullscreen) {
-            window_->showNormal();
-        }
-        if (changeScreen) {
-            handle->setScreen(target);
-        }
-        window_->setGeometry(target->geometry());
-        if (reassertFullscreen || !window_->isFullScreen()) {
-            window_->showFullScreen();
-        }
-        requestFixedWaylandFullscreen(handle, target);
-        applying_ = false;
-        qInfo() << "[DISPLAY] fixed source" << target->name()
-                << "geometry=" << target->geometry();
-    }
-
-    QWidget *window_;
-    QString outputName_;
-    QPointer<QScreen> target_;
-    QMetaObject::Connection geometryConnection_;
-    bool queued_ = false;
-    bool applying_ = false;
-    bool reassertFullscreen_ = false;
-};
-
-
 /**
  * @brief 融合应用入口。
  *
@@ -564,6 +305,8 @@ int main(int argc, char *argv[])
     QTextCodec::setCodecForLocale(QTextCodec::codecForName("UTF-8"));
 
     QApplication a(argc, argv);
+    UsbPersonImportSource::clearImportRequestOnStartup();
+    UsbPersonExportTarget::clearExportRequestOnStartup();
     QApplication::setQuitOnLastWindowClosed(false);
     QApplication::setApplicationName(QStringLiteral("MergedQtApp"));
     QApplication::setApplicationVersion(QStringLiteral("1.0.0"));
@@ -609,33 +352,14 @@ int main(int argc, char *argv[])
 
     // 根窗口首次 show() 前创建完整控件树。EGLFS 回退模式需要唯一 EGL
     // surface，Wayland 下也可避免启动阶段重复创建、销毁子 surface。
-    const QString outputName = preferredOutputName();
-    qInfo() << "[DISPLAY] selector=lvds-source-v3"
-            << "Qt=" << qVersion() << "binary=" << QCoreApplication::applicationFilePath()
-            << "requested=" << outputName;
-    for (QScreen *candidate : QGuiApplication::screens()) {
-        qInfo() << "[DISPLAY] available output" << candidate->name()
-                << "geometry=" << candidate->geometry()
-                << "physical-mm=" << candidate->physicalSize()
-                << "refresh=" << candidate->refreshRate()
-                << "make=" << candidate->manufacturer() << "model=" << candidate->model();
-    }
-    QScreen *screen = outputName.isEmpty()
-            ? QGuiApplication::primaryScreen() : findOutputScreen(outputName);
-    if (!outputName.isEmpty() && !screen) {
-        for (QScreen *candidate : QGuiApplication::screens()) {
-            qCritical() << "[DISPLAY] available output" << candidate->name()
-                        << candidate->geometry();
-        }
-        qCritical() << "[DISPLAY] requested source output is unavailable:" << outputName;
+    WaylandDisplayManager displayManager;
+    QPointer<QScreen> screen = displayManager.selectStartupScreen();
+    if (displayManager.hasFixedOutput() && !screen) {
         return EXIT_FAILURE;
     }
     const QRect screenGeometry = screen ? screen->geometry() : QRect(0, 0, 1024, 768);
     AppShell shell;
-    if (!outputName.isEmpty()) {
-        shell.winId();
-        shell.windowHandle()->setScreen(screen);
-    }
+    displayManager.placeWindow(&shell, screen);
     shell.setGeometry(screenGeometry);
     if (!shell.initialize()) {
         qCritical() << "[SHELL] initialization failed";
@@ -644,6 +368,82 @@ int main(int argc, char *argv[])
 
     // 新增 Web IPC 有独立工作线程；未启用或启动失败不影响现有 Qt 流程。
     WebRuntime webRuntime;
+    if (qgetenv("MERGEDQT_WEB_ENABLE") == "1") {
+        auto *local = WebLocalRuntime::instance();
+        // Web 与后台页面共用网卡工作线程，避免并行修改同一有线接口。
+        if (auto *network = shell.findChild<NetworkPage *>()) {
+            local->bindNetwork(network, [network](const QString &token, const QJsonObject &args) {
+                network->applyWebNetworkConfig(token, args);
+            });
+            QObject::connect(network, &NetworkPage::webNetworkFinished,
+                             local, &WebLocalRuntime::complete);
+        }
+        // 复用原 FTP 卡片样式，在总窗口显示 Web 进度，不参与播放器生命周期。
+        auto *uploadProgress = new WebUploadPresenter(&shell);
+        // 资源更新复用 U 盘覆盖层的控件与样式；独立实例不读取 U 盘状态文件。
+        auto *resourceProgress = new UdiskStatusOverlay(&shell, &shell);
+        QObject::connect(local, &WebLocalRuntime::resourceProgress,
+                         resourceProgress, &UdiskStatusOverlay::showResourceProgress,
+                         Qt::QueuedConnection);
+        QObject::connect(local, &WebLocalRuntime::uploadProgress,
+                         uploadProgress, &WebUploadPresenter::updateProgress,
+                         Qt::QueuedConnection);
+        local->bindScreen(&shell, [&shell, local](const QString &token) {
+            auto *active = shell.activeRootWidget();
+            auto *mediaRoot = shell.multimediaRootWidget();
+            const auto media =
+                mediaRoot ? mediaRoot->findChildren<MultimediaDemo *>() : QList<MultimediaDemo *>();
+            MultimediaDemo *visible = nullptr;
+            for (auto *candidate : media)
+                if (candidate->isVisible()) {
+                    visible = candidate;
+                    break;
+                }
+            if (visible)
+                visible->captureCompositeSnapshot();
+            else
+                local->image(token, active ? active->grab().toImage() : QImage());
+        });
+        // 串口和重启沿用实际平台入口，保存、发送与硬件确认分开回报。
+        auto *io = IcEventBridge::instance();
+        local->setDeviceReady(QFileInfo::exists(Rk3566Platform::rs485Device()));
+        QObject::connect(
+            local,
+            &WebLocalRuntime::deviceRequested,
+            &shell,
+            [local, io](const QString &token, const QString &op, const QJsonObject &args) {
+                if (op == "rs485") {
+                    if (!io->requestRs485Send(
+                            QByteArray::fromBase64(args.value("frame").toString().toLatin1()),
+                            "web:" + token))
+                        local->complete(token,
+                                        {{"saved", true},
+                                         {"transportSent", false},
+                                         {"hardwareConfirmed", QJsonValue::Null}},
+                                        503,
+                                        "串口请求无法投递");
+                } else if (op == "reboot") {
+                    local->complete(token, {{"state", "REBOOTING"}});
+                    QTimer::singleShot(1500, local, [local, token]() {
+                        QString error;
+                        if (!Rk3566Platform::reboot(&error))
+                            local->complete(token, {}, 503, error);
+                    });
+                }
+            });
+        QObject::connect(io,
+                         &IcEventBridge::rs485SendFinished,
+                         &shell,
+                         [local](const QString &tag, bool ok, const QString &reason) {
+                             if (tag.startsWith("web:"))
+                                 local->complete(tag.mid(4),
+                                                 {{"saved", true},
+                                                  {"transportSent", ok},
+                                                  {"hardwareConfirmed", QJsonValue::Null}},
+                                                 ok ? 200 : 503,
+                                                 reason);
+                         });
+    }
 
     SplashScreen splash(&shell);
     splash.setGeometry(shell.rect());
@@ -677,11 +477,8 @@ int main(int argc, char *argv[])
 
     // 完整控件树准备好后，只创建一个由 Weston 管理的全屏顶层窗口。
     shell.showFullScreen();
-    if (!outputName.isEmpty()) {
-        if (!requestFixedWaylandFullscreen(shell.windowHandle(), screen)) {
-            return EXIT_FAILURE;
-        }
-        new FixedOutputController(&shell, outputName);
+    if (!displayManager.trackFullscreenWindow(&shell, screen)) {
+        return EXIT_FAILURE;
     }
     splash.raise();
     a.processEvents(QEventLoop::AllEvents, 100);

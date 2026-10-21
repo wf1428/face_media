@@ -4,6 +4,7 @@
  * @author Du lin
  * @date 2026-10-09
  */
+
 /**
  * Canvas 图片压缩：将图片压到目标大小附近（默认 200~300KB），返回 base64。
  * 参考 yc_linux_web/src/utils/imageCompress.js。
@@ -33,6 +34,7 @@ export function compressImage(file, targetKB = 250, maxSize = 1280) {
         const ctx = canvas.getContext('2d')
         ctx.drawImage(img, 0, 0, width, height)
 
+        /** @brief 逐级降低 JPEG 质量直至接近目标体积。 */
         const compress = (q) => {
           const base64 = canvas.toDataURL('image/jpeg', q)
           const sizeKB = Math.round((base64.length * 3) / 4 / 1024)

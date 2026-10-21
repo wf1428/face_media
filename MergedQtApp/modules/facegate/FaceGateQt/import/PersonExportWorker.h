@@ -26,7 +26,9 @@ class PersonExportWorker : public QObject
 
 public:
     /** @brief 创建指定人员范围的导出任务。 */
-    explicit PersonExportWorker(PersonExportKind kind, QObject *parent = nullptr);
+    explicit PersonExportWorker(PersonExportKind kind, const QString &requestToken,
+                                QObject *parent = nullptr);
+    ~PersonExportWorker() override;
 
 public slots:
     /** @brief 等待可写 U 盘、生成 XLSX，并在完成前同步和卸载介质。 */
@@ -56,6 +58,7 @@ signals:
 
 private:
     PersonExportKind kind_ = PersonExportKind::Local; /**< 本次任务导出的人员范围。 */
+    QString requestToken_; /**< 插盘前预约的导出令牌。 */
     std::atomic_bool cancelled_{false}; /**< 跨线程取消标志。 */
 };
 

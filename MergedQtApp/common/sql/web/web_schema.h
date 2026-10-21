@@ -4,8 +4,11 @@
  * @author Du lin
  * @date 2026-10-09
  */
+
 #pragma once
+
 namespace WebSchema {
+
 /** @brief 在当前工作线程创建 Web 表；不修改原 Qt 业务表及 dbstore 建表代码。 */
 void migrate();
-}
+} // namespace WebSchema

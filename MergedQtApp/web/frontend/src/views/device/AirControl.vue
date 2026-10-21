@@ -4,116 +4,133 @@
  @author Du lin
  @date 2026-10-09
 -->
+
 <template>
   <div class="page">
     <UnsupportedPanel>
-    <div class="header">
-      <div class="title">{{ $t('air.title') }}</div>
-    </div>
+      <div class="header">
+        <div class="title">{{ $t('air.title') }}</div>
+      </div>
 
-    <!-- 主控面板 -->
-    <div class="air-panel">
-      <div class="temp-row">
-        <div class="temp-main">{{ air.temperature }}<span class="unit">℃</span></div>
-        <div class="temp-sub">
-          <span>{{ $t('air.roomTemp') }} {{ air.currentTemp }}℃</span>
-          <span>{{ $t('air.humidity') }} {{ air.humidity }}%</span>
+      <!-- 主控面板 -->
+      <div class="air-panel">
+        <div class="temp-row">
+          <div class="temp-main">{{ air.temperature }}<span class="unit">℃</span></div>
+          <div class="temp-sub">
+            <span>{{ $t('air.roomTemp') }} {{ air.currentTemp }}℃</span>
+            <span>{{ $t('air.humidity') }} {{ air.humidity }}%</span>
+          </div>
+        </div>
+
+        <div class="brand">{{ air.brand || '—' }} · {{ statusTextOf(air.status) }}</div>
+
+        <div class="power-row">
+          <span class="power-label">{{ $t('air.power') }}</span>
+          <van-switch disabled :model-value="air.airOn === 1" size="26" />
+        </div>
+
+        <div class="temp-control">
+          <span class="ctrl-label">{{ $t('air.setTemp') }}</span>
+          <div class="temp-btns">
+            <van-button disabled round plain size="small">-</van-button>
+            <span class="temp-val">{{ air.temperature }}℃</span>
+            <van-button disabled round plain size="small">+</van-button>
+          </div>
         </div>
       </div>
 
-      <div class="brand">{{ air.brand || '—' }} · {{ statusTextOf(air.status) }}</div>
-
-      <div class="power-row">
-        <span class="power-label">{{ $t('air.power') }}</span>
-        <van-switch disabled :model-value="air.airOn === 1" size="26" />
-      </div>
-
-      <div class="temp-control">
-        <span class="ctrl-label">{{ $t('air.setTemp') }}</span>
-        <div class="temp-btns">
-          <van-button disabled round plain size="small">-</van-button>
-          <span class="temp-val">{{ air.temperature }}℃</span>
-          <van-button disabled round plain size="small">+</van-button>
+      <!-- 模式 -->
+      <van-cell-group inset :title="$t('air.mode')">
+        <div class="mode-grid">
+          <div
+            v-for="m in modeOptions"
+            :key="m.value"
+            class="mode-item"
+            :class="{ active: air.mode === m.value }"
+          >
+            <van-icon :name="m.icon" size="24" />
+            <span>{{ $t(m.labelKey) }}</span>
+          </div>
         </div>
-      </div>
-    </div>
+      </van-cell-group>
 
-    <!-- 模式 -->
-    <van-cell-group inset :title="$t('air.mode')">
-      <div class="mode-grid">
-        <div
-          v-for="m in modeOptions"
-          :key="m.value"
-          class="mode-item"
-          :class="{ active: air.mode === m.value }"
-         
-        >
-          <van-icon :name="m.icon" size="24" />
-          <span>{{ $t(m.labelKey) }}</span>
+      <!-- 风速 -->
+      <van-cell-group inset :title="$t('air.fanSpeed')">
+        <div class="mode-grid">
+          <div
+            v-for="f in funOptions"
+            :key="f.value"
+            class="mode-item"
+            :class="{ active: air.fun === f.value }"
+          >
+            <span>{{ $t(f.labelKey) }}</span>
+          </div>
         </div>
-      </div>
-    </van-cell-group>
+      </van-cell-group>
 
-    <!-- 风速 -->
-    <van-cell-group inset :title="$t('air.fanSpeed')">
-      <div class="mode-grid">
-        <div
-          v-for="f in funOptions"
-          :key="f.value"
-          class="mode-item"
-          :class="{ active: air.fun === f.value }"
-         
-        >
-          <span>{{ $t(f.labelKey) }}</span>
-        </div>
-      </div>
-    </van-cell-group>
-
-    <!-- 循环定时 -->
-    <van-cell-group inset :title="$t('air.loopTimer')">
-      <van-cell :title="$t('air.loopSwitch')" center>
-        <template #right-icon>
-          <van-switch disabled :model-value="air.isLoopOn === 1" size="20" />
-        </template>
-      </van-cell>
-    </van-cell-group>
-
-    <!-- 周定时计划 -->
-    <van-cell-group inset :title="$t('air.weekPlan')">
-      <van-cell
-        v-for="w in weekList"
-        :key="w.key"
-        :title="$t(w.labelKey)"
-        :value="planValue(air.plan[w.key])"
-        is-link
-       
-      />
-    </van-cell-group>
-
-    <!-- 周计划编辑 -->
-    <van-popup v-model:show="showPlan" position="bottom" round>
-      <div class="plan-pop">
-        <div class="time-title">{{ $t(planTarget.labelKey) }}</div>
-        <van-cell :title="$t('common.enable')" center>
+      <!-- 循环定时 -->
+      <van-cell-group inset :title="$t('air.loopTimer')">
+        <van-cell :title="$t('air.loopSwitch')" center>
           <template #right-icon>
-            <van-switch disabled v-model="planEnabled" size="20" />
+            <van-switch disabled :model-value="air.isLoopOn === 1" size="20" />
           </template>
         </van-cell>
-        <van-cell :title="$t('elevator.onTime')" :value="planForm.timeOn === 'null' ? $t('common.notSet') : planForm.timeOn" is-link />
-        <van-cell :title="$t('elevator.offTime')" :value="planForm.timeOFF === 'null' ? $t('common.notSet') : planForm.timeOFF" is-link />
-        <van-button disabled type="primary" block round style="margin-top: 12px">{{ $t('common.save') }}</van-button>
-      </div>
-    </van-popup>
+      </van-cell-group>
 
-    <!-- 时间选择 -->
-    <van-popup v-model:show="showPlanTime" position="bottom" round>
-      <div class="plan-pop">
-        <div class="time-title">{{ planTimeTarget === 'timeOn' ? $t('elevator.onTime') : $t('elevator.offTime') }}</div>
-        <van-time-picker disabled v-model="planTimeValue" title="" :columns-type="['hour', 'minute']" />
-        <van-button disabled type="primary" block round style="margin-top: 12px">{{ $t('common.confirm') }}</van-button>
-      </div>
-    </van-popup>
-  </UnsupportedPanel>
+      <!-- 周定时计划 -->
+      <van-cell-group inset :title="$t('air.weekPlan')">
+        <van-cell
+          v-for="w in weekList"
+          :key="w.key"
+          :title="$t(w.labelKey)"
+          :value="planValue(air.plan[w.key])"
+          is-link
+        />
+      </van-cell-group>
+
+      <!-- 周计划编辑 -->
+      <van-popup v-model:show="showPlan" position="bottom" round>
+        <div class="plan-pop">
+          <div class="time-title">{{ $t(planTarget.labelKey) }}</div>
+          <van-cell :title="$t('common.enable')" center>
+            <template #right-icon>
+              <van-switch disabled v-model="planEnabled" size="20" />
+            </template>
+          </van-cell>
+          <van-cell
+            :title="$t('elevator.onTime')"
+            :value="planForm.timeOn === 'null' ? $t('common.notSet') : planForm.timeOn"
+            is-link
+          />
+          <van-cell
+            :title="$t('elevator.offTime')"
+            :value="planForm.timeOFF === 'null' ? $t('common.notSet') : planForm.timeOFF"
+            is-link
+          />
+          <van-button disabled type="primary" block round style="margin-top: 12px">{{
+            $t('common.save')
+          }}</van-button>
+        </div>
+      </van-popup>
+
+      <!-- 时间选择 -->
+      <van-popup v-model:show="showPlanTime" position="bottom" round>
+        <div class="plan-pop">
+          <div class="time-title">
+            {{ planTimeTarget === 'timeOn' ? $t('elevator.onTime') : $t('elevator.offTime') }}
+          </div>
+          <van-time-picker
+            disabled
+            v-model="planTimeValue"
+            title=""
+            :columns-type="['hour', 'minute']"
+          />
+          <van-button disabled type="primary" block round style="margin-top: 12px">{{
+            $t('common.confirm')
+          }}</van-button>
+        </div>
+      </van-popup>
+    </UnsupportedPanel>
   </div>
 </template>
 
@@ -126,20 +143,27 @@ import { api } from '../../api'
 const { t } = useI18n()
 
 const air = reactive({
-  airOn: 0, isLoopOn: 0, mode: '', brand: '', fun: '',
-  temperature: "—", currentTemp: "—", humidity: "—", status: '',
-  plan: {}
+  airOn: 0,
+  isLoopOn: 0,
+  mode: '',
+  brand: '',
+  fun: '',
+  temperature: '—',
+  currentTemp: '—',
+  humidity: '—',
+  status: '',
+  plan: {},
 })
 
 // 模式/风速/星期选项：存 i18n 键（labelKey），模板 t() 渲染，切换语言即时更新
 const modeOptions = computed(() => [
   { value: 'cool', labelKey: 'air.cool', icon: 'snowflake-o' },
   { value: 'heat', labelKey: 'air.heat', icon: 'fire-o' },
-  { value: 'fan', labelKey: 'air.fan', icon: 'award-o' }
+  { value: 'fan', labelKey: 'air.fan', icon: 'award-o' },
 ])
 const funOptions = computed(() => [
   { value: 'low', labelKey: 'air.low' },
-  { value: 'high', labelKey: 'air.high' }
+  { value: 'high', labelKey: 'air.high' },
 ])
 
 const weekList = computed(() => [
@@ -150,53 +174,90 @@ const weekList = computed(() => [
   { key: 'week5', labelKey: 'air.week5' },
   { key: 'week6', labelKey: 'air.week6' },
   { key: 'week7', labelKey: 'air.week7' },
-  { key: 'week8', labelKey: 'air.everyday' }
+  { key: 'week8', labelKey: 'air.everyday' },
 ])
 
 const showPlan = ref(false)
 const planTarget = ref({ key: 'week1', labelKey: 'air.week1' })
 const planEnabled = ref(false)
-const planForm = reactive({ timeOn: 'null', timeOFF: 'null', mode: 'cool', fun: 'low', temperature: 25 })
+const planForm = reactive({
+  timeOn: 'null',
+  timeOFF: 'null',
+  mode: 'cool',
+  fun: 'low',
+  temperature: 25,
+})
 
 const showPlanTime = ref(false)
 const planTimeTarget = ref('timeOn')
 const planTimeValue = ref(['08', '00'])
 
-/** 空调状态文案（渲染时按当前语言取值） */
+/** @brief 空调状态文案（渲染时按当前语言取值） */
 function statusTextOf(status) {
   const keyMap = { running: 'air.running', standby: 'air.standby', off: 'air.off' }
   return keyMap[status] ? t(keyMap[status]) : '—'
 }
 
-async function load() { /* 本版本仅保留控件，业务处理未接入。 */ }
+/** @brief 保留空调状态加载入口；当前版本不接入控制业务。 */
+async function load() {
+  /* 本版本仅保留控件，业务处理未接入。 */
+}
 
-/** 切换即下发 */
-async function commit(patch) { /* 本版本仅保留控件，业务处理未接入。 */ }
+/** @brief 切换即下发 */
+async function commit(patch) {
+  /* 本版本仅保留控件，业务处理未接入。 */
+}
 
-function setAirOn(v) { /* 本版本仅保留控件，业务处理未接入。 */ }
+/** @brief 保留空调开关操作入口；当前版本不下发命令。 */
+function setAirOn(v) {
+  /* 本版本仅保留控件，业务处理未接入。 */
+}
 
-function stepTemp(d) { /* 本版本仅保留控件，业务处理未接入。 */ }
+/** @brief 保留温度步进操作入口；当前版本不下发命令。 */
+function stepTemp(d) {
+  /* 本版本仅保留控件，业务处理未接入。 */
+}
 
-function setMode(m) { /* 本版本仅保留控件，业务处理未接入。 */ }
+/** @brief 保留空调模式选择入口；当前版本不下发命令。 */
+function setMode(m) {
+  /* 本版本仅保留控件，业务处理未接入。 */
+}
 
-function setFun(f) { /* 本版本仅保留控件，业务处理未接入。 */ }
+/** @brief 保留风速选择入口；当前版本不下发命令。 */
+function setFun(f) {
+  /* 本版本仅保留控件，业务处理未接入。 */
+}
 
-function setLoop(v) { /* 本版本仅保留控件，业务处理未接入。 */ }
+/** @brief 保留循环方式选择入口；当前版本不下发命令。 */
+function setLoop(v) {
+  /* 本版本仅保留控件，业务处理未接入。 */
+}
 
+/** @brief 将定时计划转换为页面显示文本。 */
 function planValue(p) {
   if (!p || p.timeOn === 'null' || p.timeOFF === 'null') return t('common.notSet')
   return `${p.timeOn} ~ ${p.timeOFF}`
 }
 
-function openPlan(w) { /* 本版本仅保留控件，业务处理未接入。 */ }
+/** @brief 保留定时计划编辑入口；当前版本不接入。 */
+function openPlan(w) {
+  /* 本版本仅保留控件，业务处理未接入。 */
+}
 
-function openPlanTime(target) { /* 本版本仅保留控件，业务处理未接入。 */ }
+/** @brief 保留定时时间选择入口；当前版本不接入。 */
+function openPlanTime(target) {
+  /* 本版本仅保留控件，业务处理未接入。 */
+}
 
-function confirmPlanTime() { /* 本版本仅保留控件，业务处理未接入。 */ }
+/** @brief 保留定时时间确认入口；当前版本不接入。 */
+function confirmPlanTime() {
+  /* 本版本仅保留控件，业务处理未接入。 */
+}
 
-async function savePlan() { /* 本版本仅保留控件，业务处理未接入。 */ }
-
-
+/** @brief 保留定时计划保存入口；当前版本不下发命令。 */
+async function savePlan() {
+  /* 本版本仅保留控件，业务处理未接入。 */
+}
 
 import UnsupportedPanel from '../../components/UnsupportedPanel.vue'
 </script>

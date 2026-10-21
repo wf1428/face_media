@@ -4,4 +4,5 @@
  * @author Du lin
  * @date 2026-10-09
  */
-export const PREVIEW_INTERVALS = [8, 10, 20, 30]
+
+export const PREVIEW_INTERVALS = [5, 10, 20, 30]

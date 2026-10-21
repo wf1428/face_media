@@ -8,6 +8,9 @@ unix:!macx {
     PKGCONFIG += wayland-client
     DEFINES += QT_YCEST_FIXED_WL_SHELL_OUTPUT
 }
+SOURCES += platform/wayland_display_manager.cpp
+HEADERS += platform/wayland_display_manager.h
+
 include($$PWD/modules/web/web.pri)
 PKGCONFIG += gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0 gstreamer-rtp-1.0 gstreamer-pbutils-1.0
 !packagesExist(gstreamer-pbutils-1.0) {
@@ -58,7 +61,8 @@ INCLUDEPATH += \
     $$PWD/modules/facegate/FaceGateQt/database \
     $$PWD/modules/facegate/FaceGateQt/import \
     $$PWD/modules/facegate/FaceGateQt/ui \
-    $$PWD/components/rga
+    $$PWD/components/rga    \
+    $$SYSROOT/usr/include
 
 !isEmpty(INSPIREFACE_ROOT) {
     DEFINES += FACEGATE_WITH_INSPIREFACE

@@ -24,6 +24,7 @@ LOG_DIR=/var/log/face-media
 LOG_FILE=$LOG_DIR/face_media.log
 LOG_DATE_FILE=$LOG_DIR/.active_date
 LOG_FIFO=$STATE_DIR/qt-log.fifo
+LOG_ACK_FILE=$STATE_DIR/qt-log-ack.$$
 LOG_MAX_SIZE=$((50 * 1024 * 1024))
 LOG_RETENTION_DAYS=10
 LOG_BURST_LIMIT=$((10 * 1024 * 1024))
@@ -176,15 +177,23 @@ start_log_maintenance()
 
 start_qt_log_writer()
 {
-    rm -f "$LOG_FIFO" 2>/dev/null || true
+    rm -f "$LOG_FIFO" "$LOG_ACK_FILE" 2>/dev/null || true
     mkfifo "$LOG_FIFO"
 
     initial_date=$(sed -n '1p' "$LOG_DATE_FILE" 2>/dev/null || date '+%Y%m%d')
     initial_size=$(get_file_size "$LOG_FILE")
+    logger_probe="[face-media-log] capture started: $(date '+%Y-%m-%d %H:%M:%S') pid=$$"
+
+    # mawk 从 FIFO 默认按块读取：探针可能直到写端关闭后才被处理。
+    # 仅对 mawk 启用逐行读取；其它 awk 保持原有调用方式。
+    awk_input_mode=
+    if awk -W version 2>&1 | grep -q '^mawk '; then
+        awk_input_mode='-W interactive'
+    fi
 
     # awk 直接消费 Qt 的 stdout/stderr，保持原始行内容；只在日志风暴时
     # 添加一次限流说明并采样，避免错误循环迅速耗尽存储空间。
-    LC_ALL=C awk \
+    LC_ALL=C awk $awk_input_mode \
         -v active="$LOG_FILE" \
         -v logdir="$LOG_DIR" \
         -v statefile="$LOG_DATE_FILE" \
@@ -192,17 +201,19 @@ start_qt_log_writer()
         -v size="$initial_size" \
         -v maxsize="$LOG_MAX_SIZE" \
         -v burstlimit="$LOG_BURST_LIMIT" \
-        -v maxline="$LOG_MAX_LINE_SIZE" '
+        -v maxline="$LOG_MAX_LINE_SIZE" \
+        -v probe="$logger_probe" \
+        -v ackfile="$LOG_ACK_FILE" '
         function file_exists(path, command) {
             command = "[ -e \"" path "\" ]"
             return system(command) == 0
         }
-        function next_archive_path(logday, path, index) {
+        function next_archive_path(logday, path, archive_index) {
             path = logdir "/face_media_" logday ".log"
             if (!file_exists(path)) return path
-            index = 1
-            while (file_exists(logdir "/face_media_" logday "_" index ".log")) index++
-            return logdir "/face_media_" logday "_" index ".log"
+            archive_index = 1
+            while (file_exists(logdir "/face_media_" logday "_" archive_index ".log")) archive_index++
+            return logdir "/face_media_" logday "_" archive_index ".log"
         }
         function rotate_active(logday, destination, command, result) {
             if (size <= 0) return
@@ -240,6 +251,12 @@ start_qt_log_writer()
             }
 
             text = $0
+            if (text == probe) {
+                append_line(text)
+                print "ready" > ackfile
+                close(ackfile)
+                next
+            }
             raw_bytes = length(text) + 1
             current_minute = int(now / 60)
             if (current_minute != minute_key) {
@@ -281,43 +298,141 @@ start_qt_log_writer()
     LOG_PIPE_OPEN=1
     LOG_CAPTURE_MODE=pipe
 
-    # 通过同一条管道写入握手标记，并确认消费者确实写到了目标文件。
-    # 若 awk 在目标系统上不兼容，立即报错，避免继续静默运行空日志。
-    logger_probe="[face-media-log] capture started: $(date '+%Y-%m-%d %H:%M:%S')"
+    # 消费者写入并刷新日志后才创建确认文件；不再反复扫描活动日志的最后 8 行。
     printf '%s\n' "$logger_probe" >&3
+    if wait_for_log_writer_ack "awk"; then
+        return 0
+    fi
+    finish_qt_log_writer
+    return 1
+}
+
+wait_for_log_writer_ack()
+{
+    writer_kind=$1
     attempts=0
-    while [ "$attempts" -lt 20 ]; do
-        if ! pid_is_running "$LOGGER_PID"; then
-            log "Qt log writer exited during startup"
-            exec 3>&-
-            LOG_PIPE_OPEN=0
-            wait "$LOGGER_PID" 2>/dev/null || true
-            LOGGER_PID=""
-            LOG_CAPTURE_MODE=none
-            rm -f "$LOG_FIFO" 2>/dev/null || true
-            return 1
-        fi
-        if tail -n 8 "$LOG_FILE" 2>/dev/null | grep -Fqx "$logger_probe"; then
+    # 板端启动和校时时可能同时触发归档；等待写入完成，最多约 1 秒。
+    while [ "$attempts" -lt 10 ]; do
+        if [ -s "$LOG_ACK_FILE" ]; then
+            rm -f "$LOG_ACK_FILE" 2>/dev/null || true
             return 0
         fi
-        sleep 0.05
+        if ! pid_is_running "$LOGGER_PID"; then
+            log "$writer_kind Qt log writer exited during startup"
+            return 1
+        fi
+        sleep 0.1
         attempts=$((attempts + 1))
     done
+    log "$writer_kind Qt log writer did not acknowledge the startup probe"
+    return 1
+}
 
-    log "Qt log writer did not acknowledge the startup probe"
-    exec 3>&-
-    LOG_PIPE_OPEN=0
-    wait "$LOGGER_PID" 2>/dev/null || true
-    LOGGER_PID=""
-    LOG_CAPTURE_MODE=none
-    rm -f "$LOG_FIFO" 2>/dev/null || true
+# awk 无法启动时使用同一个 FIFO；后备写入器仍按日期、50 MiB、限流规则处理。
+shell_rotate_active_log()
+{
+    [ "$shell_size" -gt 0 ] || return 0
+    shell_archive=$(next_archive_log_path "$shell_day") || return 1
+    mv "$LOG_FILE" "$shell_archive" || return 1
+    : > "$LOG_FILE" || return 1
+    shell_size=0
+}
+
+shell_append_log_line()
+{
+    shell_line=$1
+    shell_bytes=$((${#shell_line} + 1))
+    if [ "$shell_size" -gt 0 ] &&
+       [ $((shell_size + shell_bytes)) -gt "$LOG_MAX_SIZE" ]; then
+        shell_rotate_active_log || return 1
+    fi
+    printf '%s\n' "$shell_line" >> "$LOG_FILE" || return 1
+    shell_size=$((shell_size + shell_bytes))
+}
+
+shell_qt_log_writer()
+{
+    LC_ALL=C
+    export LC_ALL
+    shell_day=$(sed -n '1p' "$LOG_DATE_FILE" 2>/dev/null || date '+%Y%m%d')
+    shell_size=$(get_file_size "$LOG_FILE")
+    shell_minute_key=-1
+    shell_minute_bytes=0
+    shell_limited=0
+    shell_last_sample=-1
+    while IFS= read -r text || [ -n "$text" ]; do
+        set -- $(date '+%Y%m%d %s')
+        current_day=$1
+        now=$2
+        if [ "$current_day" != "$shell_day" ]; then
+            shell_rotate_active_log || return 1
+            shell_day=$current_day
+            printf '%s\n' "$shell_day" > "$LOG_DATE_FILE" || return 1
+            shell_minute_key=-1
+        fi
+
+        if [ "$text" = "$logger_probe" ]; then
+            shell_append_log_line "$text" || return 1
+            printf 'ready\n' > "$LOG_ACK_FILE" || return 1
+            continue
+        fi
+
+        raw_bytes=$((${#text} + 1))
+        current_minute=$((now / 60))
+        if [ "$current_minute" -ne "$shell_minute_key" ]; then
+            shell_minute_key=$current_minute
+            shell_minute_bytes=0
+            shell_limited=0
+            shell_last_sample=-1
+        fi
+        shell_minute_bytes=$((shell_minute_bytes + raw_bytes))
+
+        if [ "$raw_bytes" -gt "$LOG_MAX_LINE_SIZE" ]; then
+            text="$(printf '%.65536s' "$text") [line truncated by face-media logger]"
+            shell_append_log_line "$text" || return 1
+            continue
+        fi
+        if [ "$shell_minute_bytes" -le "$LOG_BURST_LIMIT" ]; then
+            shell_append_log_line "$text" || return 1
+            continue
+        fi
+        if [ "$shell_limited" -eq 0 ]; then
+            shell_append_log_line '[face-media-log] log growth exceeded 10MB in one minute; high-frequency output is now sampled' || return 1
+            shell_limited=1
+        fi
+        if [ "$now" -ne "$shell_last_sample" ]; then
+            shell_append_log_line "$text" || return 1
+            shell_last_sample=$now
+        fi
+    done
+}
+
+start_shell_qt_log_writer()
+{
+    rm -f "$LOG_FIFO" "$LOG_ACK_FILE" 2>/dev/null || true
+    mkfifo "$LOG_FIFO" || return 1
+    logger_probe="[face-media-log] shell capture started: $(date '+%Y-%m-%d %H:%M:%S') pid=$$"
+    shell_qt_log_writer < "$LOG_FIFO" &
+    LOGGER_PID=$!
+    exec 3> "$LOG_FIFO"
+    LOG_PIPE_OPEN=1
+    LOG_CAPTURE_MODE=pipe
+    printf '%s\n' "$logger_probe" >&3
+    if wait_for_log_writer_ack "shell"; then
+        return 0
+    fi
+    finish_qt_log_writer
     return 1
 }
 
 finish_qt_log_writer()
 {
     writer_pid=${LOGGER_PID:-}
-    [ -n "$writer_pid" ] || return 0
+    if [ -z "$writer_pid" ]; then
+        LOG_CAPTURE_MODE=none
+        rm -f "$LOG_ACK_FILE" 2>/dev/null || true
+        return 0
+    fi
 
     # Qt 已退出后关闭监督进程持有的写端，使 awk 收到 EOF 并正常落盘退出。
     if [ "$LOG_PIPE_OPEN" -eq 1 ]; then
@@ -336,7 +451,29 @@ finish_qt_log_writer()
     wait "$writer_pid" 2>/dev/null || true
     LOGGER_PID=""
     LOG_CAPTURE_MODE=none
-    rm -f "$LOG_FIFO" 2>/dev/null || true
+    rm -f "$LOG_FIFO" "$LOG_ACK_FILE" 2>/dev/null || true
+}
+
+append_bounded_supervisor_line()
+{
+    bounded_line=$1
+    bounded_day=$(sed -n '1p' "$LOG_DATE_FILE" 2>/dev/null || true)
+    current_day=$(date '+%Y%m%d')
+    if valid_log_date "$bounded_day" && [ "$bounded_day" != "$current_day" ]; then
+        archive_active_log "$bounded_day" || return 1
+        printf '%s\n' "$current_day" > "$LOG_DATE_FILE" || return 1
+        bounded_day=$current_day
+    elif ! valid_log_date "$bounded_day"; then
+        bounded_day=$current_day
+        printf '%s\n' "$bounded_day" > "$LOG_DATE_FILE" || return 1
+    fi
+    bounded_size=$(get_file_size "$LOG_FILE")
+    bounded_bytes=$(printf '%s\n' "$bounded_line" | wc -c | tr -d ' ')
+    if [ "$bounded_size" -gt 0 ] &&
+       [ $((bounded_size + bounded_bytes)) -gt "$LOG_MAX_SIZE" ]; then
+        archive_active_log "$bounded_day" || return 1
+    fi
+    printf '%s\n' "$bounded_line" >> "$LOG_FILE"
 }
 
 append_supervisor_log()
@@ -344,8 +481,8 @@ append_supervisor_log()
     log_line="[face-media] $*"
     if [ "$LOG_CAPTURE_MODE" = "pipe" ] && [ "$LOG_PIPE_OPEN" -eq 1 ]; then
         printf '%s\n' "$log_line" >&3 2>/dev/null || true
-    else
-        printf '%s\n' "$log_line" >> "$LOG_FILE" 2>/dev/null || true
+    elif [ "$LOG_CAPTURE_MODE" != "journal" ]; then
+        append_bounded_supervisor_line "$log_line" 2>/dev/null || true
     fi
     log "$*"
 }
@@ -792,6 +929,24 @@ ensure_runtime_environment()
     export QT_YCEST_HEARTBEAT_FILE="$HEARTBEAT_FILE"
 }
 
+# Lightweight setup only: no WiFi detection or Web child in the Qt supervisor.
+prepare_qt_web_environment()
+{
+    export MERGEDQT_WEB_ENABLE=1
+    export MERGEDQT_WEB_SOCKET=${MERGEDQT_WEB_SOCKET:-/run/mergedqt/web.sock}
+    export MERGEDQT_WEB_MEDIA_MOUNT=${MERGEDQT_WEB_MEDIA_MOUNT:-/mnt/UDISK}
+    export MERGEDQT_WEB_IMPORTS=${MERGEDQT_WEB_IMPORTS:-/home/cat/web-stage/imports}
+    export MERGEDQT_WEB_FACTORY=${MERGEDQT_WEB_FACTORY:-/home/cat/web-stage/factory-account.json}
+    export MERGEDQT_WEB_READY_FILE=${MERGEDQT_WEB_READY_FILE:-/run/mergedqt/web-ready}
+    export MERGEDQT_WEB_HOTSPOT_HELPER=${MERGEDQT_WEB_HOTSPOT_HELPER:-/home/cat/web-stage/portal-network.sh}
+    if ! install -d -m 0750 "$(dirname -- "$MERGEDQT_WEB_SOCKET")" "$(dirname -- "$MERGEDQT_WEB_READY_FILE")"; then
+        log 'Optional Web runtime directory could not be prepared; continuing Qt startup'
+    fi
+    if ! install -d -m 0770 "$MERGEDQT_WEB_IMPORTS"; then
+        log 'Optional Web imports directory could not be prepared; continuing Qt startup'
+    fi
+}
+
 load_driver()
 {
     driver_file=$1
@@ -882,10 +1037,13 @@ while true; do
 
     log "starting MergedQtApp"
     if ! start_qt_log_writer; then
-        # 日志轮转器故障不能阻塞业务程序。降级时直接追加到活动日志；下次
-        # Qt 重启仍会重新尝试恢复按日/按大小轮转。
-        LOG_CAPTURE_MODE=direct
-        append_supervisor_log "advanced Qt log capture unavailable; using direct append mode"
+        if start_shell_qt_log_writer; then
+            append_supervisor_log "advanced Qt log capture unavailable; using bounded shell capture"
+        else
+            # 两种文件采集器均不可用时交给 journald，避免活动文件无上限增长。
+            LOG_CAPTURE_MODE=journal
+            append_supervisor_log "Qt file log capture unavailable; using system journal"
+        fi
     fi
 
     # 仅在已经具备可用日志输出路径、马上要启动受管 Qt 时清理遗留实例。
@@ -899,10 +1057,13 @@ while true; do
     # 每次启动前删除上一个实例的心跳，禁止旧文件被当成新进程存活证据。
     rm -f "$HEARTBEAT_FILE" 2>/dev/null || true
 
+    prepare_qt_web_environment
+    rm -f "$MERGEDQT_WEB_READY_FILE" 2>/dev/null || true
+
     if [ "$LOG_CAPTURE_MODE" = "pipe" ]; then
         ./MergedQtApp >&3 2>&1 &
     else
-        ./MergedQtApp >> "$LOG_FILE" 2>&1 &
+        ./MergedQtApp &
     fi
     APP_PID=$!
 

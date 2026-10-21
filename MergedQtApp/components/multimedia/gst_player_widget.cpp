@@ -468,7 +468,7 @@ inline QRgb yuvToRgb(int y, int u, int v)
     return qRgb(clampByte(r), clampByte(g), clampByte(b));
 }
 
-/** @brief 保持宽高比计算 NV12 目标尺寸，并向下对齐为偶数。 */
+/** @brief 按宽高比计算 NV12 目标尺寸，宽向下按 4 对齐、高向下按 2 对齐。 */
 QSize fittedEvenNv12Size(int sourceWidth,
                          int sourceHeight,
                          int targetBoxWidth,
@@ -488,8 +488,9 @@ QSize fittedEvenNv12Size(int sourceWidth,
                                   sourceHeight / 2) / sourceHeight);
     }
 
-    // NV12 的宽高必须为偶数。向下对齐，保证目标图像不超出 Qt 视频区域。
-    width &= ~1;
+    // 目标缓冲区按图像宽度紧密排列，RGA 要求 NV12 行跨度按 4 对齐。
+    // 宽按 4、高按 2 向下对齐，保证图像不超出 Qt 视频区域。
+    width &= ~3;
     height &= ~1;
     if (width <= 0 || height <= 0) return QSize();
     return QSize(width, height);
@@ -987,35 +988,46 @@ bool setNullStateAndWait(GstElement *element)
 /** @brief 用原播放器已经使用的 GStreamer 运行环境探测 Web 上传视频。 */
 GstVideoValidationResult validateVideoWithGStreamer(const QString &path, int timeoutSeconds)
 {
+    // 复用原播放器的 GStreamer 初始化状态与插件环境。
     QString initError;
     if (!initGStreamer(&initError)) {
-        return {GstVideoValidationStatus::Unavailable,
-                QStringLiteral("设备 GStreamer 无法初始化")};
+        return {GstVideoValidationStatus::Unavailable, QStringLiteral("设备 GStreamer 无法初始化")};
     }
     if (path.isEmpty() || timeoutSeconds < 1 || timeoutSeconds > 60 || !QFileInfo(path).isFile()) {
         return {GstVideoValidationStatus::Invalid, QStringLiteral("视频文件不存在或检查参数无效")};
     }
 
+    // 仅探测媒体流，不播放、不转码，也不修改原视频文件。
     GError *error = nullptr;
-    GstDiscoverer *discoverer = gst_discoverer_new(static_cast<GstClockTime>(timeoutSeconds) * GST_SECOND, &error);
+    GstDiscoverer *discoverer =
+        gst_discoverer_new(static_cast<GstClockTime>(timeoutSeconds) * GST_SECOND, &error);
     if (!discoverer) {
-        if (error) g_error_free(error);
+        if (error)
+            g_error_free(error);
         return {GstVideoValidationStatus::Unavailable,
                 QStringLiteral("设备 GStreamer 媒体探测组件不可用")};
     }
-    if (error) { g_error_free(error); error = nullptr; }
-    const QByteArray uri = QUrl::fromLocalFile(QFileInfo(path).absoluteFilePath()).toEncoded(QUrl::FullyEncoded);
+    if (error) {
+        g_error_free(error);
+        error = nullptr;
+    }
+    const QByteArray uri =
+        QUrl::fromLocalFile(QFileInfo(path).absoluteFilePath()).toEncoded(QUrl::FullyEncoded);
     GstDiscovererInfo *info = gst_discoverer_discover_uri(discoverer, uri.constData(), &error);
-    if (error) g_error_free(error);
+    if (error)
+        g_error_free(error);
 
+    // 至少发现一条有效视频流才允许发布到设备视频目录。
     GstVideoValidationResult result{GstVideoValidationStatus::Invalid,
                                     QStringLiteral("文件不含有效视频流")};
     if (info) {
         const GstDiscovererResult discovery = gst_discoverer_info_get_result(info);
         if (discovery == GST_DISCOVERER_OK) {
             GList *streams = gst_discoverer_info_get_video_streams(info);
-            if (streams) result = {GstVideoValidationStatus::Valid, QString()};
-            if (streams) gst_discoverer_stream_info_list_free(streams);
+            if (streams)
+                result = {GstVideoValidationStatus::Valid, QString()};
+            if (streams)
+                gst_discoverer_stream_info_list_free(streams);
         } else if (discovery == GST_DISCOVERER_MISSING_PLUGINS) {
             result = {GstVideoValidationStatus::Unavailable,
                       QStringLiteral("设备缺少视频解析所需的 GStreamer 插件")};

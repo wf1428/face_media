@@ -4,10 +4,14 @@
  * @author Du lin
  * @date 2026-10-09
  */
+
 #include "web_face_bridge.h"
 #include <QCoreApplication>
 #include <QThread>
-WebFaceBridge *WebFaceBridge::instance() {
+
+/** @brief 返回供 Web 人脸校验使用的桥接实例。 */
+WebFaceBridge *WebFaceBridge::instance()
+{
     static WebFaceBridge *bridge = []() {
         Q_ASSERT(QThread::currentThread() == QCoreApplication::instance()->thread());
         return new WebFaceBridge(QCoreApplication::instance());

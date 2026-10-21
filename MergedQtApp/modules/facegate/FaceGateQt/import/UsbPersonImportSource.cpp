@@ -10,6 +10,7 @@
 
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QDebug>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
@@ -119,6 +120,17 @@ UsbPersonImportFile copyWorkbook(const QString &mountPoint)
 }
 
 } // namespace
+
+/** @brief 启动时清除遗留预约；不依赖旧PID是否已被其他进程复用。 */
+void UsbPersonImportSource::clearImportRequestOnStartup()
+{
+    // 仅在程序入口、创建页面和导入任务之前调用，避免清除正在使用的预约。
+    for (const QString &path : {kImportRequestPath, kImportReadyPath}) {
+        if (QFileInfo::exists(path) && !QFile::remove(path)) {
+            qWarning() << "无法清理遗留人员导入标记:" << path;
+        }
+    }
+}
 
 /** @brief 原子写入人员导入预约，使预约早于U盘插入事件。 */
 QString UsbPersonImportSource::beginImportRequest(QString *error)

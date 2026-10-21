@@ -4,6 +4,7 @@
  * @author Du lin
  * @date 2026-10-09
  */
+
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import Vant from 'vant'

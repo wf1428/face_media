@@ -1,0 +1,66 @@
+
+# MergedQtApp local tools and build directories
+/MergedQtApp/.web-build-tools/
+/MergedQtApp/.web-build/
+/MergedQtApp/build/
+/MergedQtApp/build-*/
+/MergedQtApp/cmake-build-*/
+/MergedQtApp/web/server/build/
+
+# Frontend dependencies and generated files
+/MergedQtApp/**/node_modules/
+/MergedQtApp/web/frontend/dist/
+/MergedQtApp/web/frontend/*.timestamp-*.mjs
+
+# Application binaries
+/MergedQtApp/MergedQtApp
+/MergedQtApp/web/server/device-webd
+/MergedQtApp/web/server/deviceweb_tests
+
+# Qt / CMake generated files
+/MergedQtApp/**/*.o
+/MergedQtApp/**/*.obj
+/MergedQtApp/**/*.moc
+/MergedQtApp/**/moc_*.cpp
+/MergedQtApp/**/qrc_*.cpp
+/MergedQtApp/**/ui_*.h
+/MergedQtApp/**/.qmake.stash
+/MergedQtApp/**/.qmake.cache
+/MergedQtApp/**/Makefile
+/MergedQtApp/**/Makefile.*
+/MergedQtApp/**/CMakeFiles/
+/MergedQtApp/**/CMakeCache.txt
+/MergedQtApp/**/cmake_install.cmake
+/MergedQtApp/**/CTestTestfile.cmake
+/MergedQtApp/**/compile_commands.json
+
+# Local IDE settings
+/MergedQtApp/**/*.pro.user*
+/MergedQtApp/**/*.qmlproject.user*
+/MergedQtApp/**/.vscode/
+/MergedQtApp/**/.idea/
+
+# Python caches
+/MergedQtApp/**/__pycache__/
+/MergedQtApp/**/*.pyc
+/MergedQtApp/**/*.pyo
+
+# Runtime databases and associated files
+/MergedQtApp/**/*.db
+/MergedQtApp/**/*.db-wal
+/MergedQtApp/**/*.db-shm
+/MergedQtApp/**/*.db-journal
+/MergedQtApp/**/*.sqlite
+/MergedQtApp/**/*.sqlite-wal
+/MergedQtApp/**/*.sqlite-shm
+/MergedQtApp/**/*.sqlite-journal
+/MergedQtApp/**/*.sqlite3
+/MergedQtApp/**/*.sqlite3-wal
+/MergedQtApp/**/*.sqlite3-shm
+/MergedQtApp/**/*.sqlite3-journal
+
+# Logs and temporary files
+/MergedQtApp/**/*.log
+/MergedQtApp/**/*.tmp
+/MergedQtApp/**/*.part
+/MergedQtApp/**/*~

@@ -14,10 +14,17 @@
 #include <QDir>
 
 /** @brief 保存人员范围；任务实际工作由后台线程调用 run() 开始。 */
-PersonExportWorker::PersonExportWorker(PersonExportKind kind, QObject *parent)
+PersonExportWorker::PersonExportWorker(PersonExportKind kind, const QString &requestToken,
+                                     QObject *parent)
     : QObject(parent),
-      kind_(kind)
+      kind_(kind),
+      requestToken_(requestToken)
 {
+}
+
+PersonExportWorker::~PersonExportWorker()
+{
+    UsbPersonExportTarget::endExportRequest(requestToken_);
 }
 
 /** @brief 原子设置取消标志，避免从界面线程直接操作后台资源。 */
@@ -35,11 +42,16 @@ void PersonExportWorker::cancel()
 void PersonExportWorker::run()
 {
     const QString kindName = PersonXlsxExporter::kindName(kind_);
+    const auto complete = [this, &kindName](bool ok, int count,
+                                           const QString &fileName, const QString &message) {
+        UsbPersonExportTarget::endExportRequest(requestToken_);
+        emit finished(ok, count, kindName, fileName, message);
+    };
     emit progress(QStringLiteral("正在检测可写U盘…"));
     const UsbPersonExportVolume volume =
-            UsbPersonExportTarget::waitForWritableVolume(30000, &cancelled_);
+            UsbPersonExportTarget::waitForWritableVolume(30000, &cancelled_, requestToken_);
     if (!volume.ok) {
-        emit finished(false, 0, kindName, QString(), volume.error);
+        complete(false, 0, QString(), volume.error);
         return;
     }
 
@@ -63,17 +75,16 @@ void PersonExportWorker::run()
         const QString message = exported.ok
                 ? QStringLiteral("文件已写入，但%1。请勿立即拔出U盘").arg(unmountError)
                 : exported.error + QStringLiteral("；") + unmountError;
-        emit finished(false, exported.personCount, kindName, fileName, message);
+        complete(false, exported.personCount, fileName, message);
         return;
     }
 
     if (!exported.ok) {
-        emit finished(false, exported.personCount, kindName, fileName, exported.error);
+        complete(false, exported.personCount, fileName, exported.error);
         return;
     }
-    emit finished(true,
+    complete(true,
                   exported.personCount,
-                  kindName,
                   fileName,
                   QStringLiteral("%1导出完成，共 %2 人。文件已保存到U盘 person/%3")
                   .arg(kindName).arg(exported.personCount).arg(fileName));

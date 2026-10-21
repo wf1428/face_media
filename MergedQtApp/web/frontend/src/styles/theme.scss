@@ -4,6 +4,7 @@
  * @author Du lin
  * @date 2026-10-09
  */
+
 // 米家风格 Design Token + Vant 组件样式覆写（对应设计文档 §11.2）
 
 :root {
@@ -37,8 +38,7 @@ body {
   padding: 0;
   background: var(--bg);
   color: var(--text-1);
-  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Helvetica Neue',
-    sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Helvetica Neue', sans-serif;
   -webkit-font-smoothing: antialiased;
 }
 

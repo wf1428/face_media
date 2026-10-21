@@ -50,6 +50,10 @@ PERSON_IMPORT_CONTROL_DIR="/run/face-media"
 PERSON_IMPORT_REQUEST="${PERSON_IMPORT_CONTROL_DIR}/person-import.request"
 PERSON_IMPORT_READY="${PERSON_IMPORT_CONTROL_DIR}/person-import.ready"
 
+# 导出单独预约，不改动现有人员导入协议；/run 重启后清空。
+PERSON_EXPORT_REQUEST="${PERSON_IMPORT_CONTROL_DIR}/person-export.request"
+PERSON_EXPORT_READY="${PERSON_IMPORT_CONTROL_DIR}/person-export.ready"
+
 # 可选日志
 LOG_FILE="/tmp/udisk_watcher.log"
 
@@ -181,7 +185,7 @@ person_import_request_token() {
     request_pid="$(sed -n '1p' "$PERSON_IMPORT_REQUEST" 2>/dev/null | tr -d '\r')"
     request_token="$(sed -n '2p' "$PERSON_IMPORT_REQUEST" 2>/dev/null | tr -d '\r')"
     case "$request_pid" in
-        ''|*[!0-9]*) request_pid="" ;;
+        ''|*[!0-9]*|0) request_pid="" ;;
     esac
 
     if [ -z "$request_pid" ] || [ -z "$request_token" ] \
@@ -206,6 +210,33 @@ publish_person_import_ready() {
         return 1
     }
     return 0
+}
+
+# 返回有效导出令牌；应用异常退出后自动清除失效预约。
+person_export_request_token() {
+    [ -r "$PERSON_EXPORT_REQUEST" ] || return 1
+    export_request_pid="$(sed -n '1p' "$PERSON_EXPORT_REQUEST" 2>/dev/null | tr -d '\r')"
+    export_request_token="$(sed -n '2p' "$PERSON_EXPORT_REQUEST" 2>/dev/null | tr -d '\r')"
+    case "$export_request_pid" in
+        ''|*[!0-9]*|0) export_request_pid="" ;;
+    esac
+    if [ -z "$export_request_pid" ] || [ -z "$export_request_token" ] \
+       || ! kill -0 "$export_request_pid" 2>/dev/null; then
+        rm -f "$PERSON_EXPORT_REQUEST" "$PERSON_EXPORT_READY" 2>/dev/null
+        return 1
+    fi
+    echo "$export_request_token"
+}
+
+# 第二行为挂载点，或 BUSY；第三行为可选拒绝原因。
+publish_person_export_ready() {
+    export_ready_tmp="${PERSON_EXPORT_READY}.tmp.$$"
+    mkdir -p "$PERSON_IMPORT_CONTROL_DIR" 2>/dev/null || return 1
+    printf '%s\n%s\n%s\n' "$1" "$2" "${3:-}" > "$export_ready_tmp" 2>/dev/null || return 1
+    mv -f "$export_ready_tmp" "$PERSON_EXPORT_READY" 2>/dev/null || {
+        rm -f "$export_ready_tmp" 2>/dev/null
+        return 1
+    }
 }
 
 find_mountpoint_under_base() {
@@ -444,22 +475,24 @@ copy_ycest_non_video_dirs_to_udisk_images_with_progress() {
 
 
 
-# 清空/mnt/UDISK/.../images 目录（不包括 video），然后重建 images 目录
+# 仅清空 U 盘 Ycest 中实际提供的资源目录；未提供的设备目录保持原样。
+# video 和 person 继续由原有的专用视频校验/人员导入流程处理。
 clear_udisk_images_dir() {
-    images_dir="${UDISK_DIR}/${QRC_DST_SUBDIR}"   # /mnt/UDISK/res/static/demoResources/images
-    video_dir="${VIDEO_DST_DIR}"                  # /mnt/UDISK/res/static/demoResources/images/video
+    resource_source="$1/$YCEST_SUBDIR"
+    images_dir="${UDISK_DIR}/${QRC_DST_SUBDIR}"
 
+    [ -d "$resource_source" ] || return 0
+    mkdir -p "$images_dir" "$VIDEO_DST_DIR" 2>/dev/null || return 1
 
-    mkdir -p "$images_dir" 2>/dev/null || return 1
-    mkdir -p "$video_dir" 2>/dev/null || return 1
-
-    # 只清理images目录下除video外的内容，保留video目录及其里面的文件
-    for item in "$images_dir"/*; do
-        [ -e "$item" ] || continue
-        [ "$item" = "$video_dir" ] && continue
-        rm -rf "$item" 2>/dev/null || return 1
+    # 名称来自源目录的直接子项，不根据目标端已有目录推断清理范围。
+    for source_item in "$resource_source"/*; do
+        [ -d "$source_item" ] || continue
+        resource_name="${source_item##*/}"
+        case "$resource_name" in
+            video|person) continue ;;
+        esac
+        rm -rf "$images_dir/$resource_name" 2>/dev/null || return 1
     done
-
     return 0
 }
 
@@ -708,7 +741,7 @@ do_job_once() {
     res_src="${mountp}/${YCEST_SUBDIR}"
     qrc_dst="${UDISK_DIR}/${QRC_DST_SUBDIR}"
 
-    # 0) 只有 Ycest 下存在除 video、person 外的UI资源目录时，才清理images（保留video）并拷贝资源
+    # 0) 仅清理 Ycest 实际提供的 UI 资源目录，缺失目录保留；video/person 走原专用流程。
     if has_non_video_dirs_under_ycest "$mountp"; then
         if ! clear_udisk_images_dir "$mountp"; then
             write_status "error" "清理images目录失败" "$mountp" "$qrc_dst" "$qrc_dst" 0 0 0 "" 106 "qrc"
@@ -769,7 +802,12 @@ daemon_loop() {
     person_session=0
     person_token=""
     person_request_active=0
+    export_session=0
+    export_token=""
+    export_request_active=0
+    copy_started=0
     rm -f "$PERSON_IMPORT_READY" 2>/dev/null
+    rm -f "$PERSON_EXPORT_READY" 2>/dev/null
 
     write_status "idle" "等待插入U盘" "" "" "$UDISK_DIR" 0 0 0 "" 0 "all"
 
@@ -789,7 +827,12 @@ daemon_loop() {
                 person_session=0
                 person_token=""
                 person_request_active=0
+                export_session=0
+                export_token=""
+                export_request_active=0
+                copy_started=0
                 rm -f "$PERSON_IMPORT_READY" 2>/dev/null
+                rm -f "$PERSON_EXPORT_READY" 2>/dev/null
                 write_status "inserted" "已插入U盘" "$mountp" "$video_src" "$UDISK_DIR" 0 0 0 "" 0 "all"
             fi
 
@@ -797,6 +840,48 @@ daemon_loop() {
             # 不再执行UI资源和视频复制；即使应用完成或取消，也要等拔盘后
             # 才恢复普通自动复制，避免同一块盘在导入结束后又被二次处理。
             current_person_token="$(person_import_request_token 2>/dev/null)"
+            current_export_token="$(person_export_request_token 2>/dev/null)"
+            if [ "$export_session" -eq 0 ] && [ -n "$current_export_token" ]; then
+                if [ "$person_session" -eq 1 ] || [ -n "$current_person_token" ] \
+                   || [ "$copy_started" -eq 1 ]; then
+                    # 已开始的更新/导入不能被中途接管，也不改变原有拔盘重启行为。
+                    publish_person_export_ready "$current_export_token" "BUSY" \
+                        "当前U盘已用于资源更新或人员导入，请拔出后重新点击导出，再插入U盘"
+                else
+                    export_session=1
+                    export_token="$current_export_token"
+                    export_request_active=1
+                    job_done=1
+                    if publish_person_export_ready "$export_token" "$mountp"; then
+                        write_status "person_ready" "人员导出U盘已就绪" \
+                            "$mountp" "${mountp}/Ycest/person" "" 0 0 0 "" 0 "person"
+                        ulog "person export session reserved: mount=$mountp token=$export_token"
+                    else
+                        write_status "error" "人员导出就绪状态写入失败" \
+                            "$mountp" "${mountp}/Ycest/person" "" 0 0 0 "" 802 "person"
+                    fi
+                fi
+            fi
+
+            # 本次插入一旦用于导出，即使完成或取消也不再自动拷贝；拔盘后复位。
+            if [ "$export_session" -eq 1 ]; then
+                if [ -n "$current_export_token" ] && [ "$current_export_token" != "$export_token" ]; then
+                    export_token="$current_export_token"
+                    export_request_active=1
+                    if publish_person_export_ready "$export_token" "$mountp"; then
+                        write_status "person_ready" "人员导出U盘已就绪" \
+                            "$mountp" "${mountp}/Ycest/person" "" 0 0 0 "" 0 "person"
+                    fi
+                elif [ -z "$current_export_token" ] && [ "$export_request_active" -eq 1 ]; then
+                    export_request_active=0
+                    rm -f "$PERSON_EXPORT_READY" 2>/dev/null
+                    write_status "person_done" "人员导出处理完成，请拔出U盘" \
+                        "$mountp" "${mountp}/Ycest/person" "" 100 0 0 "" 0 "person"
+                fi
+                sleep "$POLL_INTERVAL"
+                continue
+            fi
+
             if [ "$person_session" -eq 0 ] && [ -n "$current_person_token" ]; then
                 person_session=1
                 person_token="$current_person_token"
@@ -840,6 +925,7 @@ daemon_loop() {
             if is_dir_readable "$UDISK_DIR" && is_dir_writable "$UDISK_DIR" \
                && is_dir_readable "$mountp" && is_dir_writable "$mountp"; then
 
+                copy_started=1
                 do_job_once "$mountp"
                 rc=$?
 
@@ -865,10 +951,12 @@ daemon_loop() {
                 was_done="$job_done"
                 was_restart_needed="$restart_needed"
                 was_person_session="$person_session"
+                was_export_session="$export_session"
 
                 inserted=0
                 last_mount=""
                 rm -f "$PERSON_IMPORT_READY" 2>/dev/null
+                rm -f "$PERSON_EXPORT_READY" 2>/dev/null
 
                 if [ "$was_done" -eq 1 ] && [ "$was_restart_needed" -eq 1 ]; then
                     write_status "restarting" "U盘已拔出，正在重启程序..." \
@@ -886,6 +974,8 @@ daemon_loop() {
                         write_status "done" "U盘已拔出，程序重启完成" \
                             "" "" "$UDISK_DIR" 100 0 0 "" 0 "all"
                     fi
+                elif [ "$was_export_session" -eq 1 ]; then
+                    write_status "removed" "人员导出U盘已拔出" "" "" "$UDISK_DIR" 0 0 0 "" 0 "person"
                 elif [ "$was_person_session" -eq 1 ]; then
                     write_status "removed" "人员导入U盘已拔出" "" "" "$UDISK_DIR" 0 0 0 "" 0 "person"
                 else
@@ -897,6 +987,10 @@ daemon_loop() {
                 person_session=0
                 person_token=""
                 person_request_active=0
+                export_session=0
+                export_token=""
+                export_request_active=0
+                copy_started=0
             fi
         fi
         sleep "$POLL_INTERVAL"

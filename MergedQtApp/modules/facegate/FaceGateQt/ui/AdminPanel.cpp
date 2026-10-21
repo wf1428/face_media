@@ -13,6 +13,7 @@
 #include "shell/QuickUiRuntime.h"
 #include "AppPasswordDialog.h"
 #include "UsbPersonImportSource.h"
+#include "UsbPersonExportTarget.h"
 #include "common/responsive_ui.h"
 #include "common/storage_policy.h"
 
@@ -2821,11 +2822,17 @@ void AdminPanel::setPersonImportBusy(bool busy, int progress)
 /** @brief 提示插入U盘并在同一弹窗内选择导出人员范围。 */
 void AdminPanel::requestExportPeopleToUsb()
 {
+    QString error;
+    const QString requestToken = UsbPersonExportTarget::beginExportRequest(&error);
+    if (requestToken.isEmpty()) {
+        AppMessageDialog::warning(this, QStringLiteral("导出人员"), error);
+        return;
+    }
     AppMessageDialog::information(
                 this,
                 QStringLiteral("导出人员"),
                 QStringLiteral("请插入可写U盘。点击确定后请选择要导出的人员范围，"
-                               "系统会在后台挂载U盘并保存为固定的 xlsx 文件。"));
+                               "系统确认U盘后会保存为固定的 xlsx 文件。"));
     const int selected = AppMessageDialog::choose(
                 this,
                 QStringLiteral("选择导出人员"),
@@ -2833,13 +2840,16 @@ void AdminPanel::requestExportPeopleToUsb()
                 QStringList() << QStringLiteral("网络人员")
                               << QStringLiteral("本地人员")
                               << QStringLiteral("全部人员"));
-    if (selected < 0) return;
+    if (selected < 0) {
+        UsbPersonExportTarget::endExportRequest(requestToken);
+        return;
+    }
     if (selected == 0) {
-        emit peopleExportRequested(QStringLiteral("network"));
+        emit peopleExportRequested(QStringLiteral("network"), requestToken);
     } else if (selected == 1) {
-        emit peopleExportRequested(QStringLiteral("local"));
+        emit peopleExportRequested(QStringLiteral("local"), requestToken);
     } else {
-        emit peopleExportRequested(QStringLiteral("all"));
+        emit peopleExportRequested(QStringLiteral("all"), requestToken);
     }
 }
 

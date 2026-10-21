@@ -97,7 +97,7 @@ bool isInside(const QString &path, const QString &root)
     const QString absolutePath = absoluteCleanPath(path);
     const QString absoluteRoot = absoluteCleanPath(root);
     return absolutePath == absoluteRoot
-            || absolutePath.startsWith(absoluteRoot + QDir::separator());
+            || absolutePath.startsWith(absoluteRoot + QLatin1Char('/'));
 }
 
 QString mediaRoot()

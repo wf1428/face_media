@@ -1,0 +1,81 @@
+/* @file portal.css | @brief 无外部依赖的手机热点浏览器引导样式。 */
+:root {
+  font-family:
+    system-ui,
+    -apple-system,
+    sans-serif;
+  color: #183044;
+  background: #eef4f8;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  padding: 40px 20px;
+}
+.card {
+  max-width: 460px;
+  margin: auto;
+  padding: 28px 24px;
+  border-radius: 20px;
+  background: white;
+  box-shadow: 0 12px 40px #13304712;
+}
+.badge {
+  color: #1575c5;
+  font-weight: 600;
+}
+h1 {
+  font-size: 26px;
+  margin: 20px 0 14px;
+}
+p {
+  line-height: 1.7;
+}
+.tip,
+.help,
+#status {
+  color: #526779;
+  font-size: 14px;
+}
+.primary,
+button {
+  display: block;
+  width: 100%;
+  padding: 14px 12px;
+  margin: 16px 0;
+  border: 0;
+  border-radius: 12px;
+  font-size: 16px;
+  text-align: center;
+  cursor: pointer;
+}
+.primary {
+  background: #1677d2;
+  color: white;
+  text-decoration: none;
+}
+[hidden] {
+  display: none;
+}
+button {
+  background: #edf4fc;
+  color: #1264ad;
+}
+button:disabled {
+  opacity: 0.5;
+}
+label {
+  display: block;
+  margin: 24px 0 8px;
+  font-size: 14px;
+}
+input {
+  width: 100%;
+  padding: 12px;
+  border: 1px solid #c9d6e1;
+  border-radius: 8px;
+  background: #f7fafc;
+  font-size: 15px;
+}

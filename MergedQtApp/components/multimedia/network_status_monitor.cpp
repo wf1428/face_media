@@ -1276,11 +1276,23 @@ bool NetworkStatusMonitor::isLikelyLiveHttpBody(const QString &url,
 /** @brief 设置告警类型、文案及闪现定时器。 */
 void NetworkStatusMonitor::setWarning(WarningKind kind, const QString &detail)
 {
+    const bool warningChanged = !warningActive_ || warningKind_ != kind;
+    const QString previousText = text_;
     updateWarningText(kind, detail);
     warningKind_ = kind;
     warningActive_ = true;
 
-    // 第一次进入告警或告警类型变化时立即提示一次，之后每1分钟提示一次。
+    // 网络故障只记日志；从直播源告警切换过来时，也立即移除已有提示条。
+    if ((kind == WarningKind::LinkDown || kind == WarningKind::NoInternet) &&
+        blinkTimer_.isActive()) {
+        hideWarningNow();
+        if (warningChanged || previousText != text_) {
+            showWarningNow();
+        }
+        return;
+    }
+
+    // 首次告警立即处理，之后每1分钟处理一次；直播源告警保留原有显示方式。
     if (!blinkTimer_.isActive()) {
         showWarningNow();
         blinkTimer_.start();
@@ -1343,9 +1355,15 @@ void NetworkStatusMonitor::onBlinkTimeout()
     showWarningNow();
 }
 
-/** @brief 显示一次告警并安排自动隐藏。 */
+/** @brief 网络故障记录日志；其他告警显示一次并安排自动隐藏。 */
 void NetworkStatusMonitor::showWarningNow()
 {
+    if (warningKind_ == WarningKind::LinkDown || warningKind_ == WarningKind::NoInternet) {
+        qWarning().noquote() << "[网络告警]" << text_;
+        hideWarningNow();
+        return;
+    }
+
     if (main_) {
         setGeometry(main_->rect());
     }

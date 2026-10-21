@@ -1,15 +1,12 @@
 {
   "_comment": "@file web.json | @brief 独立 Web 服务生产部署样例；origin 必须与证书及实际访问地址一致。 @author Du lin @date 2026-10-09",
-  "bind": "192.168.50.1",
+  "bind": "192.168.10.1",
   "port": 443,
   "portal_port": 80,
-  "origin": "https://192.168.50.1",
+  "origin": "https://192.168.10.1",
   "socket": "/run/mergedqt/web.sock",
   "www": "/home/cat/web-stage/dist",
   "certificate": "/home/cat/web-stage/tls/server-chain.pem",
   "private_key": "/home/cat/web-stage/tls/server-key.pem",
-  "development_http": false,
-  "device_name": "本地设备",
-  "device_id": "FACTORY_DEVICE_ID",
-  "wifi_name": "DEVICE-SETUP"
+  "development_http": false
 }

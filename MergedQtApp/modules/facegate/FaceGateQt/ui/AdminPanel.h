@@ -151,7 +151,7 @@ signals:
     void peopleImportRequested(const QString &requestToken);
 
     /** @brief 导出人员XLSX；范围为 network、local 或 all。 */
-    void peopleExportRequested(const QString &personnelScope);
+    void peopleExportRequested(const QString &personnelScope, const QString &requestToken);
 
     /** @brief 验证日志筛选刷新请求。 */
     void passedLogsRefreshRequested(const VerifyLogFilter &filter);

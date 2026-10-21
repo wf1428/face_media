@@ -4,10 +4,24 @@
  @author Du lin
  @date 2026-10-09
 -->
+
 <template>
   <!-- 语言切换器：globe 图标 + 当前语言名 -> ActionSheet 选择 zh/en/vi/th -->
   <span class="lang-switch" :class="{ 'is-text': showLabel }" @click="show = true">
-    <van-icon name="globe-o" :size="size" />
+    <svg
+      class="language-icon"
+      :width="size"
+      :height="size"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.7"
+      aria-hidden="true"
+    >
+      <circle cx="12" cy="12" r="9" />
+      <ellipse cx="12" cy="12" rx="4" ry="9" />
+      <path d="M3 12h18M5 6.5h14M5 17.5h14" />
+    </svg>
     <span v-if="showLabel" class="lang-switch-text">{{ currentLabel }}</span>
   </span>
   <van-action-sheet
@@ -36,27 +50,27 @@ const props = defineProps({
   // 图标尺寸（px）
   size: { type: [String, Number], default: 22 },
   // 是否在图标旁显示当前语言名称
-  showLabel: { type: Boolean, default: true }
+  showLabel: { type: Boolean, default: true },
 })
 
 const show = ref(false)
 
-// 当前语言的本地名称（如 中文 / English / Tiếng Việt / ไทย），随 locale 响应式更新
+/** @brief 随当前语言更新对应的本地名称。 */
 const currentLabel = computed(() => {
   const conf = SUPPORT_LANGS.find((l) => l.value === locale.value)
   return conf ? t(conf.labelKey) : ''
 })
 
-// 动作项需随语言重算：当前语言显示选中色
+/** @brief 根据语言状态生成菜单动作项和选中色。 */
 const actions = computed(() =>
   SUPPORT_LANGS.map((l) => ({
     name: t(l.labelKey),
     value: l.value,
-    color: locale.value === l.value ? 'var(--primary)' : ''
-  }))
+    color: locale.value === l.value ? 'var(--primary)' : '',
+  })),
 )
 
-/** 选择语言后关闭弹层 */
+/** @brief 选择语言后关闭弹层 */
 function onSelect(item) {
   setLanguage(item.value)
   show.value = false
@@ -72,6 +86,10 @@ function onSelect(item) {
   padding: 4px;
   cursor: pointer;
   user-select: none;
+}
+.language-icon {
+  display: block;
+  flex-shrink: 0;
 }
 /* 带文字时做成浅底胶囊，更像可点入口 */
 .lang-switch.is-text {

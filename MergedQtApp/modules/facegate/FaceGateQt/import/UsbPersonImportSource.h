@@ -28,6 +28,9 @@ struct UsbPersonImportFile
 class UsbPersonImportSource
 {
 public:
+    /** @brief 仅在应用启动、尚无导入任务时清除上次遗留的预约及确认标记。 */
+    static void clearImportRequestOnStartup();
+
     /**
      * @brief 在显示导入确认框前登记一次人员导入预约。
      * @return 成功时返回一次性令牌，失败时返回空字符串。

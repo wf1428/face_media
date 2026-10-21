@@ -48,7 +48,7 @@
     "deviceX": "Thiết bị {id}",
     "offlineDevice": "Thiết bị ngoại tuyến",
     "deviceId": "Mã thiết bị",
-    "deviceName": "Tên thiết bị",
+    "deviceName": "WiFi SSID",
     "password": "Mật khẩu",
     "passwordPlaceholder": "Nhập mật khẩu thiết bị",
     "enter": "Vào",
@@ -56,17 +56,21 @@
     "enterPassword": "Vui lòng nhập mật khẩu",
     "loginSuccess": "Đăng nhập thành công",
     "loginFailed": "Đăng nhập thất bại",
-    "pwdWrong": "Sai mật khẩu"
+    "pwdWrong": "Sai mật khẩu",
+    "rememberPassword": "Ghi nhớ mật khẩu",
+    "showPassword": "Hiện mật khẩu",
+    "hidePassword": "Ẩn mật khẩu"
   },
   "tab": {
-    "preview": "Thiết bị",
+    "preview": "Đa phương tiện",
     "person": "Nhân sự",
     "elevator": "Thang máy",
     "air": "Điều hòa",
-    "video": "Video"
+    "video": "Video",
+    "device": "Cài đặt"
   },
   "preview": {
-    "title": "Xem trước thiết bị",
+    "title": "Đa phương tiện",
     "wifiHotspot": "Điểm phát Wi-Fi",
     "overview": "Tổng quan thiết bị",
     "personCount": "Nhân sự đã đăng ký",
@@ -79,17 +83,17 @@
     "screenshotFailed": "Chụp màn hình thất bại"
   },
   "settings": {
-    "title": "Cài đặt thiết bị",
+    "title": "Cài đặt",
     "deviceInfo": "Thông tin thiết bị",
     "deviceId": "Mã thiết bị",
-    "deviceName": "Tên thiết bị",
+    "deviceName": "WiFi SSID",
     "deviceNamePlaceholder": "Nhập tên thiết bị",
     "wifi": "Điểm phát Wi-Fi",
-    "wifiTip": "Sau khi điện thoại kết nối điểm phát này, nhập IP thiết bị trên trình duyệt để truy cập trang",
+    "wifiTip": "Tên thiết bị theo tên điểm phát. Có thể sửa tên và mật khẩu; để trống để giữ mật khẩu cũ.",
     "hotspotName": "Tên điểm phát",
     "hotspotNamePlaceholder": "Nhập tên điểm phát",
     "hotspotPassword": "Mật khẩu điểm phát",
-    "hotspotPasswordPlaceholder": "Nhập mật khẩu điểm phát",
+    "hotspotPasswordPlaceholder": "Để trống để giữ mật khẩu cũ",
     "loginPassword": "Mật khẩu đăng nhập",
     "loginPasswordTip": "Sau khi đổi, lần sau vào bảng điều khiển phải dùng mật khẩu mới",
     "oldPassword": "Mật khẩu cũ",
@@ -98,21 +102,35 @@
     "newPasswordPlaceholder": "Tối thiểu 4 ký tự",
     "confirmPassword": "Xác nhận mật khẩu",
     "confirmPasswordPlaceholder": "Nhập lại mật khẩu mới",
-    "pkgImport": "Nhập gói cấu hình (ycest)",
-    "pkgTip": "Tải lên tệp nén có tên chứa ycest, thiết bị giải nén để cấu hình thiết bị và giao diện",
+    "pkgImport": "Gói tài nguyên Ycest",
     "selectPkg": "Chọn tệp nén cấu hình",
-    "pkgHint": "Tên tệp phải chứa ycest (ví dụ ycest.zip)",
+    "pkgHint": "ZIP, TAR, TAR.GZ, TGZ hoặc RAR; tối đa 512 MiB; thư mục gốc: Ycest",
     "saveSettings": "Lưu cài đặt",
     "readFailed": "Đọc cài đặt thiết bị thất bại",
     "enterDeviceName": "Vui lòng nhập tên thiết bị",
     "enterOldPassword": "Vui lòng nhập mật khẩu cũ",
     "enterNewPassword": "Vui lòng nhập mật khẩu mới",
     "passwordMismatch": "Hai mật khẩu mới không khớp",
-    "ycestRequired": "Tên tệp phải chứa ycest",
+    "ycestRequired": "Tên tệp phải chứa Ycest",
     "selectPkgFirst": "Vui lòng chọn tệp nén cấu hình trước",
     "oldPasswordWrong": "Sai mật khẩu cũ",
     "newPasswordTooShort": "Mật khẩu mới phải có ít nhất 4 ký tự",
-    "pkgNameYcest": "Tên tệp gói cấu hình phải chứa ycest"
+    "pkgNameYcest": "Tên tệp gói cấu hình phải chứa Ycest",
+    "wifiRestartWarning": "Lưu sẽ kích hoạt lại điểm phát và ngắt kết nối điện thoại. Kết nối lại bằng tên và mật khẩu mới.",
+    "wifiSavedReconnect": "Đã lưu. Điểm phát sẽ kích hoạt lại sau 3 giây và ngắt kết nối. Kết nối lại với “{ssid}” bằng mật khẩu mới nếu đã đổi.",
+    "wifiInvalid": "SSID phải dài 1–32 byte, không có khoảng trắng ở đầu/cuối hoặc ký tự điều khiển.",
+    "hotspotPasswordHint": "Dùng 8–63 ký tự ASCII hoặc khóa thập lục phân 64 ký tự. Không hiển thị mật khẩu cũ.",
+    "hotspotPasswordInvalid": "Dùng 8–63 ký tự ASCII hoặc khóa thập lục phân 64 ký tự",
+    "pkgInvalid": "Chọn gói ZIP/TAR/TAR.GZ/TGZ/RAR không quá 512 MiB",
+    "pkgUploading": "Đang tải gói tài nguyên",
+    "pkgApplying": "Đang kiểm tra, giải nén và cập nhật tài nguyên",
+    "pkgDone": "Cập nhật hoàn tất!",
+    "pkgQuery": "Kiểm tra kết quả",
+    "pkgCancel": "Hủy tác vụ chưa hoàn thành",
+    "pkgIncomplete": "Tải lên chưa hoàn tất. Hủy và chọn lại tệp.",
+    "pkgRestarting": "Thiết bị sắp khởi động lại, vui lòng chờ.",
+    "pkgRestartFailed": "Tài nguyên đã cập nhật nhưng thiết bị chưa làm mới. Kiểm tra dịch vụ thiết bị.",
+    "pkgConfirm": "Sau khi xác nhận, thiết bị sẽ bắt đầu cập nhật."
   },
   "air": {
     "title": "Điều khiển điều hòa",
@@ -191,7 +209,8 @@
     "floorPlaceholder": "ví dụ 3,5,7",
     "confirmOpen": "Xác nhận (mặc định mở)",
     "scheduleSummary": "{action} {time} {weeks} Tầng[{floors}]",
-    "setFailed": "Cài đặt thất bại"
+    "setFailed": "Cài đặt thất bại",
+    "floorSelectionHint": "Đã chọn: mở; chưa chọn: hạn chế"
   },
   "person": {
     "title": "Danh sách nhân sự",
@@ -273,7 +292,11 @@
     "deletePersonWarn": "Xóa \"{name}\"? Thao tác này không thể hoàn tác.",
     "selectWeekday": "Vui lòng chọn thứ",
     "enterName": "Vui lòng nhập họ tên",
-    "notFound": "Không tìm thấy nhân sự"
+    "notFound": "Không tìm thấy nhân sự",
+    "closeCreate": "Đóng tạo tài khoản",
+    "viewNfcImage": "Xem mã đọc thẻ NFC",
+    "nfcImage": "Mã đọc thẻ NFC",
+    "saveNfcImage": "Lưu ảnh"
   },
   "video": {
     "title": "Quản lý video",
@@ -300,5 +323,27 @@
     "selectVideoFirst": "Vui lòng chọn tệp video trước",
     "uploadSuccess": "Video đã được tải lên và lưu",
     "deleteVideo": "Xóa video"
+  },
+  "network": {
+    "title": "Cài đặt IP",
+    "tip": "Cài đặt IPv4 cho cổng mạng dây. Địa chỉ điểm phát WiFi không thay đổi.",
+    "iface": "Giao diện",
+    "mode": "Chế độ địa chỉ",
+    "dhcp": "DHCP tự động",
+    "static": "IP tĩnh",
+    "ip": "Địa chỉ IP",
+    "netmask": "Mặt nạ mạng",
+    "gateway": "Cổng mặc định",
+    "dns": "DNS",
+    "dnsHint": "Phân cách DNS bằng dấu cách",
+    "dhcpHint": "DHCP tự động cấp địa chỉ. Các ô hiển thị thông số đã lưu gần nhất trên thiết bị.",
+    "staticHint": "Nhập IP tĩnh và mặt nạ mạng. Cổng mặc định và DNS không bắt buộc.",
+    "apply": "Áp dụng cài đặt IP",
+    "applying": "Đang áp dụng cài đặt mạng…",
+    "saved": "Đã áp dụng và lưu cài đặt mạng",
+    "waiting": "Đã khởi động DHCP và lưu cấu hình. Đang chờ địa chỉ; hãy làm mới sau.",
+    "invalid": "Kiểm tra IPv4, mặt nạ mạng liên tục, cổng mặc định và DNS",
+    "readFailed": "Không đọc được cấu hình mạng",
+    "saveFailed": "Không áp dụng được cấu hình mạng"
   }
 }

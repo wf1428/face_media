@@ -1,6 +1,6 @@
 /**
  * @file UsbPersonExportTarget.cpp
- * @brief 人员 XLSX 导出所需的固定U盘挂载检测、目录创建和安全卸载。
+ * @brief 人员 XLSX 导出预约、脚本挂载确认、目录创建和安全卸载。
  *
  * @author Dulin
  * @date 2026-08-28
@@ -8,14 +8,37 @@
 
 #include "UsbPersonExportTarget.h"
 
+#include <QCoreApplication>
+#include <QDebug>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QFileInfo>
+#include <QLockFile>
 #include <QProcess>
+#include <QSaveFile>
+#include <QStringList>
 #include <QThread>
 #include <QUuid>
 
 namespace {
+const QString kExportControlDirectory = QStringLiteral("/run/face-media");
+const QString kExportRequestPath = kExportControlDirectory
+        + QStringLiteral("/person-export.request");
+const QString kExportReadyPath = kExportControlDirectory
+        + QStringLiteral("/person-export.ready");
+
+QStringList controlFileLines(const QString &path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) return {};
+    QStringList lines;
+    for (const QByteArray &raw : file.readAll().split('\n')) {
+        const QString line = QString::fromUtf8(raw).trimmed();
+        if (!line.isEmpty()) lines.append(line);
+    }
+    return lines;
+}
 
 /** @brief 还原 /proc/mounts 对空格、制表符和反斜杠的八进制转义。 */
 QString decodeMountField(QString value)
@@ -30,8 +53,9 @@ bool isMountedAt(const QString &mountPoint)
 {
     QFile mounts(QStringLiteral("/proc/mounts"));
     if (!mounts.open(QIODevice::ReadOnly | QIODevice::Text)) return false;
-    while (!mounts.atEnd()) {
-        const QStringList fields = QString::fromUtf8(mounts.readLine()).trimmed()
+    // procfs 文件可能报告大小为0；先读取，不能用 QFile::atEnd() 决定是否读取。
+    for (const QByteArray &line : mounts.readAll().split('\n')) {
+        const QStringList fields = QString::fromUtf8(line).trimmed()
                 .split(QLatin1Char(' '), QString::SkipEmptyParts);
         if (fields.size() >= 2 && decodeMountField(fields.at(1)) == mountPoint) return true;
     }
@@ -91,15 +115,81 @@ bool preparePersonDirectory(const QString &mountPoint,
 
 } // namespace
 
+void UsbPersonExportTarget::clearExportRequestOnStartup()
+{
+    // 仅在应用入口调用，不能在每次点击导出时清理正在使用的预约。
+    for (const QString &path : {kExportRequestPath, kExportReadyPath,
+                               kExportControlDirectory + QStringLiteral("/person-export.lock")}) {
+        if (QFileInfo::exists(path) && !QFile::remove(path)) {
+            qWarning() << "无法清理遗留人员导出标记:" << path;
+        }
+    }
+}
+
+/** @brief 在插盘前原子发布导出请求；与现有导入预约使用独立文件。 */
+QString UsbPersonExportTarget::beginExportRequest(QString *error)
+{
+    if (!QDir().mkpath(kExportControlDirectory)) {
+        if (error) *error = QStringLiteral("无法创建U盘导出控制目录");
+        return {};
+    }
+    QLockFile lock(kExportControlDirectory + QStringLiteral("/person-export.lock"));
+    if (!lock.tryLock(0)) {
+        if (error) *error = QStringLiteral("已有人员导出请求，请稍后重试");
+        return {};
+    }
+    const QStringList previous = controlFileLines(kExportRequestPath);
+    if (previous.size() >= 2) {
+        bool validPid = false;
+        const qint64 pid = previous.at(0).toLongLong(&validPid);
+        if (validPid && pid > 0 &&
+            (pid == QCoreApplication::applicationPid() ||
+             QFileInfo::exists(QStringLiteral("/proc/%1").arg(pid)))) {
+            if (error) *error = QStringLiteral("已有人员导出预约，请先完成或取消");
+            return {};
+        }
+    }
+    const QString token = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QFile::remove(kExportReadyPath);
+    QSaveFile request(kExportRequestPath);
+    if (!request.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        if (error) *error = QStringLiteral("无法创建人员导出请求：%1").arg(request.errorString());
+        return {};
+    }
+    const QByteArray content = QByteArray::number(QCoreApplication::applicationPid())
+            + '\n' + token.toUtf8() + '\n';
+    if (request.write(content) != content.size() || !request.commit()) {
+        if (error) *error = QStringLiteral("无法提交人员导出请求：%1").arg(request.errorString());
+        return {};
+    }
+    return token;
+}
+
+/** @brief 只清理自己的预约，旧任务结束不会误删新任务令牌。 */
+void UsbPersonExportTarget::endExportRequest(const QString &requestToken)
+{
+    if (requestToken.isEmpty()) return;
+    const QStringList request = controlFileLines(kExportRequestPath);
+    if (request.size() >= 2 && request.at(1) == requestToken) QFile::remove(kExportRequestPath);
+    const QStringList ready = controlFileLines(kExportReadyPath);
+    if (!ready.isEmpty() && ready.at(0) == requestToken) QFile::remove(kExportReadyPath);
+}
+
 /**
- * @brief 轮询固定挂载点 /media/usb0，直到取得可写的人员导出目录。
+ * @brief 只使用 udisk watcher 为本次导出令牌确认的实际挂载点。
  *
  * 挂载点为只读时只尝试就地重新挂载，不枚举任何块设备。
  */
 UsbPersonExportVolume UsbPersonExportTarget::waitForWritableVolume(
         int timeoutMs,
-        const std::atomic_bool *cancelled)
+        const std::atomic_bool *cancelled,
+        const QString &requestToken)
 {
+    if (requestToken.trimmed().isEmpty()) {
+        UsbPersonExportVolume result;
+        result.error = QStringLiteral("人员导出预约无效，请重新点击导出");
+        return result;
+    }
     QElapsedTimer timer;
     timer.start();
     QString lastError;
@@ -110,10 +200,28 @@ UsbPersonExportVolume UsbPersonExportTarget::waitForWritableVolume(
             return result;
         }
 
-        const QString fixedMountPoint = QStringLiteral("/media/usb0");
-        if (isMountedAt(fixedMountPoint)) {
+        const QStringList request = controlFileLines(kExportRequestPath);
+        if (request.size() < 2 || request.at(1) != requestToken) {
             UsbPersonExportVolume result;
-            result.mountPoint = fixedMountPoint;
+            result.error = QStringLiteral("人员导出预约已失效，请重新点击导出");
+            return result;
+        }
+        const QStringList ready = controlFileLines(kExportReadyPath);
+        QString mountPoint;
+        if (ready.size() >= 2 && ready.at(0) == requestToken) {
+            if (ready.at(1) == QLatin1String("BUSY")) {
+                UsbPersonExportVolume result;
+                result.error = ready.size() >= 3 ? ready.at(2)
+                        : QStringLiteral("U盘正在执行其他任务，请拔盘后重新预约导出");
+                return result;
+            }
+            mountPoint = QDir::cleanPath(decodeMountField(ready.at(1)));
+        }
+        const bool usbMount = mountPoint == QLatin1String("/media/usb0") ||
+                mountPoint.startsWith(QStringLiteral("/media/usb0/"));
+        if (usbMount && isMountedAt(mountPoint)) {
+            UsbPersonExportVolume result;
+            result.mountPoint = mountPoint;
             if (preparePersonDirectory(result.mountPoint,
                                        &result.personDirectory,
                                        &result.error)) {
@@ -124,7 +232,7 @@ UsbPersonExportVolume UsbPersonExportTarget::waitForWritableVolume(
             if (runProcess(QStringLiteral("mount"),
                            QStringList() << QStringLiteral("-o")
                                          << QStringLiteral("remount,rw")
-                                         << fixedMountPoint,
+                                         << mountPoint,
                            &remountError)
                     && preparePersonDirectory(result.mountPoint,
                                               &result.personDirectory,
@@ -142,13 +250,13 @@ UsbPersonExportVolume UsbPersonExportTarget::waitForWritableVolume(
 
     UsbPersonExportVolume result;
     result.error = lastError.isEmpty()
-            ? QStringLiteral("等待U盘超时，请确认U盘已挂载到 /media/usb0 且可以写入")
+            ? QStringLiteral("等待U盘导出确认超时，请确认 udisk 服务已更新，并在点击导出后插入可写U盘")
             : lastError;
     return result;
 }
 
 /**
- * @brief 先执行 sync，再卸载固定挂载目录。
+ * @brief 先执行 sync，再卸载脚本确认的挂载目录。
  *
  * 即使 sync 报错仍尝试卸载，以优先释放系统资源；最终把同步失败返回调用方。
  */

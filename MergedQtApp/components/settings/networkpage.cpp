@@ -10,6 +10,7 @@
 #include "ui_networkpage.h"
 
 #include "components/dialogs/ui_message_box.h"
+#include "common/network_config.h"
 #include <QProcess>
 #include <QHostAddress>
 #include <QAbstractSocket>
@@ -24,6 +25,7 @@
 #include <QRegularExpression>
 #include <QRegExp>
 #include <QThread>
+#include <QSignalBlocker>
 
 #include <signal.h>
 #include <unistd.h>
@@ -180,19 +182,16 @@ static QString getDnsFromResolvConf()
 }
 
 
-/** @brief 读取接口当前地址、网关和 DNS 并回显到页面。 */
-static void refreshUiFromSystem(Ui::NetworkPage* ui, const QString& ifname)
+/** @brief 工作线程采集的值对象，不包含任何界面对象。 */
+struct NetworkRuntimeState
 {
-    QString ip, mask;
-    getIfaceIPv4AndMask(ifname, &ip, &mask);
-    const QString gw  = getDefaultGateway(ifname);
-    const QString dns = getDnsFromResolvConf();
-
-    ui->ipAddressEdit->setText(ip.isEmpty() ? "-" : ip);
-    ui->subnetMaskEdit->setText(mask.isEmpty() ? "-" : mask);
-    ui->gatewayEdit->setText(gw.isEmpty() ? "-" : gw);
-    ui->dnsEdit->setText(dns.isEmpty() ? "-" : dns);
-}
+    QString ip;
+    QString mask;
+    QString gateway;
+    QString dns;
+    bool carrierUp = false;
+    bool dhcpRunning = false;
+};
 
 
 /** @return 指定网卡 udhcpc 进程的 PID 文件路径。 */
@@ -331,12 +330,107 @@ static bool clearIfaceNetworkConfig(const QString& iface, QString* errOut = null
     return true;
 }
 
+/** @brief 仅在网络工作线程调用；断线轮询不启动网关查询进程。 */
+static NetworkRuntimeState queryNetworkRuntimeState(const QString &iface, bool requireCarrier)
+{
+    NetworkRuntimeState state;
+    state.carrierUp = isIfaceCarrierUp(iface);
+    if (requireCarrier && !state.carrierUp) return state;
+    getIfaceIPv4AndMask(iface, &state.ip, &state.mask);
+    state.gateway = getDefaultGateway(iface);
+    state.dns = getDnsFromResolvConf();
+    state.dhcpRunning = isDhcpRunning(iface);
+    return state;
+}
+
+/** @brief 后台串行运行系统调用，结果和界面操作回到 GUI 线程执行。 */
+void NetworkPage::runNetworkTask(std::function<void()> work,
+                                std::function<void()> completed)
+{
+    Q_ASSERT(!networkTaskPending_);
+    networkTaskPending_ = true;
+    const quint64 generation = networkGeneration_->load();
+    const bool queued = QMetaObject::invokeMethod(networkWorker_,
+            [this, work, completed, generation]() {
+        if (!QThread::currentThread()->isInterruptionRequested() &&
+            generation == networkGeneration_->load()) {
+            work();
+        }
+        QMetaObject::invokeMethod(this, [this, completed, generation]() {
+            networkTaskPending_ = false;
+            dhcpAutoApplying_ = false;
+            if (generation == networkGeneration_->load()) completed();
+            else if (!webNetworkToken_.isEmpty()) {
+                const auto token = webNetworkToken_;
+                webNetworkToken_.clear();
+                emit webNetworkFinished(token, {}, 409,
+                                        QStringLiteral("网络设置已被设备端新操作取代，请刷新核对"));
+            }
+
+            // 手动应用/离线清理优先，防止与尚在执行的续租命令交叉。
+            if (!networkTaskPending_ && deferredNetworkAction_) {
+                auto action = std::move(deferredNetworkAction_);
+                deferredNetworkAction_ = {};
+                action();
+            }
+            if (!networkTaskPending_ && networkRefreshPending_) {
+                networkRefreshPending_ = false;
+                refreshUiFromSystem(ifaceName_.trimmed().isEmpty()
+                                    ? QStringLiteral("eth0") : ifaceName_);
+            }
+        }, Qt::QueuedConnection);
+    }, Qt::QueuedConnection);
+    if (!queued) {
+        networkTaskPending_ = false;
+        dhcpAutoApplying_ = false;
+        appendLog(QStringLiteral("网络后台任务投递失败"));
+        if (!webNetworkToken_.isEmpty()) {
+            const auto token = webNetworkToken_;
+            webNetworkToken_.clear();
+            emit webNetworkFinished(token, {}, 503, QStringLiteral("网络后台任务投递失败"));
+        }
+    }
+}
+
+/** @brief 合并重复回显请求，后台采集后仅应用当前配置代次的结果。 */
+void NetworkPage::refreshUiFromSystem(const QString &iface, std::function<void()> completed)
+{
+    if (networkTaskPending_) {
+        if (completed) {
+            const quint64 generation = networkGeneration_->load();
+            deferredNetworkAction_ = [this, iface, completed, generation]() {
+                if (generation == networkGeneration_->load()) refreshUiFromSystem(iface, completed);
+            };
+        } else {
+            networkRefreshPending_ = true;
+        }
+        return;
+    }
+    auto state = std::make_shared<NetworkRuntimeState>();
+    runNetworkTask([state, iface]() {
+        *state = queryNetworkRuntimeState(iface, false);
+    }, [this, state, completed]() {
+        ui->ipAddressEdit->setText(state->ip.isEmpty() ? "-" : state->ip);
+        ui->subnetMaskEdit->setText(state->mask.isEmpty() ? "-" : state->mask);
+        ui->gatewayEdit->setText(state->gateway.isEmpty() ? "-" : state->gateway);
+        ui->dnsEdit->setText(state->dns.isEmpty() ? "-" : state->dns);
+        if (completed) completed();
+    });
+}
+
 /** @brief 创建网络配置 UI 和 DHCP 状态同步定时器。 */
 NetworkPage::NetworkPage(QWidget *parent)
     : QWidget(parent)
     , ui(new Ui::NetworkPage)
 {
     ui->setupUi(this);
+
+    networkThread_ = new QThread(this);
+    networkThread_->setObjectName(QStringLiteral("DhcpNetworkThread"));
+    networkWorker_ = new QObject;
+    networkWorker_->moveToThread(networkThread_);
+    connect(networkThread_, &QThread::finished, networkWorker_, &QObject::deleteLater);
+    networkThread_->start();
 
     // cancel -> signal
     connect(ui->cancelButton, &QPushButton::clicked,
@@ -375,7 +469,7 @@ NetworkPage::NetworkPage(QWidget *parent)
     handleConnectionTypeChanged(ui->connectionTypeCombo->currentIndex());
 
     //状态回显
-    refreshUiFromSystem(ui, "eth0");
+    refreshUiFromSystem("eth0");
 
     //DHCP 轮询定时器
     dhcpSyncTimer_ = new QTimer(this);
@@ -389,6 +483,11 @@ NetworkPage::NetworkPage(QWidget *parent)
 /** @brief 停止定时器并释放 Qt Designer UI。 */
 NetworkPage::~NetworkPage()
 {
+    dhcpSyncTimer_->stop();
+    networkGeneration_->fetch_add(1);
+    networkThread_->requestInterruption();
+    networkThread_->quit();
+    networkThread_->wait();
     delete ui;
 }
 
@@ -396,13 +495,15 @@ NetworkPage::~NetworkPage()
 /** @brief 有线连接模式切换时刷新可用控件。 */
 void NetworkPage::handleConnectionTypeChanged(int index)
 {
+    networkGeneration_->fetch_add(1);
+    networkRefreshPending_ = false;
     // 0=有线 1=无线
     if (index == 0) {
         // 有线页面
         ui->networkStack->setCurrentIndex(0);
 
         // 有线状态回显
-        refreshUiFromSystem(ui, "eth0");
+        refreshUiFromSystem("eth0");
     } else {
         // 无线页面
         ui->networkStack->setCurrentIndex(1);
@@ -412,6 +513,8 @@ void NetworkPage::handleConnectionTypeChanged(int index)
 /** @brief DHCP/静态模式切换时更新输入框状态。 */
 void NetworkPage::handleIpModeChanged(int index)
 {
+    networkGeneration_->fetch_add(1);
+    networkRefreshPending_ = false;
     const bool isStatic = (index == 0);     // isStatic:0=静态
     setIpFieldsEnabled(!isStatic);
 
@@ -470,6 +573,8 @@ bool NetworkPage::eventFilter(QObject *watched, QEvent *event)
 /** @brief 使用项目屏幕键盘编辑指定输入框。 */
 void NetworkPage::openKeyboardFor(QLineEdit *edit, const QString &title)
 {
+    networkGeneration_->fetch_add(1);
+    networkRefreshPending_ = false;
     bool ok = false;
 
     // 这里 maxLen 给 15（IPv4 最大 15 字符：255.255.255.255）
@@ -497,6 +602,14 @@ void NetworkPage::handleApplyClicked()
 /** @brief 执行 DHCP 或静态网络命令，并按需显示结果。 */
 bool NetworkPage::applyNetworkConfig(bool showMessage)
 {
+    const quint64 generation = networkGeneration_->fetch_add(1) + 1;
+    networkRefreshPending_ = false;
+    if (networkTaskPending_) {
+        deferredNetworkAction_ = [this, showMessage, generation]() {
+            if (generation == networkGeneration_->load()) applyNetworkConfig(showMessage);
+        };
+        return true; // 已受理；等旧后台任务结束后再应用，避免并发修改网卡。
+    }
     // online_v1-v2启用功能
     if (!isNetworkFeatureEnabled()) {
         const QString iface = ifaceName_.trimmed().isEmpty() ? QString("eth0") : ifaceName_;
@@ -514,7 +627,7 @@ bool NetworkPage::applyNetworkConfig(bool showMessage)
                 appendLog("offline_v1开启时清理配置文件IP失败");
             }
 
-            refreshUiFromSystem(ui, iface);
+            refreshUiFromSystem(iface);
         }
 
         if (showMessage) {
@@ -538,74 +651,17 @@ bool NetworkPage::applyNetworkConfig(bool showMessage)
         return false;
     }
 
+    if (mode == 0) {
+        applyDhcpNetworkConfig(iface, showMessage);
+        return true;
+    }
+
     if (!runCmd("ip", {"link", "set", iface, "up"}, &err)) {
         if (showMessage) {
             UiMessageBox::critical(this, "失败", "拉起网卡失败: " + err);
         }
         appendLog(QString("拉起网卡失败: %1").arg(err));
         return false;
-    }
-
-    if (mode == 0) {
-        // DHCP 前先判断网线是否连接
-        if (!isIfaceCarrierUp(iface)) {
-            if (showMessage) {
-                UiMessageBox::warning(this,
-                                     "网线未连接",
-                                     QString("未检测到 %1 网线连接，请插入网线后再获取DHCP。").arg(iface));
-            }
-
-            appendLog(QString("DHCP取消：%1 未检测到网线连接，carrier=0").arg(iface));
-            refreshUiFromSystem(ui, iface);
-            return false;
-        }
-
-        stopDhcpClient(iface);
-        runCmd("ip", {"addr", "flush", "dev", iface});
-        runCmd("ip", {"route", "flush", "dev", iface});
-
-        if (!startDhcpDaemon(iface, &err)) {
-            if (showMessage) {
-                UiMessageBox::warning(this, "DHCP失败",
-                                     "启动DHCP客户端失败（检查网线/上级设备DHCP）\n" + err);
-            }
-            appendLog(QString("启动DHCP客户端失败: %1").arg(err));
-            refreshUiFromSystem(ui, iface);
-            return false;
-        }
-
-        QString ipNow, maskNow;
-        for (int i = 0; i < 30; ++i) {
-            getIfaceIPv4AndMask(iface, &ipNow, &maskNow);
-            if (!ipNow.isEmpty() && ipNow != "0.0.0.0" && !maskNow.isEmpty())
-                break;
-            runCmd("sleep", {"0.1"});
-        }
-
-        refreshUiFromSystem(ui, iface);
-
-        if (!ipNow.isEmpty() && ipNow != "0.0.0.0" && !maskNow.isEmpty()) {
-            saveInputsToConfigFile(configDir_);
-
-            lastIp_ = ipNow;
-            lastMask_ = maskNow;
-            lastGateway_ = getDefaultGateway(iface);
-            lastDns_ = getDnsFromResolvConf();
-
-            if (showMessage) {
-                UiMessageBox::information(this, "设置成功", "DHCP已启动并获取到网络参数");
-            }
-            appendLog(QString("DHCP已启动并获取到网络参数：ip=%1 mask=%2 gw=%3 dns=%4")
-                      .arg(lastIp_, lastMask_, lastGateway_, lastDns_));
-        } else {
-            if (showMessage) {
-                UiMessageBox::information(this, "提示", "DHCP已启动，等待获取网络参数");
-            }
-            appendLog("DHCP已启动，但尚未获取到有效IP，等待定时器同步");
-        }
-
-        emit networkAppliedSuccessfully();
-        return true;
     }
 
     // 静态 IP
@@ -690,18 +746,189 @@ bool NetworkPage::applyNetworkConfig(bool showMessage)
         }
     }
 
-    refreshUiFromSystem(ui, iface);
-    saveInputsToConfigFile(configDir_);
-
-    if (showMessage) {
-        UiMessageBox::information(this, "成功", QString("静态 IP 已应用（%1）").arg(iface));
-    }
-    appendLog(QString("静态 IP 已应用（%1）").arg(iface));
-
-    emit networkAppliedSuccessfully();
+    refreshUiFromSystem(iface, [this, iface, showMessage]() {
+        saveInputsToConfigFile(configDir_);
+        if (showMessage) {
+            UiMessageBox::information(this, "成功", QString("静态 IP 已应用（%1）").arg(iface));
+        }
+        appendLog(QString("静态 IP 已应用（%1）").arg(iface));
+        emit networkAppliedSuccessfully();
+    });
     return true;
 }
 
+/** @brief Web 使用原网卡命令与 DHCP 客户端，在共享网络工作线程执行并保存配置。 */
+void NetworkPage::applyWebNetworkConfig(const QString &token, const QJsonObject &input)
+{
+    if (networkTaskPending_ || !webNetworkToken_.isEmpty()) {
+        emit webNetworkFinished(token, {}, 409, QStringLiteral("网络正在配置，请稍后重试"));
+        return;
+    }
+    const QString cfgPath = QDir(configDir_).filePath(configFileName_);
+    QString error;
+    const auto current = NetworkConfig::read(cfgPath, &error);
+    QJsonObject config;
+    if (!error.isEmpty() || !NetworkConfig::normalize(input, current, &config, &error) ||
+        input.value("iface") != config.value("iface")) {
+        emit webNetworkFinished(token,
+                                {},
+                                400,
+                                error.isEmpty() ? QStringLiteral("网卡配置已变化，请刷新后重试")
+                                                : error);
+        return;
+    }
+    const auto iface = config.value("iface").toString();
+    const auto device = QNetworkInterface::interfaceFromName(iface);
+    // 只操作有线接口；热点、无线、回环和点对点接口不参与设备 IP 设置。
+    bool portalAddress = false;
+    for (const auto &entry : device.addressEntries())
+        portalAddress = portalAddress || entry.ip().toString() == "192.168.10.1";
+    if (!device.isValid() || device.type() == QNetworkInterface::Wifi ||
+        device.flags().testFlag(QNetworkInterface::IsLoopBack) ||
+        device.flags().testFlag(QNetworkInterface::IsPointToPoint) || portalAddress ||
+        QFileInfo::exists("/sys/class/net/" + iface + "/wireless") ||
+        QFileInfo::exists("/sys/class/net/" + iface + "/phy80211")) {
+        emit webNetworkFinished(token,
+                                {},
+                                400,
+                                QStringLiteral("配置目标必须是可用的有线网卡，不能修改热点接口"));
+        return;
+    }
+
+    struct Result {
+        NetworkRuntimeState state;
+        QJsonObject config;
+        QString error;
+        bool saved = false;
+        bool applied = false;
+    };
+
+    auto result = std::make_shared<Result>();
+    result->config = config;
+    webNetworkToken_ = token;
+    networkGeneration_->fetch_add(1);
+    networkRefreshPending_ = false;
+    const auto generation = networkGeneration_;
+    const auto expected = generation->load();
+    runNetworkTask(
+        [result, iface, config, cfgPath, generation, expected]() {
+            const auto valid = [generation, expected]() {
+                return generation->load() == expected &&
+                       !QThread::currentThread()->isInterruptionRequested();
+            };
+            // 参数已全部校验，系统命令和地址等待均不占用 Qt 主线程。
+            auto &error = result->error;
+            if (!valid() || !runCmd("ip", {"link", "set", iface, "up"}, &error))
+                return;
+            if (config.value("dhcp").toBool() && !isIfaceCarrierUp(iface)) {
+                error = QStringLiteral("网线未连接，无法获取 DHCP 地址");
+                return;
+            }
+            if (!valid() || !stopDhcpClient(iface, &error))
+                return;
+            if (!valid() || !runCmd("ip", {"addr", "flush", "dev", iface}, &error))
+                return;
+            if (!valid() || !runCmd("ip", {"route", "flush", "dev", iface}, &error))
+                return;
+            if (config.value("dhcp").toBool()) {
+                if (!valid() || !startDhcpDaemon(iface, &error))
+                    return;
+                for (int n = 0; n < 30 && valid(); ++n) {
+                    getIfaceIPv4AndMask(iface, &result->state.ip, &result->state.mask);
+                    if (!result->state.ip.isEmpty() && result->state.ip != "0.0.0.0" &&
+                        !result->state.mask.isEmpty())
+                        break;
+                    QThread::msleep(100);
+                }
+            } else {
+                const QString cidr =
+                    config.value("ip").toString() + "/" +
+                    QString::number(netmaskToPrefix(config.value("netmask").toString()));
+                if (!valid() || !runCmd("ip", {"addr", "add", cidr, "dev", iface}, &error))
+                    return;
+                const auto gateway = config.value("gateway").toString();
+                if (!gateway.isEmpty() &&
+                    (!valid() ||
+                     !runCmd("ip",
+                             {"route", "replace", "default", "via", gateway, "dev", iface},
+                             &error)))
+                    return;
+                const auto dns = config.value("dns").toString();
+                if (!dns.isEmpty()) {
+                    QFile file("/etc/resolv.conf");
+                    QByteArray bytes;
+                    for (const auto &server : dns.split(' ', QString::SkipEmptyParts))
+                        bytes += "nameserver " + server.toUtf8() + '\n';
+                    if (!valid() || !file.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+                        file.write(bytes) != bytes.size() || !file.flush()) {
+                        error = QStringLiteral("IP 已应用，但 DNS 配置写入失败");
+                        return;
+                    }
+                }
+            }
+            if (!valid())
+                return;
+            result->state = queryNetworkRuntimeState(iface, false);
+            const auto &state = result->state;
+            result->applied = (!config.value("dhcp").toBool() || state.carrierUp) &&
+                              !state.ip.isEmpty() && state.ip != "0.0.0.0" && !state.mask.isEmpty();
+            if (config.value("dhcp").toBool()) {
+                // DHCP 启动成功但尚未取得租约时保存模式，后续沿用原 2 秒同步定时器。
+                result->config["ip"] = result->applied ? state.ip : QString();
+                result->config["netmask"] = result->applied ? state.mask : QString();
+                result->config["gateway"] = result->applied ? state.gateway : QString();
+                result->config["dns"] = result->applied ? state.dns : QString();
+            } else if (state.ip != config.value("ip").toString() ||
+                       state.mask != config.value("netmask").toString() ||
+                       (!config.value("gateway").toString().isEmpty() &&
+                        state.gateway != config.value("gateway").toString())) {
+                result->applied = false;
+                error = QStringLiteral("系统实际地址或网关未达到请求配置，请刷新核对");
+                return;
+            }
+            if (valid())
+                result->saved = NetworkConfig::save(cfgPath, result->config, &error);
+        },
+        [this, token, iface, result]() {
+            webNetworkToken_.clear();
+            if (!result->saved) {
+                emit webNetworkFinished(token,
+                                        {{"saved", false}, {"applied", result->applied}},
+                                        503,
+                                        result->error.isEmpty()
+                                            ? QStringLiteral("网络配置未完成，请刷新核对实际状态")
+                                            : result->error);
+                return;
+            }
+            // 同步后台页面和 DHCP 缓存，防止旧 UI 下一次轮询覆盖刚保存的模式。
+            webNetworkEnabled_ = true;
+            ifaceName_ = iface;
+            const QSignalBlocker blockMode(ui->ipModeComboBox);
+            const QSignalBlocker blockType(ui->connectionTypeCombo);
+            ui->connectionTypeCombo->setCurrentIndex(0);
+            ui->ipModeComboBox->setCurrentIndex(result->config.value("dhcp").toBool() ? 0 : 1);
+            setIpFieldsEnabled(!result->config.value("dhcp").toBool());
+            lastIp_ = result->config.value("ip").toString();
+            lastMask_ = result->config.value("netmask").toString();
+            lastGateway_ = result->config.value("gateway").toString();
+            lastDns_ = result->config.value("dns").toString();
+            lastCarrierUp_ = result->state.carrierUp;
+            dhcpHadValidIp_ = result->applied;
+            lastDhcpAutoTryMs_ = QDateTime::currentMSecsSinceEpoch();
+            ui->ipAddressEdit->setText(lastIp_);
+            ui->subnetMaskEdit->setText(lastMask_);
+            ui->gatewayEdit->setText(lastGateway_);
+            ui->dnsEdit->setText(lastDns_);
+            auto reply = result->config;
+            reply.insert("saved", true);
+            reply.insert("applied", result->applied);
+            reply.insert("waitingForDhcp",
+                         result->config.value("dhcp").toBool() && !result->applied);
+            emit webNetworkFinished(token, reply, 200, {});
+            if (result->applied)
+                emit networkAppliedSuccessfully();
+        });
+}
 
 /** @brief 向页面日志区追加文本。 */
 void NetworkPage::appendLog(const QString &text)
@@ -728,6 +955,9 @@ bool NetworkPage::loadInputsFromConfigFile(const QString& cfgDir)
         appendLog("配置文件存在，但 network/use_config=false，不覆盖网络输入框");
         return true;
     }
+
+    networkGeneration_->fetch_add(1);
+    networkRefreshPending_ = false;
 
     const QString iface = ini.value("network/iface", ifaceName_).toString().trimmed();
     const bool autoConnect = ini.value("network/auto_connect", false).toBool();
@@ -808,6 +1038,22 @@ void NetworkPage::autoConnectFromSavedConfig()
         return;
     }
 
+    if (webNetworkEnabled_) {
+        // 显式 Web 配置重启后仍走共享后台线程，避免静态设置占用启动主线程。
+        if (networkTaskPending_) {
+            deferredNetworkAction_ = [this]() { autoConnectFromSavedConfig(); };
+            return;
+        }
+        QString error;
+        const auto config = NetworkConfig::read(cfgPath, &error);
+        if (!error.isEmpty()) {
+            appendLog(error);
+            return;
+        }
+        applyWebNetworkConfig(QStringLiteral("network-autoconnect"), config);
+        return;
+    }
+
     const bool dhcp = ini.value("network/dhcp", true).toBool();
     if (dhcp) {
         if (!clearNetworkConfigFileIp(configDir_)) {
@@ -884,6 +1130,11 @@ bool NetworkPage::clearNetworkConfigFileIp(const QString& cfgDir)
 /** @brief 更新功能开关并决定网络功能是否可用。 */
 void NetworkPage::setFeatureSettings(const FeatureSettings &settings)
 {
+    // 只有显式 Web 配置才保留独立有线联网意图，未使用 Web 的设备沿用原模式规则。
+    QSettings networkIni(QDir(configDir_).filePath(configFileName_), QSettings::IniFormat);
+    webNetworkEnabled_ = networkIni.value("network/web_managed", false).toBool();
+    const quint64 generation = networkGeneration_->fetch_add(1) + 1;
+    networkRefreshPending_ = false;
     featureSettings_ = settings;
 
     qDebug() << "[D] setFeatureSettings:"
@@ -893,6 +1144,12 @@ void NetworkPage::setFeatureSettings(const FeatureSettings &settings)
 
     // offline_v1 启用，且网络功能未启用时，立即清理
     if (featureSettings_.offline_v1 && !isNetworkFeatureEnabled()) {
+        if (networkTaskPending_) {
+            deferredNetworkAction_ = [this, settings, generation]() {
+                if (generation == networkGeneration_->load()) setFeatureSettings(settings);
+            };
+            return;
+        }
         const QString iface = ifaceName_.trimmed().isEmpty() ? QString("eth0") : ifaceName_;
         QString err;
 
@@ -906,21 +1163,21 @@ void NetworkPage::setFeatureSettings(const FeatureSettings &settings)
             appendLog("setFeatureSettings 清理配置文件IP失败");
         }
 
-        refreshUiFromSystem(ui, iface);
+        refreshUiFromSystem(iface);
     }
 }
 
-/** @return 任一在线功能开关要求网络时返回 true。 */
+/** @return 在线功能或显式 Web 网络配置要求联网时返回 true。 */
 bool NetworkPage::isNetworkFeatureEnabled() const
 {
-    return featureSettings_.online_v1 || featureSettings_.online_v2;
+    return featureSettings_.online_v1 || featureSettings_.online_v2 || webNetworkEnabled_;
 }
 
 
 // DHCP 运行时同步
 void NetworkPage::syncDhcpRuntimeStateToConfig()
 {
-    if (!ui) return;
+    if (!ui || networkTaskPending_ || dhcpAutoApplying_) return;
 
     if (!isNetworkFeatureEnabled()) {
         return;
@@ -936,8 +1193,21 @@ void NetworkPage::syncDhcpRuntimeStateToConfig()
 
     const QString iface = ifaceName_.trimmed().isEmpty() ? QString("eth0") : ifaceName_;
 
+    auto state = std::make_shared<NetworkRuntimeState>();
+    runNetworkTask([state, iface]() {
+        *state = queryNetworkRuntimeState(iface, true);
+    }, [this, iface, state]() {
+        applyDhcpRuntimeState(iface, *state);
+    });
+}
+
+/** @brief GUI 线程沿用原状态转换，仅消费后台采集值。 */
+void NetworkPage::applyDhcpRuntimeState(const QString &iface,
+                                      const NetworkRuntimeState &state)
+{
+
     // 先看物理链路是否存在
-    const bool carrierUp = isIfaceCarrierUp(iface);
+    const bool carrierUp = state.carrierUp;
     const bool linkBecameUp = carrierUp && !lastCarrierUp_;
     const bool linkBecameDown = !carrierUp && lastCarrierUp_;
 
@@ -948,6 +1218,7 @@ void NetworkPage::syncDhcpRuntimeStateToConfig()
 
         lastDhcpAutoTryMs_ = 0;
         requestAutoDhcpRenew("网线插入后自动获取DHCP", false);
+        if (networkTaskPending_) return; // 续租后重新采样，不能应用续租前的地址。
     }
 
     if (linkBecameDown) {
@@ -979,17 +1250,16 @@ void NetworkPage::syncDhcpRuntimeStateToConfig()
         return;
     }
 
-    QString ip, mask;
-    getIfaceIPv4AndMask(iface, &ip, &mask);
-
-    const QString gw  = getDefaultGateway(iface);
-    const QString dns = getDnsFromResolvConf();
+    const QString ip = state.ip;
+    const QString mask = state.mask;
+    const QString gw = state.gateway;
+    const QString dns = state.dns;
 
     const bool hasValidIp = (!ip.isEmpty() && ip != "0.0.0.0" && !mask.isEmpty());
 
     // 链路存在但还没拿到有效 IP，也清空缓存
     if (!hasValidIp) {
-        const bool dhcpRunning = isDhcpRunning(iface);
+        const bool dhcpRunning = state.dhcpRunning;
         const qint64 now = QDateTime::currentMSecsSinceEpoch();
 
         if (!dhcpRunning) {
@@ -1042,39 +1312,15 @@ void NetworkPage::syncDhcpRuntimeStateToConfig()
 /** @brief 按重试节流请求 DHCP 续租或强制重启客户端。 */
 void NetworkPage::requestAutoDhcpRenew(const QString &reason, bool forceRestart)
 {
-    if (!ui) {
+    if (!ui || networkTaskPending_ || dhcpAutoApplying_ || !isNetworkFeatureEnabled() ||
+        ui->connectionTypeCombo->currentIndex() != 0 ||
+        ui->ipModeComboBox->currentIndex() != 0) {
         return;
     }
-
-    if (dhcpAutoApplying_) {
-        appendLog(QString("自动DHCP正在执行中，忽略重复请求：%1").arg(reason));
-        return;
-    }
-
-    if (!isNetworkFeatureEnabled()) {
-        return;
-    }
-
-    if (ui->connectionTypeCombo->currentIndex() != 0) {
-        return;
-    }
-
-    if (ui->ipModeComboBox->currentIndex() != 0) {
-        return;
-    }
-
     const QString iface = ifaceName_.trimmed().isEmpty() ? QString("eth0") : ifaceName_;
-
-    if (!isIfaceCarrierUp(iface)) {
-        appendLog(QString("自动DHCP取消：%1 未检测到网线，reason=%2")
-                  .arg(iface, reason));
-        return;
-    }
-
+    if (!lastCarrierUp_) return;
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
-
-    if (!forceRestart &&
-        lastDhcpAutoTryMs_ > 0 &&
+    if (!forceRestart && lastDhcpAutoTryMs_ > 0 &&
         now - lastDhcpAutoTryMs_ < kDhcpAutoRetryIntervalMs) {
         appendLog(QString("自动DHCP重试间隔过短，暂不重复执行：%1").arg(reason));
         return;
@@ -1082,47 +1328,148 @@ void NetworkPage::requestAutoDhcpRenew(const QString &reason, bool forceRestart)
 
     dhcpAutoApplying_ = true;
     lastDhcpAutoTryMs_ = now;
-
     appendLog(QString("自动DHCP开始：iface=%1 forceRestart=%2 reason=%3")
-              .arg(iface)
-              .arg(forceRestart ? "true" : "false")
-              .arg(reason));
-
-    QString err;
-
-    if (forceRestart || !isDhcpRunning(iface)) {
-        stopDhcpClient(iface, nullptr);
-
-        runCmd("ip", {"link", "set", iface, "up"}, &err, 3000);
-        runCmd("ip", {"addr", "flush", "dev", iface}, nullptr, 3000);
-        runCmd("ip", {"route", "flush", "dev", iface}, nullptr, 3000);
-
-        clearNetworkConfigFileIp(configDir_);
-
-        ui->ipAddressEdit->setText("-");
-        ui->subnetMaskEdit->setText("-");
-        ui->gatewayEdit->setText("-");
-        ui->dnsEdit->setText("-");
-
-        lastIp_.clear();
-        lastMask_.clear();
-        lastGateway_.clear();
-        lastDns_.clear();
-        dhcpHadValidIp_ = false;
-
-        if (!startDhcpDaemon(iface, &err)) {
-            appendLog(QString("自动DHCP启动失败：%1").arg(err));
-            refreshUiFromSystem(ui, iface);
-            dhcpAutoApplying_ = false;
+              .arg(iface).arg(forceRestart ? "true" : "false").arg(reason));
+    struct Result {
+        NetworkRuntimeState state;
+        QString error;
+        bool carrierUp = false;
+        bool reset = false;
+        bool started = false;
+    };
+    auto result = std::make_shared<Result>();
+    const auto generation = networkGeneration_;
+    const quint64 expected = generation->load();
+    runNetworkTask([iface, forceRestart, result, generation, expected]() {
+        const auto current = [generation, expected]() {
+            return generation->load() == expected &&
+                    !QThread::currentThread()->isInterruptionRequested();
+        };
+        if (!current()) return;
+        result->carrierUp = isIfaceCarrierUp(iface);
+        if (!result->carrierUp) return;
+        if (forceRestart || !isDhcpRunning(iface)) {
+            stopDhcpClient(iface, nullptr);
+            if (!current()) return;
+            runCmd("ip", {"link", "set", iface, "up"}, &result->error, 3000);
+            if (!current()) return;
+            runCmd("ip", {"addr", "flush", "dev", iface}, nullptr, 3000);
+            if (!current()) return;
+            runCmd("ip", {"route", "flush", "dev", iface}, nullptr, 3000);
+            if (!current()) return;
+            result->reset = true;
+            result->started = startDhcpDaemon(iface, &result->error);
+        }
+        if (current()) result->state = queryNetworkRuntimeState(iface, false);
+    }, [this, iface, reason, result]() {
+        if (!result->carrierUp) {
+            appendLog(QString("自动DHCP取消：%1 未检测到网线，reason=%2").arg(iface, reason));
             return;
         }
+        if (result->reset) {
+            clearNetworkConfigFileIp(configDir_);
+            lastIp_.clear();
+            lastMask_.clear();
+            lastGateway_.clear();
+            lastDns_.clear();
+            dhcpHadValidIp_ = false;
+            if (!result->started) {
+                appendLog(QString("自动DHCP启动失败：%1").arg(result->error));
+            } else {
+                appendLog(QString("自动DHCP已启动：%1，等待定时器同步IP/网关/DNS").arg(iface));
+            }
+        } else {
+            appendLog(QString("自动DHCP：%1 udhcpc 已运行，等待获取IP").arg(iface));
+        }
+        const auto &state = result->state;
+        ui->ipAddressEdit->setText(state.ip.isEmpty() ? "-" : state.ip);
+        ui->subnetMaskEdit->setText(state.mask.isEmpty() ? "-" : state.mask);
+        ui->gatewayEdit->setText(state.gateway.isEmpty() ? "-" : state.gateway);
+        ui->dnsEdit->setText(state.dns.isEmpty() ? "-" : state.dns);
+    });
+}
 
-        appendLog(QString("自动DHCP已启动：%1，等待定时器同步IP/网关/DNS").arg(iface));
-    } else {
-        appendLog(QString("自动DHCP：%1 udhcpc 已运行，等待获取IP").arg(iface));
-    }
-
-    refreshUiFromSystem(ui, iface);
-
-    dhcpAutoApplying_ = false;
+/** @brief 手动或启动 DHCP 的命令及地址等待全部在同一工作线程执行。 */
+void NetworkPage::applyDhcpNetworkConfig(const QString &iface, bool showMessage)
+{
+    struct Result {
+        NetworkRuntimeState state;
+        QString error;
+        enum Failure { None, LinkUp, NoCarrier, Start } failure = None;
+    };
+    auto result = std::make_shared<Result>();
+    const auto generation = networkGeneration_;
+    const quint64 expected = generation->load();
+    dhcpAutoApplying_ = true;
+    runNetworkTask([iface, result, generation, expected]() {
+        const auto current = [generation, expected]() {
+            return generation->load() == expected &&
+                    !QThread::currentThread()->isInterruptionRequested();
+        };
+        if (!current()) return;
+        if (!runCmd("ip", {"link", "set", iface, "up"}, &result->error)) {
+            result->failure = Result::LinkUp;
+            return;
+        }
+        if (!current()) return;
+        if (!isIfaceCarrierUp(iface)) {
+            result->failure = Result::NoCarrier;
+            result->state = queryNetworkRuntimeState(iface, false);
+            return;
+        }
+        stopDhcpClient(iface);
+        if (!current()) return;
+        runCmd("ip", {"addr", "flush", "dev", iface});
+        if (!current()) return;
+        runCmd("ip", {"route", "flush", "dev", iface});
+        if (!current()) return;
+        if (!startDhcpDaemon(iface, &result->error)) {
+            result->failure = Result::Start;
+        } else {
+            QString ip, mask;
+            for (int i = 0; i < 30 && current(); ++i) {
+                getIfaceIPv4AndMask(iface, &ip, &mask);
+                if (!ip.isEmpty() && ip != "0.0.0.0" && !mask.isEmpty()) break;
+                QThread::msleep(100);
+            }
+        }
+        if (current()) result->state = queryNetworkRuntimeState(iface, false);
+    }, [this, iface, showMessage, result]() {
+        if (result->failure == Result::LinkUp) {
+            if (showMessage) UiMessageBox::critical(this, "失败", "拉起网卡失败: " + result->error);
+            appendLog(QString("拉起网卡失败: %1").arg(result->error));
+            return;
+        }
+        const auto &state = result->state;
+        ui->ipAddressEdit->setText(state.ip.isEmpty() ? "-" : state.ip);
+        ui->subnetMaskEdit->setText(state.mask.isEmpty() ? "-" : state.mask);
+        ui->gatewayEdit->setText(state.gateway.isEmpty() ? "-" : state.gateway);
+        ui->dnsEdit->setText(state.dns.isEmpty() ? "-" : state.dns);
+        if (result->failure == Result::NoCarrier) {
+            if (showMessage) UiMessageBox::warning(this, "网线未连接",
+                    QString("未检测到 %1 网线连接，请插入网线后再获取DHCP。").arg(iface));
+            appendLog(QString("DHCP取消：%1 未检测到网线连接，carrier=0").arg(iface));
+            return;
+        }
+        if (result->failure == Result::Start) {
+            if (showMessage) UiMessageBox::warning(this, "DHCP失败",
+                    "启动DHCP客户端失败（检查网线/上级设备DHCP）\n" + result->error);
+            appendLog(QString("启动DHCP客户端失败: %1").arg(result->error));
+            return;
+        }
+        if (!state.ip.isEmpty() && state.ip != "0.0.0.0" && !state.mask.isEmpty()) {
+            saveInputsToConfigFile(configDir_);
+            lastIp_ = state.ip;
+            lastMask_ = state.mask;
+            lastGateway_ = state.gateway;
+            lastDns_ = state.dns;
+            if (showMessage) UiMessageBox::information(this, "设置成功", "DHCP已启动并获取到网络参数");
+            appendLog(QString("DHCP已启动并获取到网络参数：ip=%1 mask=%2 gw=%3 dns=%4")
+                      .arg(lastIp_, lastMask_, lastGateway_, lastDns_));
+        } else {
+            if (showMessage) UiMessageBox::information(this, "提示", "DHCP已启动，等待获取网络参数");
+            appendLog("DHCP已启动，但尚未获取到有效IP，等待定时器同步");
+        }
+        emit networkAppliedSuccessfully();
+    });
 }
