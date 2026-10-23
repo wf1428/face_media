@@ -25,7 +25,12 @@ namespace {
 
 constexpr int maxFrame = 1024 * 1024; /**< IPC 限额；二进制上传不经过 IPC。 */
 
-/** @return 配置环境值，未设置时采用平台默认值。 */
+/**
+ * @brief 读取环境变量配置，未提供时使用受控默认值。
+ * @param key 待查询的配置键名。
+ * @param fallback 配置未提供时使用的默认值。
+ * @return 配置环境值，未设置时采用平台默认值。
+ */
 QString setting(const char *key, const QString &fallback)
 {
     const auto value = qgetenv(key);
@@ -33,13 +38,19 @@ QString setting(const char *key, const QString &fallback)
 }
 } // namespace
 
-/** @brief 保存 Qt 业务配置和 Unix socket 路径。 */
+/**
+ * @brief 保存 Qt 业务配置和 Unix socket 路径。
+ * @param config 设备受控配置，包含运行所需路径或功能设置。
+ * @param socketPath 本机 Unix socket 路径。
+ */
 WebBridgeServer::WebBridgeServer(const WebServiceConfig &config, const QString &socketPath)
     : config_(config), socketPath_(socketPath)
 {
 }
 
-/** @brief 启动独立 Web 业务线程并准备本地 socket。 */
+/**
+ * @brief 启动独立 Web 业务线程并准备本地 socket。
+ */
 void WebBridgeServer::start()
 {
     try {
@@ -86,7 +97,9 @@ void WebBridgeServer::start()
     }
 }
 
-/** @brief 停止接收并清理 Web 业务线程资源。 */
+/**
+ * @brief 停止接收并清理 Web 业务线程资源。
+ */
 void WebBridgeServer::stop()
 {
     if (server_) {
@@ -99,7 +112,9 @@ void WebBridgeServer::stop()
     DbStore::close();
 }
 
-/** @brief 接收独立 HTTP 进程发来的本地连接。 */
+/**
+ * @brief 接收独立 HTTP 进程发来的本地连接。
+ */
 void WebBridgeServer::acceptConnections()
 {
     // 每个连接只处理一帧有限长 JSON，上传字节始终走 HTTP 文件流。
@@ -166,7 +181,10 @@ void WebBridgeServer::acceptConnections()
     }
 }
 
-/** @brief 按环境配置创建 Qt Web IPC 运行对象。 */
+/**
+ * @brief 按环境配置创建 Qt Web IPC 运行对象。
+ * @param parent Qt 父对象；对象销毁由父子关系管理，空指针表示无父对象。
+ */
 WebRuntime::WebRuntime(QObject *parent) : QObject(parent)
 {
     if (qgetenv("MERGEDQT_WEB_ENABLE") != "1")
@@ -181,7 +199,7 @@ WebRuntime::WebRuntime(QObject *parent) : QObject(parent)
         setting("MERGEDQT_WEB_FACTORY", QStringLiteral("/home/cat/web-stage/factory-account.json")),
         Rk3566Platform::netConfigPath(),
         setting("MERGEDQT_WEB_HOTSPOT_HELPER",
-                QStringLiteral("/home/cat/web-stage/portal-network.sh")),
+                QStringLiteral("/usr/local/sbin/portal-network.sh")),
         setting("MERGEDQT_WEB_READY_FILE", QStringLiteral("/run/mergedqt/web-ready"))};
     server_ = new WebBridgeServer(
         config,
@@ -193,7 +211,9 @@ WebRuntime::WebRuntime(QObject *parent) : QObject(parent)
     thread_.start();
 }
 
-/** @brief 停止 IPC 服务并释放运行对象。 */
+/**
+ * @brief 停止 IPC 服务并释放运行对象。
+ */
 WebRuntime::~WebRuntime()
 {
     if (!thread_.isRunning())

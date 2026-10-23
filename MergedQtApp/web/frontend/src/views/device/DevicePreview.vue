@@ -106,12 +106,18 @@ let timer = null
 let stopped = false
 const refreshing = ref(false)
 
-/** @brief 容量只保留两位小数，缺失或非有限值继续显示未知。 */
+/**
+ * @brief 容量只保留两位小数，缺失或非有限值继续显示未知。
+ * @param {number|undefined} value 设备返回的容量数值，缺省或非有限数视为未知。
+ * @returns {string} 两位小数的容量文本，缺省或非有限数返回 --。
+ */
 function storageNumber(value) {
   return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(2) : '--'
 }
 
-/** @brief 加载设备信息（设备名称/设备号/WIFI 热点） */
+/**
+ * @brief 加载设备信息（设备名称/设备号/WIFI 热点）
+ */
 async function loadDeviceInfo() {
   try {
     devInfo.value = await api.getDeviceInfo()
@@ -120,7 +126,9 @@ async function loadDeviceInfo() {
   }
 }
 
-/** @brief 加载设备概览（IP/人员/人脸/IC/二维码/存储） */
+/**
+ * @brief 加载设备概览（IP/人员/人脸/IC/二维码/存储）
+ */
 async function loadOverview() {
   try {
     const data = await api.deviceOverview()
@@ -130,7 +138,9 @@ async function loadOverview() {
   }
 }
 
-/** @brief 立即刷新一次截图 */
+/**
+ * @brief 立即刷新一次截图
+ */
 async function refresh() {
   if (stopped || refreshing.value) return
   refreshing.value = true
@@ -144,13 +154,18 @@ async function refresh() {
   }
 }
 
-/** @brief 切换轮询间隔 */
+/**
+ * @brief 切换轮询间隔
+ * @param {number} s 自动刷新间隔，单位为秒。
+ */
 function changeInterval(s) {
   interval.value = s
   restart()
 }
 
-/** @brief 按所选间隔刷新概览与当前界面截图。 */
+/**
+ * @brief 按所选间隔刷新概览与当前界面截图。
+ */
 function restart() {
   if (timer) clearInterval(timer)
   timer = window.setInterval(() => {

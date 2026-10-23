@@ -1,3 +1,6 @@
+## @file provision_account.py
+# @brief 出厂生成一次性 Web 账号摘要文件，不修改 SQLite、不传明文密码到命令行。
+
 """
 @file provision_account.py
 @brief 出厂生成一次性 Web 账号摘要文件，不修改 SQLite、不传明文密码到命令行。
@@ -13,6 +16,7 @@ import os
 from pathlib import Path
 
 
+## @brief 通过隐藏输入生成 PBKDF2-SHA256 摘要；禁止覆盖已有工厂文件。
 def main() -> None:
     """通过隐藏输入生成 PBKDF2-SHA256 摘要；禁止覆盖已有工厂文件。"""
     parser = argparse.ArgumentParser(
@@ -27,8 +31,8 @@ def main() -> None:
     password = getpass.getpass("Web account password: ")
     if password != getpass.getpass("Confirm password: "):
         parser.error("passwords do not match")
-    if not 10 <= len(password) <= 256:
-        parser.error("password must contain 10..256 characters")
+    if not 8 <= len(password) <= 256:
+        parser.error("password must contain 8..256 characters")
 
     # 出厂文件只保存随机盐和派生摘要，不保存输入的明文密码。
     salt = os.urandom(32)

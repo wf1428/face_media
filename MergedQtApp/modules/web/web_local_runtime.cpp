@@ -6,10 +6,13 @@
  */
 
 #include "web_local_runtime.h"
+#include "common/media_content_policy.h"
+#include "platform/rk3566_platform.h"
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QImage>
 #include <QFile>
+#include <QFileInfo>
 #include <QSaveFile>
 #include <QTimer>
 #include <QThread>
@@ -25,12 +28,17 @@ public:
 
     std::function<void()> action;
 
-    /** @brief 保存在线程池中执行的截图编码任务。 */
+    /**
+     * @brief 保存在线程池中执行的截图编码任务。
+     * @param fn 在线程池中执行的任务，不直接访问界面控件。
+     */
     explicit Work(std::function<void()> fn) : action(std::move(fn))
     {
     }
 
-    /** @brief 在工作线程执行已捕获的截图编码与落盘任务。 */
+    /**
+     * @brief 在工作线程执行已捕获的截图编码与落盘任务。
+     */
     void run() override
     {
         action();
@@ -38,14 +46,20 @@ public:
 };
 } // namespace
 
-/** @brief 返回由应用主线程持有的本地设备运行桥实例。 */
+/**
+ * @brief 返回由应用主线程持有的本地设备运行桥实例。
+ * @return 应用生命周期内共享的桥对象指针。
+ */
 WebLocalRuntime *WebLocalRuntime::instance()
 {
     static auto *runtime = new WebLocalRuntime(QCoreApplication::instance());
     return runtime;
 }
 
-/** @brief 在应用主线程建立请求队列和真实播放器状态采样定时器。 */
+/**
+ * @brief 在应用主线程建立请求队列和真实播放器状态采样定时器。
+ * @param parent Qt 父对象；对象销毁由父子关系管理，空指针表示无父对象。
+ */
 WebLocalRuntime::WebLocalRuntime(QObject *parent) : QObject(parent)
 {
     Q_ASSERT(QThread::currentThread() == QCoreApplication::instance()->thread());
@@ -80,13 +94,20 @@ WebLocalRuntime::WebLocalRuntime(QObject *parent) : QObject(parent)
             pendingVideo_.clear();
             execute("web-upload:" + name,
                     "videoControl",
-                    {{"videoType", "RECORDED"}, {"videoPath", name}});
+                    {{"videoType", "RECORDED"}, {"videoPath", QFileInfo(name).fileName()},
+                     {"_mediaPath", QFileInfo(name).isAbsolute() ? name : QDir(Rk3566Platform::videoDir()).filePath(name)}});
         }
     });
     timer->start(1000);
 }
 
-/** @brief 绑定实际播放器的读取和控制回调，并刷新初始快照。 */
+/**
+ * @brief 绑定实际播放器的读取和控制回调，并刷新初始快照。
+ * @param owner 回调所属对象；QPointer 在对象销毁后阻止使用失效回调。
+ * @param read 在主线程读取实际播放器状态的回调。
+ * @param control 在主线程应用播放器设置的回调。
+ * @note 在应用主线程绑定；Web 工作线程通过排队请求调用。
+ */
 void WebLocalRuntime::bindMedia(QObject *owner,
                                 std::function<QJsonObject()> read,
                                 std::function<void(const QJsonObject &)> control)
@@ -97,14 +118,24 @@ void WebLocalRuntime::bindMedia(QObject *owner,
     refreshMedia();
 }
 
-/** @brief 绑定当前活动界面的截图入口及其对象生命周期。 */
+/**
+ * @brief 绑定当前活动界面的截图入口及其对象生命周期。
+ * @param owner 回调所属对象；QPointer 在对象销毁后阻止使用失效回调。
+ * @param capture 在主线程发起截图的回调，参数为任务标识。
+ * @note 在应用主线程绑定；Web 工作线程通过排队请求调用。
+ */
 void WebLocalRuntime::bindScreen(QObject *owner, std::function<void(const QString &)> capture)
 {
     screenOwner_ = owner;
     capture_ = std::move(capture);
 }
 
-/** @brief 注册异步有线配置回调，只在 Qt 主线程调用后台页面入口。 */
+/**
+ * @brief 注册异步有线配置回调，只在 Qt 主线程调用后台页面入口。
+ * @param owner 回调所属对象；QPointer 在对象销毁后阻止使用失效回调。
+ * @param apply 在主线程提交对应异步操作的回调。
+ * @note 在应用主线程绑定；Web 工作线程通过排队请求调用。
+ */
 void WebLocalRuntime::bindNetwork(QObject *owner,
                                   std::function<void(const QString &, const QJsonObject &)> apply)
 {
@@ -112,7 +143,9 @@ void WebLocalRuntime::bindNetwork(QObject *owner,
     networkApply_ = std::move(apply);
 }
 
-/** @brief 在主线程采集播放器实际状态，再以互斥保护发布快照。 */
+/**
+ * @brief 在主线程采集播放器实际状态，再以互斥保护发布快照。
+ */
 void WebLocalRuntime::refreshMedia()
 {
     QJsonObject value;
@@ -126,30 +159,61 @@ void WebLocalRuntime::refreshMedia()
     }
 }
 
-/** @brief 返回线程安全的最近一次真实播放器快照。 */
+/**
+ * @brief 返回线程安全的最近一次真实播放器快照。
+ * @return 加锁复制的最近一次实际播放器快照。
+ */
 QJsonObject WebLocalRuntime::media() const
 {
     QMutexLocker lock(&mutex_);
     return media_;
 }
 
-/** @brief 根据缓存快照和串口就绪标记返回运行能力。 */
+/**
+ * @brief 根据缓存快照和串口就绪标记返回运行能力。
+ * @param owner 回调所属对象；QPointer 在对象销毁后阻止使用失效回调。
+ * @param apply 在主线程提交对应异步操作的回调。
+ * @note 在应用主线程绑定；Web 工作线程通过排队请求调用。
+ */
+void WebLocalRuntime::bindFloorSchedule(QObject *owner,
+                                       std::function<void(const QString &, const QJsonObject &)> apply)
+{
+    floorScheduleOwner_ = owner;
+    floorScheduleApply_ = std::move(apply);
+    QMutexLocker lock(&mutex_);
+    floorScheduleReady_ = owner && bool(floorScheduleApply_);
+}
+
+/**
+ * @brief 读取当前模块支持能力及真实就绪状态。
+ * @return 当前已接入功能与运行就绪状态。
+ */
 QJsonObject WebLocalRuntime::capabilities() const
 {
     // Read readiness from the thread-safe source snapshot, never from MQTT.
     const bool ready = media().value("available").toBool();
     QMutexLocker lock(&mutex_);
-    return {{"playback", ready}, {"screenshot", ready}, {"elevatorWrite", deviceReady_}};
+    return {{"playback", ready}, {"screenshot", ready}, {"elevatorWrite", deviceReady_},
+            {"floorScheduleWrite", floorScheduleReady_}};
 }
 
-/** @brief 线程安全地更新本地串口控制的就绪状态。 */
+/**
+ * @brief 线程安全地更新本地串口控制的就绪状态。
+ * @param ready 实际硬件或能力是否就绪。
+ */
 void WebLocalRuntime::setDeviceReady(bool ready)
 {
     QMutexLocker lock(&mutex_);
     deviceReady_ = ready;
 }
 
-/** @brief 发出本地任务完成信号，交由 Web 工作线程持久化结果。 */
+/**
+ * @brief 发出本地任务完成信号，交由 Web 工作线程持久化结果。
+ * @param token 贯穿请求与异步结果的任务标识。
+ * @param data 本次操作的数据对象。
+ * @param code 业务状态码，成功通常为 200。
+ * @param message 可返回调用方的结果或错误说明。
+ */
 void WebLocalRuntime::complete(const QString &token,
                                const QJsonObject &data,
                                int code,
@@ -158,7 +222,12 @@ void WebLocalRuntime::complete(const QString &token,
     emit finished(token, data, code, message);
 }
 
-/** @brief 在主线程分派截图、播放器切换和设备 IO 请求。 */
+/**
+ * @brief 在主线程分派截图、播放器切换和设备 IO 请求。
+ * @param token 贯穿请求与异步结果的任务标识。
+ * @param operation 白名单业务操作名。
+ * @param args 操作对应的结构化参数。
+ */
 void WebLocalRuntime::execute(const QString &token,
                               const QString &operation,
                               const QJsonObject &args)
@@ -197,6 +266,19 @@ void WebLocalRuntime::execute(const QString &token,
             complete(token, {}, 409, "播放器正在切换，请稍后重试");
             return;
         }
+        // 在GUI线程串行写入，与MQTT共用同一INI；省略字段保留当前选择。
+        const QString iniPath = Rk3566Platform::netConfigPath();
+        if (args.contains("contentType") || args.contains("smallImageMode")) {
+            const QString content = args.contains("contentType") ? args.value("contentType").toString()
+                                                                : MediaContentPolicy::contentType(iniPath);
+            const bool small = args.contains("smallImageMode") ? MediaContentPolicy::smallImageMode(args.value("smallImageMode"))
+                                                               : MediaContentPolicy::smallImageMode(iniPath);
+            QString error;
+            if (!MediaContentPolicy::saveSelection(iniPath, content, small, &error)) {
+                complete(token, {}, 503, error);
+                return;
+            }
+        }
         mediaBusy_ = true;
         control_(args);
         auto *timer = new QTimer(this);
@@ -206,26 +288,46 @@ void WebLocalRuntime::execute(const QString &token,
             refreshMedia();
             const auto state = media();
             const auto type = args.value("videoType").toString();
-            const bool modeOk = type.isEmpty() || state.value("videoType") == type;
+            const bool selectionRequest = args.contains("contentType") || args.contains("smallImageMode") || args.contains("_mediaPath");
+            const bool modeOk = type.isEmpty() || state.value("videoType") == type ||
+                    (type == "RECORDED" && selectionRequest && state.value("videoType") == "NONE" &&
+                     state.value("localPlaylistEmpty").toBool() && state.value("canStartLocalPlayback").toBool());
             const bool volumeOk = !args.contains("videoVolume") ||
                                   state.value("videoVolume") == args.value("videoVolume");
             const bool liveOk =
                 type != "LIVE" || (state.value("playbackState") == "PLAYING" &&
                                    state.value("videoUrl") == args.value("videoUrl"));
-            const bool fileOk = args.value("videoPath").toString().isEmpty() ||
+            const QString requestedFile = args.value("videoPath").toString();
+            const QString internalPath = args.value("_mediaPath").toString();
+            const QString iniPath = Rk3566Platform::netConfigPath();
+            const bool independentPic = !internalPath.isEmpty() && MediaContentPolicy::isInDirectory(
+                        internalPath, MediaContentPolicy::pictureDir(Rk3566Platform::staticRoot()));
+            const bool filteredFile = !requestedFile.isEmpty() && !MediaContentPolicy::allows(
+                        MediaContentPolicy::contentType(iniPath), requestedFile);
+            const bool selectionOk = (!args.contains("contentType") || MediaContentPolicy::contentType(iniPath) ==
+                                      MediaContentPolicy::normalizeContentType(args.value("contentType").toString())) &&
+                    (!args.contains("smallImageMode") || MediaContentPolicy::smallImageMode(iniPath) ==
+                     MediaContentPolicy::smallImageMode(args.value("smallImageMode")));
+            const bool fileOk = requestedFile.isEmpty() || independentPic || filteredFile ||
                                 (state.value("videoPath") == args.value("videoPath") &&
                                  state.value("playbackState") == "PLAYING");
-            if ((modeOk && volumeOk && liveOk && fileOk) || ++*attempts >= 40) {
+            if ((modeOk && volumeOk && liveOk && fileOk && selectionOk) || ++*attempts >= 40) {
                 timer->stop();
                 timer->deleteLater();
                 mediaBusy_ = false;
                 complete(token,
                          state,
-                         modeOk && volumeOk && liveOk && fileOk ? 200 : 504,
+                         modeOk && volumeOk && liveOk && fileOk && selectionOk ? 200 : 504,
                          "播放器未在期限内达到请求状态，请核对当前实际状态");
             }
         });
         timer->start();
+        return;
+    }
+    if (operation == "floorSchedule") {
+        if (!floorScheduleOwner_ || !floorScheduleApply_)
+            complete(token, {}, 503, QStringLiteral("定时梯控执行器尚未就绪"));
+        else floorScheduleApply_(token, args);
         return;
     }
     if (operation == "networkConfig") {
@@ -238,7 +340,10 @@ void WebLocalRuntime::execute(const QString &token,
     emit deviceRequested(token, operation, args);
 }
 
-/** @brief 接收已有界面合成信号，并解码当前等待中的截图。 */
+/**
+ * @brief 接收已有界面合成信号，并解码当前等待中的截图。
+ * @param base64 现有截图信号提供的 Base64 图像数据。
+ */
 void WebLocalRuntime::encodedImage(const QString &base64)
 {
     if (captureToken_.isEmpty())
@@ -249,7 +354,11 @@ void WebLocalRuntime::encodedImage(const QString &base64)
     image(captureToken_, QImage::fromData(QByteArray::fromBase64(bytes)));
 }
 
-/** @brief 校验当前图像并交给线程池编码落盘，随后返回小型结果元数据。 */
+/**
+ * @brief 校验当前图像并交给线程池编码落盘，随后返回小型结果元数据。
+ * @param token 贯穿请求与异步结果的任务标识。
+ * @param image 待编码的界面图像。
+ */
 void WebLocalRuntime::image(const QString &token, const QImage &image)
 {
     if (!output_.contains(token))

@@ -22,9 +22,11 @@ namespace {
 
 /**
  * @brief 保证三种协议功能开关最多启用一个。
- *
+ * 
  * 冲突时按 offline_v1、online_v1、online_v2 的既定优先级保留首选项，
  * 其他非协议功能开关不受影响。
+ * @param s 待规范化或验证的文本。
+ * @return 按设备约束规范化后的功能配置。
  */
 static FeatureSettings normalizeFeatureSettings(FeatureSettings s)
 {
@@ -52,7 +54,11 @@ static FeatureSettings normalizeFeatureSettings(FeatureSettings s)
     return s;
 }
 
-/** @return 根据功能开关推导出的 MQTT 协议模式："offline" 或 "online"。 */
+/**
+ * @brief 根据功能组合选取通信协议模式。
+ * @param s 待规范化或验证的文本。
+ * @return 根据功能开关推导出的 MQTT 协议模式："offline" 或 "online"。
+ */
 static QString protocolModeFromFeatures(const FeatureSettings &s)
 {
     // offline_v1：纯离线
@@ -76,6 +82,7 @@ static QString protocolModeFromFeatures(const FeatureSettings &s)
 
 /**
  * @brief 将历史别名归一化为当前使用的 "offline"/"online"。
+ * @param raw 配置中的原始协议模式。
  * @return 未识别值按离线模式处理，避免意外启用在线协议。
  */
 static QString normalizeProtocolModeValue(const QString &raw)
@@ -95,7 +102,10 @@ static QString normalizeProtocolModeValue(const QString &raw)
 
 
 
-/** @brief 创建全部页面、运行模块并建立跨页面信号连接。 */
+/**
+ * @brief 创建全部页面、运行模块并建立跨页面信号连接。
+ * @param parent Qt 父对象；对象销毁由父子关系管理，空指针表示无父对象。
+ */
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::MainWindow)
@@ -155,9 +165,14 @@ MainWindow::MainWindow(QWidget *parent)
 
     // 密码正确后返回菜单
     auto *cast = qobject_cast<MultimediaDemo*>(app3Page);
-    // Web 只绑定实际播放器的读取、控制和截图源，不改动原消息连接。
+    /**
+     * @brief 绑定 Web 与真实播放器，状态读取和控制回调均在主线程执行。
+     * @details 所有者销毁后回调失效；文件删除通过排队信号清理现有媒体及图片缓存。
+     */
     if (cast && qgetenv("MERGEDQT_WEB_ENABLE") == "1") {
         auto *local = WebLocalRuntime::instance();
+        connect(local, &WebLocalRuntime::mediaFileDeleted,
+                cast, &MultimediaDemo::onPlayFileDeleted, Qt::QueuedConnection);
         local->bindMedia(
             cast,
             [cast]() {
@@ -334,6 +349,13 @@ MainWindow::MainWindow(QWidget *parent)
                 auto *player = qobject_cast<MultimediaDemo*>(app3Page);
                 if (player) {
                     player->onDownloadedVideoReady(filePath);
+                }
+            });
+
+    connect(settingsDialog, &SettingsDialog::playFileDeleted,
+            this, [this](const QString &filePath) {
+                if (auto *player = qobject_cast<MultimediaDemo*>(app3Page)) {
+                    player->onPlayFileDeleted(filePath);
                 }
             });
 
@@ -527,13 +549,17 @@ MainWindow::MainWindow(QWidget *parent)
     moduleActive_ = true;
 }
 
-/** @brief 停止活动模块并释放 Qt Designer UI。 */
+/**
+ * @brief 停止活动模块并释放 Qt Designer UI。
+ */
 MainWindow::~MainWindow()
 {
     delete ui;
 }
 
-/** @brief 激活多媒体模块，并恢复模块切换前的 LIVE 或本地轮播状态。 */
+/**
+ * @brief 激活多媒体模块，并恢复模块切换前的 LIVE 或本地轮播状态。
+ */
 void MainWindow::activateModule()
 {
     if (moduleActive_) {
@@ -549,7 +575,9 @@ void MainWindow::activateModule()
     qInfo() << "[MULTIMEDIA-ADAPTER] playback resumed";
 }
 
-/** @brief 停用多媒体模块并暂停当前播放，同时保留返回时需要恢复的状态。 */
+/**
+ * @brief 停用多媒体模块并暂停当前播放，同时保留返回时需要恢复的状态。
+ */
 void MainWindow::deactivateModule()
 {
     if (!moduleActive_) {
@@ -565,7 +593,9 @@ void MainWindow::deactivateModule()
     qInfo() << "[MULTIMEDIA-ADAPTER] playback paused";
 }
 
-/** @return 多媒体模块当前处于活动状态时返回 true。 */
+/**
+ * @return 多媒体模块当前处于活动状态时返回 true。
+ */
 bool MainWindow::isModuleActive() const
 {
     return moduleActive_;
@@ -591,7 +621,9 @@ bool MainWindow::allowsPresenceSwitch() const
 }
 
 
-/** @brief 将设备键盘快捷键转换为页面或调试入口操作。 */
+/**
+ * @brief 将设备键盘快捷键转换为页面或调试入口操作。
+ */
 void MainWindow::keyPressEvent(QKeyEvent *event)
 {
     if (event->key() == Qt::Key_Escape && windowState() & Qt::WindowFullScreen)
@@ -606,7 +638,9 @@ void MainWindow::keyPressEvent(QKeyEvent *event)
     }
 }
 
-/** @brief 窗口尺寸变化后同步页面栈和 U 盘覆盖层几何。 */
+/**
+ * @brief 窗口尺寸变化后同步页面栈和 U 盘覆盖层几何。
+ */
 void MainWindow::resizeEvent(QResizeEvent *event)
 {
     QMainWindow::resizeEvent(event);
@@ -640,7 +674,10 @@ void MainWindow::setupUdiskOverlayLater()
 }
 
 
-/** @brief 归一化并保存 [feature] 开关，同时同步 MQTT 协议模式。 */
+/**
+ * @brief 归一化并保存 [feature] 开关，同时同步 MQTT 协议模式。
+ * @param settings 设备功能开关快照。
+ */
 void MainWindow::saveFeatureSettings(const FeatureSettings &settings)
 {
     const FeatureSettings normalized = normalizeFeatureSettings(settings);
@@ -671,7 +708,10 @@ void MainWindow::saveFeatureSettings(const FeatureSettings &settings)
 }
 
 
-/** @return 从平台配置读取并归一化后的功能开关。 */
+/**
+ * @brief 读取并规范化持久化的功能开关。
+ * @return 从平台配置读取并归一化后的功能开关。
+ */
 FeatureSettings MainWindow::loadFeatureSettings() const
 {
     FeatureSettings settings;

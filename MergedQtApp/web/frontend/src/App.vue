@@ -17,7 +17,9 @@ import { useAppStore } from './store'
 const router = useRouter(),
   store = useAppStore()
 
-/** @brief 会话失效统一回登录页，停止旧请求。 */
+/**
+ * @brief 会话失效统一回登录页，停止旧请求。
+ */
 function expired() {
   store.clear()
   router.replace('/login')

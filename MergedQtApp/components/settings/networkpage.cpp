@@ -34,6 +34,11 @@
 
 
 // 判断字符串是否是合法 IPv4
+/**
+ * @brief 判断文本是否为有效 IPv4 地址。
+ * @param s 待规范化或验证的文本。
+ * @return 文本是合法 IPv4 时为 true。
+ */
 static bool isIPv4(const QString &s)
 {
     QHostAddress addr;
@@ -41,6 +46,11 @@ static bool isIPv4(const QString &s)
 }
 
 // 过滤 -
+/**
+ * @brief 清理网络字段中的空白及无效占位文本。
+ * @param s 待规范化或验证的文本。
+ * @return 去除无效占位值并规范化后的网络文本。
+ */
 static QString normalizeNetValue(const QString& s)
 {
     const QString v = s.trimmed();
@@ -48,6 +58,11 @@ static QString normalizeNetValue(const QString& s)
 }
 
 //判断链路状态
+/**
+ * @brief 读取内核网卡载波状态。
+ * @param ifname 目标网卡名称。
+ * @return 内核报告网卡载波已连接时为 true。
+ */
 static bool isIfaceCarrierUp(const QString& ifname)
 {
     QFile f(QString("/sys/class/net/%1/carrier").arg(ifname));
@@ -61,6 +76,11 @@ static bool isIfaceCarrierUp(const QString& ifname)
 
 
 // 将 255.255.255.0 转为 24；若掩码不合法返回 -1
+/**
+ * @brief 将连续的 IPv4 子网掩码转换为前缀位数。
+ * @param mask 点分十进制 IPv4 子网掩码。
+ * @return 连续子网掩码对应的前缀位数，无效时返回 -1。
+ */
 static int netmaskToPrefix(const QString &mask)
 {
     // IPv4 合法性判断
@@ -96,6 +116,14 @@ static int netmaskToPrefix(const QString &mask)
 
 
 //同步执行外部命令，带超时
+/**
+ * @brief 限时运行固定系统命令并收集错误说明。
+ * @param program 固定系统命令的程序路径。
+ * @param args 操作对应的结构化参数。
+ * @param[out] errOut 可选输出，接收命令或网络操作错误。
+ * @param timeoutMs 命令执行超时，单位为毫秒。
+ * @return 程序正常结束且退出码为 0 时为 true，失败或超时为 false。
+ */
 static bool runCmd(const QString &program, const QStringList &args, QString *errOut = nullptr, int timeoutMs = 5000)
 {
     const QString executable = Rk3566Platform::findExecutable({program});
@@ -129,6 +157,12 @@ static bool runCmd(const QString &program, const QStringList &args, QString *err
 
 
 // 读出 iface 的 IPv4 和 netmask
+/**
+ * @brief 读取指定网卡的 IPv4 地址及掩码。
+ * @param ifname 目标网卡名称。
+ * @param[out] ipOut 接收网卡 IPv4 地址。
+ * @param[out] maskOut 接收网卡子网掩码。
+ */
 static void getIfaceIPv4AndMask(const QString& ifname, QString* ipOut, QString* maskOut)
 {
     if (ipOut) ipOut->clear();
@@ -149,6 +183,11 @@ static void getIfaceIPv4AndMask(const QString& ifname, QString* ipOut, QString* 
 }
 
 // 从 `ip route show default dev eth0` 里解析网关
+/**
+ * @brief 查询指定网卡的实际默认网关。
+ * @param ifname 目标网卡名称。
+ * @return 目标网卡默认网关；未查到时为空。
+ */
 static QString getDefaultGateway(const QString& ifname)
 {
     const QString ipTool = Rk3566Platform::findExecutable({QStringLiteral("ip")});
@@ -165,6 +204,10 @@ static QString getDefaultGateway(const QString& ifname)
 }
 
 // 读取 resolv.conf 的 nameserver
+/**
+ * @brief 读取系统解析器中的 DNS 地址。
+ * @return 当前解析器配置的 DNS 地址文本。
+ */
 static QString getDnsFromResolvConf()
 {
     QFile f("/etc/resolv.conf");
@@ -185,16 +228,20 @@ static QString getDnsFromResolvConf()
 /** @brief 工作线程采集的值对象，不包含任何界面对象。 */
 struct NetworkRuntimeState
 {
-    QString ip;
-    QString mask;
-    QString gateway;
-    QString dns;
-    bool carrierUp = false;
-    bool dhcpRunning = false;
+    QString ip; /**< 网卡当前 IPv4 地址，未取得时为空。 */
+    QString mask; /**< 当前 IPv4 子网掩码。 */
+    QString gateway; /**< 通过后台命令查询的默认网关。 */
+    QString dns; /**< 从解析器配置采集的 DNS 文本。 */
+    bool carrierUp = false; /**< 内核载波状态。 */
+    bool dhcpRunning = false; /**< 采样时 DHCP 客户端是否存活。 */
 };
 
 
-/** @return 指定网卡 udhcpc 进程的 PID 文件路径。 */
+/**
+ * @brief 构造指定网卡的 DHCP 客户端 PID 文件路径。
+ * @param iface 目标有线网卡名称。
+ * @return 指定网卡 udhcpc 进程的 PID 文件路径。
+ */
 static QString dhcpPidFile(const QString& iface)
 {
     const QString runDir = QStringLiteral("/run/qt_ycest");
@@ -205,7 +252,11 @@ static QString dhcpPidFile(const QString& iface)
 }
 
 
-/** @return PID 文件对应的 DHCP 客户端仍存活时返回 true。 */
+/**
+ * @brief 检查指定网卡的 DHCP 客户端进程是否存活。
+ * @param iface 目标有线网卡名称。
+ * @return PID 文件对应的 DHCP 客户端仍存活时返回 true。
+ */
 static bool isDhcpRunning(const QString& iface)
 {
     QFile f(dhcpPidFile(iface));
@@ -222,7 +273,12 @@ static bool isDhcpRunning(const QString& iface)
 }
 
 
-/** @brief 终止指定网卡的 DHCP 客户端并清理 PID 文件。 */
+/**
+ * @brief 终止指定网卡的 DHCP 客户端并清理 PID 文件。
+ * @param iface 目标有线网卡名称。
+ * @param[out] errOut 可选输出，接收命令或网络操作错误。
+ * @return 停止操作成功时为 true，否则为 false。
+ */
 static bool stopDhcpClient(const QString& iface, QString* errOut = nullptr)
 {
     const QString pidFile = dhcpPidFile(iface);
@@ -254,7 +310,10 @@ static bool stopDhcpClient(const QString& iface, QString* errOut = nullptr)
     return true;
 }
 
-/** @return 系统中第一个可用的 udhcpc 事件脚本。 */
+/**
+ * @brief 按既有候选路径查找可用的 DHCP 配置脚本。
+ * @return 系统中第一个可用的 udhcpc 事件脚本。
+ */
 static QString findDhcpScript()
 {
     const QStringList candidates = {
@@ -268,7 +327,12 @@ static QString findDhcpScript()
     return QString();
 }
 
-/** @brief 以后台守护方式为指定网卡启动 udhcpc。 */
+/**
+ * @brief 以后台守护方式为指定网卡启动 udhcpc。
+ * @param iface 目标有线网卡名称。
+ * @param[out] errOut 可选输出，接收命令或网络操作错误。
+ * @return 客户端成功启动时为 true，否则为 false。
+ */
 static bool startDhcpDaemon(const QString& iface, QString* errOut = nullptr)
 {
     if (isDhcpRunning(iface)) return true;
@@ -308,7 +372,12 @@ static bool startDhcpDaemon(const QString& iface, QString* errOut = nullptr)
 }
 
 
-/** @brief 清除接口旧地址和路由，为 DHCP 或静态配置重新应用做准备。 */
+/**
+ * @brief 清除接口旧地址和路由，为 DHCP 或静态配置重新应用做准备。
+ * @param iface 目标有线网卡名称。
+ * @param[out] errOut 可选输出，接收命令或网络操作错误。
+ * @return 地址及路由清理成功时为 true。
+ */
 static bool clearIfaceNetworkConfig(const QString& iface, QString* errOut = nullptr)
 {
     QString err;
@@ -330,7 +399,12 @@ static bool clearIfaceNetworkConfig(const QString& iface, QString* errOut = null
     return true;
 }
 
-/** @brief 仅在网络工作线程调用；断线轮询不启动网关查询进程。 */
+/**
+ * @brief 仅在网络工作线程调用；断线轮询不启动网关查询进程。
+ * @param iface 目标有线网卡名称。
+ * @param requireCarrier 为 true 且网线断开时直接返回，跳过网关等进程查询。
+ * @return 系统实际网络状态；要求载波且断线时仅返回载波状态。
+ */
 static NetworkRuntimeState queryNetworkRuntimeState(const QString &iface, bool requireCarrier)
 {
     NetworkRuntimeState state;
@@ -343,7 +417,12 @@ static NetworkRuntimeState queryNetworkRuntimeState(const QString &iface, bool r
     return state;
 }
 
-/** @brief 后台串行运行系统调用，结果和界面操作回到 GUI 线程执行。 */
+/**
+ * @brief 后台串行运行系统调用，结果和界面操作回到 GUI 线程执行。
+ * @param work 在专用网络线程串行执行的工作，不能直接刷新控件。
+ * @param completed 结果回到 GUI 线程后的完成回调。
+ * @note 同一时刻只允许一个后台网络任务；配置代次变化时丢弃过期回调，完成后再处理延期操作。
+ */
 void NetworkPage::runNetworkTask(std::function<void()> work,
                                 std::function<void()> completed)
 {
@@ -392,7 +471,11 @@ void NetworkPage::runNetworkTask(std::function<void()> work,
     }
 }
 
-/** @brief 合并重复回显请求，后台采集后仅应用当前配置代次的结果。 */
+/**
+ * @brief 合并重复回显请求，后台采集后仅应用当前配置代次的结果。
+ * @param iface 目标有线网卡名称。
+ * @param completed 结果回到 GUI 线程后的完成回调。
+ */
 void NetworkPage::refreshUiFromSystem(const QString &iface, std::function<void()> completed)
 {
     if (networkTaskPending_) {
@@ -418,7 +501,10 @@ void NetworkPage::refreshUiFromSystem(const QString &iface, std::function<void()
     });
 }
 
-/** @brief 创建网络配置 UI 和 DHCP 状态同步定时器。 */
+/**
+ * @brief 创建网络配置 UI 和 DHCP 状态同步定时器。
+ * @param parent Qt 父对象；对象销毁由父子关系管理，空指针表示无父对象。
+ */
 NetworkPage::NetworkPage(QWidget *parent)
     : QWidget(parent)
     , ui(new Ui::NetworkPage)
@@ -480,7 +566,9 @@ NetworkPage::NetworkPage(QWidget *parent)
 }
 
 
-/** @brief 停止定时器并释放 Qt Designer UI。 */
+/**
+ * @brief 停止轮询，使旧任务失效并等待网络线程退出，再释放页面。
+ */
 NetworkPage::~NetworkPage()
 {
     dhcpSyncTimer_->stop();
@@ -492,7 +580,10 @@ NetworkPage::~NetworkPage()
 }
 
 
-/** @brief 有线连接模式切换时刷新可用控件。 */
+/**
+ * @brief 有线连接模式切换时刷新可用控件。
+ * @param index 界面选项索引。
+ */
 void NetworkPage::handleConnectionTypeChanged(int index)
 {
     networkGeneration_->fetch_add(1);
@@ -510,7 +601,10 @@ void NetworkPage::handleConnectionTypeChanged(int index)
     }
 }
 
-/** @brief DHCP/静态模式切换时更新输入框状态。 */
+/**
+ * @brief DHCP/静态模式切换时更新输入框状态。
+ * @param index 界面选项索引。
+ */
 void NetworkPage::handleIpModeChanged(int index)
 {
     networkGeneration_->fetch_add(1);
@@ -532,6 +626,10 @@ void NetworkPage::handleIpModeChanged(int index)
 }
 
 //是否使能IP编辑框
+/**
+ * @brief 统一设置静态地址输入控件是否可编辑。
+ * @param enabled 是否启用相关界面或功能。
+ */
 void NetworkPage::setIpFieldsEnabled(bool enabled)
 {
     ui->ipAddressEdit->setEnabled(enabled);
@@ -541,6 +639,12 @@ void NetworkPage::setIpFieldsEnabled(bool enabled)
 }
 
 // ✅ 事件过滤：点击输入框就弹键盘
+/**
+ * @brief 处理当前页面输入事件并将其余事件交给 Qt。
+ * @param watched 收到事件的对象。
+ * @param event Qt 事件。
+ * @return 事件已被本对象处理时为 true，否则沿用 Qt 事件分派。
+ */
 bool NetworkPage::eventFilter(QObject *watched, QEvent *event)
 {
     // 只处理鼠标点击（触摸屏通常也会转成鼠标事件）
@@ -570,7 +674,11 @@ bool NetworkPage::eventFilter(QObject *watched, QEvent *event)
 }
 
 
-/** @brief 使用项目屏幕键盘编辑指定输入框。 */
+/**
+ * @brief 使用项目屏幕键盘编辑指定输入框。
+ * @param edit 接收键盘输入的文本框。
+ * @param title 键盘窗口标题。
+ */
 void NetworkPage::openKeyboardFor(QLineEdit *edit, const QString &title)
 {
     networkGeneration_->fetch_add(1);
@@ -593,13 +701,19 @@ void NetworkPage::openKeyboardFor(QLineEdit *edit, const QString &title)
 }
 
 
-/** @brief 保存并应用当前网络设置。 */
+/**
+ * @brief 保存并应用当前网络设置。
+ */
 void NetworkPage::handleApplyClicked()
 {
     applyNetworkConfig(true);
 }
 
-/** @brief 执行 DHCP 或静态网络命令，并按需显示结果。 */
+/**
+ * @brief 执行 DHCP 或静态网络命令，并按需显示结果。
+ * @param showMessage 是否向设备界面显示操作结果。
+ * @return 本次设置被校验并受理时为 true；后台结果另行回报。
+ */
 bool NetworkPage::applyNetworkConfig(bool showMessage)
 {
     const quint64 generation = networkGeneration_->fetch_add(1) + 1;
@@ -757,7 +871,12 @@ bool NetworkPage::applyNetworkConfig(bool showMessage)
     return true;
 }
 
-/** @brief Web 使用原网卡命令与 DHCP 客户端，在共享网络工作线程执行并保存配置。 */
+/**
+ * @brief Web 使用原网卡命令与 DHCP 客户端，在共享网络工作线程执行并保存配置。
+ * @param token 贯穿请求与异步结果的任务标识。
+ * @param input Web 提交的网络设置，进入异步网络操作前统一校验。
+ * @note GUI 线程受理并排队到专用网络线程；完成后通过 token 回报 Web，禁止在界面线程等待网关查询或续租命令。
+ */
 void NetworkPage::applyWebNetworkConfig(const QString &token, const QJsonObject &input)
 {
     if (networkTaskPending_ || !webNetworkToken_.isEmpty()) {
@@ -930,14 +1049,21 @@ void NetworkPage::applyWebNetworkConfig(const QString &token, const QJsonObject 
         });
 }
 
-/** @brief 向页面日志区追加文本。 */
+/**
+ * @brief 向页面日志区追加文本。
+ * @param text 待显示的日志文本。
+ */
 void NetworkPage::appendLog(const QString &text)
 {
     const QString ts = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
     qDebug().noquote() << QString("[NetworkPage][%1] %2").arg(ts, text);
 }
 
-/** @brief 从指定目录的 INI 文件回显网络输入。 */
+/**
+ * @brief 从指定目录的 INI 文件回显网络输入。
+ * @param cfgDir 网络配置所在目录。
+ * @return 配置已成功读取并回显时为 true。
+ */
 bool NetworkPage::loadInputsFromConfigFile(const QString& cfgDir)
 {
     const QString cfgPath = QDir(cfgDir).filePath(configFileName_);
@@ -1004,7 +1130,9 @@ bool NetworkPage::loadInputsFromConfigFile(const QString& cfgDir)
     return true;
 }
 
-/** @brief 根据已保存配置执行一次自动联网。 */
+/**
+ * @brief 根据已保存配置执行一次自动联网。
+ */
 void NetworkPage::autoConnectFromSavedConfig()
 {
     // online_v1-v2启用功能
@@ -1071,7 +1199,11 @@ void NetworkPage::autoConnectFromSavedConfig()
 }
 
 
-/** @brief 将当前输入保存到网络配置文件。 */
+/**
+ * @brief 将当前输入保存到网络配置文件。
+ * @param cfgDir 网络配置所在目录。
+ * @return 网络输入成功持久化时为 true。
+ */
 bool NetworkPage::saveInputsToConfigFile(const QString& cfgDir)
 {
     const QString cfgPath = QDir(cfgDir).filePath(configFileName_);
@@ -1102,7 +1234,11 @@ bool NetworkPage::saveInputsToConfigFile(const QString& cfgDir)
 }
 
 
-/** @brief 清除配置文件中的静态 IP 字段。 */
+/**
+ * @brief 清除配置文件中的静态 IP 字段。
+ * @param cfgDir 网络配置所在目录。
+ * @return 原配置中的网络地址清理成功时为 true。
+ */
 bool NetworkPage::clearNetworkConfigFileIp(const QString& cfgDir)
 {
     const QString cfgPath = QDir(cfgDir).filePath(configFileName_);
@@ -1127,7 +1263,10 @@ bool NetworkPage::clearNetworkConfigFileIp(const QString& cfgDir)
     return true;
 }
 
-/** @brief 更新功能开关并决定网络功能是否可用。 */
+/**
+ * @brief 更新功能开关并决定网络功能是否可用。
+ * @param settings 设备功能开关快照。
+ */
 void NetworkPage::setFeatureSettings(const FeatureSettings &settings)
 {
     // 只有显式 Web 配置才保留独立有线联网意图，未使用 Web 的设备沿用原模式规则。
@@ -1167,7 +1306,10 @@ void NetworkPage::setFeatureSettings(const FeatureSettings &settings)
     }
 }
 
-/** @return 在线功能或显式 Web 网络配置要求联网时返回 true。 */
+/**
+ * @brief 合并功能配置与显式 Web 设置判断是否允许联网。
+ * @return 在线功能或显式 Web 网络配置要求联网时返回 true。
+ */
 bool NetworkPage::isNetworkFeatureEnabled() const
 {
     return featureSettings_.online_v1 || featureSettings_.online_v2 || webNetworkEnabled_;
@@ -1175,6 +1317,10 @@ bool NetworkPage::isNetworkFeatureEnabled() const
 
 
 // DHCP 运行时同步
+/**
+ * @brief 按连接状态触发后台网络查询并同步 DHCP 运行参数。
+ * @note 轮询仅提交后台采样请求；已有网络任务时合并或延期，界面线程不执行阻塞网关命令。
+ */
 void NetworkPage::syncDhcpRuntimeStateToConfig()
 {
     if (!ui || networkTaskPending_ || dhcpAutoApplying_) return;
@@ -1201,7 +1347,11 @@ void NetworkPage::syncDhcpRuntimeStateToConfig()
     });
 }
 
-/** @brief GUI 线程沿用原状态转换，仅消费后台采集值。 */
+/**
+ * @brief GUI 线程沿用原状态转换，仅消费后台采集值。
+ * @param iface 目标有线网卡名称。
+ * @param state 工作线程采集的当前网卡状态。
+ */
 void NetworkPage::applyDhcpRuntimeState(const QString &iface,
                                       const NetworkRuntimeState &state)
 {
@@ -1309,7 +1459,11 @@ void NetworkPage::applyDhcpRuntimeState(const QString &iface,
 }
 
 
-/** @brief 按重试节流请求 DHCP 续租或强制重启客户端。 */
+/**
+ * @brief 按重试节流请求 DHCP 续租或强制重启客户端。
+ * @param reason 自动续租的触发原因，用于诊断日志。
+ * @param forceRestart 是否强制重启 DHCP 客户端。
+ */
 void NetworkPage::requestAutoDhcpRenew(const QString &reason, bool forceRestart)
 {
     if (!ui || networkTaskPending_ || dhcpAutoApplying_ || !isNetworkFeatureEnabled() ||
@@ -1389,7 +1543,11 @@ void NetworkPage::requestAutoDhcpRenew(const QString &reason, bool forceRestart)
     });
 }
 
-/** @brief 手动或启动 DHCP 的命令及地址等待全部在同一工作线程执行。 */
+/**
+ * @brief 手动或启动 DHCP 的命令及地址等待全部在同一工作线程执行。
+ * @param iface 目标有线网卡名称。
+ * @param showMessage 是否向设备界面显示操作结果。
+ */
 void NetworkPage::applyDhcpNetworkConfig(const QString &iface, bool showMessage)
 {
     struct Result {

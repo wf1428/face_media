@@ -3,9 +3,12 @@
  * @brief Web 命令协调；不链接 HTTP 库、不控制播放/空调/电梯、不发送 MQTT。
  * @author Du lin
  * @date 2026-10-09
+ * @note 最近修改：2026-10-23；修改人：Du lin；增加人员图片归档上传及异步展开，复用原账号匹配和防重入库，保留媒体限制及存储空间检查。
  */
 
 #include "web_service.h"
+#include "common/media_content_policy.h"
+#include "platform/rk3566_platform.h"
 #include "web_resource_update.h"
 #include "web_hotspot.h"
 #include "web_local_api.h"
@@ -38,6 +41,7 @@
 #include <QDebug>
 #include <QJsonDocument>
 #include <QStandardPaths>
+#include <memory>
 #ifdef Q_OS_UNIX
 #include <fcntl.h>
 #include <sys/file.h>
@@ -48,13 +52,20 @@ namespace {
 
 constexpr qint64 MiB = 1024LL * 1024; /**< 文件资源预算单位。 */
 
-/** @return 不带大括号的随机受控标识。 */
+/**
+ * @brief 生成用于任务或批次的随机 UUID。
+ * @return 不带大括号的随机受控标识。
+ */
 QString uuid()
 {
     return QUuid::createUuid().toString(QUuid::WithoutBraces);
 }
 
-/** @return 字符串清单的 JSON 数组。 */
+/**
+ * @brief 按原顺序将字符串列表转换为 JSON 数组。
+ * @param values 按占位符顺序绑定的参数。
+ * @return 字符串清单的 JSON 数组。
+ */
 QJsonArray strings(const QStringList &values)
 {
     QJsonArray result;
@@ -63,7 +74,11 @@ QJsonArray strings(const QStringList &values)
     return result;
 }
 
-/** @brief 不保留内部磁盘路径的业务失败数组追加。 */
+/**
+ * @brief 不保留内部磁盘路径的业务失败数组追加。
+ * @param[in,out] result 处理结果。
+ * @param faces 待校验的人脸条目，含人员及资源信息。
+ */
 void appendFailures(QJsonObject &result, const QJsonArray &faces)
 {
     QJsonArray failures = result.value("failedNames").toArray();
@@ -79,15 +94,25 @@ void appendFailures(QJsonObject &result, const QJsonArray &faces)
 }
 } // namespace
 
-/** @brief 保存 Web 业务配置并绑定到 Qt 对象生命周期。 */
+/**
+ * @brief 保存 Web 业务配置并绑定到 Qt 对象生命周期。
+ * @param config 设备受控配置，包含运行所需路径或功能设置。
+ * @param parent Qt 父对象；对象销毁由父子关系管理，空指针表示无父对象。
+ */
 WebService::WebService(const WebServiceConfig &config, QObject *parent)
     : QObject(parent), config_(config)
 {
 }
 
-/** @brief 释放尚未结束的本地人员导入互斥门。 */
+/**
+ * @brief 等待文件工作线程安全退出，再释放尚未结束的本地人员导入互斥门。
+ */
 WebService::~WebService()
 {
+    if (faceArchiveWorker_) {
+        faceArchiveWorker_->requestInterruption();
+        faceArchiveWorker_->wait();
+    }
     if (resourceWorker_) {
         resourceWorker_->requestInterruption();
         resourceWorker_->wait(); // 等待安全检查点回滚，避免销毁仍在运行的线程。
@@ -96,7 +121,9 @@ WebService::~WebService()
         LocalImportGate::release();
 }
 
-/** @brief 初始化统一数据库、工厂账号及中断任务恢复。 */
+/**
+ * @brief 初始化统一数据库、工厂账号及中断任务恢复。
+ */
 void WebService::initialize()
 {
     if (!DbStore::bootstrap(config_.database))
@@ -123,7 +150,11 @@ void WebService::initialize()
     }
 }
 
-/** @brief 生成不包含服务器内部路径的上传任务响应。 */
+/**
+ * @brief 生成不包含服务器内部路径的上传任务响应。
+ * @param task 持久化上传任务记录。
+ * @return 不暴露内部磁盘路径的上传任务状态。
+ */
 QJsonObject WebService::publicTask(const QVariantMap &task) const
 {
     QJsonObject result = WebSql::object(task);
@@ -144,7 +175,33 @@ QJsonObject WebService::publicTask(const QVariantMap &task) const
     return result;
 }
 
-/** @brief 检查目标存储空间和上传预留配额。 */
+/**
+ * @brief 检查目标存储空间和上传预留配额。
+ * @return 与 MQTT 相同的 pic 保存目录。
+ */
+QString WebService::pictureDirectory() const
+{
+    return QDir::cleanPath(QDir(config_.media).filePath("../pic"));
+}
+
+/**
+ * @brief 使用任务创建时冻结的目标目录，避免后续切换小图设置改变上传位置。
+ * @param task 持久化上传任务记录。
+ * @return 任务固定的 pic 或 video 目标根目录。
+ */
+QString WebService::taskRoot(const QVariantMap &task) const
+{
+    const QString kind = task.value("kind").toString();
+    if (kind == "ad_image" && MediaContentPolicy::isInDirectory(task.value("final_path").toString(), pictureDirectory()))
+        return pictureDirectory();
+    return kind == "video" || kind == "ad_image" ? config_.media : config_.imports;
+}
+
+/**
+ * @brief 校验已占用空间、未完成上传预留及新增资源所需字节。
+ * @param kind 资源或任务类型，用于选择目录、配额和校验规则。
+ * @param incoming 本次新增资源大小，单位为字节。
+ */
 void WebService::checkBudget(const QString &kind, qint64 incoming)
 {
     if (kind == "resource_package") {
@@ -155,12 +212,12 @@ void WebService::checkBudget(const QString &kind, qint64 incoming)
             throw WebError(507, QStringLiteral("资源包存储空间不足"));
         return; // 展开空间由独立进程按目标 eMMC 的实际剩余空间逐项核对。
     }
-    const bool video = kind == "video";
+    const bool video = kind == "video" || kind == "ad_image";
     const QString root = video ? config_.media : config_.imports;
     if (video)
         WebPaths::mounted(root, config_.mount);
     const qint64 used =
-        video ? StoragePolicy::mediaUsage().bytes
+        video ? StoragePolicy::mediaUsage().bytes + WebPaths::usage(pictureDirectory())
               : WebPaths::usage(root) - WebPaths::usage(QDir(root).filePath("resource-packages"));
     const qint64 reserved =
         WebUploads::reserved(video ? QStringLiteral("video") : QStringLiteral("person"));
@@ -172,7 +229,13 @@ void WebService::checkBudget(const QString &kind, qint64 incoming)
         throw WebError(507, QStringLiteral("设备可用空间或上传配额不足"));
 }
 
-/** @brief 校验清单和容量后创建受控上传任务。 */
+/**
+ * @brief 校验清单和容量后创建受控上传任务。
+ * @param args 操作对应的结构化参数。
+ * @param owner 已认证 Web 账号主键，用于任务归属校验。
+ * @return 新建或复用的上传任务及受控暂存路径。
+ * @note 视频最多 500 MiB，广告图片及人员图片包最多 100 MiB；仍由 checkBudget 核对配额及实际空间。
+ */
 QJsonObject WebService::createUpload(const QJsonObject &args, int owner)
 {
     // 先校验客户端声明的类别、原始文件名和长度，避免非法任务占用配额。
@@ -182,10 +245,11 @@ QJsonObject WebService::createUpload(const QJsonObject &args, int owner)
     if (sizeValue <= 0 || sizeValue > 8.0 * 1024 * 1024 * 1024)
         throw WebError(400, QStringLiteral("文件大小不符合要求"));
     const qint64 size = static_cast<qint64>(sizeValue);
-    const qint64 maxSize = kind == "video" ? StoragePolicy::mediaLimitBytes()
-                                           : (kind == "resource_package"
-                                                  ? 512 * MiB
-                                                  : (kind == "person_excel" ? 20 * MiB : 10 * MiB));
+    const bool advertisement = kind == "video" || kind == "ad_image";
+    const qint64 maxSize = kind == "video" ? 500 * MiB
+                           : (kind == "ad_image" || kind == "person_face_archive") ? 100 * MiB
+                           : kind == "resource_package" ? 512 * MiB
+                           : kind == "person_excel" ? 20 * MiB : 10 * MiB;
     if (!WebPaths::accepts(kind, name) || size <= 0 || sizeValue != double(size) || size > maxSize)
         throw WebError(400, QStringLiteral("文件类型或大小不符合要求"));
 
@@ -196,11 +260,11 @@ QJsonObject WebService::createUpload(const QJsonObject &args, int owner)
     for (const auto &task : active) {
         const QString activeKind = task.value("kind").toString();
         if ((kind == "resource_package" &&
-             (activeKind == "resource_package" || activeKind == "video")) ||
-            (kind == "video" && activeKind == "resource_package"))
+             (activeKind == "resource_package" || activeKind == "video" || activeKind == "ad_image")) ||
+            (advertisement && activeKind == "resource_package"))
             throw WebError(409,
                            QStringLiteral("资源包更新与视频上传不能同时进行，请先完成当前任务"));
-        if (kind == "video" && activeKind == "video")
+        if (advertisement && (activeKind == "video" || activeKind == "ad_image"))
             throw WebError(409, QStringLiteral("已有视频上传任务，请先完成或取消"));
     }
     QString root = config_.media, target;
@@ -222,7 +286,9 @@ QJsonObject WebService::createUpload(const QJsonObject &args, int owner)
             throw WebError(503, QStringLiteral("无法创建资源包缓存目录"));
         WebPaths::uploadDirectory(root);
         target = QDir(root).filePath(id + '.' + suffix);
-    } else if (kind != "video") {
+    } else if (!advertisement) {
+        if (kind == "person_face_archive" && !WebResourceUpdate::available())
+            throw WebError(503, QStringLiteral("图片压缩包解压库不可用"));
         // 人员文件必须属于当前账号的开放批次，并与预先提交的清单逐项一致。
         batch = args.value("batch_id").toString();
         const auto import = WebImports::get(batch.toString(), owner);
@@ -245,7 +311,8 @@ QJsonObject WebService::createUpload(const QJsonObject &args, int owner)
             throw WebError(400, QStringLiteral("每批最多 500 份文件"));
         for (const auto &entry : entries) {
             if (entry.value("original_name").toString().compare(name, Qt::CaseInsensitive) == 0 ||
-                (kind == "person_excel" && entry.value("kind") == "person_excel"))
+                (kind == "person_excel" && entry.value("kind") == "person_excel") ||
+                (kind == "person_face_archive" && entry.value("kind") == "person_face_archive"))
                 throw WebError(409, QStringLiteral("同一批次不能重复上传同名文件或多个 Excel"));
         }
         root = QDir(config_.imports).filePath(batch.toString());
@@ -256,21 +323,28 @@ QJsonObject WebService::createUpload(const QJsonObject &args, int owner)
         target = QDir(root).filePath(id + '.' + suffix);
     } else {
         // 视频只写入媒体挂载点；发布前使用同挂载点内的临时目录。
+        if (kind == "ad_image" && (args.contains("smallImageMode")
+                ? MediaContentPolicy::smallImageMode(args.value("smallImageMode"))
+                : MediaContentPolicy::smallImageMode(Rk3566Platform::netConfigPath()))) {
+            root = pictureDirectory();
+            WebPaths::inside(root, QFileInfo(config_.media).absolutePath());
+            if (!QDir().mkpath(root)) throw WebError(503, "无法创建小图目录");
+        }
         WebPaths::mounted(root, config_.mount);
         target = QDir(root).filePath(name);
         if (QFileInfo::exists(target))
             throw WebError(409, QStringLiteral("同名视频已存在，请更换名称"));
         if (!QDir().mkpath(QDir(root).filePath("_uploads")))
             throw WebError(503, QStringLiteral("无法创建视频缓存目录"));
-        WebPaths::inside(QDir(root).filePath("_uploads/check"), config_.media);
+        WebPaths::inside(QDir(root).filePath("_uploads/check"), root);
         WebPaths::uploadDirectory(QDir(root).filePath("_uploads"));
     }
 
     // 路径和空间确认后才在数据库中登记任务。
     const QString part =
-        kind == "video" ? QDir(root).filePath("_uploads/" + id + ".part") : target + ".part";
-    WebPaths::inside(target, kind == "video" ? config_.media : config_.imports);
-    WebPaths::inside(part, kind == "video" ? config_.media : config_.imports);
+        advertisement ? QDir(root).filePath("_uploads/" + id + ".part") : target + ".part";
+    WebPaths::inside(target, advertisement ? root : config_.imports);
+    WebPaths::inside(part, advertisement ? root : config_.imports);
     checkBudget(kind, size);
     const QVariantMap task = {{"id", id},
                               {"owner_id", owner},
@@ -286,7 +360,11 @@ QJsonObject WebService::createUpload(const QJsonObject &args, int owner)
     return result;
 }
 
-/** @brief 仅提示真实视频上传任务；完整接收不等于内容校验和发布完成。 */
+/**
+ * @brief 仅提示真实视频上传任务；完整接收不等于内容校验和发布完成。
+ * @param task 持久化上传任务记录。
+ * @param state 实际执行状态。
+ */
 void WebService::reportVideoUpload(const QVariantMap &task, const QString &state)
 {
     if (task.value("kind").toString() == "resource_package") {
@@ -302,7 +380,7 @@ void WebService::reportVideoUpload(const QVariantMap &task, const QString &state
             state == "FAILED");
         return;
     }
-    if (task.value("kind").toString() != "video")
+    if (task.value("kind").toString() != "video" && task.value("kind").toString() != "ad_image")
         return;
     const auto total = task.value("expected_bytes").toLongLong();
     const auto received = task.value("received_bytes").toLongLong();
@@ -315,7 +393,12 @@ void WebService::reportVideoUpload(const QVariantMap &task, const QString &state
                                                      state);
 }
 
-/** @brief 验证并发布已完整接收的文件。 */
+/**
+ * @brief 验证并发布已完整接收的文件。
+ * @param id 目标记录或任务的标识。
+ * @param owner 已认证 Web 账号主键，用于任务归属校验。
+ * @return 已完成长度、格式、同步检查后的幂等发布结果。
+ */
 QJsonObject WebService::commit(const QString &id, int owner)
 {
     // 中断恢复可能遇到已重命名文件，此时仍需完成数据库发布。
@@ -335,8 +418,8 @@ QJsonObject WebService::commit(const QString &id, int owner)
         WebPaths::sync(part);
         return startResourcePackage(task);
     }
-    const QString root = kind == "video" ? config_.media : config_.imports;
-    if (kind == "video")
+    const QString root = taskRoot(task);
+    if (kind == "video" || kind == "ad_image")
         WebPaths::mounted(root, config_.mount);
     const QString part = task.value("part_path").toString(),
                   final = task.value("final_path").toString();
@@ -356,6 +439,13 @@ QJsonObject WebService::commit(const QString &id, int owner)
         if (validation.status != GstVideoValidationStatus::Valid)
             throw WebError(validation.status == GstVideoValidationStatus::Unavailable ? 503 : 400,
                            validation.message);
+    } else if (kind == "ad_image") {
+        QImageReader reader(candidate);
+        reader.setDecideFormatFromContent(true);
+        const QSize dimensions = reader.size();
+        if (!dimensions.isValid() || qint64(dimensions.width()) * dimensions.height() > 64000000 || !reader.canRead())
+            throw WebError(400, "广告图片格式或尺寸无效");
+        if (reader.read().isNull()) throw WebError(400, "广告图片内容无法解码");
     } else if (kind == "person_excel") {
         // 临时文件以 .part 结尾，XLS 格式按原始后缀判断，预检使用最终路径副本规则。
         const bool xls =
@@ -367,15 +457,11 @@ QJsonObject WebService::commit(const QString &id, int owner)
                 throw WebError(400, QStringLiteral("不是有效 XLS 文件"));
         } else
             WebPaths::validateExcel(candidate);
+    } else if (kind == "person_face_archive") {
+        // 这里只发布已完整接收的归档；开始导入后先后台展开校验，再写人员资料。
+        if (!WebResourceUpdate::available()) throw WebError(503, QStringLiteral("图片解压库不可用"));
     } else {
-        QImageReader reader(candidate);
-        reader.setDecideFormatFromContent(true);
-        const QSize dimensions = reader.size();
-        const QByteArray format = reader.format().toLower();
-        const QString ext = QFileInfo(task.value("original_name").toString()).suffix().toLower();
-        if (!dimensions.isValid() || qint64(dimensions.width()) * dimensions.height() > 16000000 ||
-            !reader.canRead() || !(format == ext.toLatin1() || (format == "jpeg" && ext == "jpg")))
-            throw WebError(400, QStringLiteral("人脸图片格式、尺寸或扩展名不匹配"));
+        WebPaths::validateFaceImage(candidate, task.value("original_name").toString());
     }
 
     // 先持久化文件内容，再将临时文件原子改名为最终文件。
@@ -394,7 +480,7 @@ QJsonObject WebService::commit(const QString &id, int owner)
     if (!DbStore::transactionBegin())
         throw WebError(503, QStringLiteral("文件登记事务失败"));
     try {
-        if (kind == "video")
+        if (kind == "video" || kind == "ad_image")
             WebMedia::index(final, id);
         else
             WebImports::addAsset(task);
@@ -407,12 +493,17 @@ QJsonObject WebService::commit(const QString &id, int owner)
     }
     // 只有内容校验、文件原子发布、数据库提交都成功，才通知设备播放。
     reportVideoUpload(WebUploads::get(id, owner), "COMPLETED");
-    if (kind == "video")
-        emit WebLocalRuntime::instance()->videoUploaded(QFileInfo(final).fileName());
+    if (kind == "video" || kind == "ad_image")
+        emit WebLocalRuntime::instance()->videoUploaded(final);
     return publicTask(WebUploads::get(id, owner));
 }
 
-/** @brief 启动 Qt 内部更新线程，文件 IO 与解压均不占用 Web RPC 线程。 */
+/**
+ * @brief 启动 Qt 内部更新线程，文件 IO 与解压均不占用 Web RPC 线程。
+ * @param task 持久化上传任务记录。
+ * @param recovery 是否处理上次中断的资源更新。
+ * @return 异步资源更新任务的受理结果。
+ */
 QJsonObject WebService::startResourcePackage(const QVariantMap &task, bool recovery)
 {
     if (resourceWorker_ && resourceWorker_->isRunning())
@@ -452,7 +543,11 @@ QJsonObject WebService::startResourcePackage(const QVariantMap &task, bool recov
     return publicTask(WebUploads::get(id, task.value("owner_id").toInt()));
 }
 
-/** @brief 解压结果回到原 Web 线程后才登记数据库，不跨线程访问 SQLite。 */
+/**
+ * @brief 解压结果回到原 Web 线程后才登记数据库，不跨线程访问 SQLite。
+ * @param id 目标记录或任务的标识。
+ * @param result 处理结果。
+ */
 void WebService::finishResourcePackage(const QString &id, const QJsonObject &result)
 {
     const auto task = WebUploads::get(id);
@@ -469,16 +564,22 @@ void WebService::finishResourcePackage(const QString &id, const QJsonObject &res
             << (ready ? result.value("updatedDirectories") : result.value("error"));
 }
 
-/** @brief 返回设备目录中可管理的视频文件清单。 */
+/**
+ * @brief 返回设备目录中可管理的视频文件清单。
+ * @return video 目录的视频与图片清单。
+ */
 QJsonObject WebService::files()
 {
     WebPaths::mounted(config_.media, config_.mount);
     QJsonArray items;
-    for (const auto &file :
-         QDir(config_.media).entryInfoList(QDir::Files | QDir::NoSymLinks, QDir::Name)) {
-        if (!WebPaths::accepts("video", file.fileName()))
+    for (const QString &directory : {config_.media, pictureDirectory()}) {
+      if (!QFileInfo::exists(directory)) continue;
+      WebPaths::mounted(directory, config_.mount);
+      for (const auto &file : QDir(directory).entryInfoList(QDir::Files | QDir::NoSymLinks, QDir::Name)) {
+        if (!WebPaths::accepts("ad_image", file.fileName()) &&
+            (directory != config_.media || !WebPaths::accepts("video", file.fileName())))
             continue;
-        WebPaths::inside(file.absoluteFilePath(), config_.media, true);
+        WebPaths::inside(file.absoluteFilePath(), directory, true);
 
         // 若是 COMMITTING 的 Web 文件，等待其数据库发布完成再向网页展示。
         if (!WebSql::query(QStringLiteral("SELECT id FROM web_upload_tasks WHERE final_path=? AND "
@@ -491,13 +592,24 @@ QJsonObject WebService::files()
             QStringLiteral(
                 "SELECT id,name,bytes,modified_ms,state FROM web_media_files WHERE path=?"),
             {file.absoluteFilePath()});
-        if (!rows.isEmpty())
-            items.append(WebSql::object(rows.first()));
+        if (!rows.isEmpty()) {
+            auto item = WebSql::object(rows.first());
+            item.insert("mediaType", MediaContentPolicy::isImage(file.fileName()) ? "IMAGE" : "VIDEO");
+            item.insert("smallImageMode", directory == pictureDirectory() ? 1 : 0);
+            items.append(item);
+        }
+      }
     }
     return {{"files", items}};
 }
 
-/** @brief 将版本化 IPC 操作分派到对应的 Qt Web 业务。 */
+/**
+ * @brief 将版本化 IPC 操作分派到对应的 Qt Web 业务。
+ * @param operation 白名单业务操作名。
+ * @param args 操作对应的结构化参数。
+ * @param owner 已认证 Web 账号主键，用于任务归属校验。
+ * @return 白名单操作的业务结果；校验或执行失败抛出 WebError。
+ */
 QJsonObject WebService::dispatch(const QString &operation, const QJsonObject &args, int owner)
 {
     // 新 Web 连接的关键状态使用 FULL；原 Qt 连接配置不变。
@@ -590,7 +702,7 @@ QJsonObject WebService::dispatch(const QString &operation, const QJsonObject &ar
             if (state == "READY" || state == "COMMITTING")
                 throw WebError(409, QStringLiteral("任务已经发布或正在发布，不能取消"));
             const QString part = task.value("part_path").toString();
-            WebPaths::inside(part, kind == "video" ? config_.media : config_.imports);
+            WebPaths::inside(part, taskRoot(task));
 #ifdef Q_OS_UNIX
             // daemon 崩溃而 Qt 仍运行时允许取消失去写入者的任务，活跃 flock 不可解除。
             if (state == "RECEIVING" && QFileInfo::exists(part)) {
@@ -614,7 +726,7 @@ QJsonObject WebService::dispatch(const QString &operation, const QJsonObject &ar
             if (state != "RECEIVING")
                 throw WebError(409, QStringLiteral("任务已停止接收"));
             const QString part = task.value("part_path").toString();
-            WebPaths::inside(part, kind == "video" ? config_.media : config_.imports);
+            WebPaths::inside(part, taskRoot(task));
             if (QFileInfo::exists(part) && !QFile::remove(part))
                 throw WebError(503, QStringLiteral("临时文件清理失败"));
             WebUploads::setState(id, "FAILED", 0, QStringLiteral("传输未完成，请重新上传"));
@@ -634,7 +746,11 @@ QJsonObject WebService::dispatch(const QString &operation, const QJsonObject &ar
         WebPaths::mounted(config_.media, config_.mount);
         const auto item = WebMedia::get(id);
         const QString path = item.value("path").toString();
-        WebPaths::inside(path, config_.media, operation == "files.get");
+        const QString root = MediaContentPolicy::isInDirectory(path, pictureDirectory()) ? pictureDirectory() : config_.media;
+        if (root == pictureDirectory() && !MediaContentPolicy::isImage(path))
+            throw WebError(400, "小图目录只管理图片");
+        WebPaths::mounted(root, config_.mount);
+        WebPaths::inside(path, root, operation == "files.get");
         if (operation == "files.get") {
             if (item.value("state") != "READY")
                 throw WebError(409, QStringLiteral("文件正在删除"));
@@ -652,8 +768,9 @@ QJsonObject WebService::dispatch(const QString &operation, const QJsonObject &ar
         WebMedia::deleting(id);
         if (QFileInfo::exists(path) && !QFile::remove(path))
             throw WebError(503, QStringLiteral("删除失败，请重试"));
-        WebPaths::sync(config_.media, true);
+        WebPaths::sync(root, true);
         WebMedia::removed(id);
+        emit WebLocalRuntime::instance()->mediaFileDeleted(path);
         return {{"deleted", true}};
     }
 
@@ -665,25 +782,29 @@ QJsonObject WebService::dispatch(const QString &operation, const QJsonObject &ar
                 400,
                 QStringLiteral("请选择一份 Excel 和可选的人脸图片，每批最多 500 份文件"));
         QSet<QString> names;
-        int excelCount = 0;
+        int excelCount = 0, archiveCount = 0, imageCount = 0;
         qint64 total = 0;
         for (const auto &item : manifest) {
             const auto file = item.toObject();
             const auto name = WebPaths::filename(file.value("name").toString());
             const auto kind = file.value("kind").toString();
             const double size = file.value("size").toDouble(-1);
-            if ((kind != "person_excel" && kind != "person_face") ||
+            if ((kind != "person_excel" && kind != "person_face" && kind != "person_face_archive") ||
                 !WebPaths::accepts(kind, name) || size <= 0 ||
-                size > (kind == "person_excel" ? 20 * MiB : 10 * MiB) ||
+                size > (kind == "person_excel" ? 20 * MiB : kind == "person_face_archive" ? 100 * MiB : 10 * MiB) ||
                 size != double(qint64(size)) || names.contains(name.toCaseFolded()))
                 throw WebError(400, QStringLiteral("所选文件清单存在格式、大小或重名问题"));
             names.insert(name.toCaseFolded());
             total += qint64(size);
             if (kind == "person_excel")
                 ++excelCount;
+            else if (kind == "person_face_archive") ++archiveCount;
+            else ++imageCount;
         }
         if (excelCount != 1)
             throw WebError(400, QStringLiteral("每批必须包含且仅包含一份 Excel"));
+        if (archiveCount > 1 || (archiveCount && imageCount))
+            throw WebError(400, QStringLiteral("人脸图片请使用直接上传或单个压缩包中的一种方式"));
         checkBudget("person_excel", total);
         return WebImports::get(WebImports::create(owner, manifest), owner);
     }
@@ -751,12 +872,54 @@ QJsonObject WebService::dispatch(const QString &operation, const QJsonObject &ar
     throw WebError(404, QStringLiteral("本版本未接入该操作"));
 }
 
-/** @brief 解析 Excel 并按原人员导入规则处理本地批次。 */
-void WebService::importBatch(const QString &id)
+/**
+ * @brief 图片包先后台展开，解析 Excel 后按原规则处理人员及账号匹配的人脸。
+ * @param id 目标记录或任务的标识。
+ * @param extracted 后台解压返回的图片清单；初次调用为空。
+ */
+void WebService::importBatch(const QString &id, const QJsonArray &extracted)
 {
+    if (currentBatch_ != id) return;
     try {
         // 使用 Qt 原有的 XLS/XLSX 解析器和本地人员导入入口。
-        const auto assets = WebImports::assets(id);
+        auto assets = WebImports::assets(id);
+        if (extracted.isEmpty()) {
+            for (const auto &asset : assets) {
+                if (asset.value("kind") != "person_face_archive") continue;
+                const QString archive = asset.value("path").toString();
+                WebPaths::inside(archive, config_.imports, true);
+                const QString destination = QDir(QFileInfo(archive).absolutePath()).filePath("face-images");
+                const qint64 budget = 200 * MiB - WebPaths::usage(config_.imports)
+                        + WebPaths::usage(QDir(config_.imports).filePath("resource-packages"))
+                        - WebUploads::reserved("person");
+                auto result = std::make_shared<QJsonObject>();
+                WebImports::setState(id, "IMPORTING", {{"message", QStringLiteral("正在解压人脸图片")}});
+                auto *thread = QThread::create([archive, destination, budget, result] {
+                    try {
+                        result->insert("images", WebResourceUpdate::extractFaceImages(archive, destination, budget));
+                    } catch (const WebError &e) {
+                        result->insert("error", e.message);
+                    } catch (const std::exception &) {
+                        result->insert("error", QStringLiteral("人员图片压缩包处理异常"));
+                    }
+                });
+                faceArchiveWorker_ = thread;
+                thread->setParent(this);
+                connect(thread, &QThread::finished, this, [this, id, result, thread] {
+                    faceArchiveWorker_ = nullptr;
+                    thread->deleteLater();
+                    if (currentBatch_ != id) return;
+                    if (result->contains("error")) {
+                        importResult_ = {{"message", result->value("error")}};
+                        finishImport("FAILED");
+                    } else importBatch(id, result->value("images").toArray());
+                });
+                thread->start();
+                return;
+            }
+        }
+        if (!extracted.isEmpty()) checkBudget("person_excel");
+        for (const auto &image : extracted) assets.append(image.toObject().toVariantMap());
         QString excel;
         for (const auto &asset : assets)
             if (asset.value("kind") == "person_excel")
@@ -850,7 +1013,12 @@ void WebService::importBatch(const QString &id)
     }
 }
 
-/** @brief 写入通过校验的人脸图片及人员关联。 */
+/**
+ * @brief 写入通过校验的人脸图片及人员关联。
+ * @param token 贯穿请求与异步结果的任务标识。
+ * @param accepted 通过质量、防重校验的人脸条目。
+ * @param failed 校验失败的人脸条目及原因。
+ */
 void WebService::applyFaces(const QString &token,
                             const QJsonArray &accepted,
                             const QJsonArray &failed)
@@ -901,7 +1069,10 @@ void WebService::applyFaces(const QString &token,
     }
 }
 
-/** @brief 汇总导入结果并结束当前批次。 */
+/**
+ * @brief 汇总导入结果并结束当前批次。
+ * @param state 实际执行状态。
+ */
 void WebService::finishImport(const QString &state)
 {
     const QString id = currentBatch_;
@@ -920,7 +1091,10 @@ void WebService::finishImport(const QString &state)
     }
 }
 
-/** @brief 清理批次临时文件和任务记录。 */
+/**
+ * @brief 清理批次临时文件和任务记录。
+ * @param id 目标记录或任务的标识。
+ */
 void WebService::cleanupBatch(const QString &id)
 {
     if (!QRegularExpression(QStringLiteral("^[a-f0-9-]{36}$")).match(id).hasMatch())
@@ -933,7 +1107,9 @@ void WebService::cleanupBatch(const QString &id)
         throw WebError(503, QStringLiteral("批次中间文件清理失败，稍后由维护流程重试"));
 }
 
-/** @brief 恢复或标记上次中断的上传和导入任务。 */
+/**
+ * @brief 恢复或标记上次中断的上传和导入任务。
+ */
 void WebService::recover()
 {
     // 重启后只尝试幂等的已接收任务；接收中的临时文件按失败清理。
@@ -949,7 +1125,7 @@ void WebService::recover()
                 commit(id, task.value("owner_id").toInt());
             else {
                 WebPaths::inside(part,
-                                 task.value("kind") == "video" ? config_.media : config_.imports);
+                                 taskRoot(task));
                 if (QFileInfo::exists(part) && !QFile::remove(part))
                     throw WebError(503, QStringLiteral("残留临时文件清理失败"));
                 WebUploads::setState(id,

@@ -7,6 +7,7 @@
  */
 
 #include "mqttservice.h"
+#include "common/media_content_policy.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -311,9 +312,9 @@ bool MqttService::writeMqttIni(const QString& clientId,
 }
 
 /**
- * @brief 构造本地视频文件列表 JSON 数组。
+ * @brief 构造本地视频及图片文件列表 JSON 数组，并保存ID到路径的映射。
  *
- * 扫描固定目录下的视频文件，并生成如下结构数组：
+ * 扫描固定媒体目录，并生成如下结构数组：
  * @code
  * [
  *   {"id":1, "name":"xxx"},
@@ -323,30 +324,42 @@ bool MqttService::writeMqttIni(const QString& clientId,
  *
  * 对于文件名编码异常的情况，会尝试使用 GBK 重新解码。
  *
- * @return 本地视频文件数组；若目录不存在则返回空数组。
+ * @return 本地媒体文件数组；若目录不存在则返回空数组。
  */
 QJsonArray MqttService::buildLocalVideoFileArray()
 {
     QJsonArray arr;
-
-    QDir dir(videoDir);
-    if (!dir.exists()) {
-        return arr;
+    advertisedPlayFiles_.clear();
+    hasPlayFileSnapshot_ = true;
+    int idx = 1;
+    for (const LocalPlayFile &file : localPlayFiles()) {
+        advertisedPlayFiles_.insert(idx, file);
+        arr.append(QJsonObject{{"id", idx++}, {"name", file.name}});
     }
+    return arr;
+}
 
-    const QStringList filters = {
-        "*.mp4", "*.avi", "*.mov", "*.mkv", "*.ts", "*.flv", "*.m4v"
-    };
+QList<MqttService::LocalPlayFile> MqttService::localPlayFiles() const
+{
+    QList<LocalPlayFile> files;
 
-    QFileInfoList list = dir.entryInfoList(
-        filters,
-        QDir::Files | QDir::NoDotAndDotDot,
-        QDir::Name
-    );
+    // 固定媒体目录分别扫描；小图位于pic，仍沿用原来的id/name字段。
+    QFileInfoList list;
+    for (const QString &directory : {videoDir,
+                                    MediaContentPolicy::pictureDir(Rk3566Platform::staticRoot())}) {
+        const bool pictureDirectory = directory != videoDir;
+        const auto entries = QDir(directory).entryInfoList(
+                    QDir::Files | QDir::NoDotAndDotDot, QDir::Name | QDir::IgnoreCase);
+        for (const QFileInfo &file : entries) {
+            if (MediaContentPolicy::isImage(file.fileName()) ||
+                (!pictureDirectory && MediaContentPolicy::isVideo(file.fileName()))) {
+                list.append(file);
+            }
+        }
+    }
 
     QTextCodec *gbk = QTextCodec::codecForName("GBK");
 
-    int idx = 1;
     for (const QFileInfo &fi : list) {
         QString name = fi.completeBaseName();
 
@@ -360,28 +373,28 @@ QJsonArray MqttService::buildLocalVideoFileArray()
             }
         }
 
-        QJsonObject item;
-        item["id"] = idx++;
-        item["name"] = name;
-        arr.append(item);
+        files.append(LocalPlayFile{name, fi.absoluteFilePath()});
     }
 
-    return arr;
+    return files;
 }
 
 
 /**
- * @brief 按文件名删除本地视频文件。
+ * @brief 按上报文件列表中的名称和ID删除媒体文件。
  *
- * 仅匹配固定目录下的视频文件，比较逻辑使用不带扩展名的文件名。
+ * ID对应最近一次上报的文件快照，删除后不重排，防止连续删除发生错位。
+ * 兼容未携带ID的旧请求，但同名存在多个文件时拒绝猜测。
  *
  * @param targetName  要删除的目标文件名（不含扩展名）。
+ * @param targetId    文件列表中的ID；旧版请求可以不携带。
  * @param deletedPath 输出参数，成功时返回删除文件的绝对路径。
  * @param err         输出参数，失败时返回错误描述。
  * @return true  删除成功。
  * @return false 未找到匹配文件或删除失败。
  */
-bool MqttService::deleteLocalVideoByName(const QString &targetName, QString *deletedPath, QString *err)
+bool MqttService::deleteLocalPlayFile(const QString &targetName, const QJsonValue &targetId,
+                                     QString *deletedPath, QString *err)
 {
     if (deletedPath) deletedPath->clear();
     if (err) err->clear();
@@ -394,61 +407,54 @@ bool MqttService::deleteLocalVideoByName(const QString &targetName, QString *del
         return false;
     }
 
-    QDir dir(videoDir);
-    if (!dir.exists()) {
-        if (err) *err = QString("目录不存在: %1").arg(videoDir);
+    LocalPlayFile selected;
+    const bool hasId = !targetId.isUndefined() && !targetId.isNull() &&
+            !targetId.toVariant().toString().trimmed().isEmpty();
+    if (hasId) {
+        bool validId = false;
+        const int id = targetId.toVariant().toString().trimmed().toInt(&validId);
+        if (!validId || id <= 0) {
+            if (err) *err = "id 无效";
+            return false;
+        }
+        // 启动后未查询列表时允许首次扫描；已有快照时不得重新扫描导致ID移位。
+        if (!hasPlayFileSnapshot_) buildLocalVideoFileArray();
+        const auto it = advertisedPlayFiles_.constFind(id);
+        if (it == advertisedPlayFiles_.constEnd() ||
+            (it->name != rawName && it->name.trimmed() != trimmedName)) {
+            if (err) *err = "id/name 与文件列表不匹配，请重新获取文件列表";
+            return false;
+        }
+        selected = it.value();
+    } else {
+        const auto files = localPlayFiles();
+        QList<LocalPlayFile> matches;
+        for (const LocalPlayFile &file : files)
+            if (file.name == rawName) matches.append(file);
+        if (matches.isEmpty()) {
+            for (const LocalPlayFile &file : files)
+                if (file.name.trimmed() == trimmedName) matches.append(file);
+        }
+        if (matches.size() != 1) {
+            if (err) *err = matches.isEmpty() ? "未找到匹配文件" : "存在同名文件，需提供id";
+            return false;
+        }
+        selected = matches.first();
+    }
+
+    if (!QFile(selected.path).remove()) {
+        if (err) *err = QString("删除失败: %1").arg(selected.path);
         return false;
     }
-
-    const QStringList filters = {
-        "*.mp4", "*.MP4",
-        "*.avi", "*.AVI",
-        "*.mov", "*.MOV",
-        "*.mkv", "*.MKV",
-        "*.ts",  "*.TS",
-        "*.flv", "*.FLV",
-        "*.m4v", "*.M4V",
-        "*.mpg", "*.MPG",
-        "*.wmv", "*.WMV"
-    };
-
-    QFileInfoList list = dir.entryInfoList(filters, QDir::Files | QDir::NoDotAndDotDot, QDir::Name);
-
-    // 第一轮：严格按原始 name 匹配，保留尾空格语义
-    for (const QFileInfo &fi : list) {
-        const QString baseName = fi.completeBaseName();
-        if (baseName == rawName) {
-            const QString absPath = fi.absoluteFilePath();
-            QFile f(absPath);
-            if (!f.remove()) {
-                if (err) *err = QString("删除失败: %1").arg(absPath);
-                return false;
-            }
-            if (deletedPath) *deletedPath = absPath;
-            return true;
-        }
+    // 同批删除保留其余文件原ID；重复请求不能删除排到相同位置的其他文件。
+    for (auto it = advertisedPlayFiles_.begin(); it != advertisedPlayFiles_.end();) {
+        if (it->path == selected.path) it = advertisedPlayFiles_.erase(it);
+        else ++it;
     }
-
-    // 第二轮：兼容兜底，忽略首尾空格
-    for (const QFileInfo &fi : list) {
-        const QString baseName = fi.completeBaseName();
-        if (baseName.trimmed() == trimmedName) {
-            const QString absPath = fi.absoluteFilePath();
-            QFile f(absPath);
-            if (!f.remove()) {
-                if (err) *err = QString("删除失败: %1").arg(absPath);
-                return false;
-            }
-            if (deletedPath) *deletedPath = absPath;
-            return true;
-        }
-    }
-
-    if (err) {
-        *err = QString("未找到匹配文件: raw=[%1], trimmed=[%2]")
-                .arg(rawName, trimmedName);
-    }
-    return false;
+    if (currentRecordedFilePath_ == selected.path) clearCurrentRecordedFile();
+    if (deletedPath) *deletedPath = selected.path;
+    emit playFileDeleted(selected.path);
+    return true;
 }
 
 
@@ -618,6 +624,22 @@ bool MqttService::handleVideoControlMessage(const QString& topic, const QJsonObj
     const QJsonObject dataObj = payloadObj.value("data").toObject();
     const QString videoType = dataObj.value("videoType").toString().trimmed().toUpper();
 
+    // 仅新增广告选择项，不修改音量、直播和FTP其他参数的语义。
+    if (videoType == QLatin1String("RECORDED") || dataObj.contains("contentType") ||
+        dataObj.contains("smallImageMode")) {
+        QSettings ini(iniPath, QSettings::IniFormat);
+        ini.setIniCodec("UTF-8");
+        ini.setValue("playback/contentType", MediaContentPolicy::normalizeContentType(
+                         dataObj.value("contentType").toString()));
+        ini.setValue("playback/smallImageMode",
+                     MediaContentPolicy::smallImageMode(dataObj.value("smallImageMode")) ? 1 : 0);
+        ini.sync();
+        if (ini.status() != QSettings::NoError) {
+            emit logMessage(QStringLiteral("保存广告播放类型失败"));
+            return true;
+        }
+    }
+
     const QString serverTime = payloadObj.value("time").toString().trimmed();
     if (!serverTime.isEmpty()) {
         QString terr;
@@ -701,6 +723,7 @@ bool MqttService::handleVideoControlMessage(const QString& topic, const QJsonObj
         playInfo_.videoUrl.clear();
     }
     if (playInfo_.videoType != "RECORDED") {
+        currentRecordedFilePath_.clear();
         playInfo_.videoPath.clear();
     }
 
@@ -714,6 +737,7 @@ bool MqttService::handleVideoControlMessage(const QString& topic, const QJsonObj
         if (videoPath.isEmpty()) {
             emit logMessage("RECORDED：仅切回本地录播/处理音量");
 
+            currentRecordedFilePath_.clear();
             playInfo_.videoPath.clear();
             playInfo_.name.clear();
 
@@ -753,8 +777,14 @@ bool MqttService::handleVideoControlMessage(const QString& topic, const QJsonObj
 
         QString localDir;
         QString err;
-        if (!readIniFtpLocalDir(localDir, &err)) {
-            emit logMessage(QString("RECORDED：读取 ini.local_path(目录) 失败：%1").arg(err));
+        // 只有图片且开启小图模式才进入pic；视频始终进入固定video目录。
+        const bool smallPicture = MediaContentPolicy::isImage(videoPath) &&
+                MediaContentPolicy::smallImageMode(dataObj.value("smallImageMode"));
+        localDir = smallPicture
+                ? MediaContentPolicy::pictureDir(Rk3566Platform::staticRoot())
+                : Rk3566Platform::videoDir();
+        if (!QDir().mkpath(localDir)) {
+            emit logMessage(QString("RECORDED：无法创建下载目录：%1").arg(localDir));
 
             pendingVolumeAck_ = false;
             pendingVolumeAckShouldPublish_ = false;
@@ -793,6 +823,7 @@ bool MqttService::handleVideoControlMessage(const QString& topic, const QJsonObj
 
         // 收到新 RECORDED 任务后，先更新 deviceLog
         playInfo_.deviceLog = QStringLiteral("RECORDED Downloading：%1").arg(videoPath);
+        currentRecordedFilePath_ = localFile;
         playInfo_.videoPath = videoPath;
         playInfo_.name = QFileInfo(videoPath).completeBaseName();
 
@@ -893,7 +924,7 @@ bool MqttService::handleVideoControlMessage(const QString& topic, const QJsonObj
 /**
  * @brief 处理 deletePlayFile 删除文件请求。
  *
- * 从 payload.data 中提取文件名并尝试删除对应本地视频文件。
+ * 从 payload.data 中提取name和id，删除文件列表中对应的视频或图片。
  *
  * @param topic      消息 topic。
  * @param payloadObj 消息 payload 对象。
@@ -910,14 +941,14 @@ bool MqttService::handleDeletePlayFileMessage(const QString &topic, const QJsonO
     const QJsonObject dataObj = payloadObj.value("data").toObject();
 
     const QString name = dataObj.value("name").toString();
-    const QString fileId = dataObj.value("id").toString().trimmed();
+    const QJsonValue fileId = dataObj.value("id");
 
     emit logMessage(QString("收到 deletePlayFile 请求：name=%1 id=%2")
-                    .arg(name, fileId));
+                    .arg(name, fileId.toVariant().toString()));
 
     QString deletedPath;
     QString err;
-    if (deleteLocalVideoByName(name, &deletedPath, &err)) {
+    if (deleteLocalPlayFile(name, fileId, &deletedPath, &err)) {
         emit logMessage(QString("deletePlayFile 删除成功：name=%1 path=%2")
                         .arg(name, deletedPath));
     } else {
@@ -982,15 +1013,20 @@ QJsonObject MqttService::buildPlayInfoPublishPacket(const QString &reqTopic,
                                                     QString *respTopicOut)
 {
     const PlayInfoState &info = playInfo_;
+    // 不以同名文件反查其他目录，避免pic下载状态或旧回调污染主区域文件信息。
+    const bool reportRecordedFile = !currentRecordedFilePath_.isEmpty() &&
+            MediaContentPolicy::isInDirectory(currentRecordedFilePath_, videoDir) &&
+            (MediaContentPolicy::isVideo(currentRecordedFilePath_) ||
+             MediaContentPolicy::isImage(currentRecordedFilePath_));
 
     QJsonObject infoObj;
     infoObj["videoType"] = info.videoType.toLower();  // 返回 none/live/recorded
     infoObj["videoVolume"] = info.videoVolume;
-    infoObj["videoPath"] = info.videoPath;
+    infoObj["videoPath"] = reportRecordedFile ? info.videoPath : QString();
     infoObj["videoUrl"] = (info.videoType.compare("LIVE", Qt::CaseInsensitive) == 0)
                             ? info.videoUrl
                             : QString();
-    infoObj["name"] = info.name;
+    infoObj["name"] = reportRecordedFile ? info.name : QString();
     infoObj["base64Image"] = info.base64Image;
     infoObj["deviceLog"] = info.deviceLog;
 
@@ -1014,6 +1050,10 @@ QJsonObject MqttService::buildVideoControlAckPublishPacket(const QString &reqTop
                                                             const QString &reason)
 {
     QJsonObject dataObj = reqPayload.value("data").toObject();
+
+    // 已下发值原样回显，归一化仅用于本机配置和播放。
+    if (!dataObj.contains("contentType")) dataObj["contentType"] = QStringLiteral("VIDEO_IMAGE");
+    if (!dataObj.contains("smallImageMode")) dataObj["smallImageMode"] = 0;
 
     if (includeStatus) {
         dataObj["status"] = status ? "ok" : "error";
@@ -1068,6 +1108,8 @@ QJsonObject MqttService::buildLocalVideoControlStatusPublishPacket(const QString
     dataObj["videoVolume"] = volume;
     dataObj["videoPath"] = playInfo_.videoPath;
     dataObj["videoUrl"] = playInfo_.videoUrl;
+    dataObj["contentType"] = MediaContentPolicy::contentType(iniPath);
+    dataObj["smallImageMode"] = MediaContentPolicy::smallImageMode(iniPath) ? 1 : 0;
     dataObj["status"] = ok ? "ok" : "error";
     dataObj["deviceClientIp"] = readDeviceClientIpFromIni();
     dataObj["ftpDownload"] = "0%";
@@ -1146,13 +1188,19 @@ PlayInfoState MqttService::currentPlayInfo() const
  */
 void MqttService::setCurrentRecordedFile(const QString &fullPath)
 {
+    // 先判断来源目录，再读取文件属性；pic和其他目录不参与当前文件上报。
+    if (fullPath.isEmpty() || !MediaContentPolicy::isInDirectory(fullPath, videoDir) ||
+        (!MediaContentPolicy::isVideo(fullPath) && !MediaContentPolicy::isImage(fullPath))) {
+        clearCurrentRecordedFile();
+        return;
+    }
     QFileInfo fi(fullPath);
     if (!fi.exists() || !fi.isFile()) {
-        playInfo_.videoPath.clear();
-        playInfo_.name.clear();
+        clearCurrentRecordedFile();
         return;
     }
 
+    currentRecordedFilePath_ = fi.absoluteFilePath();
     playInfo_.videoPath = fi.fileName();        // xxx.mp4
     playInfo_.name = fi.completeBaseName();     // xxx
 }
@@ -1163,6 +1211,7 @@ void MqttService::setCurrentRecordedFile(const QString &fullPath)
  */
 void MqttService::clearCurrentRecordedFile()
 {
+    currentRecordedFilePath_.clear();
     playInfo_.videoPath.clear();
     playInfo_.name.clear();
 }

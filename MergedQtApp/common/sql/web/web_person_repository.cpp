@@ -1,6 +1,6 @@
 /**
  * @file web_person_repository.cpp
- * @brief 原 person 表的独立只读 Web 投影；完整写入仍复用 Excel 入库方法。
+ * @brief 现有 person 表的只读 Web 投影，人员写入由本地业务服务负责。
  * @author Du lin
  * @date 2026-10-09
  */
@@ -16,7 +16,10 @@ const QString selection = QStringLiteral(
     "person WHERE deleted=0"); /**< 基本公开字段。 */
 }
 
-/** @brief 读取可在 Web 中查看的本地人员列表。 */
+/**
+ * @brief 读取可在 Web 中查看的本地人员列表。
+ * @return 现有本地人员清单。
+ */
 QJsonObject WebPeople::list()
 {
     return {
@@ -24,7 +27,11 @@ QJsonObject WebPeople::list()
          WebSql::array(WebSql::query(selection + QStringLiteral(" ORDER BY id DESC LIMIT 5000")))}};
 }
 
-/** @brief 读取指定本地人员详情。 */
+/**
+ * @brief 读取指定本地人员详情。
+ * @param id 目标记录或任务的标识。
+ * @return 匹配标识的人员记录；不存在时抛出 WebError。
+ */
 QJsonObject WebPeople::get(const QString &id)
 {
     bool valid = false;
@@ -37,7 +44,9 @@ QJsonObject WebPeople::get(const QString &id)
     return {{"person", WebSql::object(rows.first())}};
 }
 
-/** @brief 检查本地与网络人员防重所需的数据源。 */
+/**
+ * @brief 检查本地与网络人员防重所需的数据源。
+ */
 void WebPeople::verifyConflictSources()
 {
     WebSql::query(

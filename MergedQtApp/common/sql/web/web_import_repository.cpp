@@ -10,7 +10,12 @@
 #include <QUuid>
 #include <QDateTime>
 
-/** @brief 保存新的人员导入批次和文件清单。 */
+/**
+ * @brief 保存新的人员导入批次和文件清单。
+ * @param owner 已认证 Web 账号主键，用于任务归属校验。
+ * @param manifest 待导入人员与资源清单。
+ * @return 新建导入批次的 UUID。
+ */
 QString WebImports::create(int owner, const QJsonArray &manifest)
 {
     const QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -22,7 +27,12 @@ QString WebImports::create(int owner, const QJsonArray &manifest)
     return id;
 }
 
-/** @brief 按批次编号与账号归属查询导入状态。 */
+/**
+ * @brief 按批次编号与账号归属查询导入状态。
+ * @param id 目标记录或任务的标识。
+ * @param owner 已认证 Web 账号主键，用于任务归属校验。
+ * @return 所属账号可见的批次及结果；不存在或无权访问时抛出 WebError。
+ */
 QJsonObject WebImports::get(const QString &id, int owner)
 {
     auto rows =
@@ -43,7 +53,12 @@ QJsonObject WebImports::get(const QString &id, int owner)
     return result;
 }
 
-/** @brief 更新批次状态和可展示结果。 */
+/**
+ * @brief 更新批次状态和可展示结果。
+ * @param id 目标记录或任务的标识。
+ * @param state 实际执行状态。
+ * @param result 处理结果。
+ */
 void WebImports::setState(const QString &id, const QString &state, const QJsonObject &result)
 {
     WebSql::execute(
@@ -52,7 +67,10 @@ void WebImports::setState(const QString &id, const QString &state, const QJsonOb
         {state, WebSql::json(result), QDateTime::currentMSecsSinceEpoch(), id});
 }
 
-/** @brief 记录已接收的批次文件。 */
+/**
+ * @brief 记录已接收的批次文件。
+ * @param task 持久化上传任务记录。
+ */
 void WebImports::addAsset(const QVariantMap &task)
 {
     WebSql::execute(
@@ -66,7 +84,11 @@ void WebImports::addAsset(const QVariantMap &task)
          task.value("final_path")});
 }
 
-/** @brief 读取批次中已上传的文件记录。 */
+/**
+ * @brief 读取批次中已上传的文件记录。
+ * @param id 目标记录或任务的标识。
+ * @return 按序读取的批次资源记录。
+ */
 QList<QVariantMap> WebImports::assets(const QString &id)
 {
     return WebSql::query(QStringLiteral("SELECT * FROM web_person_import_assets WHERE batch_id=? "
@@ -74,7 +96,9 @@ QList<QVariantMap> WebImports::assets(const QString &id)
                          {id});
 }
 
-/** @brief 标记重启前未完成的导入批次。 */
+/**
+ * @brief 标记重启前未完成的导入批次。
+ */
 void WebImports::recover()
 {
     WebSql::execute(

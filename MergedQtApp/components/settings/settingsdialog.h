@@ -176,6 +176,8 @@ signals:
 
     /** @brief 新视频下载完成，可加入播放列表。 */
     void downloadedVideoReady(const QString& filePath);
+    /** @brief 本地媒体删除成功，主界面据此刷新播放器。 */
+    void playFileDeleted(const QString &fullPath);
 
     /** @brief FTP 下载开始。 */
     void ftpDownloadStarted(const QString& fileName);

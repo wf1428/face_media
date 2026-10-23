@@ -98,7 +98,9 @@ const saving = ref(false)
 const status = ref('')
 const readError = ref('')
 
-/** @brief 进入、刷新及保存后都从设备配置重新读取，不使用浏览器缓存值。 */
+/**
+ * @brief 进入、刷新及保存后都从设备配置重新读取，不使用浏览器缓存值。
+ */
 async function load() {
   loading.value = true
   if (!saving.value) status.value = ''
@@ -115,7 +117,11 @@ async function load() {
   }
 }
 
-/** @brief 严格解析点分十进制 IPv4，避免无效输入进入设备应用流程。 */
+/**
+ * @brief 严格解析点分十进制 IPv4，避免无效输入进入设备应用流程。
+ * @param {string} value 待设置或校验的文本。
+ * @returns {boolean} 地址通过本页面 IPv4 校验时为 true。
+ */
 function ipv4(value) {
   if (!/^(0|[1-9]\d{0,2})(\.(0|[1-9]\d{0,2})){3}$/.test(value)) return null
   const parts = value.split('.').map(Number)
@@ -124,7 +130,9 @@ function ipv4(value) {
     : null
 }
 
-/** @brief 先校验静态字段，再提交异步任务；只有实际应用结果才显示成功。 */
+/**
+ * @brief 先校验静态字段，再提交异步任务；只有实际应用结果才显示成功。
+ */
 async function save() {
   if (!loaded.value || saving.value) return
   const data = { dhcp: form.dhcp }

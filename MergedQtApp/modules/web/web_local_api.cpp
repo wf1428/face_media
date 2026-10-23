@@ -3,9 +3,11 @@
  * @brief 标准 Web 本地业务：源数据读取、差量事务、幂等和异步任务。
  * @author Du lin
  * @date 2026-10-16
+ * @note 最近修改：2026-10-23；修改人：Du lin；通行权限保存及其幂等回执不附带人脸图片路径，避免 HTTP 重读和传输图片；保留查询图片、额度同步及原事务行为。
  */
 
 #include "web_local_api.h"
+#include "common/media_content_policy.h"
 #include "web_resource_update.h"
 #include "web_local_runtime.h"
 #include "web_paths.h"
@@ -34,29 +36,44 @@
 #include <QCoreApplication>
 #include <QUuid>
 #include <algorithm>
+#include <limits>
 #include <cmath>
 
 namespace {
 
-/** @brief 构造本地业务统一的 data/meta 返回结构。 */
+/**
+ * @brief 构造本地业务统一的 data/meta 返回结构。
+ * @param data 本次操作的数据对象。
+ * @param meta 分页等响应元数据。
+ * @return 包含 data 和可选 meta 的标准本地响应。
+ */
 QJsonObject reply(const QJsonValue &data, const QJsonObject &meta = {})
 {
     return {{"data", data}, {"meta", meta}};
 }
 
-/** @brief 生成带毫秒和时区语义的本地操作时间文本。 */
+/**
+ * @brief 生成带毫秒和时区语义的本地操作时间文本。
+ * @return 包含毫秒的当前本地时间 ISO 文本。
+ */
 QString now()
 {
     return QDateTime::currentDateTime().toString(Qt::ISODateWithMs);
 }
 
-/** @brief 生成无大括号的随机任务或资源标识。 */
+/**
+ * @brief 生成无大括号的随机任务或资源标识。
+ * @return 不含花括号的随机 UUID。
+ */
 QString uuid()
 {
     return QUuid::createUuid().toString(QUuid::WithoutBraces);
 }
 
-/** @brief 读取 Linux 启动标识，读取失败时返回空值供恢复逻辑判断。 */
+/**
+ * @brief 读取 Linux 启动标识，读取失败时返回空值供恢复逻辑判断。
+ * @return 当前 Linux 启动标识，读取失败时为空。
+ */
 QString bootId()
 {
     QFile file("/proc/sys/kernel/random/boot_id");
@@ -64,20 +81,35 @@ QString bootId()
                                           : QString();
 }
 
-/** @brief 将数据库中保存的 JSON 文本解析为对象。 */
+/**
+ * @brief 将数据库中保存的 JSON 文本解析为对象。
+ * @param v 待校验或解析的值。
+ * @return 解析后的 JSON 对象；非对象或无效 JSON 返回空对象。
+ */
 QJsonObject parsed(const QVariant &v)
 {
     return QJsonDocument::fromJson(v.toString().toUtf8()).object();
 }
 
-/** @brief 检查可选本地数据表是否已经建立。 */
+/**
+ * @brief 检查可选本地数据表是否已经建立。
+ * @param name 待处理的名称。
+ * @return 数据库存在指定表时为 true，查询错误抛出 WebError。
+ */
 bool table(const QString &name)
 {
     return !WebSql::query("SELECT name FROM sqlite_master WHERE type='table' AND name=?", {name})
                 .isEmpty();
 }
 
-/** @brief 校验整数类型与范围，拒绝小数、非数和越界值。 */
+/**
+ * @brief 校验整数类型与范围，拒绝小数、非数和越界值。
+ * @param v 待校验或解析的值。
+ * @param low 允许的整数下界。
+ * @param high 允许的整数上界。
+ * @param label 校验错误中显示的字段名称。
+ * @return 范围内的精确整数；校验失败抛出 400 错误。
+ */
 qint64 integer(const QJsonValue &v, qint64 low, qint64 high, const QString &label)
 {
     bool ok = false;
@@ -89,7 +121,11 @@ qint64 integer(const QJsonValue &v, qint64 low, qint64 high, const QString &labe
     return qint64(d);
 }
 
-/** @brief 统一解析人员请求中的 personId 或兼容 id 字段。 */
+/**
+ * @brief 统一解析人员请求中的 personId 或兼容 id 字段。
+ * @param args 操作对应的结构化参数。
+ * @return 有效的正人员主键；缺失或非法时抛出 400 错误。
+ */
 qint64 personId(const QJsonObject &args)
 {
     return integer(args.contains("personId") ? args.value("personId") : args.value("id"),
@@ -98,7 +134,13 @@ qint64 personId(const QJsonObject &args)
                    "人员编号");
 }
 
-/** @brief 规范化并校验文本长度和控制字符。 */
+/**
+ * @brief 规范化并校验文本长度和控制字符。
+ * @param args 操作对应的结构化参数。
+ * @param key 待查询的配置键名。
+ * @param max 允许的文本最大字符数。
+ * @return 去掉首尾空白的文本；超长或含非法字符时抛出 400 错误。
+ */
 QString text(const QJsonObject &args, const QString &key, int max = 160)
 {
     if (!args.value(key).isString())
@@ -112,7 +154,11 @@ QString text(const QJsonObject &args, const QString &key, int max = 160)
     return s;
 }
 
-/** @brief 拒绝请求白名单以外的字段，仅保留约定的内部任务参数。 */
+/**
+ * @brief 拒绝请求白名单以外的字段，仅保留约定的内部任务参数。
+ * @param args 操作对应的结构化参数。
+ * @param names 允许出现的请求字段名。
+ */
 void allowed(const QJsonObject &args, const QStringList &names)
 {
     for (auto it = args.begin(); it != args.end(); ++it)
@@ -125,7 +171,9 @@ class Mutation {
 
 public:
 
-    /** @brief 获取人员导入互斥门并开启即时写事务；开启失败时释放互斥门。 */
+    /**
+     * @brief 获取人员导入互斥门并开启即时写事务；开启失败时释放互斥门。
+     */
     Mutation()
     {
         if (!LocalImportGate::acquire())
@@ -138,7 +186,9 @@ public:
         }
     }
 
-    /** @brief 未提交时回滚事务，并在所有退出路径释放人员互斥门。 */
+    /**
+     * @brief 未提交时回滚事务，并在所有退出路径释放人员互斥门。
+     */
     ~Mutation()
     {
         if (!committed_)
@@ -146,7 +196,9 @@ public:
         LocalImportGate::release();
     }
 
-    /** @brief 提交当前写事务；提交失败交由析构回滚。 */
+    /**
+     * @brief 提交当前写事务；提交失败交由析构回滚。
+     */
     void commit()
     {
         if (!DbStore::transactionCommit())
@@ -155,7 +207,11 @@ public:
     }
 };
 
-/** @brief 读取人员本地编辑版本，尚未登记时返回初始版本。 */
+/**
+ * @brief 读取人员本地编辑版本，尚未登记时返回初始版本。
+ * @param id 目标记录或任务的标识。
+ * @return 人员当前版本；未登记版本时为 0。
+ */
 qint64 revision(qint64 id)
 {
     const auto rows =
@@ -163,7 +219,11 @@ qint64 revision(qint64 id)
     return rows.isEmpty() ? 0 : rows.first().value("version").toLongLong();
 }
 
-/** @brief 校验客户端版本并在同一事务内增加人员编辑版本。 */
+/**
+ * @brief 校验客户端版本并在同一事务内增加人员编辑版本。
+ * @param id 目标记录或任务的标识。
+ * @param args 操作对应的结构化参数。
+ */
 void change(qint64 id, const QJsonObject &args)
 {
     if (args.contains("version") &&
@@ -174,7 +234,11 @@ void change(qint64 id, const QJsonObject &args)
     WebSql::execute("UPDATE web_local_revisions SET version=version+1 WHERE person_id=?", {id});
 }
 
-/** @brief 生成十进制、十六进制及读头字节序的等价卡号集合。 */
+/**
+ * @brief 生成十进制、十六进制及读头字节序的等价卡号集合。
+ * @param input 待校验的输入数据。
+ * @return 去重的卡号等价写法，供本地与网络人员冲突检查。
+ */
 QStringList cardForms(const QString &input)
 {
     const auto raw = input.trimmed().toUpper();
@@ -206,7 +270,11 @@ QStringList cardForms(const QString &input)
     return forms;
 }
 
-/** @brief 逐一检查等价卡号，防止占用其他本地或网络人员的卡。 */
+/**
+ * @brief 逐一检查等价卡号，防止占用其他本地或网络人员的卡。
+ * @param card 待登记的卡号。
+ * @param self 当前人员主键，冲突检测时排除自身。
+ */
 void cardConflict(const QString &card, qint64 self)
 {
     for (const auto &form : cardForms(card)) {
@@ -222,7 +290,11 @@ void cardConflict(const QString &card, qint64 self)
     }
 }
 
-/** @brief 校验、去重并排序楼层集合，拒绝 0 和范围外楼层。 */
+/**
+ * @brief 校验、去重并排序楼层集合，拒绝 0 和范围外楼层。
+ * @param value 待解析或转换的输入值。
+ * @return 去重、排序后的合法业务楼层数组；非法时抛出 WebError。
+ */
 QJsonArray floorNumbers(const QJsonValue &value)
 {
     if (!value.isArray() || value.toArray().size() > 128)
@@ -242,7 +314,10 @@ QJsonArray floorNumbers(const QJsonValue &value)
     return out;
 }
 
-/** @brief 校验 HH:mm 格式的日内时间。 */
+/**
+ * @brief 校验 HH:mm 格式的日内时间。
+ * @param s 待规范化或验证的文本。
+ */
 void validTime(const QString &s)
 {
     if (!QRegularExpression("^([01][0-9]|2[0-3]):[0-5][0-9]$").match(s).hasMatch())
@@ -250,7 +325,11 @@ void validTime(const QString &s)
 }
 } // namespace
 
-/** @brief 接收本地异步完成信号，并定时清理本模块的临时图片。 */
+/**
+ * @brief 接收本地异步完成信号，并定时清理本模块的临时图片。
+ * @param config 设备受控配置，包含运行所需路径或功能设置。
+ * @param parent Qt 父对象；对象销毁由父子关系管理，空指针表示无父对象。
+ */
 WebLocalApi::WebLocalApi(const WebServiceConfig &config, QObject *parent)
     : QObject(parent), config_(config)
 {
@@ -267,14 +346,18 @@ WebLocalApi::WebLocalApi(const WebServiceConfig &config, QObject *parent)
     cleanup->start(60000);
 }
 
-/** @brief 销毁业务对象时释放未完成人脸任务持有的人员互斥门。 */
+/**
+ * @brief 销毁业务对象时释放未完成人脸任务持有的人员互斥门。
+ */
 WebLocalApi::~WebLocalApi()
 {
     if (!faceLeases_.isEmpty())
         LocalImportGate::release();
 }
 
-/** @brief 初始化本地辅助表、兼容字段及中断任务恢复状态。 */
+/**
+ * @brief 初始化本地辅助表、兼容字段及中断任务恢复状态。
+ */
 void WebLocalApi::initialize()
 {
 
@@ -323,7 +406,9 @@ void WebLocalApi::initialize()
     collectAssets();
 }
 
-/** @brief 按保留时间清理 Web 暂存图片和已结束任务，不处理原导入目录。 */
+/**
+ * @brief 按保留时间清理 Web 暂存图片和已结束任务，不处理原导入目录。
+ */
 void WebLocalApi::collectAssets()
 {
     // Only this module's generated files are eligible; U-disk/import files are untouched.
@@ -355,7 +440,11 @@ void WebLocalApi::collectAssets()
     }
 }
 
-/** @brief 读取未删除本地人员的公开资料和编辑版本。 */
+/**
+ * @brief 读取未删除本地人员的公开资料和编辑版本。
+ * @param id 目标记录或任务的标识。
+ * @return 当前有效本地人员的资料。
+ */
 QJsonObject WebLocalApi::person(qint64 id) const
 {
     const auto rows =
@@ -371,7 +460,13 @@ QJsonObject WebLocalApi::person(qint64 id) const
     return p;
 }
 
-/** @brief 从原本地表汇总人员的卡、二维码、人脸、规则、楼层和实际用量。 */
+/**
+ * @brief 从原本地表汇总人员的卡、二维码、人脸、规则、楼层和实际用量。
+ * @param id 目标记录或任务的标识。
+ * @param images 是否在凭证结果中附带人脸图片信息。
+ * @return 当前人员的凭证聚合及按需附带的图片信息。
+ * @note 旧记录的公开总额度至少覆盖实际余额与已用量之和，仅读取，不隐式修改数据库。
+ */
 QJsonObject WebLocalApi::credential(qint64 id, bool images) const
 {
     person(id);
@@ -466,6 +561,14 @@ QJsonObject WebLocalApi::credential(qint64 id, bool images) const
         WebSql::query("SELECT remaining_count,access_count,remaining_amount,used_amount FROM "
                       "local_access_usage WHERE person_id=?",
                       {id});
+    // 兼容此前只增加余额的记录：只读投影至少覆盖余额与已用量，下一次保存落库。
+    if (!usage.isEmpty()) {
+        const auto row = usage.first();
+        rules.insert("countDataTotal", qMax(rules.value("countDataTotal").toDouble(),
+                row.value("remaining_count").toDouble() + row.value("access_count").toDouble()));
+        rules.insert("amountDataTotal", qMax(rules.value("amountDataTotal").toDouble(),
+                row.value("remaining_amount").toDouble() + row.value("used_amount").toDouble()));
+    }
     return {{"personId", double(id)},
             {"icCards", cards},
             {"qrCodes", qrs},
@@ -476,7 +579,10 @@ QJsonObject WebLocalApi::credential(qint64 id, bool images) const
             {"version", double(revision(id))}};
 }
 
-/** @brief 按同一 SQL 快照统计人员凭证，并读取实际热点 IP 与媒体分区容量。 */
+/**
+ * @brief 按同一 SQL 快照统计人员凭证，并读取实际热点 IP 与媒体分区容量。
+ * @return 本地人员、凭证及设备资源统计。
+ */
 QJsonObject WebLocalApi::overview() const
 {
     // One SQLite statement gives all counters the same read snapshot.
@@ -516,7 +622,10 @@ QJsonObject WebLocalApi::overview() const
     return out;
 }
 
-/** @brief 报告当前已接入能力、硬件就绪状态和允许编辑的规则字段。 */
+/**
+ * @brief 报告当前已接入能力、硬件就绪状态和允许编辑的规则字段。
+ * @return 当前已接入功能与运行就绪状态。
+ */
 QJsonObject WebLocalApi::capabilities() const
 {
     auto out = WebLocalRuntime::instance()->capabilities();
@@ -524,7 +633,6 @@ QJsonObject WebLocalApi::capabilities() const
     out.insert("credentials", true);
     out.insert("faceEnrollment", true);
     out.insert("elevatorRead", true);
-    out.insert("floorScheduleWrite", false);
     out.insert("screenSleep", false);
     out.insert("boardPower", false);
     out.insert("air", false);
@@ -542,7 +650,13 @@ QJsonObject WebLocalApi::capabilities() const
     return out;
 }
 
-/** @brief 按账号、业务类型和幂等键登记或复用任务，校验请求摘要及资源上限。 */
+/**
+ * @brief 按账号、业务类型和幂等键登记或复用任务，校验请求摘要及资源上限。
+ * @param kind 资源或任务类型，用于选择目录、配额和校验规则。
+ * @param args 操作对应的结构化参数。
+ * @param owner 已认证 Web 账号主键，用于任务归属校验。
+ * @return 已持久化的异步操作标识，重复幂等键复用既有任务。
+ */
 QString WebLocalApi::beginJob(const QString &kind, const QJsonObject &args, int owner)
 {
 
@@ -595,7 +709,12 @@ QString WebLocalApi::beginJob(const QString &kind, const QJsonObject &args, int 
     return id;
 }
 
-/** @brief 按账号归属读取异步任务状态、结果和业务错误。 */
+/**
+ * @brief 按账号归属读取异步任务状态、结果和业务错误。
+ * @param id 目标记录或任务的标识。
+ * @param owner 已认证 Web 账号主键，用于任务归属校验。
+ * @return 所属账号可见的任务状态；不存在或不可见时抛出 WebError。
+ */
 QJsonObject WebLocalApi::job(const QString &id, int owner) const
 {
     const auto rows =
@@ -610,7 +729,14 @@ QJsonObject WebLocalApi::job(const QString &id, int owner) const
             {"message", r.value("message").toString()}};
 }
 
-/** @brief 保存任务完成事实；严格模式下让结果与业务写入在同一事务提交。 */
+/**
+ * @brief 保存任务完成事实；严格模式下让结果与业务写入在同一事务提交。
+ * @param id 目标记录或任务的标识。
+ * @param data 本次操作的数据对象。
+ * @param code 业务状态码，成功通常为 200。
+ * @param message 可返回调用方的结果或错误说明。
+ * @param strict 为 true 时要求任务仍处于可完成状态，否则拒绝覆盖。
+ */
 void WebLocalApi::finishJob(
     const QString &id, const QJsonObject &data, int code, const QString &message, bool strict)
 {
@@ -641,7 +767,12 @@ void WebLocalApi::finishJob(
     }
 }
 
-/** @brief 事务化新增、差量修改或软删除本地人员，保留现有凭证与消费记录。 */
+/**
+ * @brief 事务化新增、差量修改或软删除本地人员，保留现有凭证与消费记录。
+ * @param operation 白名单业务操作名。
+ * @param args 操作对应的结构化参数。
+ * @return 实际写入后的人员业务结果；失败抛出 WebError。
+ */
 QJsonObject WebLocalApi::mutatePerson(const QString &operation, const QJsonObject &args, int)
 {
     allowed(args,
@@ -758,7 +889,15 @@ QJsonObject WebLocalApi::mutatePerson(const QString &operation, const QJsonObjec
     return out;
 }
 
-/** @brief 处理人脸资源或事务化修改指定凭证、规则和人员楼层。 */
+/**
+ * @brief 处理人脸资源或事务化修改指定凭证、规则和人员楼层。
+ * @param operation 白名单业务操作名。
+ * @param args 操作对应的结构化参数。
+ * @param owner 已认证 Web 账号主键，用于任务归属校验。
+ * @return 凭证写入结果或待查询的异步任务。
+ * @note 充值在原幂等写事务内同时增加总额度和余额，不重置已用量；失败整次回滚。
+ *       credential.update 的响应及持久化回执保留凭证元数据，不附带人脸图片资源引用。
+ */
 QJsonObject
 WebLocalApi::mutateCredential(const QString &operation, const QJsonObject &args, int owner)
 {
@@ -972,7 +1111,8 @@ WebLocalApi::mutateCredential(const QString &operation, const QJsonObject &args,
 
         // 将规则补丁合并到当前配置，保留未编辑规则与既有消费记录。
         const auto patch = extra.value("rules").toObject();
-        auto rules = credential(id, false).value("rules").toObject();
+        const auto current = credential(id, false);
+        auto rules = current.value("rules").toObject();
         const bool existingRelay = rules.value("relay").toBool();
         const QStringList ruleKeys{"time",
                                    "timingRules",
@@ -1027,11 +1167,38 @@ WebLocalApi::mutateCredential(const QString &operation, const QJsonObject &args,
                 throw WebError(400, label + "无效");
             return n;
         };
-        const double amountTotal = money(rules.value("amountDataTotal"), "总金额"),
+        /**
+         * 校验新提交金额的分精度，只容忍 double 表示误差，不改变历史余额。
+         * @param value 请求中的金额或单价。
+         * @param label 返回校验错误时使用的字段名。
+         * @return 精确到分的非负金额；非零值小于 0.01 或多于两位小数时拒绝。
+         */
+        const auto centsMoney = [&](QJsonValue value, const QString &label) {
+            const double n = money(value, label), cents = n * 100.0;
+            const double tolerance = qMax(1e-8, std::abs(cents) * std::numeric_limits<double>::epsilon() * 2);
+            if ((n > 0 && n < 0.01) || std::abs(cents - std::round(cents)) > tolerance)
+                throw WebError(400, label + "最多保留两位小数，最小非零金额为0.01");
+            return std::round(cents) / 100.0;
+        };
+        const double amountTotal = qMax(money(rules.value("amountDataTotal"), "总金额"),
+                                       current.value("rules").toObject().value("amountDataTotal").toDouble()),
                      amountAdd = patch.contains("amountDataAddAmount")
-                                     ? money(patch.value("amountDataAddAmount"), "新增金额")
+                                     ? centsMoney(patch.value("amountDataAddAmount"), "新增金额")
                                      : 0,
-                     price = money(rules.value("amountDataUnitPrice"), "单价");
+                     price = patch.contains("amountDataUnitPrice")
+                                     ? centsMoney(patch.value("amountDataUnitPrice"), "单价")
+                                     : money(rules.value("amountDataUnitPrice"), "单价");
+        countTotal = qMax(countTotal, current.value("rules").toObject().value("countDataTotal").toVariant().toLongLong());
+        const auto usage = current.value("usage").toObject();
+        const qint64 remainingCount = usage.value("remaining_count").isDouble()
+                ? usage.value("remaining_count").toVariant().toLongLong() : countTotal;
+        const double remainingAmount = usage.value("remaining_amount").isDouble()
+                ? usage.value("remaining_amount").toDouble() : amountTotal;
+        if (countAdd > 1000000000 - countTotal || countAdd > 1000000000 - remainingCount ||
+            amountTotal + amountAdd > 1000000000 || remainingAmount + amountAdd > 1000000000)
+            throw WebError(400, "增加后的总额度或剩余额度超出范围");
+        const qint64 newCountTotal = countTotal + countAdd;
+        const double newAmountTotal = amountTotal + amountAdd;
         if (rules.value("amount").toBool() && price <= 0)
             throw WebError(400, "金额规则需设置有效单价");
         const auto type =
@@ -1104,7 +1271,10 @@ WebLocalApi::mutateCredential(const QString &operation, const QJsonObject &args,
                  range[1].toString()});
         }
         WebSql::execute("INSERT OR IGNORE INTO local_access_rule(person_id) VALUES(?)", {id});
-        // Preserve counters/usage; only explicit recharge deltas are added once.
+        // 总额度与余额在同一事务内增加；余额初始基数使用增加前额度，避免首次充值重复计算。
+        rules.insert("countDataTotal", double(newCountTotal));
+        rules.insert("amountDataTotal", newAmountTotal);
+        rules.insert("amountDataUnitPrice", price);
         rules.insert("countDataAddCount", 0);
         rules.insert("amountDataAddAmount", 0);
         WebSql::execute(
@@ -1122,8 +1292,8 @@ WebLocalApi::mutateCredential(const QString &operation, const QJsonObject &args,
              rules.value("remoteCall").toBool(),
              rules.value("cardPassword").toBool(),
              pass,
-             countTotal,
-             amountTotal,
+             newCountTotal,
+             newAmountTotal,
              price,
              start,
              end,
@@ -1142,7 +1312,8 @@ WebLocalApi::mutateCredential(const QString &operation, const QJsonObject &args,
                         {countTotal, countAdd, amountTotal, amountAdd, now(), id});
     } else
         throw WebError(404, "本地凭证操作不存在");
-    const auto out = reply(credential(id));
+    // 规则保存只需回显凭证元数据，避免 HTTP 为该响应读取并编码所有人脸图片。
+    const auto out = reply(credential(id, operation != "credential.update"));
     if (args.contains("_operation"))
         finishJob(args.value("_operation").toString(), out, 200, {}, true);
     tx.commit();
@@ -1160,7 +1331,13 @@ WebLocalApi::mutateCredential(const QString &operation, const QJsonObject &args,
     return out;
 }
 
-/** @brief 接收既有推理线程结果，复核图库冲突并追加单张本地人脸。 */
+/**
+ * @brief 接收既有推理线程结果，复核图库冲突并追加单张本地人脸。
+ * @param token 贯穿请求与异步结果的任务标识。
+ * @param accepted 通过质量、防重校验的人脸条目。
+ * @param failed 校验失败的人脸条目及原因。
+ * @return 结果属于本对象管理的单项人脸任务时为 true，否则为 false。
+ */
 bool WebLocalApi::applyFaces(const QString &token,
                              const QJsonArray &accepted,
                              const QJsonArray &failed)
@@ -1259,7 +1436,14 @@ bool WebLocalApi::applyFaces(const QString &token,
     return true;
 }
 
-/** @brief 读取公共梯控配置，或保存楼层/模式后通过本地 IO 异步发送。 */
+/**
+ * @brief 读取公共梯控配置，或保存楼层/模式后通过本地 IO 异步发送。
+ * @param operation 白名单业务操作名。
+ * @param args 操作对应的结构化参数。
+ * @param owner 已认证 Web 账号主键，用于任务归属校验。
+ * @return 梯控查询结果或已受理任务信息。
+ * @note 楼层和特殊模式读写 online_v1 共享配置；持久控制使用 132 字节 OPEN 帧并叠加模式，响应区分保存、发送和硬件确认。
+ */
 QJsonObject WebLocalApi::elevator(const QString &operation, const QJsonObject &args, int owner)
 {
     const QString key = "online_v1_floor_limit_bits";
@@ -1290,11 +1474,28 @@ QJsonObject WebLocalApi::elevator(const QString &operation, const QJsonObject &a
                                  {"deviceSchedules", doc.array()},
                                  {"matched", QJsonValue::Null},
                                  {"comparisonScope", "local"},
-                                 {"writable", false}});
+                                 {"writable", capabilities().value("floorScheduleWrite")}});
     }
-    if (operation.startsWith("elevator.floorSchedule."))
-        throw WebError(501,
-                       "定时梯控执行器仍归属原MQTT模块；本轮保持原模块不动，仅提供真实规则读取");
+    if (operation.startsWith("elevator.floorSchedule.")) {
+        const QString action = operation.section('.', -1);
+        if (!QStringList{"set", "delete", "resend"}.contains(action))
+            throw WebError(404, "定时梯控操作不存在");
+        allowed(args, action == "set" ? QStringList{"schedules", "baseSchedules"}
+                      : action == "delete" ? QStringList{"hashList", "baseSchedules"} : QStringList{});
+        if (!capabilities().value("floorScheduleWrite").toBool())
+            throw WebError(503, "定时梯控执行器尚未就绪");
+        const auto token = beginJob(operation, args, owner);
+        const auto record = job(token, owner);
+        if (record.value("state") != "PENDING" || !record.value("result").toObject().isEmpty())
+            return reply(record);
+        WebSql::execute("UPDATE web_local_operations SET result=? WHERE id=?",
+                        {QStringLiteral("{\"dispatched\":true}"), token});
+        emit WebLocalRuntime::instance()->requested(token, "floorSchedule", {{"action", action}, {"data", args}});
+        QTimer::singleShot(8000, this, [this, token]() {
+            finishJob(token, {}, 504, "定时规则保存超时，请刷新核对实际规则");
+        });
+        return reply(job(token, owner));
+    }
     const QStringList modeKeys{"masterSwitch",
                                "delay",
                                "parking",
@@ -1397,7 +1598,13 @@ QJsonObject WebLocalApi::elevator(const QString &operation, const QJsonObject &a
     return reply(job(token, owner));
 }
 
-/** @brief 分派标准本地业务指令，处理能力缺口、幂等写入与异步任务提交。 */
+/**
+ * @brief 分派标准本地业务指令，处理能力缺口、幂等写入与异步任务提交。
+ * @param operation 白名单业务操作名。
+ * @param args 操作对应的结构化参数。
+ * @param owner 已认证 Web 账号主键，用于任务归属校验。
+ * @return 白名单操作的业务结果；校验或执行失败抛出 WebError。
+ */
 QJsonObject WebLocalApi::dispatch(const QString &operation, const QJsonObject &args, int owner)
 {
     if (operation == "auth.changePassword")
@@ -1568,9 +1775,11 @@ QJsonObject WebLocalApi::dispatch(const QString &operation, const QJsonObject &a
         return reply(job(token, owner));
     }
     if (operation == "device.getPlayInfo") {
-        const auto state = WebLocalRuntime::instance()->media();
+        auto state = WebLocalRuntime::instance()->media();
         if (!state.value("available").toBool())
             throw WebError(503, "实际播放器尚未就绪");
+        state.insert("contentType", MediaContentPolicy::contentType(Rk3566Platform::netConfigPath()));
+        state.insert("smallImageMode", MediaContentPolicy::smallImageMode(Rk3566Platform::netConfigPath()) ? 1 : 0);
         return reply(state);
     }
     if (operation.startsWith("elevator."))
@@ -1584,7 +1793,7 @@ QJsonObject WebLocalApi::dispatch(const QString &operation, const QJsonObject &a
     if (operation == "device.screenshot" || operation == "device.videoControl" ||
         operation == "device.linux-reboot") {
         if (operation == "device.videoControl") {
-            allowed(args, {"videoType", "videoVolume", "videoUrl", "videoPath", "file"});
+            allowed(args, {"videoType", "videoVolume", "videoUrl", "videoPath", "file", "contentType", "smallImageMode"});
             const auto type = args.value("videoType").toString();
             if (!QStringList{"LIVE", "RECORDED", "NONE"}.contains(type))
                 throw WebError(400, "播放类型无效");

@@ -1,4 +1,9 @@
 #!/bin/sh
+# @file start_face_media.sh
+# @brief 初始化运行环境并监督 mqttd、Qt 程序及看门狗。
+# @author Du lin
+# @note 最近修改：2026-10-23；修改人：Du lin；在 SR505 驱动加载后，
+#       复用 load_driver 加载同一 APP_DIR 下的 2h_led_drv.ko；沿用已有模块检查和失败退出行为。
 
 set -eu
 
@@ -938,7 +943,7 @@ prepare_qt_web_environment()
     export MERGEDQT_WEB_IMPORTS=${MERGEDQT_WEB_IMPORTS:-/home/cat/web-stage/imports}
     export MERGEDQT_WEB_FACTORY=${MERGEDQT_WEB_FACTORY:-/home/cat/web-stage/factory-account.json}
     export MERGEDQT_WEB_READY_FILE=${MERGEDQT_WEB_READY_FILE:-/run/mergedqt/web-ready}
-    export MERGEDQT_WEB_HOTSPOT_HELPER=${MERGEDQT_WEB_HOTSPOT_HELPER:-/home/cat/web-stage/portal-network.sh}
+    export MERGEDQT_WEB_HOTSPOT_HELPER=${MERGEDQT_WEB_HOTSPOT_HELPER:-/usr/local/sbin/portal-network.sh}
     if ! install -d -m 0750 "$(dirname -- "$MERGEDQT_WEB_SOCKET")" "$(dirname -- "$MERGEDQT_WEB_READY_FILE")"; then
         log 'Optional Web runtime directory could not be prepared; continuing Qt startup'
     fi
@@ -987,6 +992,7 @@ prepare_log_storage
 start_log_maintenance
 
 load_driver 2h_sr505_drv.ko
+load_driver 2h_led_drv.ko
 
 if [ ! -x "$APP_DIR/mqttd" ]; then
     log "mqttd is missing or not executable: $APP_DIR/mqttd"

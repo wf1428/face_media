@@ -8,7 +8,9 @@
 #include "web_schema.h"
 #include "web_sql.h"
 
-/** @brief 在统一 Qt 数据库中迁移独立的 Web 表。 */
+/**
+ * @brief 在统一 Qt 数据库中迁移独立的 Web 表。
+ */
 void WebSchema::migrate()
 {
     if (!DbStore::transactionBegin())

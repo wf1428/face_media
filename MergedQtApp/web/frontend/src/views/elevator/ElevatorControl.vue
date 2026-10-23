@@ -3,7 +3,7 @@
   <div class="page">
     <van-notice-bar v-if="loadError" :text="loadError" />
     <van-notice-bar text="楼层和模式读取设备保存的配置；发送状态以本地执行结果为准。" />
-    <van-notice-bar text="定时梯控写入、定时开关机和信号休眠尚未接入，对应操作暂不可用。" />
+    <van-notice-bar text="定时规则与平台共用，按设备本地时间执行；定时开关机和信号休眠暂不可用。" />
     <div class="header">
       <div class="title">{{ $t('elevator.title') }}</div>
     </div>
@@ -88,7 +88,7 @@
         <template #right-icon>
           <van-icon
             name="cross"
-            :aria-disabled="!capabilities.floorScheduleWrite"
+            :aria-disabled="!capabilities.floorScheduleWrite || busy"
             @click="removeSchedule(i)"
           />
         </template>
@@ -159,10 +159,16 @@
     <van-popup v-model:show="showTime" position="bottom" round>
       <div class="time-pop">
         <div class="time-title">
-          {{ timeTarget === 'onTime' ? $t('elevator.onTime') : $t('elevator.offTime') }}
+          {{ $t(timeTarget === 'schedule' ? 'elevator.time' : timeTarget === 'onTime' ? 'elevator.onTime' : 'elevator.offTime') }}
         </div>
-        <van-time-picker v-model="timeValue" title="" :columns-type="['hour', 'minute']" />
-        <van-button type="primary" block round @click="confirmTime">{{
+        <van-time-picker
+          ref="timePicker"
+          v-model="timeValue"
+          :show-toolbar="false"
+          :columns-type="['hour', 'minute']"
+          @confirm="confirmTime"
+        />
+        <van-button type="primary" block round @click="timePicker?.confirm()">{{
           $t('common.confirm')
         }}</van-button>
       </div>
@@ -193,7 +199,14 @@
               <van-radio :name="0">{{ $t('elevator.limit') }}</van-radio>
             </van-radio-group>
           </div>
-          <van-field v-model="scheduleForm.time" :label="$t('elevator.time')" placeholder="HH:mm" />
+          <van-field
+            :model-value="scheduleForm.time"
+            :label="$t('elevator.time')"
+            readonly
+            is-link
+            :disabled="!capabilities.floorScheduleWrite || busy"
+            @click="openTime('schedule')"
+          />
           <div class="row">
             <span class="row-label">{{ $t('elevator.weekday') }}</span>
             <van-checkbox-group v-model="scheduleForm.weekDays" direction="horizontal">
@@ -233,6 +246,7 @@ const capabilities = ref({})
 const loadError = ref('')
 
 const showTime = ref(false)
+const timePicker = ref(null)
 const timeTarget = ref('onTime')
 const timeValue = ref(['08', '00'])
 
@@ -255,6 +269,7 @@ const weekOptions = computed(() => [
 const board = reactive({ onTime: '—', offTime: '—' })
 const floorLimit = reactive({ floors: [] })
 const floorSchedule = reactive({ schedules: [] })
+const baseSchedules = ref([])
 const mode = reactive({
   masterSwitch: false,
   delay: false,
@@ -280,18 +295,32 @@ const modeItems = computed(() => [
   { key: 'ext4', labelKey: 'elevator.ext4', descKey: 'elevator.extDesc' },
 ])
 
-/** 主板时间展示 */
+/**
+ * @brief 读取页面主板开关机时间草稿。
+ * 主板时间展示
+ * @returns {object} 页面草稿中的 onTime 和 offTime。
+ */
 function fmt() {
   return { onTime: board.onTime, offTime: board.offTime }
 }
 
-/** 楼层显示：负楼层 B，正楼层 n 楼（参数插值，随语言切换） */
+/**
+ * @brief 按当前语言生成地上或地下楼层标签。
+ * 楼层显示：负楼层 B，正楼层 n 楼（参数插值，随语言切换）
+ * @param {number} f 业务楼层号，地下层为负数。
+ * @returns {string} 按当前语言生成的楼层文案。
+ */
 function floorLabel(f) {
   if (f < 0) return t('common.floorBasement', { n: Math.abs(f) })
   return t('common.floorN', { n: f })
 }
 
-/** 定时规则摘要：动作 + 时间 + 星期 + 楼层 */
+/**
+ * @brief 将动作、时间、星期和楼层组合为定时规则摘要。
+ * 定时规则摘要：动作 + 时间 + 星期 + 楼层
+ * @param {object} s 包含动作、时间、星期和楼层的定时规则。
+ * @returns {string} 用于定时规则列表及删除确认的摘要。
+ */
 function scheduleTitle(s) {
   const shortKeys = [
     'common.weekShort.mon',
@@ -313,7 +342,9 @@ function scheduleTitle(s) {
   })
 }
 
-/** @brief 加载当前页面需要的实际设备资料和能力状态。 */
+/**
+ * @brief 加载当前页面需要的实际设备资料和能力状态。
+ */
 async function load() {
   loadError.value = ''
   try {
@@ -328,34 +359,49 @@ async function load() {
       status: f.status === 1 ? 'open' : 'limit',
     }))
     floorSchedule.schedules = schedules.deviceSchedules || []
+    baseSchedules.value = JSON.parse(JSON.stringify(floorSchedule.schedules))
     Object.assign(mode, currentMode)
   } catch (error) {
     loadError.value = error.message
   }
 }
 
-/** @brief 仅在具备定时开关机能力时打开时间编辑面板。 */
+/**
+ * @brief 按能力打开滚动时间选择器，确认前仅修改独立的时间草稿。
+ * @param {string} target 待编辑的时间字段或计划字段名称。
+ */
 function openTime(target) {
-  if (!capabilities.value.boardPower) return
+  if (busy.value) return
+  if (target === 'schedule' ? !capabilities.value.floorScheduleWrite : !capabilities.value.boardPower) return
   timeTarget.value = target
-  timeValue.value = (target === 'onTime' ? board.onTime : board.offTime).split(':')
+  const value = target === 'schedule' ? scheduleForm.time : target === 'onTime' ? board.onTime : board.offTime
+  timeValue.value = /^([01]\d|2[0-3]):[0-5]\d$/.test(value) ? value.split(':') : ['08', '00']
   showTime.value = true
 }
 
-/** @brief 将当前选择的时间写回页面草稿。 */
-function confirmTime() {
-  const val = timeValue.value.join(':')
-  if (timeTarget.value === 'onTime') board.onTime = val
+/**
+ * @brief 将当前选择的时间写回页面草稿。
+ * @param {object} args 时间选择器确认事件，selectedValues 为两位小时和分钟字符串。
+ * @param {string[]} args.selectedValues 滚动控件已确认的小时和分钟。
+ */
+function confirmTime({ selectedValues }) {
+  const val = selectedValues.join(':')
+  if (timeTarget.value === 'schedule') scheduleForm.time = val
+  else if (timeTarget.value === 'onTime') board.onTime = val
   else board.offTime = val
   showTime.value = false
 }
 
-/** @brief 提示定时开关机能力尚未接入，不伪造执行成功。 */
+/**
+ * @brief 提示定时开关机能力尚未接入，不伪造执行成功。
+ */
 async function saveBoard() {
   showToast('本设备尚未接入定时开关机')
 }
 
-/** @brief 确认后提交本地重启请求，并显示受理结果。 */
+/**
+ * @brief 确认后提交本地重启请求，并显示受理结果。
+ */
 async function doReboot() {
   try {
     await showConfirmDialog({
@@ -372,12 +418,18 @@ async function doReboot() {
   }
 }
 
-/** @brief 更新页面中指定楼层的开放草稿。 */
+/**
+ * @brief 更新页面中指定楼层的开放草稿。
+ * @param {object} f 页面中的楼层条目，将直接修改其 status 草稿。
+ * @param {boolean} open 是否在页面草稿中将该楼层设为开放。
+ */
 function setFloorStatus(f, open) {
   f.status = open ? 'open' : 'limit'
 }
 
-/** @brief 提交楼层草稿并刷新设备实际保存的状态。 */
+/**
+ * @brief 提交楼层草稿并刷新设备实际保存的状态。
+ */
 async function saveFloorLimit() {
   if (busy.value || !capabilities.value.elevatorWrite) return
   busy.value = true
@@ -392,14 +444,18 @@ async function saveFloorLimit() {
   }
 }
 
-/** @brief 在梯控可写时打开楼层选择面板。 */
+/**
+ * @brief 在梯控可写时打开楼层选择面板。
+ */
 function openFloorAdd() {
   if (!capabilities.value.elevatorWrite || busy.value) return
   floorAddNum.value = 1
   showFloorAdd.value = true
 }
 
-/** @brief 校验楼层范围与重复项后加入页面草稿。 */
+/**
+ * @brief 校验楼层范围与重复项后加入页面草稿。
+ */
 function confirmFloorAdd() {
   if (floorAddNum.value === 0) {
     showToast(t('elevator.floorCannotZero'))
@@ -414,7 +470,9 @@ function confirmFloorAdd() {
   showFloorAdd.value = false
 }
 
-/** @brief 仅在具备定时规则写入能力时打开新增面板。 */
+/**
+ * @brief 仅在具备定时规则写入能力时打开新增面板。
+ */
 function openScheduleAdd() {
   if (!capabilities.value.floorScheduleWrite || busy.value) return
   scheduleForm.action = 1
@@ -424,13 +482,16 @@ function openScheduleAdd() {
   showScheduleAdd.value = true
 }
 
-/** @brief 校验时刻和楼层输入后记录页面中的定时规则草稿。 */
+/**
+ * @brief 校验时刻和楼层输入后记录页面中的定时规则草稿。
+ */
 function confirmScheduleAdd() {
+  if (!capabilities.value.floorScheduleWrite || busy.value) return
   const floors = String(scheduleForm.floorText)
     .split(/[,，\s]+/)
     .map((s) => Number(s))
     .filter((n) => n !== 0 && Number.isInteger(n))
-  if (!floors.length) {
+  if (!floors.length || floors.some((n) => n < -8 || n > 120) || !scheduleForm.weekDays.length) {
     showToast(t('elevator.enterValidFloor'))
     return
   }
@@ -439,22 +500,54 @@ function confirmScheduleAdd() {
     time: scheduleForm.time,
     weekDays: [...scheduleForm.weekDays],
     floors,
-    hash: 'h' + Date.now().toString(36),
+    hash: 'web-' + crypto.randomUUID(),
   })
   showScheduleAdd.value = false
 }
 
-/** @brief 具备可写能力时移除当前页面的指定定时规则。 */
-function removeSchedule(i) {
-  if (capabilities.value.floorScheduleWrite) floorSchedule.schedules.splice(i, 1)
+/**
+ * @brief 具备可写能力时移除当前页面的指定定时规则。
+ * @param {number} i 待移除规则在页面数组中的索引。
+ */
+async function removeSchedule(i) {
+  if (!capabilities.value.floorScheduleWrite || busy.value) return
+  const rule = floorSchedule.schedules[i]
+  if (!rule) return
+  if (!baseSchedules.value.some((item) => item.hash === rule.hash)) {
+    floorSchedule.schedules.splice(i, 1)
+    return
+  }
+  try {
+    await showConfirmDialog({ title: t('common.delete'), message: scheduleTitle(rule) })
+    busy.value = true
+    const result = await api.floorScheduleDelete({ hashList: [rule.hash], baseSchedules: baseSchedules.value })
+    // 保留页面尚未保存的新增草稿，只移除已确认删除的规则。
+    floorSchedule.schedules = floorSchedule.schedules.filter((item) => item.hash !== rule.hash)
+    baseSchedules.value = result.deviceSchedules
+    showToast(t('common.deleted'))
+  } catch (error) {
+    if (error?.message) showToast(error.message)
+  } finally { busy.value = false }
 }
 
-/** @brief 明确提示当前定时规则仅可读取，保持设备配置不变。 */
+/**
+ * @brief 提交完整定时规则与读取快照，保存后同步页面中的规则和版本基线。
+ */
 async function saveSchedule() {
-  showToast('定时规则可读取，设置功能尚未接入')
+  if (!capabilities.value.floorScheduleWrite || busy.value) return
+  busy.value = true
+  try {
+    const result = await api.floorScheduleSet({ schedules: floorSchedule.schedules, baseSchedules: baseSchedules.value })
+    floorSchedule.schedules = result.deviceSchedules
+    baseSchedules.value = JSON.parse(JSON.stringify(result.deviceSchedules))
+    showToast(t('common.saved'))
+  } catch (error) { showToast(error.message) }
+  finally { busy.value = false }
 }
 
-/** @brief 提交特殊模式开关，随后重新读取保存结果。 */
+/**
+ * @brief 提交特殊模式开关，随后重新读取保存结果。
+ */
 async function onModeChange() {
   if (busy.value || !capabilities.value.elevatorWrite) return
   busy.value = true
@@ -469,7 +562,9 @@ async function onModeChange() {
   }
 }
 
-/** @brief 提示信号休眠能力尚未接入。 */
+/**
+ * @brief 提示信号休眠能力尚未接入。
+ */
 async function onSleepChange() {
   showToast('本设备尚未接入无信号休眠')
 }

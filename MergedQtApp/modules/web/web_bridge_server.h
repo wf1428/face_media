@@ -17,20 +17,30 @@ class WebBridgeServer final : public QObject {
 
 public:
 
-    /** @brief 保存配置和 socket 路径，不在构造时打开数据库。 */
+    /**
+     * @brief 保存配置和 socket 路径，不在构造时打开数据库。
+     * @param config 设备受控配置，包含运行所需路径或功能设置。
+     * @param socketPath 本机 Unix socket 路径。
+     */
     WebBridgeServer(const WebServiceConfig &config, const QString &socketPath);
 
 public slots:
 
-    /** @brief 启动恢复、设置本地 socket 权限并连接处理器。 */
+    /**
+     * @brief 启动恢复、设置本地 socket 权限并连接处理器。
+     */
     void start();
 
-    /** @brief 在所属线程停止接入并关闭数据库连接。 */
+    /**
+     * @brief 在所属线程停止接入并关闭数据库连接。
+     */
     void stop();
 
 private:
 
-    /** @brief 每个连接只处理一条限长请求，以 requestId 对应一次响应。 */
+    /**
+     * @brief 每个连接只处理一条限长请求，以 requestId 对应一次响应。
+     */
     void acceptConnections();
 
     WebServiceConfig config_;        /**< 板端资源路径。 */
@@ -46,10 +56,15 @@ class WebRuntime final : public QObject {
 
 public:
 
-    /** @brief MERGEDQT_WEB_ENABLE=1 时创建独立线程并启动服务。 */
+    /**
+     * @brief MERGEDQT_WEB_ENABLE=1 时创建独立线程并启动服务。
+     * @param parent Qt 父对象；对象销毁由父子关系管理，空指针表示无父对象。
+     */
     explicit WebRuntime(QObject *parent = nullptr);
 
-    /** @brief 退出时等待当前文件/人员写入安全结束，避免销毁仍运行线程。 */
+    /**
+     * @brief 退出时等待当前文件/人员写入安全结束，避免销毁仍运行线程。
+     */
     ~WebRuntime() override;
 
 private:

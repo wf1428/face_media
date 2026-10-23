@@ -13,7 +13,10 @@
 #define SIGKILL 9
 #endif
 
-/** @brief Windows 不执行板端 DHCP 进程操作，始终报告目标进程不存在。 */
+/**
+ * @brief Windows 不执行板端 DHCP 进程操作，始终报告目标进程不存在。
+ * @return 始终为 -1，并设置 errno=ESRCH；位置参数保留 POSIX kill 的进程号与信号签名。
+ */
 inline int kill(pid_t, int)
 {
     errno = ESRCH;

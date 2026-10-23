@@ -11,7 +11,11 @@
 #include <QString>
 
 /** @brief 区分文件无效与板端 GStreamer 组件缺失，供上传接口映射状态码。 */
-enum class GstVideoValidationStatus { Valid, Invalid, Unavailable };
+enum class GstVideoValidationStatus {
+    Valid,       /**< 容器可解析且包含视频流。 */
+    Invalid,     /**< 内容、容器或视频流不符合上传要求。 */
+    Unavailable  /**< 探测环境缺失或无法执行内容检查。 */
+};
 
 /** @brief 本地视频内容检查结果；不修改原播放器的任何状态。 */
 struct GstVideoValidationResult {
@@ -22,7 +26,7 @@ struct GstVideoValidationResult {
 /**
  * @brief 在 Web 工作线程探测完整的本地文件，要求容器可解析且包含视频流。
  * @param path 已接收完整、仍未发布的受控本地文件绝对路径。
- * @param timeoutSeconds 单文件探测上限，限制异常媒体阻塞 Web 工作线程。
+ * @param timeoutSeconds 单文件探测上限，单位为秒，限制异常媒体阻塞 Web 工作线程。
  * @return 验证结果；仅检查内容，不播放、转码或改变既有 GstPlayerWidget。
  */
 GstVideoValidationResult validateVideoWithGStreamer(const QString &path, int timeoutSeconds = 15);

@@ -14,7 +14,12 @@
 
 namespace deviceweb {
 
-/** @brief 逐字节比较令牌，避免因首个不同字节泄露比较进度。 */
+/**
+ * @brief 逐字节比较令牌，避免因首个不同字节泄露比较进度。
+ * @param a 第一个待比较的令牌。
+ * @param b 第二个待比较的令牌。
+ * @return 两个令牌长度和所有字节均相同时为 true。
+ */
 bool secureEqual(const std::string &a, const std::string &b)
 {
     if (a.size() != b.size())
@@ -25,7 +30,10 @@ bool secureEqual(const std::string &a, const std::string &b)
     return difference == 0;
 }
 
-/** @brief 从系统随机源生成会话与 CSRF 令牌。 */
+/**
+ * @brief 从系统随机源生成会话与 CSRF 令牌。
+ * @return 系统随机源生成的 256 位十六进制令牌。
+ */
 std::string SessionStore::randomToken()
 {
     std::array<unsigned char, 32> bytes{};
@@ -46,7 +54,9 @@ std::string SessionStore::randomToken()
     return result;
 }
 
-/** @brief 移除过期会话和登录限流记录。 */
+/**
+ * @brief 移除过期会话和登录限流记录。
+ */
 void SessionStore::purge()
 {
     const auto now = std::chrono::steady_clock::now();
@@ -57,7 +67,12 @@ void SessionStore::purge()
         it = it->second.until <= now ? attempts_.erase(it) : std::next(it);
 }
 
-/** @brief 为认证成功的账号建立受数量和期限约束的会话。 */
+/**
+ * @brief 为认证成功的账号建立受数量和期限约束的会话。
+ * @param owner 已认证 Web 账号主键，用于任务归属校验。
+ * @param username Web 登录账号。
+ * @return 新会话副本，包含 Cookie 和 CSRF 令牌；会话数超限时拒绝创建。
+ */
 Session SessionStore::create(int owner, const std::string &username)
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -75,7 +90,11 @@ Session SessionStore::create(int owner, const std::string &username)
     return session;
 }
 
-/** @brief 查找会话并在有效期内刷新空闲到期时间。 */
+/**
+ * @brief 查找会话并在有效期内刷新空闲到期时间。
+ * @param token HTTP Cookie 中的随机会话令牌。
+ * @return 有效会话副本，并延长空闲有效期；无效或过期抛出 401 ApiError。
+ */
 Session SessionStore::get(const std::string &token)
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -87,14 +106,20 @@ Session SessionStore::get(const std::string &token)
     return found->second;
 }
 
-/** @brief 注销指定会话令牌。 */
+/**
+ * @brief 注销指定会话令牌。
+ * @param token HTTP Cookie 中的随机会话令牌。
+ */
 void SessionStore::erase(const std::string &token)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     sessions_.erase(token);
 }
 
-/** @brief 撤销指定账号的全部 Web 会话，保留其他账号会话。 */
+/**
+ * @brief 撤销指定账号的全部 Web 会话，保留其他账号会话。
+ * @param owner 已认证 Web 账号主键，用于任务归属校验。
+ */
 void SessionStore::eraseOwner(int owner)
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -105,7 +130,10 @@ void SessionStore::eraseOwner(int owner)
             ++it;
 }
 
-/** @brief 按客户端地址累计登录尝试并执行限流。 */
+/**
+ * @brief 按客户端地址累计登录尝试并执行限流。
+ * @param address 请求来源地址，作为登录速率限制键。
+ */
 void SessionStore::attempt(const std::string &address)
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -119,7 +147,11 @@ void SessionStore::attempt(const std::string &address)
         throw ApiError(429, "登录尝试过于频繁，请一分钟后再试");
 }
 
-/** @brief 从 Cookie 头提取唯一的设备会话令牌。 */
+/**
+ * @brief 从 Cookie 头提取唯一的设备会话令牌。
+ * @param cookies HTTP Cookie 请求头。
+ * @return 唯一匹配的会话值；缺失或重复时为空。
+ */
 std::string sessionCookie(const std::string &cookies)
 {
     std::string token;

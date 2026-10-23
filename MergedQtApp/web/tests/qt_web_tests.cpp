@@ -3,6 +3,7 @@
  * @brief 实际 SQLite/文件/原 Excel 解析与本地仓储集成测试，以及阈值防重测试。
  * @author Du lin
  * @date 2026-10-09
+ * @note 最近修改：2026-10-22；修改人：Du lin；补充媒体上传单文件大小边界及超限请求不占用任务配额的验证，保留原媒体发布和空间检查用例。
  */
 
 #include "modules/web/web_service.h"
@@ -12,6 +13,7 @@
 #include "modules/web/web_local_runtime.h"
 #include "modules/web/web_local_api.h"
 #include "ic_board/local_access_service.h"
+#include "ic_board/rs485_floor_frame_builder.h"
 #include <QImage>
 #include <QBuffer>
 #include <QElapsedTimer>
@@ -35,6 +37,8 @@
 #include <QProgressBar>
 #include <QLabel>
 #include "modules/web/web_upload_presenter.h"
+#include "common/media_content_policy.h"
+#include "modules/web/web_floor_schedule.h"
 #include <QFile>
 #include <QDir>
 #include <QJsonDocument>
@@ -51,14 +55,22 @@
 
 namespace {
 
-/** @brief 不受 release/NDEBUG 影响的检查。 */
+/**
+ * @brief 不受 release/NDEBUG 影响的检查。
+ * @param value 断言条件。
+ * @param message 断言失败时显示的诊断文本。
+ */
 void check(bool value, const char *message)
 {
     if (!value)
         throw std::runtime_error(message);
 }
 
-/** @brief 检查指定操作必定被拒绝，并核对状态码。 */
+/**
+ * @brief 检查指定操作必定被拒绝，并核对状态码。
+ * @param status 预期的 WebError 状态码。
+ * @param action 应抛出预期业务错误的测试操作。
+ */
 void rejects(int status, const std::function<void()> &action)
 {
     try {
@@ -75,7 +87,13 @@ void rejects(int status, const std::function<void()> &action)
     throw std::runtime_error("unsafe operation unexpectedly accepted");
 }
 
-/** @return 生成质量提取后候选结构，向量用真实 float 二进制。 */
+/**
+ * @brief 构造用于防重测试的人脸特征条目。
+ * @param person 测试人员主键。
+ * @param x 测试特征向量第一分量。
+ * @param y 测试特征向量第二分量。
+ * @return 生成质量提取后候选结构，向量用真实 float 二进制。
+ */
 QJsonObject face(qint64 person, float x, float y)
 {
     float vector[2] = {x, y};
@@ -86,7 +104,10 @@ QJsonObject face(qint64 person, float x, float y)
             {"modelVersion", "test-v1"}};
 }
 
-/** @brief 使用 Python hashlib 的固定摘要，独立校验 Qt 端 PBKDF2 实现。 */
+/**
+ * @brief 使用 Python hashlib 的固定摘要，独立校验 Qt 端 PBKDF2 实现。
+ * @param path 待访问的文件或配置路径。
+ */
 void factory(const QString &path)
 {
     const QByteArray salt(32, 's');
@@ -101,7 +122,9 @@ void factory(const QString &path)
                    .toJson());
 }
 
-/** @brief 验证 Web 数据库没有第二份人员模型、迁移幂等及账号摘要校验。 */
+/**
+ * @brief 验证 Web 数据库没有第二份人员模型、迁移幂等及账号摘要校验。
+ */
 void schemaAndAuthentication()
 {
     WebSchema::migrate();
@@ -117,7 +140,11 @@ void schemaAndAuthentication()
     });
 }
 
-/** @brief 返回隔离测试使用的热点辅助程序路径，不操作真实网络。 */
+/**
+ * @brief 返回隔离测试使用的热点辅助程序路径，不操作真实网络。
+ * @param root 受控根目录。
+ * @return 生成的热点辅助脚本完整路径。
+ */
 QString mockHotspotHelper(const QString &root)
 {
 #ifdef Q_OS_WIN
@@ -127,7 +154,13 @@ QString mockHotspotHelper(const QString &root)
 #endif
 }
 
-/** @brief 验证设备身份、默认 SSID、热点保存和更新失败的实际反馈。 */
+/**
+ * @brief 验证设备身份、默认 SSID、热点保存和更新失败的实际反馈。
+ * @param service 隔离配置下的真实 Web 服务实例。
+ * @param network 网络人员图库。
+ * @param root 受控根目录。
+ * @param ready 测试 Web 就绪标记文件路径。
+ */
 void hotspotConfiguration(WebService &service,
                           const QString &network,
                           const QString &root,
@@ -241,7 +274,9 @@ void hotspotConfiguration(WebService &service,
     check(read(network).contains("host=unchanged"), "network config unexpectedly changed");
 }
 
-/** @brief 验证网络下发同一参数可调整防重结果、自身更新允许、同批和跨库冲突拒绝。 */
+/**
+ * @brief 验证网络下发同一参数可调整防重结果、自身更新允许、同批和跨库冲突拒绝。
+ */
 void duplicateThreshold()
 {
     FaceRecord other;
@@ -281,7 +316,12 @@ void duplicateThreshold()
     check(accepted.isEmpty(), "incompatible gallery model accepted");
 }
 
-/** @brief 使用上传任务实际写盘、原解析器和原仓储核对部分成功及网络/卡号冲突。 */
+/**
+ * @brief 使用上传任务实际写盘、原解析器和原仓储核对部分成功及网络/卡号冲突。
+ * @param service 隔离配置下的真实 Web 服务实例。
+ * @param fixture 测试夹具文件路径。
+ * @param root 受控根目录。
+ */
 void excelUploadAndImport(WebService &service, const QString &fixture, const QString &root)
 {
     LocalPersonnelStore store;
@@ -354,7 +394,12 @@ void excelUploadAndImport(WebService &service, const QString &fixture, const QSt
     check(QFileInfo::exists(QDir(root).filePath("access_control.db")), "unexpected database path");
 }
 
-/** @brief 核对缺少图片不能封存、取消清理、接收中断及不确定批次不重放。 */
+/**
+ * @brief 核对缺少图片不能封存、取消清理、接收中断及不确定批次不重放。
+ * @param service 隔离配置下的真实 Web 服务实例。
+ * @param fixture 测试夹具文件路径。
+ * @param imports 测试导入暂存目录。
+ */
 void interruptedBatches(WebService &service, const QString &fixture, const QString &imports)
 {
     const qint64 size = QFileInfo(fixture).size();
@@ -414,7 +459,12 @@ void interruptedBatches(WebService &service, const QString &fixture, const QStri
     check(WebSql::query("SELECT id FROM person").size() == 1, "recovery changed personnel");
 }
 
-/** @brief 普通 eMMC 目录不需独立挂载；容量来自视频目录，缺失目录仍拒绝。 */
+/**
+ * @brief 普通 eMMC 目录不需独立挂载；容量来自视频目录，缺失目录仍拒绝。
+ * @param service 隔离配置下的真实 Web 服务实例。
+ * @param root 受控根目录。
+ * @param media 测试媒体目录。
+ */
 void emmcStorage(WebService &service, const QString &root, const QString &media)
 {
     const auto oldMountHint = QDir(root).filePath("unused-mount-hint/missing");
@@ -455,7 +505,10 @@ void emmcStorage(WebService &service, const QString &root, const QString &media)
                  "actual capacity\n");
 }
 
-/** @brief 验证手机上传的真实字节进度、失败保持原播放、发布幂等及串行自动播放。 */
+/**
+ * @brief 验证手机上传的真实字节进度、失败保持原播放、发布幂等及串行自动播放。
+ * @param service 隔离配置下的真实 Web 服务实例。
+ */
 void videoUploadDevice(WebService &service)
 {
     QWidget device;
@@ -557,7 +610,11 @@ void videoUploadDevice(WebService &service)
     runtime->bindMedia(nullptr, {}, {});
 }
 
-/** @brief 验证 INI 源回读、校验、异步执行、幂等及失败时不伪造配置。 */
+/**
+ * @brief 验证 INI 源回读、校验、异步执行、幂等及失败时不伪造配置。
+ * @param service 隔离配置下的真实 Web 服务实例。
+ * @param root 受控根目录。
+ */
 void networkConfiguration(WebService &service, const QString &root)
 {
     const auto path = QDir(root).filePath("net_cfg.ini");
@@ -680,7 +737,11 @@ void networkConfiguration(WebService &service, const QString &root)
                  "DHCP keys\n");
 }
 
-/** @brief 验证旧目录文件也可列举与删除，.part 不暴露，未接入业务不创建路由。 */
+/**
+ * @brief 验证旧目录文件也可列举与删除，.part 不暴露，未接入业务不创建路由。
+ * @param service 隔离配置下的真实 Web 服务实例。
+ * @param media 测试媒体目录。
+ */
 void mediaDirectory(WebService &service, const QString &media)
 {
     QFile video(QDir(media).filePath("ftp-existing.mp4"));
@@ -722,7 +783,263 @@ void mediaDirectory(WebService &service, const QString &media)
     });
 }
 
-/** Regression of local transactions, actual source adapters and MQTT-independent modes. */
+/**
+ * @brief 图片使用真实解码、原子发布及两种目录；来源路径在创建时固定。
+ * @param service 隔离配置下的真实 Web 服务实例。
+ * @param media 测试媒体目录。
+ */
+void advertisementImages(WebService &service, const QString &media)
+{
+    const qint64 mib = 1024LL * 1024;
+    // 仅声明长度、创建并取消任务，不实际分配或写入数百 MiB 夹具。
+    for (const auto &limit : QList<QPair<QString, qint64>>{{"video", 500 * mib}, {"ad_image", 100 * mib}}) {
+        const QString name = limit.first == "video" ? "size-boundary.mp4" : "size-boundary.png";
+        const int activeBefore = WebUploads::incomplete().size();
+        rejects(400, [&] {
+            service.dispatch("uploads.create", {{"kind", limit.first}, {"name", name},
+                             {"size", double(limit.second + 1)}}, 1);
+        });
+        check(WebUploads::incomplete().size() == activeBefore, "oversized media reserved upload space");
+        const auto boundary = service.dispatch("uploads.create", {{"kind", limit.first}, {"name", name},
+                                                 {"size", double(limit.second)}}, 1);
+        service.dispatch("uploads.cancel", {{"id", boundary.value("id")}}, 1);
+        check(WebUploads::incomplete().size() == activeBefore, "cancelled boundary media kept reservation");
+    }
+    const QString pic = QDir::cleanPath(QDir(media).filePath("../pic"));
+    QImage image(64, 40, QImage::Format_RGB32);
+    image.fill(Qt::green);
+    QByteArray bytes;
+    QBuffer buffer(&bytes);
+    check(buffer.open(QIODevice::WriteOnly) && image.save(&buffer, "PNG"), "image fixture encode");
+    auto *runtime = WebLocalRuntime::instance();
+    QSignalSpy ready(runtime, &WebLocalRuntime::videoUploaded);
+    QSignalSpy removed(runtime, &WebLocalRuntime::mediaFileDeleted);
+    for (int small : {0, 1}) {
+        const QString name = QStringLiteral("任意名称.%1.PNG").arg(small);
+        const auto task = service.dispatch("uploads.create", {{"kind", "ad_image"}, {"name", name},
+                                            {"size", bytes.size()}, {"smallImageMode", small}}, 1);
+        const auto id = task.value("id");
+        const auto start = service.dispatch("uploads.begin", {{"id", id}}, 1);
+        const QString root = small ? pic : media;
+        check(QFileInfo(start.value("part_path").toString()).absolutePath() == root + "/_uploads", "image destination incorrect");
+        // 修改全局模式不应改变已创建任务的落盘目录。
+        check(MediaContentPolicy::saveSelection(Rk3566Platform::netConfigPath(), "IMAGE", !small), "save shared choice");
+        QFile file(start.value("part_path").toString());
+        check(file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size(), "image receive"); file.close();
+        service.dispatch("uploads.received", {{"id", id}}, 1);
+        check(service.dispatch("uploads.commit", {{"id", id}}, 1).value("state") == "READY", "image publish");
+        const QString full = QDir(root).filePath(name);
+        check(QFileInfo::exists(full) && ready.last().at(0).toString() == full, "image path notification");
+        const int notifications = ready.size(); service.dispatch("uploads.commit", {{"id", id}}, 1);
+        check(ready.size() == notifications, "duplicate image commit notified twice");
+        QString fileId;
+        for (const auto &value : service.dispatch("files.list", {}, 1).value("files").toArray()) {
+            const auto item = value.toObject();
+            if (item.value("name") == name) {
+                check(item.value("mediaType") == "IMAGE" && item.value("smallImageMode").toInt() == small, "image inventory metadata");
+                fileId = item.value("id").toString();
+            }
+        }
+        check(!fileId.isEmpty(), "image not in inventory");
+        const auto download = service.dispatch("files.get", {{"id", fileId}}, 1);
+        check(download.value("path") == full && download.value("bytes").toInt() == bytes.size(), "image download path");
+        service.dispatch("files.delete", {{"id", fileId}}, 1);
+        check(!QFileInfo::exists(full) && removed.last().at(0).toString() == full, "image deletion did not clear player cache");
+    }
+    for (const auto &ext : QStringList{"jpg", "jpeg", "png", "bmp", "gif", "webp", "tif", "tiff"})
+        check(WebPaths::accepts("ad_image", "poster." + ext.toUpper()), "common image extension rejected");
+    const auto invalid = service.dispatch("uploads.create", {{"kind", "ad_image"}, {"name", "bad.jpg"}, {"size", 3}, {"smallImageMode", 1}}, 1);
+    const auto id = invalid.value("id"); const auto begin = service.dispatch("uploads.begin", {{"id", id}}, 1);
+    QFile bad(begin.value("part_path").toString()); check(bad.open(QIODevice::WriteOnly), "bad image fixture"); bad.write("bad"); bad.close();
+    service.dispatch("uploads.received", {{"id", id}}, 1);
+    rejects(400, [&] { service.dispatch("uploads.commit", {{"id", id}}, 1); });
+    service.dispatch("uploads.cancel", {{"id", id}}, 1);
+    check(!QFileInfo::exists(bad.fileName()), "small image cancellation failed");
+    std::fprintf(stdout, "Advertisement image checks passed: decoding, directories, task snapshot, inventory, download, delete, formats\n");
+}
+
+/**
+ * @brief Web 与原 MQTT 共用的模式存储入口交叉读写，并保护通行帧高八位。
+ * @param service 隔离配置下的真实 Web 服务实例。
+ */
+void sharedElevatorModes(WebService &service)
+{
+    using namespace Rs485FloorFrameBuilder;
+    const QString modeKey = "online_v1_elevator_mode";
+    const bool hadMode = DbStore::hasConfig(modeKey);
+    const QVariant original = DbStore::getConfig(modeKey);
+    const QVariant floors = DbStore::getConfig("online_v1_floor_limit_bits");
+    const QStringList fields{"delay", "parking", "driver", "independent", "ext1", "ext2", "ext3", "ext4"};
+    const auto stateJson = [](const ElevatorModeState &state) {
+        return QJsonObject{{"masterSwitch", state.masterSwitch}, {"delay", state.delay},
+                           {"parking", state.parking}, {"driver", state.driver},
+                           {"independent", state.independent}, {"ext1", state.ext1},
+                           {"ext2", state.ext2}, {"ext3", state.ext3}, {"ext4", state.ext4}};
+    };
+    const auto readWeb = [&] {
+        return service.dispatch("local.elevator.elevatorMode.get", {}, 1).value("data").toObject();
+    };
+    auto *runtime = WebLocalRuntime::instance();
+    runtime->setDeviceReady(true);
+    QObject receiver;
+    QList<QByteArray> frames;
+    const auto transport = QObject::connect(runtime, &WebLocalRuntime::deviceRequested, &receiver,
+        [&](const QString &token, const QString &operation, const QJsonObject &args) {
+            if (operation != "rs485") return;
+            frames.append(QByteArray::fromBase64(args.value("frame").toString().toLatin1()));
+            runtime->complete(token, {{"saved", true}, {"transportSent", true}}, 200);
+        });
+    const auto writeWeb = [&](QJsonObject mode, const QString &key) {
+        mode.insert("_key", key);
+        const auto task = service.dispatch("local.elevator.elevatorMode.set", mode, 1).value("data").toObject();
+        QElapsedTimer timer; timer.start();
+        QJsonObject job;
+        do {
+            QCoreApplication::processEvents();
+            QTest::qWait(1);
+            job = service.dispatch("local.operations.get", {{"id", task.value("operationId")}}, 1).value("data").toObject();
+        } while (job.value("state") == "PENDING" && timer.elapsed() < 3000);
+        check(job.value("state") == "APPLIED", "Web mode did not complete serial dispatch");
+    };
+    ElevatorModeState initial;
+    check(saveElevatorModeState(initial), "clear mode fixture");
+    writeWeb(stateJson(initial), "mode-baseline");
+    const QByteArray baseline = frames.last();
+    check(baseline.size() == 132 && baseline.startsWith("OPEN"), "mode used temporary passage frame");
+    for (int index = 0; index < fields.size(); ++index) {
+        // 使用原 MQTT 设置/查询直接调用的真实公共函数；不链接或修改 MQTT 管理器。
+        ElevatorModeState mqtt;
+        mqtt.masterSwitch = true;
+        bool *switches[] = {&mqtt.delay, &mqtt.parking, &mqtt.driver, &mqtt.independent,
+                            &mqtt.ext1, &mqtt.ext2, &mqtt.ext3, &mqtt.ext4};
+        *switches[index] = true;
+        check(saveElevatorModeState(mqtt), "MQTT mode storage entry failed");
+        const auto mqttMode = stateJson(mqtt);
+        check(readWeb() == mqttMode, "Web read stale/different mode after MQTT storage write");
+
+        auto webMode = mqttMode;
+        for (const auto &field : fields) webMode[field] = !webMode.value(field).toBool();
+        writeWeb(webMode, QString("mode-web-%1").arg(index));
+        check(stateJson(elevatorModeState()) == webMode, "MQTT query entry read stale/different Web mode");
+        check(readWeb() == webMode, "Web query disagreed with shared MQTT state");
+        const auto wire = frames.last();
+        check(wire.left(124) == baseline.left(124), "mode changed ordinary floor state");
+        for (int bit = 0; bit < fields.size(); ++bit)
+            check(wire.at(124 + bit) == (webMode.value(fields[bit]).toBool() ? '1' : '0'), "Web mode wire mapping differs from shared state");
+        check(applyElevatorModeOverlay(baseline) == wire, "MQTT/common final overlay differs from Web frame");
+        const QByteArray passage = QByteArray("#@") + QByteArray(32, 'F') + "#!";
+        const QByteArray protectedPassage = applyElevatorModeOverlay(passage);
+        check(protectedPassage == passage.left(32) + "00#!", "card/QR frame could trigger occupied mode channels");
+        check(readWeb() == webMode, "passage frame changed persisted mode");
+    }
+    auto disabled = readWeb();
+    disabled["masterSwitch"] = false;
+    writeWeb(disabled, "mode-disable");
+    check(frames.last() == baseline && stateJson(elevatorModeState()) == disabled,
+          "master disable did not restore original floors/shared switches");
+    check(DbStore::getConfig("online_v1_floor_limit_bits") == floors, "mode write overwrote original floor permissions");
+    QObject::disconnect(transport);
+    runtime->setDeviceReady(false);
+    if (hadMode) check(DbStore::setConfig(modeKey, original), "restore original mode");
+    else DbStore::deleteConfig(modeKey);
+    std::fprintf(stdout, "Shared elevator mode checks passed: Web/MQTT storage cross-read, eight mode bits, persistent OPEN frames, card/QR protection, master restore\n");
+}
+
+/**
+ * @brief 无MQTT链接的真实Web执行器：校验、位序、重复抑制、共享规则与重建恢复。
+ */
+void independentFloorSchedules()
+{
+    const QStringList keys{"online_v1_floor_schedules", "online_v1_floor_schedule_bits",
+                            "online_v1_floor_limit_bits", "online_v1_floor_schedule_last_minute",
+                            "floor_schedule_local_enabled"};
+    QMap<QString, QVariant> backup;
+    for (const auto &key : keys) if (DbStore::hasConfig(key)) backup.insert(key, DbStore::getConfig(key));
+    for (const auto &key : keys) DbStore::deleteConfig(key);
+    const QDateTime due(QDate::currentDate().addDays(1), QTime(8, 17));
+    const auto rule = [&](const QString &hash, int action = 1, const QJsonArray &floors = QJsonArray{-8, -1, 1, 120}) {
+        return QJsonObject{{"hash", hash}, {"action", action}, {"floors", floors},
+                           {"weekDays", QJsonArray{due.date().dayOfWeek()}}, {"time", "08:17"}};
+    };
+    QList<QByteArray> frames;
+    QStringList tags;
+    QObject owner;
+    const auto send = [&](const QByteArray &frame, const QString &tag) { frames.append(frame); tags.append(tag); return true; };
+    int status = 200;
+    QString error;
+    QJsonArray saved;
+    {
+        WebFloorSchedule scheduler(&owner, send);
+        const QJsonArray platform{rule("platform")};
+        check(DbStore::setConfig("online_v1_floor_schedules", QString::fromUtf8(QJsonDocument(platform).toJson(QJsonDocument::Compact))), "shared rule fixture");
+        scheduler.checkDue(due);
+        check(frames.isEmpty(), "Web executed without local enable flag");
+        auto result = scheduler.apply("set", {{"schedules", QJsonArray{rule("web")}}, {"baseSchedules", platform}}, &status, &error);
+        check(status == 200 && result.value("saved").toBool(), "independent Web save failed");
+        saved = result.value("deviceSchedules").toArray();
+        check(DbStore::getConfig("floor_schedule_local_enabled").toBool(), "Web flag not persisted");
+        scheduler.checkDue(due);
+        check(frames.size() == 1 && frames.last().size() == 132 && frames.last().startsWith("OPEN"), "Web due frame missing");
+        for (int i : {4, 11, 12, 131}) check(frames.last().at(i) == '0', "negative/positive floor board mapping incorrect");
+        check(tags.last().startsWith("webFloorSchedule:"), "Web sender still uses MQTT source");
+        check(DbStore::getConfig("online_v1_floor_schedule_last_minute").toString() == due.toString("yyyy-MM-dd HH:mm"), "shared minute marker missing");
+        scheduler.checkDue(due);
+        scheduler.apply("set", {{"schedules", saved}, {"baseSchedules", saved}}, &status, &error);
+        scheduler.checkDue(due);
+        check(status == 200 && frames.size() == 1, "same rules or minute resent frame");
+        scheduler.apply("set", {{"schedules", QJsonArray{rule("stale")}}, {"baseSchedules", platform}}, &status, &error);
+        check(status == 409, "stale Web snapshot overwrote shared rules");
+        scheduler.apply("set", {{"schedules", QJsonArray{rule("invalid", 1, QJsonArray{0})}}}, &status, &error);
+        check(status == 400, "floor zero accepted");
+        scheduler.apply("set", {{"schedules", QJsonArray{rule("dup"), rule("dup")}}}, &status, &error);
+        check(status == 400, "duplicate hash accepted");
+        scheduler.apply("set", {{"schedules", QJsonArray{rule("open", 1), rule("limit", 0)}}}, &status, &error);
+        check(status == 400, "conflicting actions accepted");
+        auto invalidTime = rule("time"); invalidTime["time"] = "25:00";
+        scheduler.apply("set", {{"schedules", QJsonArray{invalidTime}}}, &status, &error);
+        check(status == 400, "invalid clock accepted");
+    }
+    // 新对象没有内存去重状态，仍读取持久化的分钟标记。
+    WebFloorSchedule restarted(&owner, send);
+    restarted.checkDue(due);
+    check(frames.size() == 1, "recreated Web executor lost persisted deduplication");
+    const QDateTime following = due.addDays(7);
+    // 模拟原执行器已写入同一共享分钟，Web不得再发送。
+    DbStore::setConfig("online_v1_floor_schedule_last_minute", following.toString("yyyy-MM-dd HH:mm"));
+    restarted.checkDue(following);
+    check(frames.size() == 1, "Web ignored shared execution marker");
+    const auto previousBits = DbStore::getConfig("online_v1_floor_limit_bits");
+    restarted.apply("delete", {{"hashList", QJsonArray{"web"}}, {"baseSchedules", saved}}, &status, &error);
+    check(status == 200 && frames.size() == 1 && DbStore::getConfig("online_v1_floor_limit_bits") == previousBits, "delete changed already applied floor state");
+    restarted.checkDue(due.addDays(14)); check(frames.size() == 1, "deleted rule executed");
+    // 验证真正的周期回调，而不仅是手动调用checkDue；覆盖等待期间跨分钟的情况。
+    const auto now = QDateTime::currentDateTime();
+    auto periodic = rule("periodic");
+    periodic["time"] = now.time().toString("HH:mm");
+    periodic["weekDays"] = QJsonArray{1, 2, 3, 4, 5, 6, 7};
+    auto nextMinute = periodic;
+    nextMinute["hash"] = "periodic-next";
+    nextMinute["time"] = now.addSecs(60).time().toString("HH:mm");
+    restarted.apply("set", {{"schedules", QJsonArray{periodic, nextMinute}}}, &status, &error);
+    check(status == 200, "periodic fixture save failed");
+    const int beforeTimer = frames.size();
+    DbStore::setConfig("online_v1_floor_schedule_last_minute", QStringLiteral(""));
+    QElapsedTimer waiting; waiting.start();
+    while (frames.size() == beforeTimer && waiting.elapsed() < 6500) QTest::qWait(25);
+    check(frames.size() == beforeTimer + 1, "independent Web timer did not execute without MQTT");
+    for (const auto &key : keys) {
+        if (backup.contains(key)) DbStore::setConfig(key, backup.value(key));
+        else DbStore::deleteConfig(key);
+    }
+    std::fprintf(stdout, "Independent Web scheduler checks passed: shared format, no MQTT link, offline timer logic, conflicts, mapping, persistence, deduplication\n");
+}
+
+/**
+ * @brief 验证本地人员、凭证、梯控与任务查询业务。
+ * Regression of local transactions, actual source adapters and MQTT-independent modes.
+ * @param service 隔离配置下的真实 Web 服务实例。
+ * @param root 受控根目录。
+ */
 void localBusiness(WebService &service, const QString &root)
 {
     const auto call =
@@ -747,7 +1064,7 @@ void localBusiness(WebService &service, const QString &root)
     rejects(501, [&] {
         call("device.airControl.set", {{"power", true}});
     });
-    rejects(501, [&] {
+    rejects(503, [&] {
         call("elevator.floorSchedule.set");
     });
     rejects(501, [&] {
@@ -942,6 +1259,27 @@ void localBusiness(WebService &service, const QString &root)
                      {{"videoType", "NONE"}, {"videoVolume", 33}, {"_key", "media-once"}});
     check(poll(task.value("operationId").toString()).value("state") == "APPLIED",
           "local media task failed");
+    task = data("device.videoControl", {{"videoType", "RECORDED"}, {"contentType", "IMAGE"}, {"smallImageMode", 1}, {"_key", "image-choice"}});
+    check(poll(task.value("operationId").toString()).value("state") == "APPLIED", "shared image selection failed");
+    check(MediaContentPolicy::contentType(Rk3566Platform::netConfigPath()) == "IMAGE" && MediaContentPolicy::smallImageMode(Rk3566Platform::netConfigPath()), "Web wrote different playback config");
+    MediaContentPolicy::saveSelection(Rk3566Platform::netConfigPath(), "VIDEO", false);
+    const auto shared = data("device.getPlayInfo");
+    check(shared.value("contentType") == "VIDEO" && shared.value("smallImageMode").toInt() == 0, "Web read stale selection after external write");
+    int scheduleCalls = 0;
+    WebFloorSchedule scheduler(&source, [](const QByteArray &, const QString &) { return true; });
+    runtime->bindFloorSchedule(&scheduler, [&](const QString &token, const QJsonObject &args) {
+        check(args.value("action") == "set" && args.value("data").toObject().contains("schedules"), "scheduler request lost data");
+        ++scheduleCalls;
+        int status = 200; QString error;
+        const auto result = scheduler.apply(args.value("action").toString(), args.value("data").toObject(), &status, &error);
+        runtime->complete(token, result, status, error);
+    });
+    check(data("device.capabilities").value("floorScheduleWrite").toBool(), "bound scheduler still disabled");
+    const QJsonObject scheduled{{"schedules", QJsonArray{}}, {"_key", "schedule-once"}};
+    task = data("elevator.floorSchedule.set", scheduled);
+    data("elevator.floorSchedule.set", scheduled);
+    check(poll(task.value("operationId").toString()).value("state") == "APPLIED" && scheduleCalls == 1, "scheduler request not dispatched exactly once");
+    runtime->bindFloorSchedule(nullptr, {});
     WebSql::execute("INSERT INTO web_accounts(id,username,salt,password_hash,iterations) SELECT "
                     "2,'other',salt,password_hash,iterations FROM web_accounts WHERE id=1");
     rejects(404, [&] {
@@ -1045,7 +1383,9 @@ void localBusiness(WebService &service, const QString &root)
 
 } // namespace
 
-/** @brief 原 U 盘覆盖层直接展示资源进度，且不发送 U 盘状态事件。 */
+/**
+ * @brief 原 U 盘覆盖层直接展示资源进度，且不发送 U 盘状态事件。
+ */
 void resourceDeviceProgress()
 {
     QWidget host;
@@ -1076,7 +1416,11 @@ void resourceDeviceProgress()
     check(host.grab().save("resource-device-progress.png"), "resource progress screenshot failed");
 }
 
-/** @brief 第二个目录发布失败时，前一个目录和备份均恢复，且不安排重启。 */
+/**
+ * @brief 第二个目录发布失败时，前一个目录和备份均恢复，且不安排重启。
+ * @param root 受控根目录。
+ * @param fixture 测试夹具文件路径。
+ */
 void resourceRollback(const QString &root, const QString &fixture)
 {
     const QString target = QDir(root).filePath("rollback-resources");
@@ -1111,7 +1455,12 @@ void resourceRollback(const QString &root, const QString &fixture)
     check(!QFileInfo::exists(record), "failed update scheduled restart");
 }
 
-/** @brief 真实资源上传经 Qt 白名单、异步解压、结果查询，核对未提供目录保留。 */
+/**
+ * @brief 真实资源上传经 Qt 白名单、异步解压、结果查询，核对未提供目录保留。
+ * @param service 隔离配置下的真实 Web 服务实例。
+ * @param root 受控根目录。
+ * @param fixture 测试夹具文件路径。
+ */
 void resourcePackageUpload(WebService &service, const QString &root, const QString &fixture)
 {
     QSignalSpy progress(WebLocalRuntime::instance(), &WebLocalRuntime::resourceProgress);
@@ -1216,6 +1565,12 @@ void resourcePackageUpload(WebService &service, const QString &root, const QStri
           "native resource progress did not cover extraction and completion");
 }
 
+/**
+ * @brief 初始化运行环境并执行模块主流程。
+ * @param argc 命令行参数个数。
+ * @param argv 命令行参数数组。
+ * @return 全部测试通过返回 0；断言或异常失败返回非零值。
+ */
 int main(int argc, char **argv)
 {
     qputenv("QT_QPA_PLATFORM", "offscreen");
@@ -1340,6 +1695,9 @@ int main(int argc, char **argv)
         videoUploadDevice(service);
         mediaDirectory(service, media);
         localBusiness(service, root);
+        sharedElevatorModes(service);
+        independentFloorSchedules();
+        advertisementImages(service, media);
         networkConfiguration(service, root);
         resourcePackageUpload(service, root, QString::fromLocal8Bit(argv[1]));
         resourceRollback(root, QString::fromLocal8Bit(argv[1]));

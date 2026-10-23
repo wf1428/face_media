@@ -224,6 +224,8 @@ signals:
     void liveStreamReady(const QString &url, const QString &kind);
     /** @brief FTP 下载配置已就绪。 */
     void ftpDownloadTaskReady();
+    /** @brief 本地媒体已删除，通知界面刷新缓存。 */
+    void playFileDeleted(const QString &fullPath);
 
     /** @brief 请求业务层捕获当前播放信息后发送响应。 */
     void getPlayInfoRequested(const QString &topic,

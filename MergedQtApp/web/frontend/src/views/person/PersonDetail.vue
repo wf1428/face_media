@@ -1,4 +1,9 @@
-<!-- @file PersonDetail.vue | 本地人员与标准分项凭证接口；不发送 MQTT。 -->
+<!--
+ @file PersonDetail.vue
+ @brief 本地人员与标准分项凭证、通行权限配置页面。
+ @author Du lin
+ @note 最近修改：2026-10-23；修改人：Du lin；凭证加载后先生成本地二维码预览，再等待人脸结果查询，避免慢查询延迟二维码显示；保留原权限保存及人脸查询流程。
+-->
 <template>
   <div class="page">
     <van-overlay :show="busy || saving || savingPerson" :z-index="3000"
@@ -114,7 +119,7 @@
         </div>
 
         <!-- 次数详情 -->
-        <div v-if="rules.count" class="rule-detail">
+        <div v-if="rules.count" class="rule-detail quota-count">
           <van-field
             v-model.number="rules.countDataAddCount"
             type="number"
@@ -126,40 +131,46 @@
             :label="$t('person.totalCount')"
             readonly
           />
+          <van-field :model-value="String(usage.remaining_count ?? 0)" :label="$t('person.remainingCount')" readonly />
+          <van-field :model-value="String(usage.access_count ?? 0)" :label="$t('person.usedCount')" readonly />
         </div>
 
         <!-- 金额详情 -->
-        <div v-if="rules.amount" class="rule-detail">
+        <div v-if="rules.amount" class="rule-detail quota-amount">
           <van-field
             v-model.number="rules.amountDataAddAmount"
             type="number"
+            :formatter="formatMoneyInput"
             :label="$t('person.perAdd')"
             placeholder="0.00"
           />
           <van-field
-            :model-value="String(rules.amountDataTotal)"
+            :model-value="formatMoney(rules.amountDataTotal)"
             :label="$t('person.totalAmount')"
             readonly
           />
+          <van-field :model-value="formatMoney(usage.remaining_amount)" :label="$t('person.remainingAmount')" readonly />
+          <van-field :model-value="formatMoney(usage.used_amount)" :label="$t('person.usedAmount')" readonly />
           <van-field
             v-model.number="rules.amountDataUnitPrice"
             type="number"
+            :formatter="formatMoneyInput"
             :label="$t('person.unitPrice')"
             placeholder="0.50"
           />
         </div>
 
         <!-- 期限详情 -->
-        <div v-if="rules.duration" class="rule-detail">
+        <div v-if="rules.duration" class="rule-detail duration-detail">
           <van-field
-            v-model="rules.durationDataStartTime"
+            :model-value="rules.durationDataStartTime"
             :label="$t('person.startTime')"
-            placeholder="YYYY-MM-DD HH:mm"
+            :placeholder="$t('common.notSet')" readonly is-link @click="openPassTime('durationStart')"
           />
           <van-field
-            v-model="rules.durationDataEndTime"
+            :model-value="rules.durationDataEndTime"
             :label="$t('person.endTime')"
-            placeholder="YYYY-MM-DD HH:mm"
+            :placeholder="$t('common.notSet')" readonly is-link @click="openPassTime('durationEnd')"
           />
         </div>
 
@@ -201,10 +212,10 @@
         </div>
 
         <!-- 密码通行详情 -->
-        <div v-if="rules.cardPassword" class="rule-detail">
+        <div v-if="rules.cardPassword" class="rule-detail password-detail">
           <van-field
             v-model="rules.cardPasswordDataPassword"
-            type="password"
+            type="text"
             :label="$t('person.passPassword')"
             :placeholder="$t('person.enterPassword')"
           />
@@ -360,13 +371,16 @@
             }}</van-checkbox>
           </van-checkbox-group>
         </div>
-        <van-field v-model="timingForm.start" :label="$t('common.start')" placeholder="HH:mm" />
-        <van-field v-model="timingForm.end" :label="$t('common.end')" placeholder="HH:mm" />
+        <van-field :model-value="timingForm.start" :label="$t('common.start')" readonly is-link @click="openPassTime('timingStart')" />
+        <van-field :model-value="timingForm.end" :label="$t('common.end')" readonly is-link @click="openPassTime('timingEnd')" />
         <van-button type="primary" block round @click="confirmTiming">{{
           $t('common.confirm')
         }}</van-button>
       </div>
     </van-popup>
+
+    <PassTimePicker v-model:show="showPassTime" v-model="passTimeValue" :title="passTimeTitle"
+      :date-time="passTimeTarget.startsWith('duration')" />
 
     <input
       ref="fileInput"
@@ -385,7 +399,8 @@ import { useI18n } from 'vue-i18n'
 import { showToast, showConfirmDialog, showImagePreview } from 'vant'
 import { api } from '../../api'
 import { compressImage } from '../../utils/imageCompress'
-import { generateQrDataUrl } from '../../utils/qr'
+import { generateQrDataUrl, credentialQrPayload } from '../../utils/qr'
+import PassTimePicker from '../../components/PassTimePicker.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -395,13 +410,18 @@ const id = Number(route.params.id)
 const person = ref(null)
 const cred = reactive({ icCards: [], faces: [], qrCodes: [], rules: {}, floors: [] })
 const rules = reactive({})
+/** @description 设备返回的实际余额和消费量，读取时不把增量命令作为余额。 */
+const usage = reactive({ remaining_count: 0, access_count: 0, remaining_amount: 0, used_amount: 0 })
 const saving = ref(false)
 const busy = ref(false)
 const personVersion = ref(0)
 
 // 默认规则（8 个功能开关 + 详情）
 
-/** @brief 创建规则表单的初始结构，随后由设备实际规则覆盖。 */
+/**
+ * @brief 创建规则表单的初始结构，随后由设备实际规则覆盖。
+ * @returns {object} 可供合并的独立默认规则对象。
+ */
 const defaultRules = () => ({
   time: false,
   timingRules: [],
@@ -458,6 +478,19 @@ const showFloor = ref(false)
 const floorSelected = ref([])
 const showTiming = ref(false)
 const timingForm = reactive({ days: [1], start: '09:00', end: '18:00' })
+const showPassTime = ref(false), passTimeTarget = ref('timingStart')
+/** @description 选择器确认后才写回对应时间草稿；关闭弹窗不修改原值。 */
+const passTimeValue = computed({
+  get: () => ({ timingStart: timingForm.start, timingEnd: timingForm.end,
+    durationStart: rules.durationDataStartTime, durationEnd: rules.durationDataEndTime })[passTimeTarget.value] || '',
+  set: (value) => {
+    if (passTimeTarget.value === 'timingStart') timingForm.start = value
+    else if (passTimeTarget.value === 'timingEnd') timingForm.end = value
+    else if (passTimeTarget.value === 'durationStart') rules.durationDataStartTime = value
+    else rules.durationDataEndTime = value
+  },
+})
+const passTimeTitle = computed(() => t(passTimeTarget.value.endsWith('Start') ? 'person.startTime' : 'person.endTime'))
 const fileInput = ref(null)
 const faceResults = ref([])
 const qrImageMap = ref({})
@@ -478,13 +511,23 @@ const floorOptions = [
   ...Array.from({ length: 120 }, (_, i) => i + 1),
 ]
 
-/** 楼层显示：负楼层 B，正楼层 n 楼（参数插值，随语言切换） */
+/**
+ * @brief 按当前语言生成地上或地下楼层标签。
+ * 楼层显示：负楼层 B，正楼层 n 楼（参数插值，随语言切换）
+ * @param {number} f 业务楼层号，地下层为负数。
+ * @returns {string} 按当前语言生成的楼层文案。
+ */
 function floorLabel(f) {
   if (f < 0) return t('common.floorBasement', { n: Math.abs(f) })
   return t('common.floorN', { n: f })
 }
 
-/** 定时规则文案：周(几) 时间段 */
+/**
+ * @brief 将人员规则中的星期和时间段组合为展示文本。
+ * 定时规则文案：周(几) 时间段
+ * @param {object} r 人员凭证中的星期与时段规则。
+ * @returns {string} 星期与时间段的本地化描述。
+ */
 function timingText(r) {
   const shortKeys = [
     'common.weekShort.mon',
@@ -503,31 +546,77 @@ function timingText(r) {
   return t('common.timingLine', { weeks, range })
 }
 
-/** @brief 并行读取本地人员与凭证，刷新规则、人脸结果和二维码预览。 */
+/**
+ * @brief 并行读取人员与凭证，先生成本地二维码，再查询人脸注册结果。
+ * @returns {Promise<void>} 查询及页面刷新完成；人员或凭证读取失败显示提示，人脸结果失败由其查询内部处理。
+ */
 async function load() {
   try {
     const { person: p, credential: c } = await api.personDetail({ id })
     person.value = p
-    personVersion.value = c.version
     cred.icCards = c.icCards || []
     cred.faces = c.faces || []
     cred.qrCodes = c.qrCodes || []
     cred.floors = c.floors || []
-    Object.assign(rules, defaultRules(), c.rules || {})
-    cred.rules = rules
-    await loadFaceRegister()
+    applyRulesSnapshot(c)
     loadQrImages()
+    await loadFaceRegister()
   } catch (error) {
     showToast(error.message || t('common.loadFailed'))
   }
 }
 
-/** @brief 响应用户操作，打开本地人脸图片选择器。 */
+/**
+ * 应用设备已保存的规则与用量；规则请求成功后立即清除充值增量，楼层失败后重试不会再充值。
+ * @param {object} credential 设备返回的规则、实际用量与编辑版本。
+ */
+function applyRulesSnapshot(credential) {
+  personVersion.value = credential.version
+  Object.assign(rules, defaultRules(), credential.rules || {}, { countDataAddCount: 0, amountDataAddAmount: 0 })
+  Object.assign(usage, { remaining_count: 0, access_count: 0, remaining_amount: 0, used_amount: 0 }, credential.usage || {})
+  cred.rules = rules
+}
+
+/**
+ * 打开与控梯相同的 Vant 滑动时间列；期限额外提供日期列。
+ * @param {string} target timingStart、timingEnd、durationStart 或 durationEnd。
+ */
+function openPassTime(target) {
+  if (busy.value || saving.value) return
+  passTimeTarget.value = target
+  showPassTime.value = true
+}
+
+/**
+ * 固定两位小数展示金额；空值或无效值展示 0.00，不修改实际余额。
+ * @param {number|string|null} value 设备返回的金额。
+ * @returns {string} 两位小数的只读显示文本。
+ */
+function formatMoney(value) {
+  const number = Number(value)
+  return (Number.isFinite(number) ? number : 0).toFixed(2)
+}
+
+/**
+ * 保留非负十进制金额输入的前两位小数，不允许负号或指数输入。
+ * @param {string} value 输入控件的当前文本。
+ * @returns {string} 可继续编辑的金额文本，允许尚未输入完整的小数点。
+ */
+function formatMoneyInput(value) {
+  return String(value).match(/^\d*(?:\.\d{0,2})?/)?.[0] || ''
+}
+
+/**
+ * @brief 响应用户操作，打开本地人脸图片选择器。
+ */
 function chooseFace() {
   fileInput.value && fileInput.value.click()
 }
 
-/** @brief 压缩单张图片并提交本地人脸任务，完成后刷新凭证。 */
+/**
+ * @brief 压缩单张图片并提交本地人脸任务，完成后刷新凭证。
+ * @param {Event} e 文件输入控件的变更事件。
+ */
 async function onFaceFile(e) {
   const file = e.target.files?.[0]
   e.target.value = ''
@@ -553,7 +642,11 @@ async function onFaceFile(e) {
 
 // 人脸注册结果：按 faceBase64 匹配（真实场景由 QT 将 Imagesresult 映射为每张人脸结果）
 
-/** @brief 按本地 faceId 优先匹配注册结果，未完成项保持等待状态。 */
+/**
+ * @brief 按本地 faceId 优先匹配注册结果，未完成项保持等待状态。
+ * @param {object} f 人脸凭证条目，包含 faceId 和图片数据。
+ * @returns {object} 包含提示类型、状态文本及失败说明的展示结果。
+ */
 function faceStatus(f) {
   const r = faceResults.value.find(
     (x) => (f.faceId && x.faceId === f.faceId) || x.faceBase64 === f.faceBase64,
@@ -567,12 +660,17 @@ function faceStatus(f) {
   }
 }
 
-/** @brief 预览当前凭证中的实际人脸图片。 */
+/**
+ * @brief 预览当前凭证中的实际人脸图片。
+ * @param {object} f 人脸凭证条目，包含 faceId 和图片数据。
+ */
 function previewFace(f) {
   if (f.faceBase64) showImagePreview([f.faceBase64])
 }
 
-/** @brief 读取本地人脸任务结果，查询失败不覆盖人员资料。 */
+/**
+ * @brief 读取本地人脸任务结果，查询失败不覆盖人员资料。
+ */
 async function loadFaceRegister() {
   try {
     const r = await api.faceRegisterResult({ id })
@@ -583,7 +681,11 @@ async function loadFaceRegister() {
   }
 }
 
-/** @brief 确认后按子项类型与人员版本撤销指定凭证。 */
+/**
+ * @brief 确认后按子项类型与人员版本撤销指定凭证。
+ * @param {string} key 凭证数组键，如 icCards、faces 或 qrCodes。
+ * @param {number} index 待操作项的数组索引。
+ */
 async function removeItem(key, index) {
   if (busy.value) return
   const item = cred[key][index]
@@ -604,14 +706,18 @@ async function removeItem(key, index) {
   }
 }
 
-/** @brief 清空录卡表单并打开对话框。 */
+/**
+ * @brief 清空录卡表单并打开对话框。
+ */
 function openCard() {
   cardForm.name = ''
   cardForm.cardId = ''
   showCard.value = true
 }
 
-/** @brief 提交单张门禁卡并刷新本地凭证列表。 */
+/**
+ * @brief 提交单张门禁卡并刷新本地凭证列表。
+ */
 async function addCard() {
   if (!cardForm.cardId || busy.value) {
     showToast(t('person.enterCardNo'))
@@ -634,14 +740,18 @@ async function addCard() {
   }
 }
 
-/** @brief 初始化二维码类型和名称草稿。 */
+/**
+ * @brief 初始化二维码类型和名称草稿。
+ */
 function openQr() {
   qrForm.name = ''
   qrForm.qrType = 'QR_STANDALONE'
   showQr.value = true
 }
 
-/** @brief 生成二维码编号并提交所选类型及访客截止时间。 */
+/**
+ * @brief 生成二维码编号并提交所选类型及访客截止时间。
+ */
 async function addQr() {
   if (busy.value) return
   const bytes = new Uint32Array(1)
@@ -673,45 +783,62 @@ async function addQr() {
 
 // 按 qrUnique 生成二维码缩略图
 
-/** @brief 按设备返回的二维码编号生成本地预览图。 */
+/**
+ * @brief 将原二维码编号包装为设备接受的 qrCode JSON 后生成预览图。
+ * @param {object} q 二维码凭证数据。
+ */
 async function genQr(q) {
   if (!q.qrUnique) return
   try {
-    qrImageMap.value[q.qrUnique] = await generateQrDataUrl(q.qrUnique)
+    qrImageMap.value[q.qrUnique] = await generateQrDataUrl(credentialQrPayload(q.qrUnique))
   } catch (e) {
     // 生成失败保持占位图标
   }
 }
 
-/** @brief 为已保存二维码补齐页面预览图。 */
+/**
+ * @brief 为已保存二维码补齐页面预览图。
+ */
 function loadQrImages() {
   cred.qrCodes.forEach((q) => genQr(q))
 }
 
-/** @brief 打开当前二维码的图片预览。 */
+/**
+ * @brief 打开当前二维码的图片预览。
+ * @param {object} q 二维码凭证数据。
+ */
 function previewQr(q) {
   const src = qrImageMap.value[q.qrUnique]
   if (src) showImagePreview([src])
 }
 
-/** @brief 从实际楼层集合创建独立的选择草稿。 */
+/**
+ * @brief 从实际楼层集合创建独立的选择草稿。
+ */
 function openFloorPicker() {
   floorSelected.value = [...(cred.floors || [])]
   showFloor.value = true
 }
 
-/** @brief 在楼层选择草稿中全选或清空。 */
+/**
+ * @brief 在楼层选择草稿中全选或清空。
+ * @param {boolean} checked 是否选中全部可用楼层。
+ */
 function toggleAll(checked) {
   floorSelected.value = checked ? [...floorOptions] : []
 }
 
-/** @brief 将已选楼层排序后写回待提交表单。 */
+/**
+ * @brief 将已选楼层排序后写回待提交表单。
+ */
 function confirmFloor() {
   cred.floors = [...floorSelected.value].sort((a, b) => a - b)
   showFloor.value = false
 }
 
-/** @brief 初始化通行时段编辑表单。 */
+/**
+ * @brief 初始化通行时段编辑表单。
+ */
 function openTiming() {
   timingForm.days = [1]
   timingForm.start = '09:00'
@@ -719,7 +846,9 @@ function openTiming() {
   showTiming.value = true
 }
 
-/** @brief 校验星期选择后把通行时段加入规则草稿。 */
+/**
+ * @brief 校验星期选择后把通行时段加入规则草稿。
+ */
 function confirmTiming() {
   if (!timingForm.days.length) {
     showToast(t('person.selectWeekday'))
@@ -732,7 +861,9 @@ function confirmTiming() {
   showTiming.value = false
 }
 
-/** @brief 依次保存规则与楼层，区分全部完成和部分保存失败。 */
+/**
+ * @brief 依次保存规则与楼层，规则成功即刷新总额度和余额并清除充值命令，保留楼层草稿。
+ */
 async function save() {
   if (saving.value || busy.value) return
   saving.value = true
@@ -744,7 +875,7 @@ async function save() {
       extra: { rules: JSON.parse(JSON.stringify(rules)) },
     })
     rulesSaved = true
-    personVersion.value = c.version
+    applyRulesSnapshot(c)
     await api.personFloorSave({ personId: id, version: c.version, floor: [...cred.floors] })
     showToast(t('common.saved'))
     await load()
@@ -755,7 +886,9 @@ async function save() {
   }
 }
 
-/** @brief 确认后按当前版本软删除人员并退出详情页。 */
+/**
+ * @brief 确认后按当前版本软删除人员并退出详情页。
+ */
 async function onDeletePerson() {
   try {
     await showConfirmDialog({
@@ -770,7 +903,9 @@ async function onDeletePerson() {
   }
 }
 
-/** @brief 从人员实际资料填充编辑表单。 */
+/**
+ * @brief 从人员实际资料填充编辑表单。
+ */
 function openEditPerson() {
   personForm.name = person.value.name || ''
   personForm.employeeNo = person.value.employeeNo || ''
@@ -781,7 +916,9 @@ function openEditPerson() {
   showEditPerson.value = true
 }
 
-/** @brief 按当前版本提交基本资料，成功后重新读取设备状态。 */
+/**
+ * @brief 按当前版本提交基本资料，成功后重新读取设备状态。
+ */
 async function savePerson() {
   if (!personForm.name || savingPerson.value) return
   savingPerson.value = true

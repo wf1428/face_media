@@ -192,69 +192,107 @@ const showPlanTime = ref(false)
 const planTimeTarget = ref('timeOn')
 const planTimeValue = ref(['08', '00'])
 
-/** @brief 空调状态文案（渲染时按当前语言取值） */
+/**
+ * @brief 空调状态文案（渲染时按当前语言取值）
+ * @param {string} status 页面空调状态值。
+ * @returns {string} 当前语言的空调状态文本，未知状态显示占位符。
+ */
 function statusTextOf(status) {
   const keyMap = { running: 'air.running', standby: 'air.standby', off: 'air.off' }
   return keyMap[status] ? t(keyMap[status]) : '—'
 }
 
-/** @brief 保留空调状态加载入口；当前版本不接入控制业务。 */
+/**
+ * @brief 保留空调状态加载入口；当前版本不接入控制业务。
+ */
 async function load() {
   /* 本版本仅保留控件，业务处理未接入。 */
 }
 
-/** @brief 切换即下发 */
+/**
+ * @brief 保留空调补丁提交入口，当前版本未接入实际执行。
+ * @param {object} patch 预留的空调状态补丁，当前版本不发送。
+ */
 async function commit(patch) {
   /* 本版本仅保留控件，业务处理未接入。 */
 }
 
-/** @brief 保留空调开关操作入口；当前版本不下发命令。 */
+/**
+ * @brief 保留空调开关操作入口；当前版本不下发命令。
+ * @param {boolean} v 开关目标状态；当前空调入口未接入实际执行。
+ */
 function setAirOn(v) {
   /* 本版本仅保留控件，业务处理未接入。 */
 }
 
-/** @brief 保留温度步进操作入口；当前版本不下发命令。 */
+/**
+ * @brief 保留温度步进操作入口；当前版本不下发命令。
+ * @param {number} d 温度调整增量；当前入口未接入实际执行。
+ */
 function stepTemp(d) {
   /* 本版本仅保留控件，业务处理未接入。 */
 }
 
-/** @brief 保留空调模式选择入口；当前版本不下发命令。 */
+/**
+ * @brief 保留空调模式选择入口；当前版本不下发命令。
+ * @param {string} m 目标空调模式；当前入口未接入实际执行。
+ */
 function setMode(m) {
   /* 本版本仅保留控件，业务处理未接入。 */
 }
 
-/** @brief 保留风速选择入口；当前版本不下发命令。 */
+/**
+ * @brief 保留风速选择入口；当前版本不下发命令。
+ * @param {string} f 目标风速；当前入口未接入实际执行。
+ */
 function setFun(f) {
   /* 本版本仅保留控件，业务处理未接入。 */
 }
 
-/** @brief 保留循环方式选择入口；当前版本不下发命令。 */
+/**
+ * @brief 保留循环方式选择入口；当前版本不下发命令。
+ * @param {boolean} v 开关目标状态；当前空调入口未接入实际执行。
+ */
 function setLoop(v) {
   /* 本版本仅保留控件，业务处理未接入。 */
 }
 
-/** @brief 将定时计划转换为页面显示文本。 */
+/**
+ * @brief 将定时计划转换为页面显示文本。
+ * @param {object} p 当前人员记录或页面定时计划。
+ * @returns {string} 计划起止时间文本，未设置时返回占位提示。
+ */
 function planValue(p) {
   if (!p || p.timeOn === 'null' || p.timeOFF === 'null') return t('common.notSet')
   return `${p.timeOn} ~ ${p.timeOFF}`
 }
 
-/** @brief 保留定时计划编辑入口；当前版本不接入。 */
+/**
+ * @brief 保留定时计划编辑入口；当前版本不接入。
+ * @param {string} w 待编辑的计划名称。
+ */
 function openPlan(w) {
   /* 本版本仅保留控件，业务处理未接入。 */
 }
 
-/** @brief 保留定时时间选择入口；当前版本不接入。 */
+/**
+ * @brief 保留定时时间选择入口；当前版本不接入。
+ * @param {string} target 待编辑的时间字段或计划字段名称。
+ */
 function openPlanTime(target) {
   /* 本版本仅保留控件，业务处理未接入。 */
 }
 
-/** @brief 保留定时时间确认入口；当前版本不接入。 */
+/**
+ * @brief 保留定时时间确认入口；当前版本不接入。
+ */
 function confirmPlanTime() {
   /* 本版本仅保留控件，业务处理未接入。 */
 }
 
-/** @brief 保留定时计划保存入口；当前版本不下发命令。 */
+/**
+ * @brief 保留定时计划保存入口；当前版本不下发命令。
+ */
 async function savePlan() {
   /* 本版本仅保留控件，业务处理未接入。 */
 }

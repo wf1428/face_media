@@ -1,3 +1,6 @@
+## @file resource_package_check.py
+# @brief 开发机造包并执行真实 Qt/C++ 更新测试；不在设备运行，不实现解压业务。
+
 """@file resource_package_check.py
 @brief 开发机造包并执行真实 Qt/C++ 更新测试；不在设备运行，不实现解压业务。
 @author Du lin
@@ -42,9 +45,19 @@ if os.name == "nt":
     )
 
 
+## @brief 独立构造 RAR4 路径/链接边界样本，不包含任何生产解码逻辑。
+# @param name 归档成员名称。
+# @param body 归档成员的原始内容字节。
+# @param attributes 测试归档成员的权限与文件类型标志。
+# @return 构造的 RAR4 归档字节。
 def rar4_stored(name, body, attributes=stat.S_IFREG | 0o644):
     """独立构造 RAR4 路径/链接边界样本，不包含任何生产解码逻辑。"""
 
+    ## @brief 计算样本头 CRC16。
+    # @param kind RAR4 测试块类型。
+    # @param flags RAR4 测试块标志位。
+    # @param payload 测试块原始数据。
+    # @return 附带 CRC16 的测试块字节。
     def block(kind, flags, payload):
         """计算样本头 CRC16。"""
         header = struct.pack("<BHH", kind, flags, len(payload) + 7) + payload
@@ -72,9 +85,11 @@ def rar4_stored(name, body, attributes=stat.S_IFREG | 0o644):
     )
 
 
+## @brief 所有删除/替换均由生产 C++ 在明确的隔离临时目录执行。
 class ResourcePackages(unittest.TestCase):
     """所有删除/替换均由生产 C++ 在明确的隔离临时目录执行。"""
 
+    ## @brief 准备独立设备资源目录，避免接触实际系统资源。
     def setUp(self):
         """准备独立设备资源目录，避免接触实际系统资源。"""
         self.temporary = tempfile.TemporaryDirectory(dir=str(BUILD))
@@ -87,12 +102,17 @@ class ResourcePackages(unittest.TestCase):
             (self.root / name / "old.txt").write_text(name)
         self.archive, self.result = self.base / "upload.part", self.base / "result.json"
 
+    ## @brief ZIP 文件名和内容完全由测试数据控制。
+    # @param entries 归档路径到内容字节的映射。
     def package(self, entries):
         """ZIP 文件名和内容完全由测试数据控制。"""
         with zipfile.ZipFile(str(self.archive), "w", zipfile.ZIP_DEFLATED) as package:
             for name, body in entries.items():
                 package.writestr(name, body)
 
+    ## @brief 调用 Qt 测试入口；其中直接运行正式 WebResourceUpdate::execute。
+    # @param recovery 为 true 时运行真实 Qt 目录恢复入口。
+    # @return Qt 测试入口输出的实际结果 JSON。
     def run_qt(self, recovery=False):
         """调用 Qt 测试入口；其中直接运行正式 WebResourceUpdate::execute。"""
         process = subprocess.run(
@@ -114,11 +134,13 @@ class ResourcePackages(unittest.TestCase):
         self.assertEqual(result["state"] == "READY", process.returncode == 0, result)
         return result
 
+    ## @brief 逐个核对旧资源，避免只检查接口状态而遗漏误删除。
     def unchanged(self):
         """逐个核对旧资源，避免只检查接口状态而遗漏误删除。"""
         for name in ("logo", "pic", "tl", "video"):
             self.assertEqual((self.root / name / "old.txt").read_text(), name)
 
+    ## @brief 替换提供的 logo 并新增目录，缺失的三个目录保持原样。
     def test_selective_replacement(self):
         """替换提供的 logo 并新增目录，缺失的三个目录保持原样。"""
         self.package(
@@ -142,6 +164,7 @@ class ResourcePackages(unittest.TestCase):
         self.assertFalse((self.root / "Ycest").exists())
         self.assertFalse((self.root / ".ycest-update").exists())
 
+    ## @brief TAR.GZ 的空目录和视频子目录同样按一级目录替换。
     def test_tar_gz_and_empty_directory(self):
         """TAR.GZ 的空目录和视频子目录同样按一级目录替换。"""
         with tarfile.open(str(self.archive), "w:gz") as package:
@@ -156,6 +179,7 @@ class ResourcePackages(unittest.TestCase):
         self.assertEqual((self.root / "video/nested/new.mp4").read_bytes(), b"video")
         self.assertTrue((self.root / "logo/old.txt").exists())
 
+    ## @brief 实际压缩的 RAR4/RAR5/固实包支持中文和空目录。
     def test_real_rar_formats(self):
         """实际压缩的 RAR4/RAR5/固实包支持中文和空目录。"""
         for name in ("ycest-rar4.rar", "ycest-rar5.rar", "ycest-rar5-solid.rar"):
@@ -171,6 +195,7 @@ class ResourcePackages(unittest.TestCase):
                 self.assertFalse((self.root / "logo/old.txt").exists())
                 self.assertTrue((self.root / "logo/empty").is_dir())
 
+    ## @brief 坏路径、错误根目录和根层文件都在正式目录替换前拒绝。
     def test_invalid_paths_and_roots(self):
         """坏路径、错误根目录和根层文件都在正式目录替换前拒绝。"""
         for name in (
@@ -185,6 +210,7 @@ class ResourcePackages(unittest.TestCase):
                 self.assertEqual(self.run_qt()["state"], "FAILED")
                 self.unchanged()
 
+    ## @brief ZIP 符号链接、TAR 硬链接、RAR 链接都不能发布。
     def test_links_rejected(self):
         """ZIP 符号链接、TAR 硬链接、RAR 链接都不能发布。"""
         member = zipfile.ZipInfo("Ycest/logo/link")
@@ -204,6 +230,7 @@ class ResourcePackages(unittest.TestCase):
         self.assertEqual(self.run_qt()["state"], "FAILED")
         self.unchanged()
 
+    ## @brief 加密或损坏 RAR 不会触发重启。
     def test_encrypted_and_corrupt_rar(self):
         """加密或损坏 RAR 不会触发重启。"""
         for name in ("ycest-rar5-password.rar", "ycest-rar5.rar"):
@@ -215,6 +242,7 @@ class ResourcePackages(unittest.TestCase):
             self.assertFalse((self.base / "restart.log").exists())
             self.unchanged()
 
+    ## @brief 不完整包和重名条目不得误报成功。
     def test_duplicate_paths_and_corrupt_data(self):
         """不完整包和重名条目不得误报成功。"""
         self.archive.write_bytes(b"not an archive")
@@ -225,12 +253,16 @@ class ResourcePackages(unittest.TestCase):
         self.assertEqual(self.run_qt()["state"], "FAILED")
         self.unchanged()
 
+    ## @brief 非寻址写入的普通 ZIP 也可更新，不能依赖本地头预先填写长度。
     def test_zip_data_descriptor(self):
         """非寻址写入的普通 ZIP 也可更新，不能依赖本地头预先填写长度。"""
 
+        ## @brief 强制 zipfile 使用 data descriptor。
         class Streaming(io.BytesIO):
             """强制 zipfile 使用 data descriptor。"""
 
+            ## @brief 模拟手机或网络流无法回填 ZIP 头的写入环境。
+            # @param args 传给固定测试程序的独立参数。
             def seek(self, *args):
                 """模拟手机或网络流无法回填 ZIP 头的写入环境。"""
                 raise io.UnsupportedOperation()
@@ -242,6 +274,7 @@ class ResourcePackages(unittest.TestCase):
         result = self.run_qt()
         self.assertEqual(result["state"], "READY", result)
 
+    ## @brief 超大声明长度不会真的分配 2 GiB，也不会清理原资源。
     def test_expansion_limit(self):
         """超大声明长度不会真的分配 2 GiB，也不会清理原资源。"""
         entry = tarfile.TarInfo("Ycest/logo/oversized.bin")
@@ -250,6 +283,7 @@ class ResourcePackages(unittest.TestCase):
         self.assertEqual(self.run_qt()["state"], "FAILED")
         self.unchanged()
 
+    ## @brief 兼容旧事务日志，启动恢复只回滚，不重新解压或安排重启。
     def test_interrupted_recovery(self):
         """兼容旧事务日志，启动恢复只回滚，不重新解压或安排重启。"""
         work = self.root / ".ycest-update"
@@ -270,6 +304,7 @@ class ResourcePackages(unittest.TestCase):
         self.unchanged()
         self.assertFalse((self.base / "restart.log").exists())
 
+    ## @brief 文件提交后 Qt 尚未登记时，只登记结果，不回滚已提交更新。
     def test_committed_recovery(self):
         """文件提交后 Qt 尚未登记时，只登记结果，不回滚已提交更新。"""
         work = self.root / ".ycest-update"
@@ -291,6 +326,7 @@ class ResourcePackages(unittest.TestCase):
         self.assertFalse((self.base / "restart.log").exists())
 
 
+## @brief 为 Qt 上传及回滚集成测试造包；设备不部署这个测试脚本。
 def fixtures():
     """为 Qt 上传及回滚集成测试造包；设备不部署这个测试脚本。"""
     directory = ROOT / ".web-build/fixtures"

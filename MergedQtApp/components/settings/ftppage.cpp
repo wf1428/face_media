@@ -7,6 +7,7 @@
  */
 
 #include "ftppage.h"
+#include "common/media_content_policy.h"
 #include <QResizeEvent>
 
 #include <QRegularExpression>
@@ -1207,7 +1208,7 @@ static bool looksLikeFileSegment(const QString& name)
     const QString ext = name.mid(dotPos + 1).toLower();
     static const QSet<QString> kKnownFileExts = {
         "mp4","MP4","avi","AVI","mov","MOV","mkv","MKV","wmv","WMV","flv","FLV","ts","TS","mpg","MPG","m3u8",
-        "jpg","jpeg","png","bmp",
+        "jpg","jpeg","png","bmp","gif","webp","tif","tiff",
         "txt","json","ini","cfg","log","bin","zip"
     };
     return kKnownFileExts.contains(ext);
@@ -2336,6 +2337,8 @@ void FtpPage::handleAutoDownloadPreflightFinished(int exitCode, QProcess::ExitSt
         setStatusText(QStringLiteral("文件已存在，无需重复下载"));
         showToast(QStringLiteral("文件已存在，无需重复下载"), 3000);
         appendLog(reason);
+        // 已有资源同样需要按新下发的广告类型和小图目录刷新播放。
+        emit localFileDownloaded(localPath);
         emit ftpDownloadAlreadyExists(localPath, reason);
         return;
     }
@@ -2457,7 +2460,11 @@ void FtpPage::startAutoDownloadFromConfig()
         return;
     }
 
-    QString localDir = Rk3566Platform::videoDir();
+    const bool smallPicture = MediaContentPolicy::isImage(remotePath) &&
+            MediaContentPolicy::smallImageMode(cfgPath);
+    QString localDir = smallPicture
+            ? MediaContentPolicy::pictureDir(Rk3566Platform::staticRoot())
+            : Rk3566Platform::videoDir();
     localDir = normalizeLocalDirPath(localDir, remotePath);
     if (localDir.isEmpty()) {
         const QString reason = QStringLiteral("自动下载失败：固定 local_dir 非法");

@@ -1,3 +1,6 @@
+## @file make_fixture.py
+# @brief 使用标准 ZIP/XML 生成原 Qt 模板字段的 Excel 测试输入，不依赖 Excel 软件。
+
 """
 @file make_fixture.py
 @brief 使用标准 ZIP/XML 生成原 Qt 模板字段的 Excel 测试输入，不依赖 Excel 软件。
@@ -11,6 +14,8 @@ import sys
 import zipfile
 
 
+## @brief 生成有效行、文件内重复账号、无效手机号和示例行混合的 XLSX。
+# @param path 待生成的夹具路径或相对于隔离服务的请求路径。
 def create(path: Path) -> None:
     """生成有效行、文件内重复账号、无效手机号和示例行混合的 XLSX。"""
     # 列顺序与 Qt 的本地人员 Excel 模板保持一致。

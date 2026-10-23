@@ -5,18 +5,21 @@
 # @date 2026-10-16
 
 set -eu
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-. "${PORTAL_ENV:-$SCRIPT_DIR/portal.env}"
-NETWORK="$SCRIPT_DIR/portal-network.sh"
+
+# 管理脚本统一安装在 /usr/local/sbin，配置仍保留原部署目录。
+. "${PORTAL_ENV:-/home/cat/web-stage/portal.env}"
+NETWORK=/usr/local/sbin/portal-network.sh
 WEB_PID=
 PREPARING=0
 
 # @brief 按脚本来源输出一条控制台日志。
+# @param ... 日志文本，按原样连接后输出单行。
 log() {
     printf '%s\n' "[device-web-start] $*"
 }
 
 # @brief 核对实际 Qt PID、Unix socket 和设备身份就绪文件。
+# @return socket、Qt PID 和身份标记均就绪时返回 0，否则非 0。
 qt_ready() {
     [ -S "$QT_SOCKET" ] && [ -f "$QT_READY_FILE" ] || return 1
     pid=$(sed -n '1p' "$QT_READY_FILE")

@@ -15,7 +15,11 @@
 #include <sys/stat.h>
 #endif
 
-/** @brief 为设备视频路径生成稳定的文件标识。 */
+/**
+ * @brief 为设备视频路径生成稳定的文件标识。
+ * @param path 待访问的文件或配置路径。
+ * @return 基于路径与文件版本信息生成的文件标识。
+ */
 QString WebMedia::fileId(const QString &path)
 {
     const QFileInfo file(path);
@@ -36,7 +40,11 @@ QString WebMedia::fileId(const QString &path)
         QCryptographicHash::hash(identity, QCryptographicHash::Sha256).toHex());
 }
 
-/** @brief 登记已发布视频及其上传任务。 */
+/**
+ * @brief 登记已发布视频及其上传任务。
+ * @param path 待访问的文件或配置路径。
+ * @param uploadId 关联上传任务标识；可空时表示目录扫描发现的文件。
+ */
 void WebMedia::index(const QString &path, const QString &uploadId)
 {
     const QFileInfo file(path);
@@ -56,7 +64,11 @@ void WebMedia::index(const QString &path, const QString &uploadId)
          file.lastModified().toMSecsSinceEpoch()});
 }
 
-/** @brief 按文件标识读取视频索引。 */
+/**
+ * @brief 按文件标识读取视频索引。
+ * @param id 目标记录或任务的标识。
+ * @return 匹配标识的媒体版本记录；不存在时抛出 WebError。
+ */
 QVariantMap WebMedia::get(const QString &id)
 {
     const auto rows =
@@ -68,13 +80,19 @@ QVariantMap WebMedia::get(const QString &id)
     return rows.first();
 }
 
-/** @brief 标记视频删除操作开始。 */
+/**
+ * @brief 标记视频删除操作开始。
+ * @param id 目标记录或任务的标识。
+ */
 void WebMedia::deleting(const QString &id)
 {
     WebSql::execute(QStringLiteral("UPDATE web_media_files SET state='DELETING' WHERE id=?"), {id});
 }
 
-/** @brief 移除已删除视频的索引。 */
+/**
+ * @brief 移除已删除视频的索引。
+ * @param id 目标记录或任务的标识。
+ */
 void WebMedia::removed(const QString &id)
 {
     WebSql::execute(QStringLiteral("DELETE FROM web_media_files WHERE id=?"), {id});

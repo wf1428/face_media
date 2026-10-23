@@ -6,29 +6,36 @@
 
 set -eu
 export LC_ALL=C
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-. "${PORTAL_ENV:-$SCRIPT_DIR/portal.env}"
+
+# 脚本迁入 /usr/local/sbin，继续读取原配置并保留测试/部署覆盖入口。
+. "${PORTAL_ENV:-/home/cat/web-stage/portal.env}"
 : "${PORTAL_RUNTIME:=/run/device-webd}"
 AP_IP=${AP_ADDRESS%/*}
 RULE_TAG=yc-device-portal
 
 # @brief 按脚本来源输出一条控制台日志。
+# @param ... 日志文本，按原样连接后输出单行。
 log() {
     printf '%s\n' "[portal-network] $*" >&2
 }
 
 # @brief 对 NetworkManager 命令设置统一等待与总超时上限。
+# @param ... 传递给 nmcli 的独立参数。
+# @return 固定超时内的 nmcli 退出码。
 nm() {
     timeout 20 nmcli --wait 15 --escape no "$@"
 }
 
 # @brief 读取原始 UTF-8 SSID，避免 C 字符集将中文转换为问号。
+# @return 成功时返回 0 并将原始 UTF-8 SSID 写到标准输出。
 read_ssid() {
     LC_ALL=C.UTF-8 timeout 20 nmcli --wait 15 --escape no \
         -g 802-11-wireless.ssid connection show id "$AP_CONNECTION"
 }
 
 # @brief 校验 WPA-PSK 密码，空值只允许由调用方解释为保持原密码。
+# @param password 第一个位置参数，待校验的 WPA-PSK 密码。
+# @return 合法的 8~63 字节可打印密码或 64 位十六进制 PSK 返回 0。
 validate_password() {
     case "$1" in *[!\ -~]*) return 1 ;; esac
     length=${#1}
@@ -40,12 +47,15 @@ validate_password() {
 }
 
 # @brief 限制实际网卡名称的字符和长度，防止无效设备名进入命令。
+# @param interface 第一个位置参数，候选网卡名。
+# @return 字符与长度均合法时返回 0。
 valid_interface() {
     case "$1" in '' | *[!a-zA-Z0-9_.-]*) return 1 ;; esac
     [ "${#1}" -le 15 ]
 }
 
 # @brief 读取本门户记录的实际网卡，并再次校验名称。
+# @return 已记录网卡存在且名称合法时返回 0，并设置脚本内 iface。
 read_interface() {
     [ -f "$PORTAL_RUNTIME/interface" ] || return 1
     IFS= read -r iface < "$PORTAL_RUNTIME/interface"
@@ -53,16 +63,19 @@ read_interface() {
 }
 
 # @brief 检查配置的专用 NetworkManager 连接是否存在。
+# @return 配置的专用连接存在时返回 0。
 profile_exists() {
     nm -g connection.id connection show id "$AP_CONNECTION" > /dev/null 2>&1
 }
 
 # @brief 确认同名连接属于无线网络类型。
+# @return 专用连接是 Wi-Fi 类型时返回 0。
 profile_is_wifi() {
     [ "$(nm -g connection.type connection show id "$AP_CONNECTION" 2> /dev/null)" = 802-11-wireless ]
 }
 
 # @brief 核对专用连接及实际网卡是否已取得配置的热点地址。
+# @return 专用连接已激活且包含目标热点地址时返回 0。
 active() {
     read_interface || return 1
     [ "$(nm -g GENERAL.CONNECTION device show "$iface" 2> /dev/null)" = "$AP_CONNECTION" ] \
@@ -84,6 +97,7 @@ tools() {
 }
 
 # @brief 选择空闲、受管理且支持 AP 的实际无线接口。
+# @return 找到可用网卡时返回 0 并输出名称；无可用网卡返回非 0。
 detect() {
     tools || return 1
     [ "$(nm radio wifi 2> /dev/null)" = enabled ] || {
@@ -145,6 +159,8 @@ write_dns() {
 }
 
 # @brief 为直接调用脚本的路径校验 SSID 字节数与控制字符。
+# @param ssid 第一个位置参数，待校验的 UTF-8 名称。
+# @return 名称为 1~32 字节且无控制字符、首尾空格时返回 0。
 validate_ssid() {
     [ -n "$1" ] && [ "$(printf '%s' "$1" | wc -c)" -le 32 ] || return 1
     # Qt also validates UTF-8 length and whitespace. This protects direct helper calls.
@@ -153,6 +169,7 @@ validate_ssid() {
 }
 
 # @brief 校验接口、网段和配置后建立专用共享热点，并落实隔离规则。
+# @return 专用热点准备成功返回 0；无候选网卡返回 10，其余失败为非 0。
 prepare() {
     iface=$(detect) || return 10
     install -d -m 0750 "$PORTAL_RUNTIME"
@@ -218,6 +235,8 @@ prepare() {
 }
 
 # @brief 保存 SSID 和可选新密码；持久化失败时恢复原连接设置。
+# @param ssid 第一个位置参数，新热点名称；密码由标准输入传入。
+# @return 配置及重载请求按既有脚本路径成功时返回 0。
 save_ssid() {
     ssid=$1
     validate_ssid "$ssid" || {

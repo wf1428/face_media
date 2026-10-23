@@ -51,9 +51,9 @@ online_v1 使用“一条下行主题 + 一条上行主题”，以 JSON `method
 
 | method | 方向 | 设备是否回消息 | 说明 |
 |---|---|---:|---|
-| `getPlayFileList` | 下行 | 是：`sendPlayFileList` | 查询本地视频列表 |
+| `getPlayFileList` | 下行 | 是：`sendPlayFileList` | 查询本地视频和图片列表 |
 | `getPlayInfo` | 下行 | 是：`sendPlayInfo` | 查询当前播放状态与截图 |
-| `deletePlayFile` | 下行 | **否** | 删除本地视频 |
+| `deletePlayFile` | 下行 | **否** | 按文件列表 name/id 删除本地视频或图片 |
 | `videoControl` | 下行/上行 | 是：同 method | 控制直播、录播、停止、音量；也用于本地音量主动同步 |
 | `linuxReboot` | 下行 | 是：同 method | 回执后约 1 秒重启设备 |
 | `floorLimit` | 下行 | 是：同 method | 设置一个或多个楼层开放/限行状态并下发分层板 |
@@ -83,7 +83,7 @@ online_v1 使用“一条下行主题 + 一条上行主题”，以 JSON `method
 
 ## 3. 多媒体与系统接口
 
-### 3.1 查询本地视频列表
+### 3.1 查询本地视频和图片列表
 
 下行 `getPlayFileList`：
 
@@ -114,7 +114,7 @@ online_v1 使用“一条下行主题 + 一条上行主题”，以 JSON `method
 }
 ```
 
-`name` 是不带扩展名的文件基本名；`id` 是按本次目录扫描结果从 1 临时编号，不是稳定资源 ID。设备扫描的扩展名为 `mp4/avi/mov/mkv/ts/flv/m4v`。
+`name` 是不带扩展名的文件基本名；`id` 是按本次目录扫描结果从 1 临时编号，不是稳定资源 ID。扫描固定 video 目录的视频及图片，并补充固定 pic 目录的图片；图片支持 `png/jpg/jpeg/bmp/gif/webp/tif/tiff`，不区分扩展名大小写。删除时使用同一条记录的 `name` 和 `id`，重新查询后使用新列表中的 ID。
 
 ### 3.2 查询当前播放信息
 
@@ -144,15 +144,15 @@ online_v1 使用“一条下行主题 + 一条上行主题”，以 JSON `method
 |---|---|---|
 | `videoType` | string | `none` / `live` / `recorded`，响应为小写 |
 | `videoVolume` | integer | 当前音量，0–100 |
-| `videoPath` | string | 当前录播文件名 |
+| `videoPath` | string | 当前 video 目录中的录播视频或图片文件名；仅有 pic 时为空 |
 | `videoUrl` | string | 仅 `live` 时返回 URL，其他类型为空 |
-| `name` | string | 当前资源显示名 |
+| `name` | string | 当前 video 目录中资源的基础名；pic 不参与文件信息上报 |
 | `base64Image` | string | 当前画面截图 Base64；代码未固定是否带 data URL 前缀 |
 | `deviceLog` | string | 最近的播放、音量、下载状态或错误说明 |
 
 当前实现没有截图等待超时回包；如果界面没有产生截图回调，前端可能收不到 `sendPlayInfo`，应设置业务超时。
 
-### 3.3 删除本地视频
+### 3.3 删除本地视频或图片
 
 ```json
 {
@@ -167,7 +167,8 @@ online_v1 使用“一条下行主题 + 一条上行主题”，以 JSON `method
 }
 ```
 
-- 实际只使用 `data.name`，按不带扩展名的文件基本名匹配；`data.id` 仅记录日志。
+- `data.name` 与 `data.id` 对应最近一次 `sendPlayFileList` 中的同一条记录；名称不带扩展名，ID 兼容数值及整数字符串。video 目录的视频/图片及 pic 目录的图片均可删除，同名但不同目录/扩展名时由 ID 确定目标。
+- 连续删除保留同一份列表中其余文件的原 ID；再次获取列表后使用新 ID。未携带 ID 的旧请求仅在名称唯一时删除。ID/名称不匹配时拒绝删除并记录日志。
 - 当前实现无 MQTT 成功/失败回执。前端需要确认时，可随后调用 `getPlayFileList` 验证。
 
 ### 3.4 播放与音量控制 `videoControl`

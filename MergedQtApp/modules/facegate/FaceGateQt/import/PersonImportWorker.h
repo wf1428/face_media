@@ -2,8 +2,9 @@
  * @file PersonImportWorker.h
  * @brief 在后台线程串联 U 盘复制、XLS/XLSX 解析、本地人员和人脸导入。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-08-28
+ * @note 最近修改：2026-10-23；修改人：Du lin；明确 U 盘人脸校验及入库前跨库防重契约，其他导入流程不变。
  */
 
 #ifndef PERSON_IMPORT_WORKER_H
@@ -41,7 +42,12 @@ public slots:
     /** @brief 等待并复制人员表，解析后批量导入本地人员库。 */
     void run();
 
-    /** @brief 接收推理线程的图片质量与特征校验结果并完成入库。 */
+    /**
+     * @brief 接收推理线程防重结果，复核最新图库后替换本次通过图片。
+     * @param token 当前任务标识，过期回调忽略。
+     * @param validatedFaces 已通过质量与跨库相似度校验的图片。
+     * @param failedFaces 失败图片及原因，计入最终导入结果。
+     */
     void applyFaceValidation(const QString &token,
                              const QJsonArray &validatedFaces,
                              const QJsonArray &failedFaces);

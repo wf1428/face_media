@@ -19,7 +19,11 @@
 namespace deviceweb {
 namespace {
 
-/** @brief 递归将受控图像元数据转换为 HTTP Base64，并限制单次图片总量。 */
+/**
+ * @brief 递归将受控图像元数据转换为 HTTP Base64，并限制单次图片总量。
+ * @param[in,out] budget 剩余允许展开的数据预算，展开时递减。
+ * @param[in,out] value 包含受控图片资源引用的结果树，处理后将引用替换为 Base64。
+ */
 void hydrate(Json &value, size_t &budget)
 {
     if (value.is_array()) {
@@ -55,7 +59,10 @@ void hydrate(Json &value, size_t &budget)
         hydrate(v.value(), budget);
 }
 
-/** @brief 要求 JSON 对象并拒绝客户端传入保留内部字段。 */
+/**
+ * @brief 要求 JSON 对象并拒绝客户端传入保留内部字段。
+ * @param args 操作对应的结构化参数。
+ */
 void checkArguments(const Json &args)
 {
     if (!args.is_object())
@@ -65,7 +72,11 @@ void checkArguments(const Json &args)
             throw ApiError(400, "请求包含保留字段");
 }
 
-/** @brief 限长解码人脸 Base64，校验字符、填充和解码后的字节数。 */
+/**
+ * @brief 限长解码人脸 Base64，校验字符、填充和解码后的字节数。
+ * @param value Base64 文本或带 MIME 头的 Data URL。
+ * @return 解码后的原始图片字节；无效编码或超出 512 KiB 时抛出 ApiError。
+ */
 [[maybe_unused]] std::string imageBytes(const Json &value)
 {
     if (!value.is_string())
@@ -112,7 +123,13 @@ void checkArguments(const Json &args)
 }
 } // namespace
 
-/** @brief 复用会话并转换标准参数，处理图片暂存、任务结果和 HTTP 返回。 */
+/**
+ * @brief 复用会话并转换标准参数，处理图片暂存、任务结果和 HTTP 返回。
+ * @param op 白名单业务操作名。
+ * @param request 当前 HTTP 请求，身份由会话校验取得。
+ * @param response 待写入的 HTTP 响应。
+ * @param args 操作对应的结构化参数。
+ */
 void WebServer::standardCall(const std::string &op,
                              const httplib::Request &request,
                              httplib::Response &response,
@@ -223,7 +240,9 @@ void WebServer::standardCall(const std::string &op,
                          "application/json; charset=utf-8");
 }
 
-/** @brief 登记标准 API 白名单，将路径、参数及业务指令显式对应。 */
+/**
+ * @brief 登记标准 API 白名单，将路径、参数及业务指令显式对应。
+ */
 void WebServer::standardRoutes()
 {
 
@@ -401,7 +420,13 @@ void WebServer::standardRoutes()
         });
 }
 
-/** @brief 分块接收标准 multipart 视频或资源包，不把整个文件读入内存。 */
+/**
+ * @brief 分块接收标准 multipart 视频或资源包，不把整个文件读入内存。
+ * @param request 当前 HTTP 请求，身份由会话校验取得。
+ * @param response 待写入的 HTTP 响应。
+ * @param reader 流式请求体读取器。
+ * @param kind 资源或任务类型，用于选择目录、配额和校验规则。
+ */
 void WebServer::standardUpload(const httplib::Request &request,
                                httplib::Response &response,
                                const httplib::ContentReader &reader,

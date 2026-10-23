@@ -1,8 +1,12 @@
+## @file browser_check.py
+# @brief 使用真实 Chromium 验证生产网页；隔离测试响应不进入交付前端。
+
 """
 @file browser_check.py
 @brief 使用真实 Chromium 验证生产网页；隔离测试响应不进入交付前端。
 @author Du lin
 @date 2026-10-09
+Note: 最近修改：2026-10-22；修改人：Du lin；验证混合媒体队列累计选择、移除重选、逐项上传及断线后原任务取消恢复。
 """
 
 import argparse
@@ -17,9 +21,14 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, expect
 
 
+## @brief 实际 device-webd 提供静态文件/CSP；仅 Qt 业务使用浏览器测试桩。
+# @param dist 实际 Vite 构建输出目录。
+# @param executable 本机 Chromium 可执行文件路径。
+# @param output 隔离测试日志及截图输出目录。
+# @param server_executable 待验证的真实 device-webd 可执行文件。
 def check(dist: Path, executable: str, output: Path, server_executable: Path) -> None:
     """实际 device-webd 提供静态文件/CSP；仅 Qt 业务使用浏览器测试桩。"""
     output = output.resolve()
@@ -83,7 +92,10 @@ def check(dist: Path, executable: str, output: Path, server_executable: Path) ->
             "rules": {},
         }
     }
+    schedules = []
     play = {
+        "contentType": "VIDEO_IMAGE",
+        "smallImageMode": 0,
         "videoType": "NONE",
         "name": "",
         "videoVolume": 35,
@@ -105,6 +117,8 @@ def check(dist: Path, executable: str, output: Path, server_executable: Path) ->
     floor_states = {n: int(n == 1) for n in [*range(-8, 0), *range(1, 121)]}
     pixel = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jh1sAAAAASUVORK5CYII="
 
+    ## @brief 提供标准 API 的浏览器隔离响应，并记录意外业务调用。
+    # @param route Playwright 路由对象，测试响应仅用于当前隔离浏览器。
     def standard(route):
         """提供标准 API 的浏览器隔离响应，并记录意外业务调用。"""
         request = route.request
@@ -172,7 +186,7 @@ def check(dist: Path, executable: str, output: Path, server_executable: Path) ->
                 "screenshot": True,
                 "elevatorRead": True,
                 "elevatorWrite": True,
-                "floorScheduleWrite": False,
+                "floorScheduleWrite": True,
                 "screenSleep": False,
                 "boardPower": False,
                 "air": False,
@@ -267,11 +281,19 @@ def check(dist: Path, executable: str, output: Path, server_executable: Path) ->
             data = {"operationId": ident, "state": "PENDING"}
         elif path == "/elevator/floorSchedule/get":
             data = {
-                "deviceSchedules": [],
+                "deviceSchedules": list(schedules),
                 "platformSchedules": None,
                 "matched": None,
-                "writable": False,
+                "writable": True,
             }
+        elif path in ("/elevator/floorSchedule/set", "/elevator/floorSchedule/delete"):
+            if path.endswith("/set"):
+                schedules[:] = args["schedules"]
+            else:
+                schedules[:] = [item for item in schedules if item["hash"] not in args["hashList"]]
+            ident = str(uuid.uuid4())
+            jobs[ident] = {"operationId": ident, "state": "APPLIED", "result": {"deviceSchedules": list(schedules), "saved": True}}
+            data = {"operationId": ident, "state": "PENDING"}
         elif path == "/elevator/elevatorMode/get":
             data = {
                 k: False
@@ -297,8 +319,11 @@ def check(dist: Path, executable: str, output: Path, server_executable: Path) ->
             return
         route.fulfill(json={"code": 200, "message": "ok", "data": data, "meta": meta})
 
+    ## @brief 白名单测试桩：记录每个请求，意外业务立即使测试失败。
+    # @param route Playwright 路由对象，测试响应仅用于当前隔离浏览器。
     def respond(route):
         """白名单测试桩：记录每个请求，意外业务立即使测试失败。"""
+        nonlocal task_id
         request = route.request
         path = request.url.split("/api/v1", 1)[1]
         calls.append((request.method, path, request.post_data_buffer, request.headers))
@@ -340,14 +365,27 @@ def check(dist: Path, executable: str, output: Path, server_executable: Path) ->
             }
         elif path == "/uploads":
             item = request.post_data_json
+            if item["kind"] in ("video", "ad_image"):
+                assert not any(task["kind"] in ("video", "ad_image")
+                               and task["state"] not in ("READY", "FAILED", "CANCELLED")
+                               for task in tasks.values()), "Media queue started concurrent receiving tasks"
+            task_id = str(uuid.uuid4())
             tasks[task_id] = {**item, "id": task_id, "state": "CREATED"}
             data = tasks[task_id]
         elif path == f"/uploads/{task_id}/content":
             assert request.post_data_buffer, "File body missing"
             assert request.headers.get("content-type") == "application/octet-stream"
             assert request.headers.get("x-csrf-token") == "test-csrf"
+            if state.get("fail_media_name") == tasks[task_id]["name"]:
+                state.pop("fail_media_name")
+                tasks[task_id]["state"] = "RECEIVING"
+                route.abort()
+                return
             tasks[task_id]["state"] = "RECEIVED"
             data = tasks[task_id]
+        elif path == f"/uploads/{task_id}/cancel":
+            tasks[task_id]["state"] = "CANCELLED"
+            data = {"cancelled": True}
         elif path == f"/uploads/{task_id}/commit":
             tasks[task_id]["state"] = (
                 "COMMITTING"
@@ -355,7 +393,7 @@ def check(dist: Path, executable: str, output: Path, server_executable: Path) ->
                 else "READY"
             )
             data = tasks[task_id]
-            if data["kind"] not in ("video", "resource_package"):
+            if data["kind"] not in ("video", "ad_image", "resource_package"):
                 assets.append({"name": data["name"], "kind": data["kind"]})
         elif path == f"/uploads/{task_id}":
             if tasks[task_id]["kind"] == "resource_package":
@@ -408,6 +446,10 @@ def check(dist: Path, executable: str, output: Path, server_executable: Path) ->
         else:
             raise AssertionError("device-webd did not become ready")
 
+        ## @brief 向实际测试服务器发起请求，统一返回成功或错误状态码。
+        # @param path 待生成的夹具路径或相对于隔离服务的请求路径。
+        # @param kwargs 传给 urllib 请求的额外参数。
+        # @return HTTP 响应状态码，错误响应也返回其实际状态。
         def fetch(path, **kwargs):
             """向实际测试服务器发起请求，统一返回成功或错误状态码。"""
             try:
@@ -415,6 +457,9 @@ def check(dist: Path, executable: str, output: Path, server_executable: Path) ->
             except urllib.error.HTTPError as error:
                 return error.code
 
+        ## @brief 取得指定 HTTP 请求的实际状态码，不把错误响应当成连接失败。
+        # @param request 已构建的 HTTP 请求对象。
+        # @return HTTP 响应状态码，错误响应也返回其实际状态。
         def fetch_status(request):
             """取得指定 HTTP 请求的实际状态码，不把错误响应当成连接失败。"""
             try:
@@ -544,6 +589,8 @@ def check(dist: Path, executable: str, output: Path, server_executable: Path) ->
                 }});"""
             )
 
+            ## @brief 只允许测试设备同源请求，记录并拒绝外部资源加载。
+            # @param route Playwright 路由对象，测试响应仅用于当前隔离浏览器。
             def allow_local_only(route):
                 """只允许测试设备同源请求，记录并拒绝外部资源加载。"""
                 if route.request.url.startswith(origin + "/"):
@@ -819,7 +866,7 @@ def check(dist: Path, executable: str, output: Path, server_executable: Path) ->
             ).is_enabled()
             assert page.get_by_role(
                 "button", name="保存并下发", exact=True
-            ).is_disabled()
+            ).is_enabled()
             assert page.get_by_role(
                 "button", name="提交定时开关机", exact=True
             ).is_disabled()
@@ -838,14 +885,73 @@ def check(dist: Path, executable: str, output: Path, server_executable: Path) ->
             page.set_viewport_size({"width": 390, "height": 844})
             page.get_by_role("checkbox", name="B1", exact=True).click()
             page.get_by_role("button", name="提交楼层设置", exact=True).click()
-            page.wait_for_function(
-                "() => !document.querySelector('button.van-button--loading')"
-            )
+            expect(page.get_by_role("button", name="提交楼层设置", exact=True)).to_be_enabled()
             assert (
                 floor_states[-1] == 1
             ), "Circle selection did not submit open permission"
             page.locator(".van-toast").wait_for(state="hidden")
             page.screenshot(path=str(output / "elevator-local.png"), full_page=True)
+            page.get_by_text("添加定时规则", exact=True).click()
+            popup = page.locator(".schedule-pop")
+            popup.wait_for(state="visible", timeout=5000)
+            page.screenshot(path=str(output / "schedule-dialog.png"), full_page=True)
+            time_field = popup.locator(".van-field").filter(has=page.get_by_text("时间", exact=True))
+            expect(time_field.locator("input")).to_have_attribute("readonly", "")
+            time_field.click()
+            time_popup = page.locator(".time-pop")
+            time_popup.wait_for(state="visible")
+            columns = time_popup.locator(".van-picker-column")
+            assert columns.count() == 2
+            expect(columns.nth(0).locator(".van-picker-column__item--selected")).to_have_text("08")
+            expect(columns.nth(1).locator(".van-picker-column__item--selected")).to_have_text("00")
+            # 实际触摸滑动两列，确认选择写回并保存；关闭遮罩不提交草稿。
+            touch = page.context.new_cdp_session(page)
+            touch.send("Emulation.setTouchEmulationEnabled", {"enabled": True})
+
+            ## @brief 通过实际触摸手势滚动时间列并等待控件稳定。
+            # @param column 时间选择器的小时或分钟滚动列。
+            # @param rows 模拟滑动跨越的条目数。
+            def slide_time_column(column, rows):
+                box = column.bounding_box()
+                item_height = column.locator("li").first.bounding_box()["height"]
+                x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+                touch.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [{"x": x, "y": y}]})
+                touch.send("Input.dispatchTouchEvent", {"type": "touchMove", "touchPoints": [{"x": x, "y": y - rows * item_height}]})
+                page.wait_for_timeout(350)  # 松手前停稳，避免惯性改变预期时刻。
+                touch.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+
+            page.wait_for_timeout(350)  # 底部弹窗滑入后再开始手势。
+            slide_time_column(columns.nth(0), 6)
+            slide_time_column(columns.nth(1), 1)
+            expect(columns.nth(0).locator(".van-picker-column__item--selected")).to_have_text("14")
+            expect(columns.nth(1).locator(".van-picker-column__item--selected")).to_have_text("01")
+            page.screenshot(path=str(output / "schedule-time-picker.png"))
+            time_popup.get_by_role("button", name="确认", exact=True).click()
+            time_popup.wait_for(state="hidden")
+            expect(time_field.locator("input")).to_have_value("14:01")
+            time_field.click()
+            time_popup.wait_for(state="visible")
+            page.wait_for_timeout(350)
+            slide_time_column(columns.nth(0), -1)
+            expect(columns.nth(0).locator(".van-picker-column__item--selected")).to_have_text("13")
+            page.mouse.click(10, 10)  # 点击当前最上层遮罩，不依赖弹窗的 DOM 顺序。
+            time_popup.wait_for(state="hidden")
+            expect(popup).to_be_visible()
+            expect(time_field.locator("input")).to_have_value("14:01")
+            touch.send("Emulation.setTouchEmulationEnabled", {"enabled": False})
+            touch.detach()
+            popup.get_by_role("button", name="确认", exact=True).click()
+            page.get_by_role("button", name="保存并下发", exact=True).click()
+            expect(page.get_by_role("button", name="保存并下发", exact=True)).to_be_enabled()
+            assert len(schedules) == 1 and schedules[0]["hash"].startswith("web-")
+            assert schedules[0]["time"] == "14:01", "Wheel time was not persisted"
+            page.locator(".van-toast").wait_for(state="hidden")
+            page.reload()
+            page.locator(".van-icon-cross").wait_for()
+            page.locator(".van-icon-cross").click()
+            page.locator(".van-dialog:visible").get_by_role("button", name="确认", exact=True).click()
+            page.wait_for_function("() => document.querySelectorAll('.van-icon-cross').length === 0")
+            assert schedules == []
             page.goto(origin + "/#/home/person")
             # X 可在未创建时退出，不发送创建请求；再次打开时草稿清空。
             page.get_by_role("button", name="新建账户", exact=True).click()
@@ -884,13 +990,18 @@ def check(dist: Path, executable: str, output: Path, server_executable: Path) ->
             assert credentials[2]["icCards"][0]["cardId"] == "01020304"
             page.screenshot(path=str(output / "person-local.png"), full_page=True)
             page.goto(origin + "/#/home/video")
+            sources = page.locator(".source-row").first.locator(".van-radio")
+            expect(sources.nth(2)).to_have_attribute("aria-checked", "true")
+            expect(page.locator(".content-type-row")).to_have_count(0)
+            sources.nth(0).click()
+            expect(page.locator(".content-type-row")).to_be_visible()
             assert (
-                page.locator(".source-options").evaluate(
+                page.locator(".source-options").first.evaluate(
                     "n=>getComputedStyle(n).flexWrap"
                 )
                 == "wrap"
             )
-            positions = page.locator(".source-options .van-radio").evaluate_all(
+            positions = page.locator(".source-options").first.locator(".van-radio").evaluate_all(
                 "nodes=>nodes.map(n=>n.getBoundingClientRect().top)"
             )
             assert len(set(positions)) == 1, "Video sources did not fit a phone row"
@@ -902,13 +1013,26 @@ def check(dist: Path, executable: str, output: Path, server_executable: Path) ->
             )
             assert page.locator(".footer").evaluate(
                 "n=>n.nextElementSibling.classList.contains('van-cell-group__title')"
-                " && n.nextElementSibling.textContent.includes('视频列表')"
+                " && n.nextElementSibling.textContent.includes('广告列表')"
             )
+            page.screenshot(path=str(output / "video-controls.png"), full_page=True)
+            assert page.locator(".content-type-row .van-radio").count() == 3
+            content_positions = page.locator(".content-type-row .van-radio").evaluate_all("nodes=>nodes.map(n=>n.getBoundingClientRect().top)")
+            assert len(set(content_positions)) == 1, "Content choices did not fit a phone row"
+            page.locator(".content-type-row .van-radio").nth(1).click()
+            sources.nth(1).click()
+            expect(page.locator(".content-type-row")).to_have_count(0)
+            page.screenshot(path=str(output / "video-network-controls.png"), full_page=True)
+            sources.nth(2).click()
+            expect(page.locator(".content-type-row")).to_have_count(0)
+            sources.nth(0).click()
+            expect(page.locator(".content-type-row .van-radio").nth(1)).to_have_attribute("aria-checked", "true")
             page.get_by_role("button", name="保存播放设置", exact=True).click()
             page.wait_for_function(
                 "() => !document.querySelector('button.van-button--loading')"
             )
             assert any(path == "/std/device/videoControl" for _, path, _, _ in calls)
+            assert play["contentType"] == "IMAGE" and play["smallImageMode"] == 0
             assert any(
                 path.startswith("/std/operations/") for _, path, _, _ in calls
             ), "Operation result not polled"
@@ -917,7 +1041,7 @@ def check(dist: Path, executable: str, output: Path, server_executable: Path) ->
 
             # 视频和人脸图片都应作为原始字节发送，清单名称保持不变。
             with page.expect_file_chooser() as chooser:
-                page.get_by_text("选择本地视频文件", exact=True).click()
+                page.get_by_text("选择视频或图片", exact=True).click()
             chooser.value.set_files(
                 {
                     "name": "browser-video.mp4",
@@ -935,6 +1059,81 @@ def check(dist: Path, executable: str, output: Path, server_executable: Path) ->
                 for _, path, body, _ in calls
                 if path.endswith("/content")
             ), "Video bytes altered or omitted"
+            with page.expect_file_chooser() as chooser:
+                page.get_by_text("选择视频或图片", exact=True).click()
+            chooser.value.set_files({"name": "任意广告.PNG", "mimeType": "image/png", "buffer": b"raw-image-bytes"})
+            page.locator(".play-settings [role=switch]").click()
+            page.get_by_role("button", name="上传到设备").click()
+            page.wait_for_function("() => !document.querySelector('button.van-button--loading')")
+            assert any(path == "/uploads" and json.loads(body).get("kind") == "ad_image" and json.loads(body).get("smallImageMode") == 1
+                       for _, path, body, _ in calls if path == "/uploads" and body)
+            assert any(body == b"raw-image-bytes" for _, path, body, _ in calls if path.endswith("/content"))
+            expect(page.get_by_role('button', name='保存播放设置', exact=True)).to_be_enabled()
+
+            # 五项后再次选择十项必须整次拒绝；通过 x 移除后可继续补选。
+            media_input = page.locator('input[type="file"]')
+            queue_rows = page.locator('.upload-queue-row')
+
+            def media_fixture(name):
+                """小字节夹具仍经过真实文件选择和上传请求，不分配大文件。"""
+                return {"name": name, "mimeType": "image/png" if name.endswith('.png') else "video/mp4",
+                        "buffer": ("queue-bytes:" + name).encode()}
+
+            first_five = [media_fixture(f"queue-first-{n}.{'png' if n % 2 else 'mp4'}") for n in range(5)]
+            media_input.set_input_files(first_five)
+            expect(queue_rows).to_have_count(5)
+            media_input.set_input_files([media_fixture(f"queue-over-{n}.mp4") for n in range(10)])
+            expect(page.locator('.van-toast').filter(has_text='最多选择 10 个文件')).to_be_visible()
+            expect(queue_rows).to_have_count(5)
+            page.locator('.van-toast').wait_for(state='hidden')
+            # 同名再次选择不会重复加入。
+            media_input.set_input_files(first_five)
+            expect(queue_rows).to_have_count(5)
+            page.locator('.van-toast').wait_for(state='hidden')
+            queue_rows.nth(0).locator('.queue-remove').click()
+            expect(queue_rows).to_have_count(4)
+            media_input.set_input_files([media_fixture(f"queue-add-{n}.{'png' if n % 2 else 'mp4'}") for n in range(6)])
+            expect(queue_rows).to_have_count(10)
+            page.screenshot(path=str(output / 'media-upload-queue.png'), full_page=True)
+            assert page.locator('.upload-queue-row').evaluate_all(
+                'nodes=>nodes.every(n=>n.scrollWidth<=n.clientWidth+1)'
+            ), 'Queue overflows phone width'
+            queue_call_start = len(calls)
+            page.get_by_role('button', name='上传到设备', exact=True).click()
+            expect(queue_rows).to_have_count(0)
+            expect(page.get_by_role('button', name='保存播放设置', exact=True)).to_be_enabled()
+            queued = [json.loads(body) for method, path, body, _ in calls[queue_call_start:]
+                      if method == 'POST' and path == '/uploads']
+            assert len(queued) == 10 and {item['kind'] for item in queued} == {'video', 'ad_image'}
+            assert all(item['smallImageMode'] == 1 for item in queued if item['kind'] == 'ad_image')
+            assert all(item['name'] != 'queue-first-0.mp4' for item in queued), 'Removed file uploaded'
+            assert page.evaluate("sessionStorage.getItem('device-video-task')") is None
+            page.locator('.van-toast').wait_for(state='hidden')
+
+            # 第二项断线时停止队列；x 先取消原任务，再允许保留的第三项继续上传。
+            state['fail_media_name'] = 'queue-fail.png'
+            media_input.set_input_files([media_fixture('queue-ok.mp4'), media_fixture('queue-fail.png'), media_fixture('queue-after.mp4')])
+            failure_start = len(calls)
+            page.get_by_role('button', name='上传到设备', exact=True).click()
+            expect(queue_rows).to_have_count(2)
+            page.get_by_role('button', name='查询并取消未完成任务', exact=True).wait_for()
+            expect(page.get_by_role('button', name='上传到设备', exact=True)).to_be_disabled()
+            assert page.evaluate("sessionStorage.getItem('device-video-task')"), 'Active task not recoverable'
+            created = [json.loads(body)['name'] for method, path, body, _ in calls[failure_start:]
+                       if method == 'POST' and path == '/uploads']
+            assert created == ['queue-ok.mp4', 'queue-fail.png'], 'Failure did not stop queue'
+            page.locator('.van-toast').wait_for(state='hidden')
+            queue_rows.nth(0).locator('.queue-remove').click()
+            expect(queue_rows).to_have_count(1)
+            expect(page.get_by_role('button', name='上传到设备', exact=True)).to_be_enabled()
+            assert tasks[task_id]['state'] == 'CANCELLED', 'X left an active remote task'
+            page.get_by_role('button', name='上传到设备', exact=True).click()
+            expect(queue_rows).to_have_count(0)
+            expect(page.get_by_role('button', name='保存播放设置', exact=True)).to_be_enabled()
+            created = [json.loads(body)['name'] for method, path, body, _ in calls[failure_start:]
+                       if method == 'POST' and path == '/uploads']
+            assert created == ['queue-ok.mp4', 'queue-fail.png', 'queue-after.mp4'], 'Completed file was replayed'
+            page.locator('.van-toast').wait_for(state='hidden')
             page.goto(origin + "/#/home/person")
             with page.expect_file_chooser() as chooser:
                 page.get_by_text("选择 Excel 人员表", exact=True).click()
@@ -998,7 +1197,7 @@ def check(dist: Path, executable: str, output: Path, server_executable: Path) ->
             )
             print(
                 "Browser checks passed: local reads/CRUD/credentials/media/password, capability controls, "
-                "raw uploads, complete manifest, refresh recovery, offline icons, CSP, console logs"
+                "raw uploads, image destination, local-only content choices, touch time picker and cancellation, schedule add/save/delete, complete manifest, refresh recovery, offline icons, CSP, console logs"
             )
     finally:
         server.terminate()

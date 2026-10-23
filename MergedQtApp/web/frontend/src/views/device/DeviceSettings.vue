@@ -156,7 +156,9 @@ const form = reactive({ deviceName: '', wifiName: '', wifiPassword: '' })
 const pwd = reactive({ oldPassword: '', newPassword: '', confirmPassword: '' })
 const changingPassword = ref(false)
 
-/** @brief 验证原登录密码并更新当前账号，成功后要求重新登录。 */
+/**
+ * @brief 验证原登录密码并更新当前账号，成功后要求重新登录。
+ */
 async function changePassword() {
   if (!pwd.oldPassword || pwd.newPassword.length < 8 || pwd.newPassword.length > 128) {
     showToast('请输入原密码，新密码需为8至128个字符')
@@ -203,7 +205,9 @@ onMounted(async () => {
   }
 })
 
-/** @brief 保存热点名称和可选新密码，提示重激活后使用新设置重新连接。 */
+/**
+ * @brief 保存热点名称和可选新密码，提示重激活后使用新设置重新连接。
+ */
 async function save() {
   const ssid = form.wifiName
   if (
@@ -255,12 +259,17 @@ async function save() {
   }
 }
 
-/** @brief 选择配置压缩包 */
+/**
+ * @brief 选择配置压缩包
+ */
 function pickPkg() {
   if (!pkgUploading.value && !pkgTaskId.value) pkgRef.value?.click()
 }
 
-/** @brief 校验压缩包类型及大小；内部 Ycest 目录由设备解压时校验。 */
+/**
+ * @brief 校验压缩包类型及大小；内部 Ycest 目录由设备解压时校验。
+ * @param {Event} e 文件输入控件的变更事件。
+ */
 function onPkgChange(e) {
   const file = e.target.files?.[0]
   e.target.value = ''
@@ -277,7 +286,10 @@ function onPkgChange(e) {
   pkgMessage.value = ''
 }
 
-/** @brief 格式化文件大小 */
+/**
+ * @brief 格式化文件大小
+ * @param {number} bytes 文件长度，单位为字节。
+ */
 function formatPkgSize(bytes) {
   if (!bytes && bytes !== 0) return '-'
   const mb = bytes / 1024 / 1024
@@ -285,7 +297,9 @@ function formatPkgSize(bytes) {
   return Math.max(1, Math.round(bytes / 1024)) + 'KB'
 }
 
-/** @brief 传输和解压阶段分别展示；只在目录替换完成后报告成功。 */
+/**
+ * @brief 传输和解压阶段分别展示；只在目录替换完成后报告成功。
+ */
 async function onPkgUpload() {
   if (!pkgFile.value || pkgUploading.value || pkgTaskId.value) return
   try {
@@ -307,7 +321,10 @@ async function onPkgUpload() {
   }
 }
 
-/** @brief 显示上传字节进度，99% 阶段等待设备解压和替换。 */
+/**
+ * @brief 显示上传字节进度，99% 阶段等待设备解压和替换。
+ * @param {object} event 上传任务进度，包含 id、percent 和 state，不是 DOM 事件。
+ */
 function packageProgress(event) {
   pkgTaskId.value = event.id
   pkgProgress.value = event.percent
@@ -315,7 +332,10 @@ function packageProgress(event) {
     event.state === 'RECEIVING' ? t('settings.pkgUploading') : t('settings.pkgApplying')
 }
 
-/** @brief 处理设备返回的已替换目录清单，并释放前端任务预约。 */
+/**
+ * @brief 处理设备返回的已替换目录清单，并释放前端任务预约。
+ * @param {object} result 资源目录更新的实际终态结果，供页面显示成功目录或失败原因。
+ */
 function packageDone(result) {
   if (result.state !== 'READY') throw new Error(t('settings.pkgIncomplete'))
   pkgMessage.value = t('settings.pkgDone')
@@ -327,7 +347,9 @@ function packageDone(result) {
   showToast(pkgMessage.value)
 }
 
-/** @brief 刷新或请求中断后查询原任务，避免重复上传和重复替换。 */
+/**
+ * @brief 刷新或请求中断后查询原任务，避免重复上传和重复替换。
+ */
 async function resumePkg() {
   if (!pkgTaskId.value || pkgUploading.value) return
   pkgUploading.value = true
@@ -340,7 +362,9 @@ async function resumePkg() {
   }
 }
 
-/** @brief 仅取消允许取消的任务；目录替换期间由服务端拒绝取消。 */
+/**
+ * @brief 仅取消允许取消的任务；目录替换期间由服务端拒绝取消。
+ */
 async function cancelPkg() {
   try {
     await api.cancelUpload(pkgTaskId.value)

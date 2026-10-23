@@ -9,18 +9,16 @@ set -eu
     echo 'Run as root' >&2
     exit 1
 }
-# 资源包由 Python 标准库安全解压，不依赖独立 unzip/tar 守护进程。
-command -v python3 >/dev/null 2>&1 || {
-    echo 'Python 3 is required for Ycest resource updates' >&2
-    exit 1
-}
 SOURCE=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 STAGE=/home/cat/web-stage
 install -d -m 0750 "$STAGE"
+install -d -m 0755 /usr/local/sbin
 install -m 0755 "$SOURCE/scripts/start_face_media.sh" /usr/local/sbin/start_face_media.sh
-for script in device-web-start.sh portal-network.sh ycest-resource-update.py; do
-    install -m 0755 "$SOURCE/web/deploy/$script" "$STAGE/$script"
+for script in device-web-start.sh portal-network.sh; do
+    install -m 0755 "$SOURCE/web/deploy/$script" "/usr/local/sbin/$script"
 done
+# 旧 Python 更新入口已由 Qt 内部模块替代，清理原门户专用文件。
+rm -f "$STAGE/ycest-resource-update.py"
 if [ ! -f "$STAGE/portal.env" ]; then
     install -m 0600 "$SOURCE/web/deploy/portal.env" "$STAGE/portal.env"
 fi
@@ -36,7 +34,8 @@ install -m 0644 "$SOURCE/web/deploy/device-webd.service" /etc/systemd/system/dev
 systemctl disable --now device-hotspot.service 2> /dev/null || true
 # Only explicitly retired portal-owned files are removed. No recursive cleanup.
 rm -f /etc/systemd/system/device-hotspot.service
-for old in device-hotspot.service hotspot-start.sh hotspot.env hostapd.conf dnsmasq.conf mergedqt-web.conf; do
+for old in device-hotspot.service hotspot-start.sh hotspot.env hostapd.conf dnsmasq.conf \
+    mergedqt-web.conf device-web-start.sh portal-network.sh; do
     rm -f "$STAGE/$old"
 done
 # The old sample instructed users to install this exact Web drop-in.

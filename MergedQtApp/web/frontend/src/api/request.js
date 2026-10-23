@@ -9,14 +9,24 @@ import axios from 'axios'
 
 let csrf = '' // 当前会话 CSRF；仅内存保存。
 
-/** @brief 登录/刷新会话后更新状态修改请求 token。 */
+/**
+ * @brief 登录/刷新会话后更新状态修改请求 token。
+ * @param {string} value 会话 CSRF 令牌，空值清除当前令牌。
+ */
 export function setCsrf(value) {
   csrf = value || ''
 }
 
 const client = axios.create({ baseURL: '/api/v1', timeout: 30000, withCredentials: true })
 
-/** @return 解包后的真实设备响应；会话过期清理内存并通知根页面。 */
+/**
+ * @brief 发送同源 API 请求，解包响应并统一传播认证及业务错误。
+ * @param {string} method HTTP 方法，小写 get、post、put 或 delete。
+ * @param {string} url 相对于 API 根的请求地址。
+ * @param {object|File|undefined} data 查询参数、业务请求体或上传原始文件，按接口约定传入。
+ * @param {object} options Axios 请求选项；envelope=true 返回完整响应包，timeout 的单位为毫秒。
+ * @returns {Promise<*>} 默认返回响应 data，envelope=true 返回完整包；失败抛出附带 status 的错误。
+ */
 export async function request(method, url, data, options = {}) {
   try {
     const { envelope = false, ...httpOptions } = options

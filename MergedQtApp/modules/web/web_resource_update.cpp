@@ -1,10 +1,12 @@
 /**
  * @file web_resource_update.cpp
  * @brief libarchive 流式读取资源包，先暂存、后逐目录替换，异常回滚。
+ * @note 最近修改：2026-10-23；修改人：Du lin；复用归档读取器展开人员图片包，允许任意目录名并保留原资源更新规则。
  * @author Du lin
  * @date 2026-10-20
  */
 #include "web_resource_update.h"
+#include "web_paths.h"
 #include "common/sql/web/web_sql.h"
 #include <archive.h>
 #include <archive_entry.h>
@@ -36,13 +38,19 @@ constexpr qint64 MiB = 1024LL * 1024;
 constexpr qint64 ExpandedLimit = 2048 * MiB;
 const QString Work = QStringLiteral(".ycest-update");
 
-/** @brief 保持异常格式与原 Web 业务一致。 */
+/**
+ * @brief 保持异常格式与原 Web 业务一致。
+ * @param message 可返回调用方的结果或错误说明。
+ * @param code 业务状态码，成功通常为 200。
+ */
 void fail(const QString &message, int code = 400)
 {
     throw WebError(code, message);
 }
 
-/** @brief 在安全检查点响应停止；回滚阶段不会因停止请求中断。 */
+/**
+ * @brief 在安全检查点响应停止；回滚阶段不会因停止请求中断。
+ */
 void interrupted()
 {
     if (QThread::currentThread()->isInterruptionRequested())
@@ -80,7 +88,9 @@ public:
     ARCHIVE_FUNCTION(archive_entry_size)
 #undef ARCHIVE_FUNCTION
 
-    /** @brief 只解析受支持格式的必要符号，不调用外部 tar/unzip/unrar。 */
+    /**
+     * @brief 只解析受支持格式的必要符号，不调用外部 tar/unzip/unrar。
+     */
     ArchiveApi()
     {
 #ifdef Q_OS_WIN
@@ -122,7 +132,11 @@ public:
 #undef LOAD
     }
 
-    /** @brief 警告也不当作完整成功，避免发布截断或无法解码的归档。 */
+    /**
+     * @brief 警告也不当作完整成功，避免发布截断或无法解码的归档。
+     * @param code libarchive 调用返回码。
+     * @param handle libarchive 句柄，用于获取详细错误。
+     */
     void check(int code, struct archive *handle) const
     {
         if (code != ARCHIVE_OK) {
@@ -137,6 +151,9 @@ public:
 class ArchiveLocale {
 public:
 
+    /**
+     * @brief 临时切换当前线程的归档文件名 locale。
+     */
     ArchiveLocale()
     {
 #ifdef Q_OS_LINUX
@@ -147,7 +164,9 @@ public:
 #endif
     }
 
-    /** @brief 恢复线程原 locale 并释放临时对象。 */
+    /**
+     * @brief 恢复线程原 locale 并释放临时对象。
+     */
     ~ArchiveLocale()
     {
 #ifdef Q_OS_LINUX
@@ -172,7 +191,10 @@ public:
     QByteArray block = QByteArray(65536, '\0');
     struct archive *handle = nullptr;
 
-    /** @brief 打开普通受控文件；各格式由库根据实际内容识别。 */
+    /**
+     * @brief 打开普通受控文件；各格式由库根据实际内容识别。
+     * @param path 待访问的文件或配置路径。
+     */
     explicit ArchiveReader(const QString &path) : file(path)
     {
         if (!file.open(QIODevice::ReadOnly))
@@ -200,14 +222,21 @@ public:
         }
     }
 
-    /** @brief 任意退出路径均关闭归档句柄。 */
+    /**
+     * @brief 任意退出路径均关闭归档句柄。
+     */
     ~ArchiveReader()
     {
         if (handle)
             api.archive_read_free(handle);
     }
 
-    /** @brief 向 C 解码器提供固定大小的下一个输入块。 */
+    /**
+     * @brief 向 C 解码器提供固定大小的下一个输入块。
+     * @param context 归档文件读取上下文。
+     * @param buffer 输出读取缓冲区地址，内存由上下文持有。
+     * @return 实际读取字节数；底层文件错误返回负值。
+     */
     static la_ssize_t read(struct archive *, void *context, const void **buffer)
     {
         auto *self = static_cast<ArchiveReader *>(context);
@@ -216,7 +245,13 @@ public:
         return static_cast<la_ssize_t>(count);
     }
 
-    /** @brief 由 Qt 文件对象处理定位，兼容带 data descriptor 的常见 ZIP。 */
+    /**
+     * @brief 由 Qt 文件对象处理定位，兼容带 data descriptor 的常见 ZIP。
+     * @param context 归档读取上下文。
+     * @param offset 相对指定起点的字节偏移。
+     * @param whence 定位起点，遵循 SEEK_SET、SEEK_CUR 或 SEEK_END。
+     * @return 定位后的文件偏移，失败返回 -1。
+     */
     static la_int64_t seek(struct archive *, void *context, la_int64_t offset, int whence)
     {
         auto &file = static_cast<ArchiveReader *>(context)->file;
@@ -227,7 +262,10 @@ public:
     }
 };
 
-/** @brief 按原资源包规则限制 ZIP 条目/中央目录，防止解码元数据占满 Qt 内存。 */
+/**
+ * @brief 按原资源包规则限制 ZIP 条目/中央目录，防止解码元数据占满 Qt 内存。
+ * @param path 待访问的文件或配置路径。
+ */
 void checkZipDirectory(const QString &path)
 {
     QFile file(path);
@@ -249,7 +287,12 @@ void checkZipDirectory(const QString &path)
         fail(QStringLiteral("ZIP 目录过大或不支持 ZIP64"));
 }
 
-/** @return Ycest 下的安全相对路径，空字符串代表包根目录本身。 */
+/**
+ * @brief 规范化归档成员名称并拒绝越界路径。
+ * @param name 待处理的名称。
+ * @param directory 目标是否为目录。
+ * @return Ycest 下的安全相对路径，空字符串代表包根目录本身。
+ */
 QString relativePath(const QString &name, bool directory)
 {
     QString clean = name;
@@ -276,7 +319,11 @@ QString relativePath(const QString &name, bool directory)
     return parts.mid(1).join('/');
 }
 
-/** @brief 持久化文件或目录项，保证事务日志和目录重命名顺序。 */
+/**
+ * @brief 持久化文件或目录项，保证事务日志和目录重命名顺序。
+ * @param path 待访问的文件或配置路径。
+ * @param directory 目标是否为目录。
+ */
 void syncPath(const QString &path, bool directory = false)
 {
 #ifdef Q_OS_UNIX
@@ -294,7 +341,11 @@ void syncPath(const QString &path, bool directory = false)
 #endif
 }
 
-/** @brief 原子保存任务状态或事务日志，不向查询方暴露半个 JSON。 */
+/**
+ * @brief 原子保存任务状态或事务日志，不向查询方暴露半个 JSON。
+ * @param path 待访问的文件或配置路径。
+ * @param value 待解析或转换的输入值。
+ */
 void saveJson(const QString &path, const QJsonObject &value)
 {
     QSaveFile file(path);
@@ -304,7 +355,11 @@ void saveJson(const QString &path, const QJsonObject &value)
     syncPath(QFileInfo(path).absolutePath(), true);
 }
 
-/** @return 不存在时为空；事务日志损坏时拒绝继续替换。 */
+/**
+ * @brief 读取资源更新的持久化 JSON 结果。
+ * @param path 待访问的文件或配置路径。
+ * @return 不存在时为空；事务日志损坏时拒绝继续替换。
+ */
 QJsonObject readJson(const QString &path)
 {
     if (!QFileInfo::exists(path))
@@ -319,7 +374,11 @@ QJsonObject readJson(const QString &path)
     return document.object();
 }
 
-/** @brief 仅允许删除受控目录的直接子项，符号链接本身被删除但不跟随。 */
+/**
+ * @brief 仅允许删除受控目录的直接子项，符号链接本身被删除但不跟随。
+ * @param path 待访问的文件或配置路径。
+ * @param root 受控根目录。
+ */
 void removeChild(const QString &path, const QString &root)
 {
     const QFileInfo info(path);
@@ -334,7 +393,11 @@ void removeChild(const QString &path, const QString &root)
     }
 }
 
-/** @brief 同文件系统内移动目录，并同步两侧目录项。 */
+/**
+ * @brief 同文件系统内移动目录，并同步两侧目录项。
+ * @param source 待移动的源目录。
+ * @param destination 受控目标目录。
+ */
 void moveDirectory(const QString &source, const QString &destination)
 {
     if (!QDir().rename(source, destination))
@@ -348,6 +411,10 @@ void moveDirectory(const QString &source, const QString &destination)
 class UpdateLock {
 public:
 
+    /**
+     * @brief 为资源目录更新取得进程间独占锁。
+     * @param root 受控根目录。
+     */
     explicit UpdateLock(const QString &root)
     {
 #ifdef Q_OS_UNIX
@@ -368,7 +435,9 @@ public:
 #endif
     }
 
-    /** @brief 退出后自动释放，不删除可复用的 Linux 锁文件。 */
+    /**
+     * @brief 退出后自动释放，不删除可复用的 Linux 锁文件。
+     */
     ~UpdateLock()
     {
 #ifdef Q_OS_UNIX
@@ -386,7 +455,11 @@ private:
 #endif
 };
 
-/** @return 恢复的旧日志；未提交目录回滚，已提交事务仅清理备份。 */
+/**
+ * @brief 根据目录事务日志恢复中断的资源替换。
+ * @param root 受控根目录。
+ * @return 恢复的旧日志；未提交目录回滚，已提交事务仅清理备份。
+ */
 QJsonObject recoverDirectories(const QString &root)
 {
     const QString work = QDir(root).filePath(Work);
@@ -416,7 +489,11 @@ QJsonObject recoverDirectories(const QString &root)
     return journal;
 }
 
-/** @brief 保存提交成功状态后安排独立的既有 Qt 重启入口。 */
+/**
+ * @brief 保存提交成功状态后安排独立的既有 Qt 重启入口。
+ * @param command 固定的重启命令及参数。
+ * @param[in,out] result 处理结果。
+ */
 void scheduleRestart(const QStringList &command, QJsonObject &result)
 {
     QProcess process;
@@ -433,7 +510,11 @@ void scheduleRestart(const QStringList &command, QJsonObject &result)
 }
 } // namespace
 
-/** @brief 初始化线程及跨线程 JSON 结果类型。 */
+/**
+ * @brief 初始化线程及跨线程 JSON 结果类型。
+ * @param options 受控资源更新参数；路径和重启命令均不来自网页。
+ * @param parent Qt 父对象；对象销毁由父子关系管理，空指针表示无父对象。
+ */
 WebResourceUpdate::WebResourceUpdate(const WebResourceOptions &options, QObject *parent)
     : QThread(parent), options_(options)
 {
@@ -441,7 +522,10 @@ WebResourceUpdate::WebResourceUpdate(const WebResourceOptions &options, QObject 
     setObjectName(QStringLiteral("web-resource-update"));
 }
 
-/** @return 只检查库和接口，不修改资源、不启动线程或重启。 */
+/**
+ * @brief 检查资源更新所需的 libarchive 接口是否可用。
+ * @return 只检查库和接口，不修改资源、不启动线程或重启。
+ */
 bool WebResourceUpdate::available()
 {
     try {
@@ -452,7 +536,9 @@ bool WebResourceUpdate::available()
     }
 }
 
-/** @brief 独立线程调用同一生产处理函数，再排队通知 Web 服务。 */
+/**
+ * @brief 独立线程调用同一生产处理函数，再排队通知 Web 服务。
+ */
 void WebResourceUpdate::run()
 {
     emit completed(
@@ -461,7 +547,107 @@ void WebResourceUpdate::run()
         }));
 }
 
-/** @brief 校验全部条目、流式解压、目录事务、落盘结果；失败回滚未提交目录。 */
+/** @brief 在独立批次目录展开图片，所有路径只用于校验，输出文件统一使用原始文件名。 */
+QJsonArray WebResourceUpdate::extractFaceImages(const QString &archive,
+                                               const QString &destination,
+                                               qint64 expandedBudget)
+{
+    const QFileInfo input(archive), folder(destination);
+    if (!input.isFile() || input.isSymLink() || input.size() <= 0 || input.size() > 100 * MiB)
+        fail(QStringLiteral("人员图片压缩包大小无效，最多 100 MiB"));
+    if (expandedBudget <= 0)
+        fail(QStringLiteral("人员图片展开空间或配额不足"), 507);
+    const QString parent = folder.absolutePath();
+    if (folder.exists() || folder.isSymLink() || QFileInfo(parent).canonicalFilePath() != parent ||
+        !QDir().mkdir(folder.absoluteFilePath()))
+        fail(QStringLiteral("人员图片解压目录不可用"));
+    ArchiveLocale locale;
+    checkZipDirectory(archive);
+    ArchiveReader reader(archive);
+    struct archive_entry *item = nullptr;
+    QJsonArray images;
+    QSet<QString> names;
+    qint64 expanded = 0;
+    int entries = 0;
+    QByteArray buffer(65536, '\0');
+    for (;;) {
+        interrupted();
+        const int code = reader.api.archive_read_next_header(reader.handle, &item);
+        if (code == ARCHIVE_EOF) break;
+        reader.api.check(code, reader.handle);
+        if (++entries > 20000) fail(QStringLiteral("人员图片压缩包条目过多"));
+        const auto type = reader.api.archive_entry_filetype(item);
+        const bool directory = type == AE_IFDIR;
+        if ((type != AE_IFREG && !directory) || reader.api.archive_entry_symlink(item) ||
+            reader.api.archive_entry_hardlink(item) || reader.api.archive_entry_is_encrypted(item))
+            fail(QStringLiteral("人员图片包不允许加密、链接或特殊文件"));
+        const char *text = reader.api.archive_entry_pathname_utf8(item);
+        if (!text) fail(QStringLiteral("图片包文件名无法转换为 UTF-8"));
+        QString path = QString::fromUtf8(text);
+        while (path.startsWith("./")) path.remove(0, 2);
+        while (path.endsWith('/')) path.chop(1);
+        if (path.isEmpty() && directory) continue;
+        const auto parts = path.split('/');
+        if (path.startsWith('/') || path.contains('\\') || path.contains(':'))
+            fail(QStringLiteral("人员图片包路径无效"));
+        for (const auto &part : parts) {
+            if (part.isEmpty() || part == "." || part == "..")
+                fail(QStringLiteral("人员图片包包含路径穿越"));
+            for (const auto ch : part)
+                if (ch.unicode() < 32 || ch.unicode() == 127)
+                    fail(QStringLiteral("人员图片包路径含控制字符"));
+        }
+        if (directory) continue;
+        const qint64 size = reader.api.archive_entry_size(item);
+        if (!reader.api.archive_entry_size_is_set(item) || size < 0 ||
+            size > expandedBudget - expanded)
+            fail(QStringLiteral("人员图片展开空间或配额不足"), 507);
+        expanded += size;
+        const QString name = parts.last();
+        if (!WebPaths::accepts("person_face", name) || parts.contains("__MACOSX") || name.startsWith("._")) {
+            reader.api.check(reader.api.archive_read_data_skip(reader.handle), reader.handle);
+            continue;
+        }
+        WebPaths::filename(name);
+        if (images.size() >= 499 || names.contains(name.toCaseFolded()))
+            fail(QStringLiteral("图片包最多 499 张，且不同目录不能包含同名图片"));
+        if (size <= 0 || size > 10 * MiB)
+            fail(QStringLiteral("人脸图片为空或超过 10 MiB：") + name);
+        QStorageInfo storage(parent);
+        storage.refresh();
+        if (!storage.isReady() || storage.bytesAvailable() < size + 64 * MiB)
+            fail(QStringLiteral("人员图片解压剩余空间不足"), 507);
+        const QString target = QDir(destination).filePath(name);
+        QFile output(target);
+        if (!output.open(QIODevice::WriteOnly | QIODevice::NewOnly))
+            fail(QStringLiteral("人员图片暂存文件创建失败"), 503);
+        qint64 written = 0;
+        for (;;) {
+            interrupted();
+            const auto count = reader.api.archive_read_data(reader.handle, buffer.data(), size_t(buffer.size()));
+            if (count < 0) reader.api.check(int(count), reader.handle);
+            if (count == 0) break;
+            if (count > size - written || output.write(buffer.constData(), count) != count)
+                fail(QStringLiteral("人员图片长度错误或写入失败"), 503);
+            written += count;
+        }
+        if (written != size || !output.flush()) fail(QStringLiteral("人员图片解压不完整"));
+        output.close();
+        WebPaths::validateFaceImage(target, name);
+        names.insert(name.toCaseFolded());
+        images.append(QJsonObject{{"kind", "person_face"}, {"original_name", name}, {"path", target}});
+    }
+    if (images.isEmpty()) fail(QStringLiteral("压缩包中没有可导入的 JPG、JPEG、PNG 或 BMP 图片"));
+    return images;
+}
+
+/**
+ * @brief 校验全部条目、流式解压、目录事务、落盘结果；失败回滚未提交目录。
+ * @param options 受控资源更新参数；路径和重启命令均不来自网页。
+ * @param progress 实际进度回调，不提供时忽略进度通知。
+ * @return 实际更新或恢复结果，含成功目录或失败原因。
+ * @note 仅操作受控文件路径；归档校验、目录替换和结果落盘在线程内完成，不访问数据库或控件。
+ */
 QJsonObject WebResourceUpdate::execute(const WebResourceOptions &options, Progress progress)
 {
     QJsonObject result;

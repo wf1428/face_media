@@ -18,6 +18,7 @@ SOURCES += \
     $$PWD/../../components/multimedia/media_toast.cpp \
     $$PWD/../../modules/web/web_local_api.cpp \
     $$PWD/../../modules/web/web_local_runtime.cpp \
+    $$PWD/../../modules/web/web_floor_schedule.cpp \
     $$PWD/../../ic_board/rs485_floor_frame_builder.cpp \
     $$PWD/../../ic_board/local_access_service.cpp \
     $$PWD/../../modules/web/web_hotspot.cpp \

@@ -8,6 +8,7 @@ SOURCES += \
     $$PWD/web_upload_presenter.cpp \
     $$PWD/web_local_api.cpp \
     $$PWD/web_local_runtime.cpp \
+    $$PWD/web_floor_schedule.cpp \
     $$PWD/web_hotspot.cpp \
     $$PWD/web_paths.cpp \
     $$PWD/web_service.cpp \
@@ -29,6 +30,7 @@ HEADERS += \
     $$PWD/web_upload_presenter.h \
     $$PWD/web_local_api.h \
     $$PWD/web_local_runtime.h \
+    $$PWD/web_floor_schedule.h \
     $$PWD/web_hotspot.h \
     $$PWD/web_paths.h \
     $$PWD/web_service.h \

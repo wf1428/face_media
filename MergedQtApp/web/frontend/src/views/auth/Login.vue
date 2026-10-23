@@ -133,7 +133,9 @@ onMounted(async () => {
   }
 })
 
-/** @brief 提交账号密码并在登录成功后进入设备页面。 */
+/**
+ * @brief 提交账号密码并在登录成功后进入设备页面。
+ */
 async function onLogin() {
   if (loading.value) return
   if (!password.value) {

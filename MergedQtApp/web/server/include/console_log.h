@@ -16,11 +16,20 @@
 #include <string>
 
 namespace deviceweb {
-enum class LogLevel { Info, Warning, Error };
+/** @brief 控制台输出等级，仅影响日志前缀。 */
+enum class LogLevel {
+    Info,    /**< 正常操作与状态信息。 */
+    Warning, /**< 可继续服务的异常或被拒绝操作。 */
+    Error    /**< 请求或模块执行失败。 */
+};
 
 // Keep untrusted paths and error descriptions on one bounded console line.
 
-/** @brief 将外部文本转换为有长度上限的单行日志内容。 */
+/**
+ * @brief 将外部文本转换为有长度上限的单行日志内容。
+ * @param value 待清理控制字符并限制长度的外部日志文本。
+ * @return 转义控制字符后的单行日志文本。
+ */
 inline std::string logText(const std::string &value)
 {
     std::string result;
@@ -42,7 +51,11 @@ inline std::string logText(const std::string &value)
     return result;
 }
 
-/** @brief 线程安全地输出带时间和级别的控制台日志，并立即刷新。 */
+/**
+ * @brief 线程安全地输出带时间和级别的控制台日志，并立即刷新。
+ * @param level 日志等级。
+ * @param message 可返回调用方的结果或错误说明。
+ */
 inline void consoleLog(LogLevel level, const std::string &message)
 {
     static std::mutex mutex;

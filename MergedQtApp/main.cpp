@@ -38,6 +38,7 @@
 #include "modules/facegate/FaceGateQt/import/UsbPersonImportSource.h"
 #include "modules/web/web_bridge_server.h"
 #include "modules/web/web_local_runtime.h"
+#include "modules/web/web_floor_schedule.h"
 #include "modules/web/web_upload_presenter.h"
 #include "components/settings/networkpage.h"
 #include "ic_board/ic_event_bridge.h"
@@ -60,14 +61,18 @@ static QtMessageHandler g_oldHandler = nullptr;
 class VirtualKeyboardFocusFilter final : public QObject
 {
 public:
-    /** @brief 创建应用级虚拟键盘事件过滤器。 */
+    /**
+     * @brief 创建应用级虚拟键盘事件过滤器。
+     */
     explicit VirtualKeyboardFocusFilter(QObject *parent = nullptr)
         : QObject(parent)
     {
     }
 
 protected:
-    /** @brief 在输入控件聚焦或鼠标释放后异步显示输入法面板。 */
+    /**
+     * @brief 在输入控件聚焦或鼠标释放后异步显示输入法面板。
+     */
     bool eventFilter(QObject *watched, QEvent *event) override
     {
         auto *widget = qobject_cast<QWidget *>(watched);
@@ -92,7 +97,9 @@ protected:
     }
 };
 
-/** @return 平台参数去除空白并忽略大小写后以 "linuxfb" 开头时返回 true。 */
+/**
+ * @return 平台参数去除空白并忽略大小写后以 "linuxfb" 开头时返回 true。
+ */
 static bool isLinuxFbPlatformValue(const QByteArray &value)
 {
     return value.trimmed().toLower().startsWith(QByteArrayLiteral("linuxfb"));
@@ -100,7 +107,7 @@ static bool isLinuxFbPlatformValue(const QByteArray &value)
 
 /**
  * @brief 从 QApplication 参数中移除遗留的 linuxfb 平台选项。
- *
+ * 
  * Qt 命令行参数优先于环境变量；必须在创建 QApplication 之前原地压缩 argv，
  * 才能保证 RK3566 使用 EGLFS。
  */
@@ -133,7 +140,7 @@ static void removeLegacyLinuxFbArguments(int &argc, char **argv)
 
 /**
  * @brief 判断一条已知且无业务价值的 Qt 图形/输入警告是否应被抑制。
- *
+ * 
  * 只过滤明确匹配的 libpng 配置及已拔出 evdev 鼠标告警，其余消息保持原样输出。
  */
 static bool shouldDropPngWarning(QtMsgType type, const QString &msg)
@@ -161,7 +168,7 @@ static bool shouldDropPngWarning(QtMsgType type, const QString &msg)
 
 /**
  * @brief 将 Qt 日志统一编码为 UTF-8 并直接写入 stderr。
- *
+ * 
  * Fatal 消息写出后立即终止进程；已知噪声由 shouldDropPngWarning() 提前过滤。
  */
 static void myUtf8MessageHandler(QtMsgType type,
@@ -203,9 +210,10 @@ static void myUtf8MessageHandler(QtMsgType type,
 
 /**
  * @brief 创建应用存活心跳文件，并每 10 秒原子更新一次。
- *
+ * 
  * 定时器以 app 为父对象，随应用生命周期自动释放；首次启动时立即写入一次，
  * 避免监控端必须等待第一个定时周期。
+ * @param app 应用对象，提供心跳定时器的生命周期。
  */
 static void setupQtHeartbeat(QCoreApplication *app)
 {
@@ -235,9 +243,12 @@ static void setupQtHeartbeat(QCoreApplication *app)
 
 /**
  * @brief 融合应用入口。
- *
+ * 
  * 在 QApplication 创建前完成 Wayland/OpenGL ES、虚拟键盘和日志环境配置，
  * 随后初始化外壳、启动页、数据库退出清理及 IC 板 I/O。
+ * @param argc 命令行参数个数。
+ * @param argv 命令行参数数组。
+ * @return Qt 事件循环退出码，初始化失败按既有路径返回非零值。
  */
 int main(int argc, char *argv[])
 {
@@ -366,7 +377,7 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    // 新增 Web IPC 有独立工作线程；未启用或启动失败不影响现有 Qt 流程。
+    /** @brief Web IPC 在独立线程处理文件和数据库，主线程只绑定实际运行入口。 */
     WebRuntime webRuntime;
     if (qgetenv("MERGEDQT_WEB_ENABLE") == "1") {
         auto *local = WebLocalRuntime::instance();
@@ -406,6 +417,17 @@ int main(int argc, char *argv[])
         });
         // 串口和重启沿用实际平台入口，保存、发送与硬件确认分开回报。
         auto *io = IcEventBridge::instance();
+        /** @brief Web 使用独立执行器，规则、楼层位和分钟去重标记与平台入口共用。 */
+        auto *scheduler = new WebFloorSchedule(local, [io](const QByteArray &frame, const QString &tag) {
+            return io->requestRs485Send(frame, tag);
+        });
+        local->bindFloorSchedule(scheduler, [local, scheduler](const QString &token, const QJsonObject &args) {
+            int status = 200;
+            QString error;
+            const auto result = scheduler->apply(
+                        args.value("action").toString(), args.value("data").toObject(), &status, &error);
+            local->complete(token, result, status, error);
+        });
         local->setDeviceReady(QFileInfo::exists(Rk3566Platform::rs485Device()));
         QObject::connect(
             local,

@@ -3,6 +3,7 @@
  @brief 无目录要求的本地 Excel/人脸批次上传、封存、状态及部分成功反馈。
  @author Du lin
  @date 2026-10-09
+ @note 最近修改：2026-10-23；修改人：Du lin；移除图片压缩包选择处的文件夹和图片命名提示，保留支持格式、大小提示及原上传处理。
 -->
 
 <template>
@@ -25,7 +26,16 @@
       :disabled="busy || !!batch"
       @change="selectExcel"
     />
+    <van-cell title="人脸图片导入方式">
+      <template #label>
+        <van-radio-group v-model="imageMode" direction="horizontal" :disabled="busy || !!batch">
+          <van-radio name="images">直接上传图片</van-radio>
+          <van-radio name="archive">上传图片压缩包</van-radio>
+        </van-radio-group>
+      </template>
+    </van-cell>
     <van-cell
+      v-if="imageMode === 'images'"
       title="选择人脸图片（可多选）"
       :label="`${batch?.result?.manifest?.filter((file) => file.kind === 'person_face').length ?? images.length} 张，原名须为 账号_序号，例如 zhangsan_1.jpg`"
       is-link
@@ -40,8 +50,13 @@
       :disabled="busy || !!batch"
       @change="selectImages"
     />
+    <van-cell v-if="imageMode === 'archive'" title="选择人脸图片压缩包"
+      :label="faceArchive?.name || batch?.result?.manifest?.find((file) => file.kind === 'person_face_archive')?.name || '支持 ZIP、RAR、TAR、TAR.GZ（最多 100 MiB）'"
+      is-link @click="archiveInput.click()" />
+    <input ref="archiveInput" class="file-input" type="file" accept=".zip,.rar,.tar,.gz,.tgz"
+      :disabled="busy || !!batch" @change="selectArchive" />
     <van-cell
-      v-for="file in images"
+      v-for="file in imageMode === 'images' ? images : []"
       :key="file.name"
       :title="file.name"
       :value="formatSize(file.size)"
@@ -118,6 +133,8 @@ import { api, formatSize } from '../api'
 import { showToast, showConfirmDialog } from 'vant'
 
 const emit = defineEmits(['changed'])
+/** @description 同一批次只能选择直接图片或单个归档；切换方式不修改已封存清单。 */
+const imageMode = ref('images'), faceArchive = ref(null), archiveInput = ref(null)
 const excel = ref(null),
   images = ref([]),
   batch = ref(null),
@@ -145,7 +162,10 @@ const stateLabel = computed(
     })[batch.value?.state] || batch.value?.state,
 )
 
-/** @brief 文件选择不要求目录；已上传批次不替换清单。 */
+/**
+ * @brief 文件选择不要求目录；已上传批次不替换清单。
+ * @param {Event} event 文件选择或进度事件，按具体回调读取 target 或 loaded。
+ */
 function selectExcel(event) {
   const file = event.target.files?.[0]
   event.target.value = ''
@@ -157,7 +177,10 @@ function selectExcel(event) {
   excel.value = file
 }
 
-/** @brief 保留图片名字与字节，不压缩改名，保持账号匹配规则。 */
+/**
+ * @brief 保留图片名字与字节，不压缩改名，保持账号匹配规则。
+ * @param {Event} event 文件选择或进度事件，按具体回调读取 target 或 loaded。
+ */
 function selectImages(event) {
   const files = Array.from(event.target.files || [])
   event.target.value = ''
@@ -176,16 +199,35 @@ function selectImages(event) {
   images.value = files
 }
 
-/** @brief 所有文件顺序上传到一个批次，成功后才允许开始导入。 */
+/**
+ * @brief 只登记压缩包原文件，解压及图片校验由设备后台完成。
+ * @param {Event} event 单文件选择事件；清空控件以允许重新选择同一文件。
+ */
+function selectArchive(event) {
+  const file = event.target.files?.[0]
+  event.target.value = ''
+  if (busy.value || batch.value || !file) return
+  if (!/\.(zip|rar|tar|gz|tgz)$/i.test(file.name) || file.size <= 0 || file.size > 100 * 1048576) {
+    showToast('请选择不超过 100 MiB 的 ZIP、RAR 或 TAR 图片压缩包')
+    return
+  }
+  faceArchive.value = file
+}
+
+/**
+ * @brief 所有文件顺序上传到一个批次，成功后才允许开始导入。
+ */
 async function upload() {
   if (!excel.value || busy.value || batch.value) return
   busy.value = true
   error.value = ''
   try {
-    // 清单固定一份 Excel 和当前所选图片，后续任务都归属同一批次。
+    // 固定一份 Excel 加直接图片或单个图片包；两种模式不会同时上传。
     const files = [
       { file: excel.value, kind: 'person_excel' },
-      ...images.value.map((file) => ({ file, kind: 'person_face' })),
+      ...(imageMode.value === 'archive'
+        ? (faceArchive.value ? [{ file: faceArchive.value, kind: 'person_face_archive' }] : [])
+        : images.value.map((file) => ({ file, kind: 'person_face' }))),
     ]
     batch.value = await api.createImport(
       files.map(({ file, kind }) => ({ name: file.name, size: file.size, kind })),
@@ -210,7 +252,9 @@ async function upload() {
   }
 }
 
-/** @brief 封存后只执行一次；网络响应丢失只查询原批次。 */
+/**
+ * @brief 封存后只执行一次；网络响应丢失只查询原批次。
+ */
 async function start() {
   if (!batch.value || busy.value || !uploaded.value) return
   try {
@@ -233,14 +277,18 @@ async function start() {
   }
 }
 
-/** @brief 仅工作阶段轮询，终止/离页停止。 */
+/**
+ * @brief 仅工作阶段轮询，终止/离页停止。
+ */
 function schedule() {
   clearTimeout(timer)
   if (batch.value && !terminal.value && batch.value.state !== 'OPEN')
     timer = setTimeout(refresh, 1500)
 }
 
-/** @brief 查询真实结果，不把失败请求显示为成功。 */
+/**
+ * @brief 查询真实结果，不把失败请求显示为成功。
+ */
 async function refresh() {
   if (!batch.value) return
   try {
@@ -248,6 +296,7 @@ async function refresh() {
     batch.value = await api.importStatus(batch.value.id)
     const manifest = batch.value.result?.manifest || [],
       assets = batch.value.assets || []
+    if (manifest.length) imageMode.value = manifest.some((file) => file.kind === 'person_face_archive') ? 'archive' : 'images'
     uploaded.value =
       manifest.length > 0 &&
       manifest.every((file) =>
@@ -261,7 +310,9 @@ async function refresh() {
   }
 }
 
-/** @brief 新建页面批次不重复执行旧批次，保留服务端结果供核对。 */
+/**
+ * @brief 新建页面批次不重复执行旧批次，保留服务端结果供核对。
+ */
 async function reset() {
   // 开放中的旧批次先在服务端丢弃，已封存批次只清理本地页面状态。
   if (batch.value?.state === 'OPEN') {
@@ -280,11 +331,15 @@ async function reset() {
   uploaded.value = false
   excel.value = null
   images.value = []
+  faceArchive.value = null
+  imageMode.value = 'images'
   error.value = ''
   progress.value = ''
 }
 
-/** @brief 释放断线后任务，活动写入者由服务端拒绝；已完成任务仅查询，不重传。 */
+/**
+ * @brief 释放断线后任务，活动写入者由服务端拒绝；已完成任务仅查询，不重传。
+ */
 async function cancelFailedTask() {
   try {
     const task = await api.uploadStatus(failedTask.value)

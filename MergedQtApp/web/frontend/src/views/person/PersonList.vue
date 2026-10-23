@@ -3,6 +3,7 @@
  @brief 本地人员管理与原 Excel/人脸批次导入入口。
  @author Du lin
  @date 2026-10-09
+ @note 最近修改：2026-10-23；修改人：Du lin；新建成功后按返回的人员编号进入详情页，仍需手动配置通行权限。
 -->
 
 <template>
@@ -114,7 +115,11 @@ const showNfc = ref(false)
 const saving = ref(false)
 const form = reactive({ name: '', employeeNo: '', department: '', phone: '' })
 
-/** @brief 人员行副标题：工号 + 部门（无部门显示“未分配”） */
+/**
+ * @brief 人员行副标题：工号 + 部门（无部门显示“未分配”）
+ * @param {object} p 当前人员记录或页面定时计划。
+ * @returns {string} 工号和部门副标题，缺失字段按当前语言及占位规则展示。
+ */
 function personLabel(p) {
   const dept = p.department || t('person.unassignedDept')
   return p.employeeNo
@@ -122,7 +127,9 @@ function personLabel(p) {
     : p.department || ''
 }
 
-/** @brief 清空保留的新增人员表单字段。 */
+/**
+ * @brief 清空保留的新增人员表单字段。
+ */
 function resetForm() {
   form.name = ''
   form.employeeNo = ''
@@ -130,7 +137,9 @@ function resetForm() {
   form.phone = ''
 }
 
-/** @brief 从设备读取并刷新本地人员列表。 */
+/**
+ * @brief 从设备读取并刷新本地人员列表。
+ */
 async function load() {
   try {
     persons.value = await api.personList()
@@ -139,17 +148,24 @@ async function load() {
   }
 }
 
-/** @brief 打开选中人员的详情页面。 */
+/**
+ * @brief 打开选中人员的详情页面。
+ * @param {object} p 当前人员记录或页面定时计划。
+ */
 function goDetail(p) {
   router.push('/person/' + p.id)
 }
 
-/** @brief 打开本地人员新建表单。 */
+/**
+ * @brief 打开本地人员新建表单。
+ */
 function openAdd() {
   showAdd.value = true
 }
 
-/** @brief 通过本地 API 新增人员。 */
+/**
+ * @brief 通过本地 API 新增人员后进入详情页，不自动保存规则或授予权限。
+ */
 async function onAdd() {
   if (!form.name) {
     showToast(t('person.nameRequired'))
@@ -157,10 +173,10 @@ async function onAdd() {
   }
   saving.value = true
   try {
-    await api.personAdd({ ...form })
+    const created = await api.personAdd({ ...form })
     showToast({ type: 'success', message: t('person.created') })
     showAdd.value = false
-    load()
+    await router.push('/person/' + created.id)
   } catch (e) {
     showToast({ type: 'fail', message: e.message || t('person.createFailed') })
   } finally {
@@ -168,7 +184,10 @@ async function onAdd() {
   }
 }
 
-/** @brief 删除所选本地人员。 */
+/**
+ * @brief 删除所选本地人员。
+ * @param {object} p 当前人员记录或页面定时计划。
+ */
 async function onDelete(p) {
   try {
     await showConfirmDialog({

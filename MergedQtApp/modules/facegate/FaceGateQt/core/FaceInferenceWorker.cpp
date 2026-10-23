@@ -2,8 +2,9 @@
  * @file FaceInferenceWorker.cpp
  * @brief 专用推理线程中的人脸引擎与验证状态机门面的实现。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-10-23；修改人：Du lin；本地 U 盘图片特征提取后复用 WebFacePolicy，与本地、网络及本批次图库进行相似度防重。
  */
 
 #include "FaceInferenceWorker.h"
@@ -11,6 +12,7 @@
 #include "FaceEngine.h"
 #include "LivenessWorker.h"
 #include "VerificationController.h"
+#include "modules/web/web_face_policy.h"
 
 #include <QDebug>
 #include <QJsonArray>
@@ -446,6 +448,13 @@ void FaceInferenceWorker::validateSyncedFaceImages(
                 validatedFaces, failedFaces);
 }
 
+/**
+ * @brief 在推理线程提取本地导入人脸，使用统一阈值排除跨人员重复图片。
+ * @param token 本次导入任务标识，原样随结果返回。
+ * @param faces 已匹配本地人员的图片列表，同一人员自身旧人脸不算冲突。
+ * @param config 质量校验与相似度阈值配置。
+ * @note 不修改数据库；失败图片随原因返回，不触发网络同步。
+ */
 void FaceInferenceWorker::validateLocalImportFaceImages(
         const QString &token,
         const QJsonArray &faces,
@@ -489,5 +498,8 @@ void FaceInferenceWorker::validateLocalImportFaceImages(
         face.insert(QStringLiteral("recognitionQuality"), detectConfidence);
         validatedFaces.append(face);
     }
-    emit localImportFaceImagesValidated(token, validatedFaces, failedFaces);
+    QJsonArray accepted;
+    WebFacePolicy::filter(validatedFaces, gallery_, networkGallery_,
+                          config.duplicateFaceCosineThreshold, &accepted, &failedFaces);
+    emit localImportFaceImagesValidated(token, accepted, failedFaces);
 }

@@ -61,8 +61,7 @@ INCLUDEPATH += \
     $$PWD/modules/facegate/FaceGateQt/database \
     $$PWD/modules/facegate/FaceGateQt/import \
     $$PWD/modules/facegate/FaceGateQt/ui \
-    $$PWD/components/rga    \
-    $$SYSROOT/usr/include
+    $$PWD/components/rga
 
 !isEmpty(INSPIREFACE_ROOT) {
     DEFINES += FACEGATE_WITH_INSPIREFACE
@@ -191,6 +190,8 @@ HEADERS += \
     common/face_image_sync_bridge.h \
     common/responsive_ui.h \
     common/storage_policy.h \
+    common/media_content_policy.h \
+    common/ui_image_resources.h \
     common/clients/icboard_client.h \
     common/clients/signalboard_client.h \
     common/debug/probe_log.h \

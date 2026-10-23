@@ -68,7 +68,7 @@ export const SUPPORT_LANGS = [
 ]
 
 /**
- * 浏览器语言检测：将 navigator.language(s) 映射到支持的语言
+ * @brief 浏览器语言检测：将 navigator.language(s) 映射到支持的语言
  * 优先级：精确前缀匹配（zh/en/vi/th），无法识别则回退 null
  * @returns {string|null} zh/en/vi/th 或 null
  */
@@ -88,7 +88,7 @@ function detectBrowserLang() {
 }
 
 /**
- * 初始语言决策：用户已保存偏好 > 浏览器语言自动检测 > 中文兜底
+ * @brief 初始语言决策：用户已保存偏好 > 浏览器语言自动检测 > 中文兜底
  * @returns {string} zh/en/vi/th
  */
 function resolveInitialLang() {
@@ -106,7 +106,7 @@ const i18n = createI18n({
 })
 
 /**
- * 按语言同步外部环境：Vant 语言包、html lang、文档标题
+ * @brief 按语言同步外部环境：Vant 语言包、html lang、文档标题
  * @param {string} lang 语言码 zh/en/vi/th
  */
 function syncEnv(lang) {
@@ -117,7 +117,7 @@ function syncEnv(lang) {
 }
 
 /**
- * 切换语言并持久化
+ * @brief 切换语言并持久化
  * @param {string} lang 语言码 zh/en/vi/th
  */
 export function setLanguage(lang) {
@@ -128,7 +128,7 @@ export function setLanguage(lang) {
 }
 
 /**
- * 获取当前时间格式化区域（供 mock 等非组件模块使用）
+ * @brief 取得当前界面语言对应的时间格式区域，供非组件工具调用。
  * @returns {string} BCP 47 区域码
  */
 export function currentTimeLocale() {

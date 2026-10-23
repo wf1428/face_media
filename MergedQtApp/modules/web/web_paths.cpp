@@ -3,14 +3,17 @@
  * @brief Web 受控路径、媒体目录可用性和文件校验实现。
  * @author Du lin
  * @date 2026-10-09
+ * @note 最近修改：2026-10-23；修改人：Du lin；允许人员人脸归档后缀，抽取原图片格式校验供上传及解压图片复用。
  */
 
 #include "web_paths.h"
+#include "common/media_content_policy.h"
 #include "common/sql/web/web_sql.h"
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QImageReader>
 #include <QStorageInfo>
 #include <QtEndian>
 #ifdef Q_OS_UNIX
@@ -18,7 +21,11 @@
 #include <unistd.h>
 #endif
 
-/** @brief 校验上传文件名并阻止路径穿越。 */
+/**
+ * @brief 校验上传文件名并阻止路径穿越。
+ * @param name 待处理的名称。
+ * @return 校验后的单一文件名；路径分隔符等非法输入抛出 WebError。
+ */
 QString WebPaths::filename(const QString &name)
 {
     if (name.isEmpty() || name.size() > 180 || name.startsWith('.') || name != name.trimmed() ||
@@ -30,22 +37,48 @@ QString WebPaths::filename(const QString &name)
     return name;
 }
 
-/** @brief 核对上传类别与允许的文件扩展名。 */
+/**
+ * @brief 核对上传类别与允许的文件扩展名。
+ * @param kind 资源或任务类型，用于选择目录、配额和校验规则。
+ * @param name 待处理的名称。
+ * @return 文件扩展名符合资源类型允许集合时为 true。
+ */
 bool WebPaths::accepts(const QString &kind, const QString &name)
 {
     const QString suffix = QFileInfo(name).suffix().toLower();
     if (kind == "video")
         return QStringList({"mp4", "avi", "mov", "mkv", "m4v", "ts", "webm"}).contains(suffix);
+    if (kind == "ad_image") return MediaContentPolicy::isImage(name);
     if (kind == "person_excel")
         return suffix == "xls" || suffix == "xlsx";
     if (kind == "person_face")
         return QStringList({"jpg", "jpeg", "png", "bmp"}).contains(suffix);
-    if (kind == "resource_package")
+    if (kind == "resource_package" || kind == "person_face_archive")
         return QStringList({"zip", "tar", "gz", "tgz", "rar"}).contains(suffix);
     return false;
 }
 
-/** @brief 验证目标路径位于受控根目录内。 */
+/** @brief 按直接上传的原约束检查人脸图片，扩展名不能冒充真实格式。 */
+void WebPaths::validateFaceImage(const QString &path, const QString &name)
+{
+    QImageReader reader(path);
+    reader.setDecideFormatFromContent(true);
+    const QSize dimensions = reader.size();
+    const QByteArray format = reader.format().toLower();
+    const QString ext = QFileInfo(name).suffix().toLower();
+    const qint64 size = QFileInfo(path).size();
+    if (!accepts("person_face", name) || size <= 0 || size > 10 * 1048576LL ||
+        !dimensions.isValid() || qint64(dimensions.width()) * dimensions.height() > 16000000 ||
+        !reader.canRead() || !(format == ext.toLatin1() || (format == "jpeg" && ext == "jpg")))
+        throw WebError(400, QStringLiteral("人脸图片格式、尺寸或扩展名不匹配"));
+}
+
+/**
+ * @brief 验证目标路径位于受控根目录内。
+ * @param path 待访问的文件或配置路径。
+ * @param root 受控根目录。
+ * @param mustExist 为 true 时要求目标已存在。
+ */
 void WebPaths::inside(const QString &path, const QString &root, bool mustExist)
 {
     const QFileInfo rootInfo(root), file(path);
@@ -63,7 +96,11 @@ void WebPaths::inside(const QString &path, const QString &root, bool mustExist)
         throw WebError(400, QStringLiteral("文件路径无效"));
 }
 
-/** @brief 确认媒体目录可读写；允许直接使用 eMMC 上的普通目录。 */
+/**
+ * @brief 确认媒体目录可读写；允许直接使用 eMMC 上的普通目录。
+ * @param root 受控根目录。
+ * @param mountRoot 旧挂载点配置，保留兼容用途。
+ */
 void WebPaths::mounted(const QString &root, const QString &mountRoot)
 {
     // 保留旧参数以兼容已有部署配置，不再要求独立挂载点。
@@ -85,7 +122,10 @@ void WebPaths::mounted(const QString &root, const QString &mountRoot)
         throw WebError(503, QStringLiteral("视频目录没有读写权限"));
 }
 
-/** @brief 创建受控上传目录并校验其文件类型。 */
+/**
+ * @brief 创建受控上传目录并校验其文件类型。
+ * @param path 待访问的文件或配置路径。
+ */
 void WebPaths::uploadDirectory(const QString &path)
 {
     const QFileInfo directory(path);
@@ -100,7 +140,11 @@ void WebPaths::uploadDirectory(const QString &path)
 #endif
 }
 
-/** @brief 同步文件或目录以保证提交后的持久性。 */
+/**
+ * @brief 同步文件或目录以保证提交后的持久性。
+ * @param path 待访问的文件或配置路径。
+ * @param directory 为 true 时按目录执行同步，否则按文件同步。
+ */
 void WebPaths::sync(const QString &path, bool directory)
 {
 #ifdef Q_OS_UNIX
@@ -118,7 +162,11 @@ void WebPaths::sync(const QString &path, bool directory)
 #endif
 }
 
-/** @brief 统计受控目录当前占用的文件字节数。 */
+/**
+ * @brief 统计受控目录当前占用的文件字节数。
+ * @param root 受控根目录。
+ * @return 目录中受统计文件的总字节数。
+ */
 qint64 WebPaths::usage(const QString &root)
 {
     qint64 bytes = 0;
@@ -132,7 +180,10 @@ qint64 WebPaths::usage(const QString &root)
     return bytes;
 }
 
-/** @brief 校验 Excel 文件结构并沿用原导入格式要求。 */
+/**
+ * @brief 校验 Excel 文件结构并沿用原导入格式要求。
+ * @param path 待访问的文件或配置路径。
+ */
 void WebPaths::validateExcel(const QString &path)
 {
     QFile file(path);

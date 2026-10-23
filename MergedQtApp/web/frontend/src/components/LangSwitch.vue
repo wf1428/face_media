@@ -70,7 +70,10 @@ const actions = computed(() =>
   })),
 )
 
-/** @brief 选择语言后关闭弹层 */
+/**
+ * @brief 选择语言后关闭弹层
+ * @param {object} item 语言选项，包含目标语言代码。
+ */
 function onSelect(item) {
   setLanguage(item.value)
   show.value = false

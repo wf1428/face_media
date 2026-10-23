@@ -58,7 +58,10 @@ watch(
   },
 )
 
-/** @brief 切换底部导航对应的页面路由。 */
+/**
+ * @brief 切换底部导航对应的页面路由。
+ * @param {string} name 选中的导航项名称。
+ */
 function onChange(name) {
   router.replace(tabPath[name])
 }

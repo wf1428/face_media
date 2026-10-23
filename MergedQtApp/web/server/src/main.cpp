@@ -14,7 +14,12 @@
 #include <signal.h>
 #endif
 
-/** @brief 加载部署配置并运行独立 Web 服务。 */
+/**
+ * @brief 加载部署配置并运行独立 Web 服务。
+ * @param argc 命令行参数个数。
+ * @param argv 命令行参数数组。
+ * @return 正常退出返回 0；配置或启动失败返回非零值。
+ */
 int main(int argc, char **argv)
 {
     if (argc != 2) {

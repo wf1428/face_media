@@ -2,8 +2,9 @@
  * @file PersonImportWorker.cpp
  * @brief XLS/XLSX 人员表后台导入任务实现。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-08-28
+ * @note 最近修改：2026-10-23；修改人：Du lin；U 盘人脸保存前复核最新本地与网络图库，冲突项保留失败原因，不改变人员表入库和图片替换规则。
  */
 
 #include "PersonImportWorker.h"
@@ -13,6 +14,8 @@
 #include "UsbPersonImportSource.h"
 #include "common/sql/dbstore.h"
 #include "modules/web/local_import_gate.h"
+#include "modules/web/web_face_policy.h"
+#include "common/sql/web/web_sql.h"
 
 #include <QDir>
 #include <QFileInfo>
@@ -47,7 +50,7 @@ void PersonImportWorker::cancel()
  */
 void PersonImportWorker::run()
 {
-    // 新增 Web 与 U 盘共用互斥预约；原表格解析、覆盖和图片校验保持原实现。
+    // Web 与 U 盘共用互斥预约；表格按原规则入库，图片通过统一防重后再保存。
     if (!LocalImportGate::acquire()) {
         cleanupResources();
         emit finished(false, 0, 0, 0, 0, {}, {}, QStringLiteral("已有本地人员导入任务，请稍后重试"), QString());
@@ -171,6 +174,13 @@ void PersonImportWorker::run()
     emit faceValidationRequested(pendingToken_, faceCandidates);
 }
 
+/**
+ * @brief 复核最新图库后保存本地图片，失败图片不替换旧人脸。
+ * @param token 当前待校验任务标识，过期结果忽略。
+ * @param validatedFaces 推理线程通过质量和相似度防重的图片。
+ * @param failedFaces 推理线程拒绝的图片及原因。
+ * @note 人员资料已按原规则入库；图库读取失败时拒绝本次图片，保留已有照片。
+ */
 void PersonImportWorker::applyFaceValidation(const QString &token,
                                              const QJsonArray &validatedFaces,
                                              const QJsonArray &failedFaces)
@@ -178,8 +188,22 @@ void PersonImportWorker::applyFaceValidation(const QString &token,
     if (token != pendingToken_ || pendingToken_.isEmpty()) return;
     pendingToken_.clear();
     emit progress(85, QStringLiteral("人脸图片校验完成，正在保存导入结果…"));
+    QJsonArray verified, rejected = failedFaces;
+    try {
+        QVector<FaceRecord> local, network;
+        WebFacePolicy::currentGalleries(&local, &network);
+        const float threshold = validatedFaces.isEmpty() ? 1.0f
+                : float(validatedFaces.first().toObject().value("duplicateThreshold").toDouble());
+        WebFacePolicy::filter(validatedFaces, local, network, threshold, &verified, &rejected);
+    } catch (const WebError &e) {
+        for (const auto &value : validatedFaces) {
+            auto face = value.toObject();
+            face.insert("message", e.message);
+            rejected.append(face);
+        }
+    }
     QHash<QString, QStringList> faceErrorsByPerson;
-    for (const QJsonValue &value : failedFaces) {
+    for (const QJsonValue &value : rejected) {
         const QJsonObject face = value.toObject();
         const QString name = face.value(QStringLiteral("personName")).toString().trimmed();
         const QString personLabel = name.isEmpty()
@@ -198,7 +222,7 @@ void PersonImportWorker::applyFaceValidation(const QString &token,
 
     QStringList storageFailures;
     QString storageError;
-    if (!store_.replaceValidatedFaces(validatedFaces, &savedFaces_,
+    if (!store_.replaceValidatedFaces(verified, &savedFaces_,
                                       &storageFailures, &storageError)) {
         failed_ += storageFailures.size();
         failedNames_.append(storageFailures);

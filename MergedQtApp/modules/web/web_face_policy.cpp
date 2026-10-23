@@ -12,7 +12,12 @@
 
 namespace {
 
-/** @return float 特征余弦；复制到对齐 float 后计算，坏值/维度不一致返回 -1。 */
+/**
+ * @brief 计算以 float 字节保存的两个人脸特征的余弦相似度。
+ * @param left 第一个待比较的字节序列。
+ * @param right 第二个待比较的字节序列。
+ * @return float 特征余弦；复制到对齐 float 后计算，坏值/维度不一致返回 -1。
+ */
 float cosine(const QByteArray &left, const QByteArray &right)
 {
     if (left.isEmpty() || left.size() != right.size() || left.size() % sizeof(float))
@@ -32,7 +37,15 @@ float cosine(const QByteArray &left, const QByteArray &right)
 }
 } // namespace
 
-/** @brief 依据本地和网络人脸库及下发阈值筛选待导入人脸。 */
+/**
+ * @brief 依据本地和网络人脸库及下发阈值筛选待导入人脸。
+ * @param input 待校验的输入数据。
+ * @param local 本地人员图库。
+ * @param network 网络人员图库。
+ * @param configured 配置的余弦防重阈值，使用时限制在 [0, 1]。
+ * @param[out] accepted 追加通过防重的人脸，调用方提供有效数组指针。
+ * @param[out] failed 追加失败条目及原因，调用方提供有效数组指针。
+ */
 void WebFacePolicy::filter(const QJsonArray &input,
                            const QVector<FaceRecord> &local,
                            const QVector<FaceRecord> &network,
@@ -100,7 +113,11 @@ void WebFacePolicy::filter(const QJsonArray &input,
     }
 }
 
-/** @brief 读取本地和网络人员的人脸特征用于防重。 */
+/**
+ * @brief 读取本地和网络人员的人脸特征用于防重。
+ * @param[out] local 输出本地图库，先清空再填入，不可为空。
+ * @param[out] network 输出网络图库，先清空再填入，不可为空。
+ */
 void WebFacePolicy::currentGalleries(QVector<FaceRecord> *local, QVector<FaceRecord> *network)
 {
     // 两类人员共享统一数据库，但各自从对应的人员和人脸表取特征。

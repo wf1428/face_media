@@ -2,8 +2,10 @@
  * @file multimediademo.h
  * @brief 协调信号板显示、本地轮播、直播、音量、截图和 MQTT 状态。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-10-23；修改人：Du lin；明确结果照片清理后的恢复契约：识别活动时恢复摄像头，
+ *       退出识别后才恢复 PIC；未更改接口签名、配置或前台计时。
  */
 
 #ifndef MULTIMEDIADEMO_H
@@ -118,187 +120,314 @@ class MultimediaDemo : public QDialog
     Q_OBJECT
 
 public:
-    /** @brief 创建信号板、多媒体、MQTT、截图和告警子系统。 */
+    /**
+     * @brief 创建信号板、多媒体、MQTT、截图和告警子系统。
+     */
     explicit MultimediaDemo(QWidget *parent = nullptr);
-    /** @brief 停止播放器和工作线程后释放页面资源。 */
+    /**
+     * @brief 停止播放器和工作线程后释放页面资源。
+     */
     ~MultimediaDemo();
 
-    /** @brief 保存直播地址和协议类型（如 rtsp、hls），但不立即切换。 */
+    /**
+     * @brief 保存直播地址和协议类型（如 rtsp、hls），但不立即切换。
+     */
     void setStreamUrl(const QString& url, const QString& kind);
 
-    /** @brief 使用独立播放器预探测直播首帧，成功后再切换主播放器。 */
+    /**
+     * @brief 使用独立播放器预探测直播首帧，成功后再切换主播放器。
+     */
     void probeLiveStream(const QString& url);
-    /** @brief 停止本地轮播并让主播放器进入指定直播源。 */
+    /**
+     * @brief 停止本地轮播并让主播放器进入指定直播源。
+     */
     void switchToLiveStream(const QString& url, const QString& kind);
 
-    /** @brief 把新视频插入当前项之后，使其成为下一播放项。 */
-    void insertVideoNext(const QString& filePath);
-
-    /** @brief 下载完成后更新列表并按当前模式决定是否立即播放。 */
+    /**
+     * @brief 下载完成后更新列表并按当前模式决定是否立即播放。
+     * @param filePath 待读取的文件路径。
+     */
     void onDownloadedVideoReady(const QString& filePath);
+    /**
+     * @brief 删除本地媒体后清理轮播列表及已解码的图片缓存。
+     * @param filePath 待读取的文件路径。
+     */
+    void onPlayFileDeleted(const QString &filePath);
 
-    /** @brief 清除“期望直播”状态并停止后台探测和重试。 */
+    /**
+     * @brief 清除“期望直播”状态并停止后台探测和重试。
+     */
     void stopDesiredLive();
 
-    /** @brief 合成 UI 与当前视频帧后异步编码为 Base64。 */
+    /**
+     * @brief 合成 UI 与当前视频帧后异步编码为 Base64。
+     */
     void captureCompositeSnapshot();
-    /** @brief 向 MQTT 管理器上报当前录播文件或清除状态。 */
+    /**
+     * @brief 向 MQTT 管理器上报当前录播文件或清除状态。
+     */
     void notifyCurrentRecordedFile();
 
-    /** @return false while password/time-setting UI is handling input. */
+    /**
+     * @return false while password/time-setting UI is handling input.
+     */
     bool allowsPresenceSwitch() const;
 
-    /** @brief 为本地 Web 读取实际播放器和音量状态。 */
+    /**
+     * @brief 为本地 Web 读取实际播放器和音量状态。
+     * @return 实际播放状态与同一 INI 中保存的 contentType、smallImageMode；仅报告 video 区域。
+     */
     QJsonObject localWebPlaybackState() const;
 
-    /** @brief 通过既有入口应用本地播放设置，不经过 MQTT handler。 */
+    /**
+     * @brief 通过既有入口应用本地播放设置，不经过 MQTT handler。
+     * @param request 当前 HTTP 请求，身份由会话校验取得。
+     */
     void applyLocalWebPlayback(const QJsonObject &request);
 
 public slots:
-    /** @brief 启动页结束后放行首次媒体播放；重复调用保持幂等。 */
+    /**
+     * @brief 启动页结束后放行首次媒体播放；重复调用保持幂等。
+     */
     void startPlaybackAfterSplash();
-    /** @brief 模块临时切往人脸识别时停止播放器，但保留当前 LIVE 业务目标。 */
+    /**
+     * @brief 模块临时切往人脸识别时停止播放器，但保留当前 LIVE 业务目标。
+     */
     void suspendPlaybackForModuleSwitch();
-    /** @brief 模块重新显示时恢复暂停前的 LIVE 或本地轮播状态。 */
+    /**
+     * @brief 模块重新显示时恢复暂停前的 LIVE 或本地轮播状态。
+     */
     void resumePlaybackAfterModuleSwitch();
-    /** @brief 离开页面时停止全部播放器、探测和定时任务，避免后台占用解码资源。 */
-    void leaveAndStopVideo();
-    /** @brief 从列表首项恢复本地轮播。 */
+    /**
+     * @brief 从列表首项恢复本地轮播。
+     */
     void resumeLocalPlaylistFromStart();
 
-    /** @brief 保持视频播放，在 pictureRect 内以摄像头预览替换 PIC 轮播。 */
+    /**
+     * @brief 保持视频播放，在 pictureRect 内以摄像头预览替换 PIC 轮播。
+     */
     void beginEmbeddedFaceRecognition();
-    /** @brief 关闭 pictureRect 内的人脸预览并恢复 PIC 轮播。 */
+    /**
+     * @brief 关闭 pictureRect 内的人脸预览并恢复 PIC 轮播。
+     */
     void endEmbeddedFaceRecognition();
-    /** @brief 更新内嵌人脸预览帧。 */
+    /**
+     * @brief 更新内嵌人脸预览帧。
+     */
     void setEmbeddedFaceFrame(const QImage &image);
-    /** @brief 更新内嵌人脸框。 */
+    /**
+     * @brief 更新内嵌人脸框。
+     */
     void setEmbeddedFaceFaces(const QVector<DetectedFace> &faces);
-    /** @brief 更新内嵌识别状态。 */
+    /**
+     * @brief 更新内嵌识别状态。
+     */
     void setEmbeddedFaceState(VerifyState state, const QString &message);
-    /** @brief 在配置区域显示一名通过人员图片。 */
+    /**
+     * @brief 在配置区域显示一名通过人员图片。
+     */
     void showRecognitionImage(const QImage &image, const QString &name, int durationMs);
-    /** @brief 显示摄像头不可用提示。 */
+    /**
+     * @brief 显示摄像头不可用提示。
+     */
     void setEmbeddedFaceUnavailable(const QString &message);
-    /** @brief 通过页面既有覆盖层显示短时业务提示。 */
+    /**
+     * @brief 通过页面既有覆盖层显示短时业务提示。
+     */
     void showTransientStatus(const QString &message, int durationMs = 3000);
 
-    /** @brief 应用 MQTT 下发音量并回报执行结果。 */
+    /**
+     * @brief 应用 MQTT 下发音量并回报执行结果。
+     */
     void onMqttVolumeChanged(int volume);
 
-    /** @brief 切换到录播模式；已在本地轮播时仅同步业务状态。 */
+    /**
+     * @brief 切换到录播模式；已在本地轮播时仅同步业务状态。
+     */
     void switchToRecordedMode();
-    /** @brief 停止直播、本地轮播及预加载播放器。 */
+    /**
+     * @brief 停止直播、本地轮播及预加载播放器。
+     */
     void stopAllPlayback();
 
-    /** @brief 根据 MQTT 连接标志刷新网络信息显示。 */
+    /**
+     * @brief 根据 MQTT 连接标志刷新网络信息显示。
+     */
     void onMqttConnMarkChanged(int mark);
 
-    /** @brief 下载开始时暂停本地播放并显示进度提示。 */
+    /**
+     * @brief 下载开始时暂停本地播放并显示进度提示。
+     */
     void onDownloadStarted(const QString& fileName);
-    /** @brief 更新当前下载文件的进度提示。 */
+    /**
+     * @brief 更新当前下载文件的进度提示。
+     */
     void onDownloadProgress(const QString& fileName, int percent);
-    /** @brief 下载成功后隐藏提示、更新媒体列表并恢复播放。 */
+    /**
+     * @brief 下载成功后隐藏提示、更新媒体列表并恢复播放。
+     * @param filePath 待读取的文件路径。
+     */
     void onDownloadFinished(const QString& filePath);
-    /** @brief 下载失败后显示原因并恢复被暂停的本地播放。 */
+    /**
+     * @brief 下载失败后显示原因并恢复被暂停的本地播放。
+     */
     void onDownloadFailed(const QString& fileName, const QString& reason);
 
 private slots:
-    /** @brief 更新信号板演示数据或界面轮询状态。 */
+    /**
+     * @brief 更新信号板演示数据或界面轮询状态。
+     */
     void onTimeout();
-    /** @brief 刷新日期、星期和时间文本。 */
+    /**
+     * @brief 刷新日期、星期和时间文本。
+     */
     void onTimeoutDate();
 
-    /** @brief 收到播放器视频帧后与 UI 图像一起提交后台编码。 */
+    /**
+     * @brief 收到播放器视频帧后与 UI 图像一起提交后台编码。
+     */
     void onVideoSnapshotReady(const QImage& image);
-    /** @brief 结束失败的截图请求并上报原因。 */
+    /**
+     * @brief 结束失败的截图请求并上报原因。
+     */
     void onVideoSnapshotFailed(const QString& reason);
 
-    /** @brief 演示模式下轮换空调工作模式图标。 */
+    /**
+     * @brief 演示模式下轮换空调工作模式图标。
+     */
     void onAirCondiModeTimeout();
 
-    /** @brief 演示模式下轮换空调风速图标。 */
+    /**
+     * @brief 演示模式下轮换空调风速图标。
+     */
     void onAirCondiWindSpeedTimeout();
 
-    /** @brief 演示模式下按当前方向调整空调温度。 */
+    /**
+     * @brief 演示模式下按当前方向调整空调温度。
+     */
     void onAirCondiTempTimeout();
 
-    /** @brief 提高视频质量等级并应用相关参数。 */
+    /**
+     * @brief 递增内部质量等级计数，不改变播放器参数。
+     * @note 保留原有质量监测定时器的等级上限和日志行为。
+     */
     void increaseQuality();
-    /** @brief 将当前质量等级换算为播放器参数。 */
-    void applyVideoQualitySettings();
 
-    /** @brief 使用备用播放器准备列表中的下一段视频。 */
-    void preloadNextVideo();
-
-    /** @brief 播放恢复时重新启用被暂停的定时器和资源。 */
-    void restoreResourcesOnPlay();
-
-    /** @brief 输出当前播放器优化参数和状态，供现场诊断。 */
+    /**
+     * @brief 输出当前播放器优化参数和状态，供现场诊断。
+     */
     void testVideoOptimizations();
 
-    /** @brief 使用屏幕键盘请求退出密码并与配置值校验。 */
+    /**
+     * @brief 使用屏幕键盘请求退出密码并与配置值校验。
+     */
     bool requestPasswordAndCheck();
 
-    /** @brief 将完整信号板状态映射为楼层、方向和状态 UI。 */
+    /**
+     * @brief 将完整信号板状态映射为楼层、方向和状态 UI。
+     * @param st 完整信号板状态，raw 应包含合法的 12 字节帧。
+     * @note 通过排队连接在 GUI 线程执行；普通模式立即刷新，演示模式保存串口状态但由独立 1 秒节拍推进显示。
+     */
     void onSignalBoardState(const SignalBoardState& st);
 
-    /** @brief 处理直播中断，并按业务期望决定回退本地或继续重试。 */
+    /**
+     * @brief 处理直播中断，并按业务期望决定回退本地或继续重试。
+     */
     void onLiveStreamInterrupted(const QString& reason, bool keepLiveRetry);
-    /** @brief 强制释放当前直播播放器后回退本地轮播。 */
+    /**
+     * @brief 强制释放当前直播播放器后回退本地轮播。
+     */
     void forceStopCurrentLivePlayerForFallback(const QString& reason);
-    /** @brief 上游仍有压缩数据但无解码输出时，原地完整重建直播管线。 */
+    /**
+     * @brief 上游仍有压缩数据但无解码输出时，原地完整重建直播管线。
+     */
     void restartLivePipelineAfterDecoderStall(const QString& reason);
 
-    /** @brief 启动直播首帧/持续无帧 watchdog。 */
+    /**
+     * @brief 启动直播首帧/持续无帧 watchdog。
+     */
     void startLiveWatchdog();
-    /** @brief 停止直播 watchdog 并清空计时状态。 */
+    /**
+     * @brief 停止直播 watchdog 并清空计时状态。
+     */
     void stopLiveWatchdog();
-    /** @brief 判定首帧或持续无帧超时并触发回退。 */
+    /**
+     * @brief 判定首帧或持续无帧超时并触发回退。
+     */
     void onLiveWatchdogTimeout();
 
-    /** @brief 保存后台生成的 Base64 快照并通知 MQTT 状态。 */
+    /**
+     * @brief 保存后台生成的 Base64 快照并通知 MQTT 状态。
+     */
     void onSnapshotProcessFinished(const QString &base64);
-    /** @brief 释放截图忙状态并记录后台处理失败。 */
+    /**
+     * @brief 释放截图忙状态并记录后台处理失败。
+     */
     void onSnapshotProcessFailed(const QString &reason);
 
 signals:
-    /** @brief 退出密码正确后请求主窗口切回菜单。 */
+    /**
+     * @brief 退出密码正确后请求主窗口切回菜单。
+     */
     void backToMenuRequested();
 
-    /** @brief 当前录播文件发生变化，空字符串表示无录播。 */
+    /**
+     * @brief 当前录播文件发生变化，空字符串表示无录播。
+     */
     void currentRecordedFileChanged(const QString &fullPath);
-    /** @brief 当前播放画面 Base64 快照已更新。 */
+    /**
+     * @brief 当前播放画面 Base64 快照已更新。
+     */
     void currentPlayImageChanged(const QString &base64Image);
 
-    /** @brief 当前用户音量发生变化。 */
+    /**
+     * @brief 当前用户音量发生变化。
+     */
     void currentPlayVolumeChanged(int volume);
 
-    /** @brief 上报本地手动音量变化及原因。 */
+    /**
+     * @brief 上报本地手动音量变化及原因。
+     */
     void localManualVolumeChanged(int volume, const QString &reason);
 
-    /** @brief 请求工作线程合成 UI、视频帧和视频区域。 */
+    /**
+     * @brief 请求工作线程合成 UI、视频帧和视频区域。
+     */
     void processSnapshotAsync(const QImage &uiImage, const QImage &videoImage, const QRect &videoRect);
-    /** @brief 无视频帧时请求工作线程仅编码 UI 快照。 */
+    /**
+     * @brief 无视频帧时请求工作线程仅编码 UI 快照。
+     */
     void processUiSnapshotAsync(const QImage &uiImage);
 
-    /** @brief 请求页面外层显示指定时长的状态提示。 */
+    /**
+     * @brief 请求页面外层显示指定时长的状态提示。
+     */
     void statusMessageRequested(const QString &text, int durationMs = 3000);
 
-    /** @brief 多媒体主页面左键持续按住五秒后请求进入人脸管理界面。 */
+    /**
+     * @brief 多媒体主页面左键持续按住五秒后请求进入人脸管理界面。
+     */
     void adminLongPressRequested();
 
-    /** @brief 一批等待中的通过图片开始显示，需要重新计算结果保持时间。 */
+    /**
+     * @brief 一批等待中的通过图片开始显示，需要重新计算结果保持时间。
+     */
     void recognitionResultDisplayStarted();
 
 
 protected:
-    /** @brief 处理返回、音量和网络信息热区，并维护光标空闲状态。 */
+    /**
+     * @brief 处理返回、音量和网络信息热区，并维护光标空闲状态。
+     */
     bool eventFilter(QObject *watched, QEvent *event) override;
 
-    /** @brief 页面显示时恢复定时器、网络监测和本地播放。 */
+    /**
+     * @brief 页面显示时恢复定时器、网络监测和本地播放。
+     */
     void showEvent(QShowEvent *e) override;
-    /** @brief 页面隐藏时暂停不应在后台运行的交互状态。 */
+    /**
+     * @brief 页面隐藏时暂停不应在后台运行的交互状态。
+     */
     void hideEvent(QHideEvent *e) override;
 
 private:
@@ -578,8 +707,9 @@ private:
     int currentVideoRectMediaIndex;
     QTimer *videoRectPictureTimer;
     bool m_currentVideoRectIsImage;
-    QString m_currentVideoRectImagePath;
     QString m_currentVideoRectMediaPath;   /**< 当前 videoRect 正在播放的资源路径。 */
+    QString m_adContentType = QStringLiteral("VIDEO_IMAGE"); /**< videoRect广告筛选，pic保持独立显示。 */
+    bool m_pictureRefreshPending = false; /**< 后台下载小图后，返回页面时刷新pic缓存。 */
 
     // 图片显示相关变量
     QLabel *label_picture;
@@ -714,191 +844,375 @@ private:
 
 
 private:
-    /** @brief 执行原有日期、时间和视频区短按热点。 */
+    /**
+     * @brief 执行原有日期、时间和视频区短按热点。
+     */
     bool handleShortLeftClick(const QPoint &position);
-    /** @brief 取消尚未触发的管理入口长按。 */
+    /**
+     * @brief 取消尚未触发的管理入口长按。
+     */
     void cancelAdminLongPress();
-    /** @brief 按固定卡片宽度和区域容量居中布局当前批次通过图片。 */
+    /**
+     * @brief 按固定卡片宽度和区域容量居中布局当前批次通过图片。
+     */
     void layoutRecognitionImages();
-    /** @brief 将一张通过图片加入当前显示批次并启动其显示时长。 */
+    /**
+     * @brief 将一张通过图片加入当前显示批次并启动其显示时长。
+     */
     void appendRecognitionImage(const RecognitionImageItem &item);
-    /** @return 当前批次增加该图片后是否仍能完整容纳在目标区域。 */
+    /**
+     * @return 当前批次增加该图片后是否仍能完整容纳在目标区域。
+     */
     bool canAppendRecognitionImage(const QImage &image) const;
-    /** @brief 当前批次全部结束后，从等待队列填充下一批。 */
+    /**
+     * @brief 当前批次全部结束后，从等待队列填充下一批。
+     */
     void startNextRecognitionBatch();
-    /** @return 以识别虚线框比例和 pic 高度计算的固定卡片宽度。 */
+    /**
+     * @return 以识别虚线框比例和 pic 高度计算的固定卡片宽度。
+     */
     int recognitionCardWidth(const QImage &image) const;
-    /** @return 以识别虚线框为基准、且不超过 pic 高度的卡片高度。 */
+    /**
+     * @return 以识别虚线框为基准、且不超过 pic 高度的卡片高度。
+     */
     int recognitionCardHeight() const;
-    /** @return 带圆角及底部姓名栏的通过人员卡片。 */
+    /**
+     * @return 带圆角及底部姓名栏的通过人员卡片。
+     */
     QPixmap renderRecognitionCard(const QImage &image,
                                   const QString &name,
                                   const QSize &size) const;
-    /** @brief 清理所有临时通过图片并恢复 pic 轮播。 */
+    /**
+     * @brief 清理所有临时通过图片及待显示队列，并按需恢复识别区域内容。
+     * @param restorePicturePlayback 为 true 时按当前识别状态恢复摄像头或 PIC；false 仅清理照片。
+     */
     void clearRecognitionImages(bool restorePicturePlayback);
-    /** @brief 在临时通过图片全部消失后恢复 pic 区原有内容。 */
+    /**
+     * @brief 结果照片清空后，识别活动时恢复摄像头预览，否则恢复 PIC。
+     * @note GUI 线程调用；识别活动时保持 PIC 暂停，不改变摄像头采集、推理、LED 或超时状态。
+     */
     void restorePictureAfterRecognitionResult();
-    /** @brief 加载图片并屏蔽现场资源文件可能产生的非致命解码告警。 */
-    QPixmap loadPixmapWithIgnoreWarnings(const QString &imagePath);
-    /** @brief 优先解析外部资源路径，不存在时回退到 qrc。 */
-    QString resolveResourcePath(const QString &pathOrRel) const;
-    /** @brief 从缓存取得信号板 UI 图片，首次访问时加载。 */
-    QPixmap cachedSignalUiPixmap(const QString &imagePath);
-    /** @brief 启动时预加载楼层、方向和状态图片，降低串口更新抖动。 */
+    /**
+     * @brief 按候选顺序解码图片，失败时继续尝试并记录诊断。
+     * @param imagePath 原图片路径，可以是外部路径、相对路径或内置 qrc 路径。
+     * @param allowGif 是否允许 GIF 候选；关闭时继续查找同名静态图片。
+     * @return 首个成功解码的候选图片；所有候选均失败时返回空 QPixmap。
+     * @note QImageReader 按内容识别格式；仅外部 logo/tl 放宽扩展名，内置 qrc 使用完整原名称。
+     */
+    QPixmap loadPixmapWithIgnoreWarnings(const QString &imagePath, bool allowGif = true);
+    /**
+     * @brief 从缓存取得信号板 UI 图片，首次访问时加载。
+     * @param imagePath 原图片路径，可以是外部路径、相对路径或内置 qrc 路径。
+     * @param allowGif 是否允许 GIF 候选；关闭时继续查找同名静态图片。
+     * @return 已缓存图片或本次成功解码的图片；失败返回空 QPixmap。
+     * @note 使用逻辑路径和 GIF 许可作为缓存键；只缓存成功图片，失败不会阻止后续重试。
+     */
+    QPixmap cachedSignalUiPixmap(const QString &imagePath, bool allowGif = true);
+    /**
+     * @brief 启动时预加载楼层、方向和状态图片，降低串口更新抖动。
+     */
     void preloadSignalUiPixmaps();
-    /** @brief 优先播放方向 GIF，不可用时回退到原 PNG。 */
+    /**
+     * @brief 优先播放方向 GIF，不可用时回退到外部静态图或内置 PNG。
+     * @param direction 方向状态枚举；静态回退入口只用于上行或下行，无方向由 showDirectionImage 清空。
+     * @note QMovie 由本页面持有；隐藏时暂停，损坏或无法播放的 GIF 排队回退到同名静态图片。
+     */
     void showDirectionImage(DirectionStatus direction);
-    /** @brief 停止并解除当前方向动画与标签的关联。 */
+    /**
+     * @brief 停止并解除当前方向动画与标签的关联。
+     */
     void clearDirectionMovie();
-    /** @brief 显示方向 PNG；图片不可用时隐藏标签。 */
+    /**
+     * @brief 显示方向静态图，内置仍使用原 PNG；图片不可用时隐藏标签。
+     * @param direction 方向状态枚举；静态回退入口只用于上行或下行，无方向由 showDirectionImage 清空。
+     */
     void showDirectionPng(DirectionStatus direction);
 
-    /** @brief 按配置区域缩放并显示楼层图片。 */
+    /**
+     * @brief 按配置区域缩放并显示楼层图片。
+     */
     void showFloor(const QPixmap &pixmap, QLabel *label, int x, int y, int width, int height);
-    /** @brief 设置标签几何并显示指定图片。 */
+    /**
+     * @brief 设置标签几何并显示指定图片。
+     */
     void showImage(const QPixmap &pixmap, QLabel *label, const QString &imagePath, int x, int y, int width, int height);
-    /** @brief 从系统时钟刷新日期、星期和时间标签。 */
+    /**
+     * @brief 从系统时钟刷新日期、星期和时间标签。
+     */
     void getTimeWithQt();
-    /** @brief 按配置样式格式化星期文本。 */
+    /**
+     * @brief 按配置样式格式化星期文本。
+     */
     QString formatWeekText(int dayOfWeek, int style);
-    /** @brief 创建页面标签、播放器、监测器和业务对象。 */
+    /**
+     * @brief 创建页面标签、播放器、监测器和业务对象。
+     */
     void initializeComponents();
-    /** @brief 创建并连接页面全部周期定时器。 */
+    /**
+     * @brief 创建并连接页面全部周期定时器。
+     */
     void initializeTimers();
-    /** @brief 读取配置后初始化界面可见性和几何参数。 */
+    /**
+     * @brief 读取配置后初始化界面可见性和几何参数。
+     */
     void initializeConfiguration();
-    /** @brief 初始化信号板接收缓冲及电梯演示状态。 */
+    /**
+     * @brief 初始化信号板接收缓冲及电梯演示状态。
+     */
     void simulateBufferData();
-    /** @brief 演示模式下每秒推进楼层、轮换四种标志，并在楼层端点反向。 */
+    /**
+     * @brief 演示模式下每秒推进楼层、轮换四种标志，并在楼层端点反向。
+     * @note 仅演示模式推进；每 1 秒变更楼层及方向，并按满载、超载、消防、检修循环状态。
+     */
     void onElevatorDemoTimeout();
-    /** @brief 从设备配置文件加载显示、媒体和功能参数。 */
+    /**
+     * @brief 从设备配置文件加载显示、媒体和功能参数。
+     */
     void readConfigurationFromFile();
-    /** @brief 用十位和个位标签显示普通数字楼层。 */
+    /**
+     * @brief 用十位和个位标签显示普通数字楼层。
+     * @param floor 业务楼层号，支持 -8~-1 和 1~120，0 无效。
+     * @param one 个位楼层数字。
+     * @param ten 楼层十位数字。
+     */
     void displayFloorAsText(int floor, int ten, int one);
-    /** @brief 显示单字母楼层。 */
+    /**
+     * @brief 显示单字母楼层。
+     * @param letter 单字母楼层字符。
+     */
     void displaySingleLetterFloorAsText(char letter);
-    /** @brief 显示带 B 或负号前缀的楼层。 */
+    /**
+     * @brief 显示带 B 或负号前缀的楼层。
+     * @param prefix 负号或地下楼层前缀字符。
+     * @param one 个位楼层数字。
+     */
     void displayPrefixedFloorAsText(char prefix, int one);
-    /** @brief 创建主/预加载播放器并连接状态信号。 */
+    /**
+     * @brief 创建主/预加载播放器并连接状态信号。
+     */
     void initVideoPlayer();
-    /** @brief 按列表索引切换到下一段本地视频。 */
+    /**
+     * @brief 按列表索引切换到下一段本地视频。
+     */
     void playNextVideo();
-    /** @brief 扫描图片目录并启动图片轮播。 */
+    /**
+     * @brief 扫描图片目录并启动图片轮播。
+     * @note pic 使用任意名称的常见图片；仍遵循 pictureRect 开关及轮播间隔，不由 contentType 筛选。
+     */
     void initPicturePlayer();
 
     /** @brief 重新扫描 videoRect 专用图片列表。 */
-    /** @brief 按配置顺序重建 videoRect 视频/图片混播列表。 */
+    /**
+     * @brief 按配置顺序重建 videoRect 视频/图片混播列表。
+     */
     void rebuildVideoRectMediaList();
-    /** @brief 从混播列表移除运行期间已不存在的文件。 */
+    /**
+     * @brief 从混播列表移除运行期间已不存在的文件。
+     */
     void pruneMissingVideoRectMedia();
-    /** @brief 按环形索引播放一个 videoRect 媒体项。 */
+    /**
+     * @brief 按环形索引播放一个 videoRect 媒体项。
+     * @param index videoRect 混播列表中的零基索引；越界时直接返回。
+     */
     void playVideoRectMediaAt(int index);
-    /** @brief 让主播放器播放 videoRect 视频项。 */
+    /**
+     * @brief 让主播放器播放 videoRect 视频项。
+     * @param filePath 待读取的文件路径。
+     */
     void playVideoRectVideo(const QString &filePath);
-    /** @brief 隐藏视频画布并显示 videoRect 图片项。 */
+    /**
+     * @brief 隐藏视频画布并显示 videoRect 图片项。
+     * @param filePath 待读取的文件路径。
+     * @note 通过 Qt 图片路径显示并按 videoRect 的图片间隔切换，避免把静态图片送入 DMA-BUF 视频解码链路。
+     */
     void playVideoRectImage(const QString &filePath);
-    /** @brief 停止 videoRect 图片计时器并按需隐藏标签。 */
+    /**
+     * @brief 停止 videoRect 图片计时器并按需隐藏标签。
+     * @param hideLabel 是否同时清空并隐藏图片标签。
+     */
     void stopVideoRectPictureDisplay(bool hideLabel = true);
     /** @return 当前混播项是图片时返回 true。 */
 
-    /** @brief 轮换普通图片显示区域中的下一张图片。 */
+    /**
+     * @brief 轮换普通图片显示区域中的下一张图片。
+     */
     void playNextPicture();
 
-    /** @brief 重新扫描本地视频目录并保持可用的当前索引。 */
+    /**
+     * @brief 重新扫描本地视频目录并保持可用的当前索引。
+     */
     void reloadVideoFileList();
 
     /** @brief 从本地视频列表移除运行期间已删除的文件。 */
 
-    /** @brief 打开日期时间输入并同步系统与 RTC。 */
+    /**
+     * @brief 打开日期时间输入并同步系统与 RTC。
+     */
     void openDateTimeSetting();
-    /** @brief 使用系统命令设置本地系统时间。 */
+    /**
+     * @brief 使用系统命令设置本地系统时间。
+     */
     bool setSystemTimeFromLocal(const QDateTime& localDT, QString* err);
-    /** @brief 将本地时间写入 RTC 设备。 */
+    /**
+     * @brief 将本地时间写入 RTC 设备。
+     */
     bool setRtcFromLocal(const QDateTime& localDT, QString* err);
-    /** @brief 从 RTC 恢复系统时间。 */
+    /**
+     * @brief 从 RTC 恢复系统时间。
+     */
     bool restoreSystemTime(QString* err = nullptr);
 
-    /** @brief 在仍期望直播时启动定时重试。 */
+    /**
+     * @brief 在仍期望直播时启动定时重试。
+     */
     void startLiveRetry();
-    /** @brief 停止直播重试并清除重入标记。 */
+    /**
+     * @brief 停止直播重试并清除重入标记。
+     */
     void stopLiveRetry();
-    /** @brief 重试定时到达时重新探测期望直播源。 */
+    /**
+     * @brief 重试定时到达时重新探测期望直播源。
+     */
     void onLiveRetryTimeout();
 
-    /** @brief 仅停止主播放器中的直播，不清除业务期望状态。 */
+    /**
+     * @brief 仅停止主播放器中的直播，不清除业务期望状态。
+     */
     void stopCurrentLivePlaybackOnly();
 
-    /** @return 配置允许持久化在线播放状态时返回 true。 */
+    /**
+     * @return 配置允许持久化在线播放状态时返回 true。
+     */
     bool isOnlinePlaybackPersistEnabled() const;
-    /** @brief 把期望模式、实际模式和切换原因写入网络配置。 */
+    /**
+     * @brief 把期望模式、实际模式和切换原因写入网络配置。
+     */
     void persistPlaybackStateToNetCfg(const QString &targetMode,
                                       const QString &currentMode,
                                       const QString &reason);
-    /** @brief 启动时从网络配置恢复上次播放目标。 */
+    /**
+     * @brief 启动时从网络配置恢复上次播放目标。
+     */
     void restorePlaybackStateFromNetCfg();
 
-    /** @brief 本地列表为空时启动短周期目录观察。 */
+    /**
+     * @brief 本地列表为空时启动短周期目录观察。
+     */
     void startEmptyVideoListWatch();
-    /** @brief 有可播文件或页面退出时停止空列表观察。 */
+    /**
+     * @brief 有可播文件或页面退出时停止空列表观察。
+     */
     void stopEmptyVideoListWatch();
-    /** @brief 重新扫描目录并在发现文件后启动首项。 */
+    /**
+     * @brief 重新扫描目录并在发现文件后启动首项。
+     */
     void onEmptyVideoListWatchTimeout();
-    /** @brief 立即播放刚下载的文件并保护本次启动不被旧回调覆盖。 */
+    /**
+     * @brief 立即播放刚下载的文件并保护本次启动不被旧回调覆盖。
+     * @param filePath 待读取的文件路径。
+     */
     void playDownloadedVideoNow(const QString& filePath);
 
-    /** @brief 从当前列表首个可用文件启动本地轮播。 */
+    /**
+     * @brief 从当前列表首个可用文件启动本地轮播。
+     */
     void startFirstLocalVideoFromList();
 
-    /** @brief 从配置读取并刷新网络/MQTT 信息面板字段。 */
+    /**
+     * @brief 从配置读取并刷新网络/MQTT 信息面板字段。
+     */
     void readNetConfiguration();
 
-    /** @brief 隐藏音量、网络等临时信息面板。 */
+    /**
+     * @brief 隐藏音量、网络等临时信息面板。
+     */
     void hideInfoPanels();
 
-    /** @brief 从 INI 加载特殊楼层数值到显示名称的映射。 */
+    /**
+     * @brief 从 INI 加载特殊楼层数值到显示名称的映射。
+     * @param iniPath 广告播放配置 INI 的完整路径。
+     */
     void loadFloorRemap(const QString& iniPath);
-    /** @brief 按 moveTextRect 配置读取外部 notice.txt 并启动滚动。 */
+    /**
+     * @brief 按 moveTextRect 配置读取外部 notice.txt 并启动滚动。
+     */
     void initializeMovingText();
-    /** @brief 将通知文字向左推进一帧，完全离开后从右侧重新进入。 */
+    /**
+     * @brief 将通知文字向左推进一帧，完全离开后从右侧重新进入。
+     */
     void advanceMovingText();
-    /** @brief 将滚动文字保持在媒体、普通图片和识别结果图片之上。 */
+    /**
+     * @brief 将滚动文字保持在媒体、普通图片和识别结果图片之上。
+     */
     void raiseMovingTextOverlay();
-    /** @brief 尝试显示当前楼层对应的专用图片。 */
+    /**
+     * @brief 尝试显示当前楼层对应的专用图片。
+     * @param Value 业务楼层号，按配置查找对应的特殊整层图片。
+     * @return 已找到并显示特殊整层图片时为 true，否则返回 false 供常规楼层渲染。
+     */
     bool tryShowSpecialFloorImage(int Value);
 
-    /** @brief 根据弹窗和用户活动刷新空闲计时状态。 */
+    /**
+     * @brief 根据弹窗和用户活动刷新空闲计时状态。
+     */
     void refreshUiIdleStateByActivity();
 
-    /** @brief 按页面可见性和模态状态启停光标隐藏定时。 */
+    /**
+     * @brief 按页面可见性和模态状态启停光标隐藏定时。
+     */
     void updateIdleTimerState();
 
-    /** @brief 若软件光标已隐藏则恢复显示。 */
+    /**
+     * @brief 若软件光标已隐藏则恢复显示。
+     */
     void showCursorIfHidden();
 
-    /** @return 事件来源属于本页面或其子控件时返回 true。 */
+    /**
+     * @return 事件来源属于本页面或其子控件时返回 true。
+     */
     bool isEventFromThisPage(QObject *watched, QEvent *event) const;
-    /** @brief 出现模态窗口时暂停页面空闲隐藏逻辑。 */
+    /**
+     * @brief 出现模态窗口时暂停页面空闲隐藏逻辑。
+     */
     void suspendUiIdleForModal();
-    /** @brief 页面离开时停用空闲隐藏并恢复光标。 */
+    /**
+     * @brief 页面离开时停用空闲隐藏并恢复光标。
+     */
     void deactivateUiIdle();
 
-    /** @brief 创建密码错误的非模态提示标签和定时器。 */
+    /**
+     * @brief 创建密码错误的非模态提示标签和定时器。
+     */
     void initPasswordErrorToast();
-    /** @brief 显示指定时长的密码错误提示。 */
+    /**
+     * @brief 显示指定时长的密码错误提示。
+     */
     void showPasswordErrorToast(const QString &text, int ms = 1800);
 
-    /** @brief 下载期间暂停本地轮播并记录是否需要恢复。 */
+    /**
+     * @brief 下载期间暂停本地轮播并记录是否需要恢复。
+     */
     void pauseLocalPlaybackForDownload();
-    /** @brief 下载结束后按之前状态恢复本地轮播。 */
+    /**
+     * @brief 下载结束后按之前状态恢复本地轮播。
+     */
     void resumeLocalPlaybackAfterDownload();
-    /** @brief 更新非模态下载进度提示。 */
+    /**
+     * @brief 更新非模态下载进度提示。
+     */
     void showDownloadProgressToast(const QString &title, int percent, const QString &detail = QString());
-    /** @brief 隐藏并重置下载进度提示。 */
+    /**
+     * @brief 隐藏并重置下载进度提示。
+     */
     void hideDownloadProgressToast();
 
-    /** @brief 生成本地播放启动序号，用于识别异步回调所属启动。 */
+    /**
+     * @brief 生成本地播放启动序号，用于识别异步回调所属启动。
+     */
     quint64 issueLocalPlaybackStartSerial();
-    /** @brief 递增序号，使所有在途本地播放启动回调失效。 */
+    /**
+     * @brief 递增序号，使所有在途本地播放启动回调失效。
+     */
     void invalidatePendingLocalPlaybackStarts();
 };
 

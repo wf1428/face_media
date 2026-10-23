@@ -10,7 +10,13 @@ const copyButton = document.getElementById('copy-address')
 const address = document.getElementById('server-address')
 const status = document.getElementById('status')
 
-/** @brief 生成安卓浏览器请求；不指定厂商包名，失败时回到引导页。 */
+/**
+ * @brief 生成安卓浏览器请求；不指定厂商包名，失败时回到引导页。
+ * @param {string} origin 设备 Web 同源入口。
+ * @param {string} loginUrl 普通浏览器登录入口。
+ * @param {string} guideUrl 引导页面地址。
+ * @returns {string} Android 的浏览器 Intent URL；其他平台直接返回登录地址。
+ */
 function browserLink(origin, loginUrl, guideUrl) {
   if (!/Android/i.test(navigator.userAgent)) return loginUrl
   const target = new URL(origin)
@@ -21,7 +27,9 @@ function browserLink(origin, loginUrl, guideUrl) {
   )
 }
 
-/** @brief 请求复制地址；HTTP 门户没有 Clipboard API 时使用选中复制。 */
+/**
+ * @brief 请求复制地址；HTTP 门户没有 Clipboard API 时使用选中复制。
+ */
 async function copyAddress() {
   try {
     if (window.isSecureContext && navigator.clipboard?.writeText) {
@@ -41,7 +49,9 @@ async function copyAddress() {
   }
 }
 
-/** @brief 读取固定部署地址；不自动发起应用跳转，保留真实用户点击。 */
+/**
+ * @brief 读取固定部署地址；不自动发起应用跳转，保留真实用户点击。
+ */
 async function initialize() {
   try {
     const response = await fetch('/portal-config.json', { cache: 'no-store' })

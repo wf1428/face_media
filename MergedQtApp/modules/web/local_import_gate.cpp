@@ -13,14 +13,19 @@ namespace {
 std::atomic_bool busy{false}; /**< 全应用共享本地人员批量导入占用标志。 */
 }
 
-/** @brief 申请本地人员导入互斥门，防止与 U 盘导入并发。 */
+/**
+ * @brief 申请本地人员导入互斥门，防止与 U 盘导入并发。
+ * @return 成功取得导入互斥权时为 true；已有导入或校验任务占用时为 false。
+ */
 bool LocalImportGate::acquire()
 {
     bool expected = false;
     return busy.compare_exchange_strong(expected, true);
 }
 
-/** @brief 释放本地人员导入互斥门。 */
+/**
+ * @brief 释放本地人员导入互斥门。
+ */
 void LocalImportGate::release()
 {
     busy.store(false);

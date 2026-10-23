@@ -2,8 +2,9 @@
  * @file FaceInferenceWorker.h
  * @brief 专用推理线程中的人脸引擎与验证状态机门面。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-10-23；修改人：Du lin；明确本地导入与 Web 共用跨库相似度防重，保持网络同步入口不变。
  */
 
 #ifndef FACE_INFERENCE_WORKER_H
@@ -48,7 +49,7 @@ public:
     void shutdown();
 
 public slots:
-    /** @brief Web 专用质量及跨库防重校验；不改变既有 U 盘/网络导入语义。 */
+    /** @brief Web 质量及跨库防重结果桥接，调用与 U 盘相同的本地校验入口。 */
     void validateWebImportFaceImages(const QString &token, const QJsonArray &faces, const AppConfig &config);
     /** @brief 对一帧执行门禁验证；完成后发出 frameProcessed() 解除背压。 */
     void processVerificationFrame(const CameraFrame &frame);
@@ -80,7 +81,13 @@ public slots:
                                   const QJsonArray &faces,
                                   const AppConfig &config);
 
-    /** @brief 校验U盘本地人员图片并提取特征，不触发网络同步。 */
+    /**
+     * @brief 提取本地导入图片并检查本地、网络及本批次的跨人员重复人脸。
+     * @param token 本次导入任务标识。
+     * @param faces 已匹配本地人员的图片列表，当前人员自身旧人脸排除比较。
+     * @param config 图片质量与相似度阈值配置。
+     * @note 在推理线程调用；返回通过项和失败原因，不写数据库或触发网络同步。
+     */
     void validateLocalImportFaceImages(const QString &token,
                                        const QJsonArray &faces,
                                        const AppConfig &config);
@@ -127,7 +134,7 @@ signals:
                                    const QJsonArray &validatedFaces,
                                    const QJsonArray &failedFaces);
 
-    /** @brief 返回U盘本地人员图片的质量和特征校验结果。 */
+    /** @brief 返回本地导入图片的质量、特征及跨人员相似度防重结果。 */
     void localImportFaceImagesValidated(const QString &token,
                                         const QJsonArray &validatedFaces,
                                         const QJsonArray &failedFaces);

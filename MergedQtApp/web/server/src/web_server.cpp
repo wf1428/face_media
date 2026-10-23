@@ -33,13 +33,20 @@ struct RequestTrace {
 // metadata is added to browser-visible headers, parameters or cookies.
 thread_local RequestTrace requestTrace;
 
-/** @brief 记录请求开始时间，供控制台访问日志计算耗时。 */
+/**
+ * @brief 记录请求开始时间，供控制台访问日志计算耗时。
+ * @param request 当前 HTTP 请求，身份由会话校验取得。
+ */
 void beginRequest(const httplib::Request &request)
 {
     requestTrace = {&request, RequestClock::now()};
 }
 
-/** @brief 输出不含请求体、凭据和查询参数的访问日志。 */
+/**
+ * @brief 输出不含请求体、凭据和查询参数的访问日志。
+ * @param request 当前 HTTP 请求，身份由会话校验取得。
+ * @param response 待写入的 HTTP 响应。
+ */
 void logRequest(const httplib::Request &request, const httplib::Response &response)
 {
     const auto elapsed = requestTrace.request == &request
@@ -58,7 +65,10 @@ void logRequest(const httplib::Request &request, const httplib::Response &respon
                    " status=" + std::to_string(response.status) + " elapsed=" + elapsed);
 }
 
-/** @brief 取得当前平台 socket 错误的固定诊断文本。 */
+/**
+ * @brief 取得当前平台 socket 错误的固定诊断文本。
+ * @return 当前监听错误的可读说明。
+ */
 std::string socketError()
 {
 #ifdef _WIN32
@@ -70,7 +80,11 @@ std::string socketError()
 }
 } // namespace
 
-/** @brief 读取并校验监听地址、证书和部署路径。 */
+/**
+ * @brief 读取并校验监听地址、证书和部署路径。
+ * @param path 待访问的文件或配置路径。
+ * @return 通过校验的服务配置；无效路径或配置抛出异常。
+ */
 ServerConfig ServerConfig::load(const std::string &path)
 {
     std::ifstream file(path);
@@ -101,7 +115,10 @@ ServerConfig ServerConfig::load(const std::string &path)
     return config;
 }
 
-/** @brief 创建 HTTPS 服务、限制请求资源并登记路由。 */
+/**
+ * @brief 创建 HTTPS 服务、限制请求资源并登记路由。
+ * @param config 设备受控配置，包含运行所需路径或功能设置。
+ */
 WebServer::WebServer(ServerConfig config) : config_(std::move(config)), rpc_(config_.socket)
 {
     if (config_.developmentHttp)
@@ -126,13 +143,22 @@ WebServer::WebServer(ServerConfig config) : config_(std::move(config)), rpc_(con
     routes();
 }
 
-/** @brief 根据请求 Cookie 获取当前登录会话。 */
+/**
+ * @brief 根据请求 Cookie 获取当前登录会话。
+ * @param request 当前 HTTP 请求，身份由会话校验取得。
+ * @return 校验通过的会话；未登录或过期抛出 ApiError。
+ */
 Session WebServer::session(const httplib::Request &request)
 {
     return sessions_.get(sessionCookie(request.get_header_value("Cookie")));
 }
 
-/** @brief 写入统一格式的 JSON 响应。 */
+/**
+ * @brief 写入统一格式的 JSON 响应。
+ * @param response 待写入的 HTTP 响应。
+ * @param data 本次操作的数据对象。
+ * @param status 接收本次操作的业务状态码。
+ */
 void WebServer::result(httplib::Response &response, const Json &data, int status)
 {
     response.status = status;
@@ -141,7 +167,12 @@ void WebServer::result(httplib::Response &response, const Json &data, int status
                          "application/json; charset=utf-8");
 }
 
-/** @brief 限长读取并解析 JSON 请求体。 */
+/**
+ * @brief 限长读取并解析 JSON 请求体。
+ * @param request 当前 HTTP 请求，身份由会话校验取得。
+ * @param reader 流式请求体读取器。
+ * @return 通过大小及 JSON 格式校验的请求对象；非法请求抛出 ApiError。
+ */
 Json WebServer::readJson(const httplib::Request &request, const httplib::ContentReader &reader)
 {
     if (request.get_header_value("Content-Type").rfind("application/json", 0) != 0 ||
@@ -161,7 +192,9 @@ Json WebServer::readJson(const httplib::Request &request, const httplib::Content
     return data;
 }
 
-/** @brief 登记公开、认证、文件和人员导入接口及请求保护。 */
+/**
+ * @brief 登记公开、认证、文件和人员导入接口及请求保护。
+ */
 void WebServer::routes()
 {
     server_->set_logger(logRequest);
@@ -394,7 +427,12 @@ void WebServer::routes()
         });
 }
 
-/** @brief 流式接收上传内容并与 Qt 中的上传任务协调。 */
+/**
+ * @brief 流式接收上传内容并与 Qt 中的上传任务协调。
+ * @param request 当前 HTTP 请求，身份由会话校验取得。
+ * @param response 待写入的 HTTP 响应。
+ * @param reader 流式请求体读取器。
+ */
 void WebServer::upload(const httplib::Request &request,
                        httplib::Response &response,
                        const httplib::ContentReader &reader)
@@ -512,7 +550,11 @@ void WebServer::upload(const httplib::Request &request,
 #endif
 }
 
-/** @brief 按文件租约分块发送视频内容。 */
+/**
+ * @brief 按文件租约分块发送视频内容。
+ * @param request 当前 HTTP 请求，身份由会话校验取得。
+ * @param response 待写入的 HTTP 响应。
+ */
 void WebServer::download(const httplib::Request &request, httplib::Response &response)
 {
     // 持有下载计数期间禁止删除同一文件。
@@ -565,7 +607,11 @@ void WebServer::download(const httplib::Request &request, httplib::Response &res
         });
 }
 
-/** @brief 返回离线门户页面及配置，服务器地址只使用已校验部署配置。 */
+/**
+ * @brief 返回离线门户页面及配置，服务器地址只使用已校验部署配置。
+ * @param request 当前 HTTP 请求，身份由会话校验取得。
+ * @param response 待写入的 HTTP 响应。
+ */
 void WebServer::portalResponse(const httplib::Request &request, httplib::Response &response)
 {
     response.set_header("Cache-Control", "no-store");
@@ -608,7 +654,10 @@ void WebServer::portalResponse(const httplib::Request &request, httplib::Respons
                                  : "text/html; charset=utf-8");
 }
 
-/** @brief 启动 HTTP 浏览器引导入口与主服务监听。 */
+/**
+ * @brief 启动 HTTP 浏览器引导入口与主服务监听。
+ * @return 监听正常结束时的结果；监听建立失败返回 false。
+ */
 bool WebServer::run()
 {
     consoleLog(LogLevel::Info, "Web directory: " + config_.www);
@@ -675,7 +724,9 @@ bool WebServer::run()
     return ok;
 }
 
-/** @brief 停止入口与主服务监听。 */
+/**
+ * @brief 停止入口与主服务监听。
+ */
 void WebServer::stop()
 {
     // 主服务退出后由 run() 唯一负责停止/回收门户线程，避免两个线程重复 stop。

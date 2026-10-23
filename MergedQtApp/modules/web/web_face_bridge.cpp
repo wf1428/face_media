@@ -9,7 +9,10 @@
 #include <QCoreApplication>
 #include <QThread>
 
-/** @brief 返回供 Web 人脸校验使用的桥接实例。 */
+/**
+ * @brief 返回供 Web 人脸校验使用的桥接实例。
+ * @return 应用生命周期内共享的桥对象指针。
+ */
 WebFaceBridge *WebFaceBridge::instance()
 {
     static WebFaceBridge *bridge = []() {

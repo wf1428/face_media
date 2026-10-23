@@ -1,3 +1,6 @@
+## @file portal_network_check.py
+# @brief 在隔离目录中验证门户网络部署脚本，不操作开发机实际网络。
+
 """Run portal shell scripts with isolated fake NM/firewall tools; never changes networking."""
 
 import argparse
@@ -9,6 +12,7 @@ import sys
 import time
 
 
+## @brief 模拟 NetworkManager、iptables 和系统工具，所有状态写入隔离测试目录。
 def driver():
     """模拟 NetworkManager、iptables 和系统工具，所有状态写入隔离测试目录。"""
     root = Path(os.environ["PORTAL_TEST_ROOT"])
@@ -136,6 +140,9 @@ def driver():
     raise SystemExit(code)
 
 
+## @brief 在隔离环境中验证热点检测、网络规则和服务启动脚本。
+# @param shell 用于执行部署脚本的 shell 路径。
+# @param output 隔离测试日志及截图输出目录。
 def check(shell: str, output: Path):
     """在隔离环境中验证热点检测、网络规则和服务启动脚本。"""
     repository = Path(__file__).resolve().parents[2]
@@ -207,6 +214,11 @@ def check(shell: str, output: Path):
     env["PORTAL_TEST_SHELL"] = shell
     env["PORTAL_TEST_NETWORK"] = network.as_posix()
 
+    ## @brief 执行被测门户脚本，并核对实际退出码和捕获输出。
+    # @param expected 预期退出码，默认 0。
+    # @param password_input 经标准输入提供的测试密码，None 表示不提供。
+    # @param args 传给固定测试程序的独立参数。
+    # @return 测试辅助程序去掉首尾空白后的标准输出文本。
     def run(*args, expected=0, password_input=None):
         """执行被测门户脚本，并核对实际退出码和捕获输出。"""
         command = 'PATH="$PORTAL_TEST_BIN:$PATH"; export PATH; exec sh "$@"'
@@ -226,10 +238,14 @@ def check(shell: str, output: Path):
 
     state_file = output / "state.json"
 
+    ## @brief 从隔离目录读取当前模拟网络状态。
+    # @return 当前隔离模拟工具的状态对象。
     def state():
         """从隔离目录读取当前模拟网络状态。"""
         return json.loads(state_file.read_text(encoding="utf-8"))
 
+    ## @brief 重置模拟网卡与连接状态，准备下一项独立测试。
+    # @param changes 准备下个场景时合并到模拟状态的字段。
     def reset(**changes):
         """重置模拟网卡与连接状态，准备下一项独立测试。"""
         data = {

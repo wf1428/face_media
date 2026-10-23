@@ -255,6 +255,8 @@ MqttPage::MqttPage(QWidget *parent) : QWidget(parent)
             this, &MqttPage::liveStreamReady);
     connect(manager_, &MqttManager::ftpDownloadTaskReady,
             this, &MqttPage::ftpDownloadTaskReady);
+    connect(manager_, &MqttManager::playFileDeleted,
+            this, &MqttPage::playFileDeleted);
 
     connect(manager_, &MqttManager::getPlayInfoRequested,
             this, &MqttPage::onGetPlayInfoRequested);

@@ -22,7 +22,14 @@
 
 namespace deviceweb {
 
-/** @brief 序列化白名单请求，经 Unix socket 交给 Qt 并解包响应。 */
+/**
+ * @brief 序列化白名单请求，经 Unix socket 交给 Qt 并解包响应。
+ * @param operation 白名单业务操作名。
+ * @param args 操作对应的结构化参数。
+ * @param owner 已认证 Web 账号主键，用于任务归属校验。
+ * @return Qt 响应中的 data；传输、协议或业务失败抛出 ApiError。
+ * @note 连接、发送和接收共用 25 秒截止时间；IPC 单帧上限 1 MiB，不传送媒体文件字节。
+ */
 Json RpcClient::call(const std::string &operation, const Json &args, int owner) const
 {
     const auto failure =

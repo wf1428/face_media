@@ -1,4 +1,7 @@
-/* @file portal.css | @brief 无外部依赖的手机热点浏览器引导样式。 */
+/**
+ * @file portal.css
+ * @brief 无外部依赖的手机热点浏览器引导样式。
+ */
 :root {
   font-family:
     system-ui,

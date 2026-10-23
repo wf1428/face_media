@@ -7,6 +7,7 @@
  */
 
 #include "mqttmanager.h"
+#include "common/media_content_policy.h"
 
 #include <QDebug>
 #include <QCryptographicHash>
@@ -683,11 +684,10 @@ static QString recordedDownloadTaskKey(const QJsonObject &dataObj)
             : portValue.toString().trimmed();
     const QString user = dataObj.value("ftpUser").toString().trimmed();
     const QString fileName = QFileInfo(dataObj.value("videoPath").toString().trimmed()).fileName();
-    return QString("%1|%2|%3|%4")
-            .arg(host)
-            .arg(port)
-            .arg(user)
-            .arg(fileName);
+    return QString("%1|%2|%3|%4|%5|%6")
+            .arg(host, port, user, fileName,
+                 MediaContentPolicy::normalizeContentType(dataObj.value("contentType").toString()),
+                 QString::number(MediaContentPolicy::smallImageMode(dataObj.value("smallImageMode")) ? 1 : 0));
 }
 
 /**
@@ -1196,6 +1196,8 @@ MqttManager::MqttManager(QObject *parent)
             this, &MqttManager::liveStreamReady);
     connect(service_, &MqttService::ftpDownloadTaskReady,
             this, &MqttManager::ftpDownloadTaskReady);
+    connect(service_, &MqttService::playFileDeleted,
+            this, &MqttManager::playFileDeleted);
     connect(service_, &MqttService::stopAllPlayRequested,
             this, &MqttManager::stopAllPlayRequested);
     connect(service_, &MqttService::volumeControlResultReady,

@@ -10,6 +10,8 @@
 
 #include <QObject>
 #include <QJsonObject>
+#include <QList>
+#include <QMap>
 #include <functional>
 #include <QDateTime>
 #include "platform/rk3566_platform.h"
@@ -46,7 +48,7 @@ public:
     /** @brief 校验并删除指定本地播放文件。 */
     bool handleDeletePlayFileMessage(const QString &topic, const QJsonObject &payloadObj);
 
-    /** @brief 枚举本地视频并构建文件列表响应包。 */
+    /** @brief 枚举固定目录的视频和图片并构建文件列表响应包。 */
     QJsonObject buildPlayFileListPublishPacket(const QString &reqTopic,
                                                const QString &reqId,
                                                const QString &deviceId,
@@ -117,6 +119,9 @@ signals:
     /** @brief FTP 下载参数已经写入配置。 */
     void ftpDownloadTaskReady();
 
+    /** @brief 本地媒体删除成功，通知播放器移除文件及图片缓存。 */
+    void playFileDeleted(const QString &fullPath);
+
     /** @brief 请求停止所有媒体播放。 */
     void stopAllPlayRequested();
 
@@ -139,11 +144,17 @@ private:
     /** @brief 将 FTP 远端、本地路径及可选流地址写入配置。 */
     bool writeIniFtpPaths(const QString& remotePath, const QString& localPath, const QString& streamUrl = QString(), QString* err = nullptr);
 
-    /** @brief 扫描本地视频目录并生成协议文件数组。 */
+    /** @brief 扫描固定媒体目录并记录协议ID对应的文件快照。 */
     QJsonArray buildLocalVideoFileArray();
 
-    /** @brief 校验文件名边界后删除本地视频。 */
-    bool deleteLocalVideoByName(const QString &targetName, QString *deletedPath = nullptr, QString *err = nullptr);
+    struct LocalPlayFile { QString name; QString path; };
+    /** @brief 使用文件列表相同的目录、格式和名称规则扫描媒体。 */
+    QList<LocalPlayFile> localPlayFiles() const;
+    /** @brief 按上报列表的id/name定位；旧版无id请求仅允许唯一名称。 */
+    bool deleteLocalPlayFile(const QString &targetName, const QJsonValue &targetId,
+                             QString *deletedPath, QString *err);
+    QMap<int, LocalPlayFile> advertisedPlayFiles_;
+    bool hasPlayFileSnapshot_ = false;
 
     /** @brief 根据请求主题约定构造响应主题。 */
     static QString buildResponseTopicFromRequest(const QString &reqTopic);
@@ -169,6 +180,7 @@ private:
     bool syncSystemTimeFromServerString(const QString& serverTimeStr, QString* err);
 
     PlayInfoState playInfo_;
+    QString currentRecordedFilePath_; /**< 文件信息来源完整路径，sendPlayInfo仅接受video目录。 */
     const QString iniPath = Rk3566Platform::netConfigPath();
     const QString videoDir = Rk3566Platform::videoDir();
 

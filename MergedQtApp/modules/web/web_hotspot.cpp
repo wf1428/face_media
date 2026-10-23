@@ -18,7 +18,11 @@
 
 namespace {
 
-/** @brief 从设备配置读取 Qt 已更新的 client_id，未就绪时返回业务错误。 */
+/**
+ * @brief 从设备配置读取 Qt 已更新的 client_id，未就绪时返回业务错误。
+ * @param path 待访问的文件或配置路径。
+ * @return 配置中的设备标识。
+ */
 QString clientId(const QString &path)
 {
     if (!QFileInfo(path).isFile())
@@ -31,7 +35,10 @@ QString clientId(const QString &path)
     return id;
 }
 
-/** @brief 按 UTF-8 字节数、首尾空白和控制字符校验热点名称。 */
+/**
+ * @brief 按 UTF-8 字节数、首尾空白和控制字符校验热点名称。
+ * @param ssid 热点名称，按 UTF-8 长度及字符规则校验。
+ */
 void validateSsid(const QString &ssid)
 {
     if (ssid.isEmpty() || ssid != ssid.trimmed() || ssid.toUtf8().size() > 32)
@@ -41,7 +48,11 @@ void validateSsid(const QString &ssid)
             throw WebError(400, QStringLiteral("SSID 不能包含换行或控制字符"));
 }
 
-/** @brief 按 YC_设备号后五位_0000 生成并校验默认热点名称。 */
+/**
+ * @brief 按 YC_设备号后五位_0000 生成并校验默认热点名称。
+ * @param id 目标记录或任务的标识。
+ * @return 设备默认热点名称。
+ */
 QString defaultSsid(const QString &id)
 {
     const auto result = QStringLiteral("YC_%1_0000").arg(id.right(5));
@@ -49,7 +60,13 @@ QString defaultSsid(const QString &id)
     return result;
 }
 
-/** @brief 限时启动固定的热点辅助脚本，避免网络命令无限等待。 */
+/**
+ * @brief 限时启动固定的热点辅助脚本，避免网络命令无限等待。
+ * @param process 受调用方管理的异步进程对象。
+ * @param helper 固定的热点管理辅助程序路径。
+ * @param arguments 传给固定辅助程序的独立命令参数。
+ * @param seconds 辅助程序执行超时，单位为秒。
+ */
 void startHelper(QProcess *process,
                  const QString &helper,
                  const QStringList &arguments,
@@ -68,7 +85,13 @@ void startHelper(QProcess *process,
 }
 } // namespace
 
-/** @brief 绑定热点配置和就绪文件，定时发布设备身份而不在启动时配置 WiFi。 */
+/**
+ * @brief 绑定热点配置和就绪文件，定时发布设备身份而不在启动时配置 WiFi。
+ * @param networkConfig net_cfg.ini 路径。
+ * @param helper 固定的热点管理辅助程序路径。
+ * @param readyFile Qt Web 就绪标记文件路径。
+ * @param parent Qt 父对象；对象销毁由父子关系管理，空指针表示无父对象。
+ */
 WebHotspot::WebHotspot(const QString &networkConfig,
                        const QString &helper,
                        const QString &readyFile,
@@ -93,14 +116,18 @@ WebHotspot::WebHotspot(const QString &networkConfig,
     QTimer::singleShot(0, this, attempt);
 }
 
-/** @brief 销毁身份发布对象时移除本进程的 Web 就绪标记。 */
+/**
+ * @brief 销毁身份发布对象时移除本进程的 Web 就绪标记。
+ */
 WebHotspot::~WebHotspot()
 {
     if (!readyFile_.isEmpty())
         QFile::remove(readyFile_);
 }
 
-/** @brief 将当前 Qt PID、设备号和默认 SSID 原子写入就绪文件。 */
+/**
+ * @brief 将当前 Qt PID、设备号和默认 SSID 原子写入就绪文件。
+ */
 void WebHotspot::synchronize()
 {
     const auto id = clientId(networkConfig_);
@@ -118,7 +145,13 @@ void WebHotspot::synchronize()
         throw WebError(503, QStringLiteral("Web 就绪标记保存失败"));
 }
 
-/** @brief 执行受控热点命令，限时等待并按需取得标准输出。 */
+/**
+ * @brief 执行受控热点命令，限时等待并按需取得标准输出。
+ * @param arguments 传给固定辅助程序的独立命令参数。
+ * @param[out] output 可选输出，接收辅助程序标准输出。
+ * @param input 通过标准输入提供的数据，避免敏感内容出现在命令参数中。
+ * @return 固定辅助程序成功结束时为 true；失败或超时为 false。
+ */
 bool WebHotspot::command(const QStringList &arguments,
                          QString *output,
                          const QByteArray &input) const
@@ -146,7 +179,10 @@ bool WebHotspot::command(const QStringList &arguments,
     return process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
 }
 
-/** @brief 返回实际设备号、热点名称和待重启/更新错误状态。 */
+/**
+ * @brief 返回实际设备号、热点名称和待重启/更新错误状态。
+ * @return 实际热点配置及辅助程序报告的运行状态。
+ */
 QJsonObject WebHotspot::info() const
 {
     const auto id = clientId(networkConfig_);
@@ -160,7 +196,12 @@ QJsonObject WebHotspot::info() const
             {"wifiUpdateError", updateError_}};
 }
 
-/** @brief 保存 SSID 和可选新密码，沿用延迟重新激活及错误回报流程。 */
+/**
+ * @brief 保存 SSID 和可选新密码，沿用延迟重新激活及错误回报流程。
+ * @param ssid 热点名称，按 UTF-8 长度及字符规则校验。
+ * @param password 新热点密码；空值表示保留原密码。
+ * @return 保存后的热点状态；空密码保留原密码，重载异步执行。
+ */
 QJsonObject WebHotspot::save(const QString &ssid, const QString &password)
 {
     validateSsid(ssid);

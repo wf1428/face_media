@@ -13,7 +13,12 @@
 
 namespace {
 
-/** @brief 只接受点分十进制 IPv4，拒绝命令字符和含糊的数字地址。 */
+/**
+ * @brief 只接受点分十进制 IPv4，拒绝命令字符和含糊的数字地址。
+ * @param value 待校验的点分十进制 IPv4 文本。
+ * @param[out] number 可选输出，接收转换后的 IPv4 数值。
+ * @return 输入为合法点分十进制 IPv4 时为 true。
+ */
 bool ipv4(const QString &value, quint32 *number = nullptr)
 {
     static const QRegularExpression pattern("^(0|[1-9][0-9]{0,2})(\\.(0|[1-9][0-9]{0,2})){3}$");
@@ -26,7 +31,12 @@ bool ipv4(const QString &value, quint32 *number = nullptr)
     return true;
 }
 
-/** @brief 统一填入调用方错误说明。 */
+/**
+ * @brief 统一填入调用方错误说明。
+ * @param[out] error 接收失败原因；允许为空时不写入错误文本。
+ * @param message 可返回调用方的结果或错误说明。
+ * @return 始终返回 false，便于调用方直接返回失败。
+ */
 bool fail(QString *error, const QString &message)
 {
     if (error)
@@ -36,7 +46,12 @@ bool fail(QString *error, const QString &message)
 
 } // namespace
 
-/** @brief 每次请求重新读 INI，刷新页面可以看到 Qt 或 DHCP 更新后的保存值。 */
+/**
+ * @brief 每次请求重新读 INI，刷新页面可以看到 Qt 或 DHCP 更新后的保存值。
+ * @param path 待访问的文件或配置路径。
+ * @param[out] error 接收失败原因；允许为空时不写入错误文本。
+ * @return 保存的网络配置；文件缺失或读取失败返回空对象。
+ */
 QJsonObject NetworkConfig::read(const QString &path, QString *error)
 {
     if (error)
@@ -63,7 +78,15 @@ QJsonObject NetworkConfig::read(const QString &path, QString *error)
     return result;
 }
 
-/** @brief 网络应用前校验全部字段，避免修改系统地址后才发现输入无效。 */
+/**
+ * @brief 网络应用前校验全部字段，避免修改系统地址后才发现输入无效。
+ * @param input 待校验的输入数据。
+ * @param current 当前保存配置，提供受控网卡等字段。
+ * @param[out] output 接收规范化结果，调用方应提供有效指针。
+ * @param[out] error 接收失败原因；允许为空时不写入错误文本。
+ * @return 全部字段合法时为 true；失败时为 false 且写入错误说明。
+ * @note 网卡名取自 current；DHCP 模式清空静态字段，静态模式校验掩码、网关及 DNS。
+ */
 bool NetworkConfig::normalize(const QJsonObject &input,
                               const QJsonObject &current,
                               QJsonObject *output,
@@ -117,7 +140,13 @@ bool NetworkConfig::normalize(const QJsonObject &input,
     return true;
 }
 
-/** @brief 写入与后台一致的网络键；QSettings 合并保留其他组的配置。 */
+/**
+ * @brief 写入与后台一致的网络键；QSettings 合并保留其他组的配置。
+ * @param path 待访问的文件或配置路径。
+ * @param value 已通过统一校验的网络配置，包含 iface、dhcp 和静态地址字段。
+ * @param[out] error 接收失败原因；允许为空时不写入错误文本。
+ * @return INI 同步成功时为 true；失败返回 false 并写入错误说明。
+ */
 bool NetworkConfig::save(const QString &path, const QJsonObject &value, QString *error)
 {
     QSettings ini(path, QSettings::IniFormat);

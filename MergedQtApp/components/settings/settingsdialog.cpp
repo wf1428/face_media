@@ -358,6 +358,8 @@ void SettingsDialog::setupConnections()
 
     connect(mqttPage, &MqttPage::mqttVolumeReceived,
             this, &SettingsDialog::mqttVolumeChanged);
+    connect(mqttPage, &MqttPage::playFileDeleted,
+            this, &SettingsDialog::playFileDeleted);
 
 
     // 自动连接

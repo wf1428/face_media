@@ -89,6 +89,8 @@ signals:
     void liveStreamReady(const QString &url, const QString &kind);
     /** @brief FTP 下载配置已经就绪。 */
     void ftpDownloadTaskReady();
+    /** @brief 本地媒体删除成功。 */
+    void playFileDeleted(const QString &fullPath);
 
     /** @brief 请求媒体页捕获当前播放画面。 */
     void requestCapturePlayImage();

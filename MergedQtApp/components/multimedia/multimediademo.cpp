@@ -2,11 +2,15 @@
  * @file multimediademo.cpp
  * @brief 协调信号板显示、本地轮播、直播、音量、截图和 MQTT 状态。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-10-23；修改人：Du lin；通过人员照片到期后，仍在识别时恢复摄像头预览并保持 PIC 暂停；
+ *       仅退出识别后恢复 PIC 轮播，保持原前台超时、摄像头和 LED 生命周期。
  */
 
 #include "multimediademo.h"
+#include "common/media_content_policy.h"
+#include "common/ui_image_resources.h"
 #include "ui_multimediademo.h"
 #include <QGraphicsDropShadowEffect>
 #include <QPushButton>
@@ -49,13 +53,17 @@
 #include "shell/QuickUiRuntime.h"
 #include "volumepopup.h"
 
-/** @return 字节是可显示的大写字母楼层编码时返回 true。 */
+/**
+ * @return 字节是可显示的大写字母楼层编码时返回 true。
+ */
 static inline bool isFloorUpperLetterAscii(char ch)
 {
     return ch >= 'A' && ch <= 'Z';
 }
 
-/** @return 鼠标事件在目标控件中的局部坐标，不依赖 Wayland 全局窗口位置。 */
+/**
+ * @return 鼠标事件在目标控件中的局部坐标，不依赖 Wayland 全局窗口位置。
+ */
 static QPoint mousePositionIn(QObject *watched,
                               const QMouseEvent *event,
                               QWidget *target)
@@ -86,9 +94,12 @@ namespace {
 
 /**
  * @brief 扫描目录中名称符合规则的图片候选文件。
- *
+ * 
  * 扩展名不参与判断，实际格式由 QImageReader 根据文件内容识别；同一编号
  * 存在多个文件时，使用按文件名排序后的第一个，保证每次启动结果一致。
+ * @param directoryPath 外部图片目录完整路径。
+ * @param baseNamePattern 固定基础名称正则，第一个捕获组为正整数编号。
+ * @return 正整数编号到排序后首个候选文件的映射；未找到时为空。
  */
 static QMap<int, QString> scanIndexedImageFiles(const QString &directoryPath,
                                                 const QRegExp &baseNamePattern)
@@ -122,10 +133,14 @@ static QMap<int, QString> scanIndexedImageFiles(const QString &directoryPath,
 /** 持续探测失败期间，同一直播地址每小时最多打印一次探测状态。 */
 constexpr qint64 kLiveProbeFailureLogIntervalMs = 60LL * 60LL * 1000LL;
 
-/** @return 平台统一的网络配置文件路径。 */
+/**
+ * @return 平台统一的网络配置文件路径。
+ */
 static QString netCfgPath() { return Rk3566Platform::netConfigPath(); }
 
-/** @brief 将配置中的播放模式兼容值归一化为 NONE、LIVE 或 RECORDED。 */
+/**
+ * @brief 将配置中的播放模式兼容值归一化为 NONE、LIVE 或 RECORDED。
+ */
 static QString normalizePlaybackModeForCfg(const QString &raw)
 {
     const QString v = raw.trimmed().toUpper();
@@ -143,7 +158,9 @@ static QString normalizePlaybackModeForCfg(const QString &raw)
 }
 
 
-/** @brief 读取网卡 carrier；valid 区分“链路断开”和“节点不可读”。 */
+/**
+ * @brief 读取网卡 carrier；valid 区分“链路断开”和“节点不可读”。
+ */
 static bool readNetworkCarrierForLiveRetry(const QString &ifaceName, bool *valid)
 {
     if (valid) {
@@ -167,7 +184,9 @@ static bool readNetworkCarrierForLiveRetry(const QString &ifaceName, bool *valid
     return v == QStringLiteral("1");
 }
 
-/** @return 直播重试前确认默认有线网卡链路可用时返回 true。 */
+/**
+ * @return 直播重试前确认默认有线网卡链路可用时返回 true。
+ */
 static bool isWiredLinkUpForLiveRetry()
 {
     // T113/Tina 常见是 eth0，部分系统可能叫 end0。
@@ -206,7 +225,9 @@ static bool isWiredLinkUpForLiveRetry()
     return !sawCarrier;
 }
 
-/** @return 当前直播重试应按裸 UDP 或 SRT 数据到达方式探测时返回 true。 */
+/**
+ * @return 当前直播重试应按裸 UDP 或 SRT 数据到达方式探测时返回 true。
+ */
 static bool isRawUdpOrSrtLiveKindForLiveRetry(const QString &scheme, const QString &kind)
 {
     const QString s = scheme.trimmed().toLower();
@@ -216,7 +237,9 @@ static bool isRawUdpOrSrtLiveKindForLiveRetry(const QString &scheme, const QStri
            k == QStringLiteral("multicast") || k.contains(QStringLiteral("multicast"));
 }
 
-/** @return 当前直播重试应按裸 UDP 数据流探测时返回 true。 */
+/**
+ * @return 当前直播重试应按裸 UDP 数据流探测时返回 true。
+ */
 static bool isRawUdpLiveKindForLiveRetry(const QString &scheme, const QString &kind)
 {
     const QString s = scheme.trimmed().toLower();
@@ -239,7 +262,9 @@ struct UdpLiveProbeTargetForLiveRetry
     bool multicast = false; /**< 目标属于 IPv4 组播范围时为 true。 */
 };
 
-/** @brief 从直播 URL 解析 UDP 地址、端口及组播属性。 */
+/**
+ * @brief 从直播 URL 解析 UDP 地址、端口及组播属性。
+ */
 static UdpLiveProbeTargetForLiveRetry parseUdpLiveProbeTargetForLiveRetry(const QString &url)
 {
     UdpLiveProbeTargetForLiveRetry target;
@@ -284,7 +309,9 @@ static UdpLiveProbeTargetForLiveRetry parseUdpLiveProbeTargetForLiveRetry(const 
     return target;
 }
 
-/** @return 文本地址属于 224.0.0.0/4 时返回 true。 */
+/**
+ * @return 文本地址属于 224.0.0.0/4 时返回 true。
+ */
 static bool isMulticastIpv4ForLiveRetry(const QString &ipText)
 {
     QString ip = ipText.trimmed();
@@ -303,7 +330,9 @@ static bool isMulticastIpv4ForLiveRetry(const QString &ipText)
     return ok && first >= 224 && first <= 239;
 }
 
-/** @return SDP 连接字段声明组播地址时返回 true。 */
+/**
+ * @return SDP 连接字段声明组播地址时返回 true。
+ */
 static bool sdpLooksLikeMulticastForLiveRetry(const QString &sdp)
 {
     const QStringList lines = sdp.split('\n', QString::SkipEmptyParts);
@@ -321,7 +350,9 @@ static bool sdpLooksLikeMulticastForLiveRetry(const QString &sdp)
     return false;
 }
 
-/** @brief 按 URL scheme 和扩展名推断写入配置的直播类型。 */
+/**
+ * @brief 按 URL scheme 和扩展名推断写入配置的直播类型。
+ */
 static QString detectLiveKindFromUrlForCfg(const QString &url)
 {
     const QString lower = url.trimmed().toLower();
@@ -358,7 +389,9 @@ struct ActiveMqttRouteInfo
     bool ok = false;   /**< 功能开关唯一且配置可用时为 true。 */
 };
 
-/** @brief 根据互斥功能开关解析当前 MQTT 路由和主题。 */
+/**
+ * @brief 根据互斥功能开关解析当前 MQTT 路由和主题。
+ */
 static ActiveMqttRouteInfo resolveActiveMqttRoute(QSettings &settings)
 {
     ActiveMqttRouteInfo info;
@@ -409,7 +442,9 @@ static ActiveMqttRouteInfo resolveActiveMqttRoute(QSettings &settings)
     return info;
 }
 
-/** @brief 从 RTSP 状态行解析三位状态码。 */
+/**
+ * @brief 从 RTSP 状态行解析三位状态码。
+ */
 static int parseRtspStatusCodeForLiveRetry(const QByteArray &statusLine)
 {
     const QList<QByteArray> parts = statusLine.trimmed().split(' ');
@@ -422,7 +457,9 @@ static int parseRtspStatusCodeForLiveRetry(const QByteArray &statusLine)
     return ok ? code : 0;
 }
 
-/** @brief 从 RTSP 头部解析 Content-Length。 */
+/**
+ * @brief 从 RTSP 头部解析 Content-Length。
+ */
 static int parseRtspContentLengthForLiveRetry(const QByteArray &header)
 {
     const QList<QByteArray> lines = header.split('\n');
@@ -456,7 +493,9 @@ struct RtspProbeResponse
     int consumedBytes = 0;  /**< 当前响应在累计缓冲区中占用的字节数。 */
 };
 
-/** @brief 从累计 TCP 缓冲区提取一个完整 RTSP 响应。 */
+/**
+ * @brief 从累计 TCP 缓冲区提取一个完整 RTSP 响应。
+ */
 static RtspProbeResponse parseRtspResponseForLiveRetry(const QByteArray &buffer)
 {
     RtspProbeResponse resp;
@@ -489,14 +528,18 @@ static RtspProbeResponse parseRtspResponseForLiveRetry(const QByteArray &buffer)
     return resp;
 }
 
-/** @brief 从 SDP 中选择视频媒体段的 control 值。 */
+/**
+ * @brief 从 SDP 中选择视频媒体段的 control 值。
+ * @param sdpBody RTSP DESCRIBE 响应中的 SDP 正文字节。
+ * @return 首个视频媒体段内的非空 control；未找到时返回空字符串。
+ * @note 不使用会话级或音频轨的 control 来证明视频轨存在。
+ */
 static QString findRtspVideoControlForLiveRetry(const QByteArray &sdpBody)
 {
     const QString sdp = QString::fromUtf8(sdpBody);
     const QStringList lines = sdp.split('\n', QString::SkipEmptyParts);
 
     bool inVideoBlock = false;
-    QString sessionControl;
 
     for (QString line : lines) {
         line = line.trimmed();
@@ -521,17 +564,14 @@ static QString findRtspVideoControlForLiveRetry(const QByteArray &sdpBody)
         if (inVideoBlock) {
             return control;
         }
-
-        // session 级 control 只能作为兜底，不能单独证明有 video track。
-        if (sessionControl.isEmpty()) {
-            sessionControl = control;
-        }
     }
 
     return QString();
 }
 
-/** @brief 将 SDP control 字段解析为绝对 RTSP 地址。 */
+/**
+ * @brief 将 SDP control 字段解析为绝对 RTSP 地址。
+ */
 static QString buildRtspControlUrlForLiveRetry(const QUrl &baseUrl, const QString &control)
 {
     const QString c = control.trimmed();
@@ -560,7 +600,9 @@ static QString buildRtspControlUrlForLiveRetry(const QUrl &baseUrl, const QStrin
     return base + c;
 }
 
-/** @brief 发送用于直播源预检的 RTSP DESCRIBE 请求。 */
+/**
+ * @brief 发送用于直播源预检的 RTSP DESCRIBE 请求。
+ */
 static void sendRtspDescribeForLiveRetry(QTcpSocket *sock, const QString &url)
 {
     QByteArray req;
@@ -575,7 +617,9 @@ static void sendRtspDescribeForLiveRetry(QTcpSocket *sock, const QString &url)
     sock->flush();
 }
 
-/** @brief 发送用于确认媒体轨可用性的 RTSP SETUP 请求。 */
+/**
+ * @brief 发送用于确认媒体轨可用性的 RTSP SETUP 请求。
+ */
 static void sendRtspSetupForLiveRetry(QTcpSocket *sock, const QString &trackUrl)
 {
     QByteArray req;
@@ -591,20 +635,26 @@ static void sendRtspSetupForLiveRetry(QTcpSocket *sock, const QString &trackUrl)
 }
 
 
-/** @return HTTP 状态码表示成功时返回 true。 */
+/**
+ * @return HTTP 状态码表示成功时返回 true。
+ */
 static bool isHttpSuccessStatusForLiveRetry(int statusCode)
 {
     return statusCode == 200 || statusCode == 204 || statusCode == 206;
 }
 
-/** @return HTTP 状态码表示重定向时返回 true。 */
+/**
+ * @return HTTP 状态码表示重定向时返回 true。
+ */
 static bool isHttpRedirectStatusForLiveRetry(int statusCode)
 {
     return statusCode == 301 || statusCode == 302 || statusCode == 303 ||
            statusCode == 307 || statusCode == 308;
 }
 
-/** @return 响应正文更像 HTML 错误页而非媒体数据时返回 true。 */
+/**
+ * @return 响应正文更像 HTML 错误页而非媒体数据时返回 true。
+ */
 static bool isProbablyHtmlBodyForLiveRetry(const QByteArray &body)
 {
     const QByteArray trimmed = body.left(256).trimmed().toLower();
@@ -613,7 +663,9 @@ static bool isProbablyHtmlBodyForLiveRetry(const QByteArray &body)
            trimmed.contains("<html");
 }
 
-/** @return 正文包含 HLS 播放列表标记时返回 true。 */
+/**
+ * @return 正文包含 HLS 播放列表标记时返回 true。
+ */
 static bool isLikelyHlsPlaylistForLiveRetry(const QByteArray &body)
 {
     const QByteArray b = body.left(8192).trimmed();
@@ -628,7 +680,9 @@ static bool isLikelyHlsPlaylistForLiveRetry(const QByteArray &body)
            b.contains(".m4s");
 }
 
-/** @return 数据具有 MPEG-TS 同步字节特征时返回 true。 */
+/**
+ * @return 数据具有 MPEG-TS 同步字节特征时返回 true。
+ */
 static bool isLikelyTsBodyForLiveRetry(const QByteArray &body)
 {
     if (body.size() < 188) {
@@ -649,19 +703,25 @@ static bool isLikelyTsBodyForLiveRetry(const QByteArray &body)
     return false;
 }
 
-/** @return 数据具有 FLV 文件头时返回 true。 */
+/**
+ * @return 数据具有 FLV 文件头时返回 true。
+ */
 static bool isLikelyFlvBodyForLiveRetry(const QByteArray &body)
 {
     return body.size() >= 3 && body.left(3) == "FLV";
 }
 
-/** @return 数据具有 MP4 box 文件头时返回 true。 */
+/**
+ * @return 数据具有 MP4 box 文件头时返回 true。
+ */
 static bool isLikelyMp4BodyForLiveRetry(const QByteArray &body)
 {
     return body.size() >= 12 && body.mid(4, 4) == "ftyp";
 }
 
-/** @brief 综合 URL、Content-Type 和正文魔数判断 HTTP 直播内容。 */
+/**
+ * @brief 综合 URL、Content-Type 和正文魔数判断 HTTP 直播内容。
+ */
 static bool isLikelyLiveHttpBodyForLiveRetry(const QString &url,
                                              const QString &contentType,
                                              const QByteArray &body,
@@ -920,7 +980,9 @@ MultimediaDemo::MultimediaDemo(QWidget *parent) :
 }
 
 
-/** @brief splash 隐藏后启动视频区域，并延续原有的播放状态恢复时序。 */
+/**
+ * @brief splash 隐藏后启动视频区域，并延续原有的播放状态恢复时序。
+ */
 void MultimediaDemo::startPlaybackAfterSplash()
 {
     const bool firstRelease = !m_startupPlaybackReleased;
@@ -968,7 +1030,9 @@ void MultimediaDemo::startPlaybackAfterSplash()
 }
 
 
-/** @brief 创建密码错误的非模态提示标签和定时器。 */
+/**
+ * @brief 创建密码错误的非模态提示标签和定时器。
+ */
 void MultimediaDemo::initPasswordErrorToast()
 {
     if (m_passwordToastLabel) {
@@ -1013,7 +1077,9 @@ void MultimediaDemo::initPasswordErrorToast()
     });
 }
 
-/** @brief 显示指定时长的密码错误提示。 */
+/**
+ * @brief 显示指定时长的密码错误提示。
+ */
 void MultimediaDemo::showPasswordErrorToast(const QString &text, int ms)
 {
     if (QuickUiRuntime::instance()->showToast(text, ms, false)) {
@@ -1058,7 +1124,9 @@ void MultimediaDemo::showPasswordErrorToast(const QString &text, int ms)
 
 
 
-/** @brief 临时切往其他模块时停止解码资源，同时保留返回后需要恢复的 LIVE 目标。 */
+/**
+ * @brief 临时切往其他模块时停止解码资源，同时保留返回后需要恢复的 LIVE 目标。
+ */
 void MultimediaDemo::suspendPlaybackForModuleSwitch()
 {
     if (m_modulePlaybackSuspended) return;
@@ -1103,7 +1171,9 @@ void MultimediaDemo::suspendPlaybackForModuleSwitch()
     }
 }
 
-/** @brief 返回多媒体模块时恢复暂停前的 LIVE 目标，否则沿用原本的本地轮播恢复。 */
+/**
+ * @brief 返回多媒体模块时恢复暂停前的 LIVE 目标，否则沿用原本的本地轮播恢复。
+ */
 void MultimediaDemo::resumePlaybackAfterModuleSwitch()
 {
     m_modulePlaybackSuspended = false;
@@ -1146,7 +1216,9 @@ void MultimediaDemo::resumePlaybackAfterModuleSwitch()
     resumeLocalPlaylistFromStart();
 }
 
-/** @brief 保持视频持续播放，在配置 pictureRect 内用摄像头替换 PIC 轮播。 */
+/**
+ * @brief 保持视频持续播放，在配置 pictureRect 内用摄像头替换 PIC 轮播。
+ */
 void MultimediaDemo::beginEmbeddedFaceRecognition()
 {
     if (m_embeddedFaceRecognitionActive) {
@@ -1180,7 +1252,9 @@ void MultimediaDemo::beginEmbeddedFaceRecognition()
     LOG_VIDEO("视频保持播放，pictureRect 已由 PIC 切换到人脸识别预览");
 }
 
-/** @brief 停止 pictureRect 内的人脸展示并恢复 PIC 轮播，视频保持原状态。 */
+/**
+ * @brief 停止 pictureRect 内的人脸展示并恢复 PIC 轮播，视频保持原状态。
+ */
 void MultimediaDemo::endEmbeddedFaceRecognition()
 {
     if (!m_embeddedFaceRecognitionActive) {
@@ -1262,13 +1336,17 @@ void MultimediaDemo::setEmbeddedFaceUnavailable(const QString &message)
     }
 }
 
-/** @brief 复用主窗口已有覆盖提示层显示短时业务消息。 */
+/**
+ * @brief 复用主窗口已有覆盖提示层显示短时业务消息。
+ */
 void MultimediaDemo::showTransientStatus(const QString &message, int durationMs)
 {
     emit statusMessageRequested(message, qMax(1, durationMs));
 }
 
-/** @brief 显示通过人员图；当前区域放不下时进入下一批等待队列。 */
+/**
+ * @brief 显示通过人员图；当前区域放不下时进入下一批等待队列。
+ */
 void MultimediaDemo::showRecognitionImage(const QImage &image,
                                            const QString &name,
                                            int durationMs)
@@ -1302,7 +1380,9 @@ void MultimediaDemo::showRecognitionImage(const QImage &image,
     appendRecognitionImage(item);
 }
 
-/** @brief 将照片加入当前批次，并从真正显示时开始计算保持时间。 */
+/**
+ * @brief 将照片加入当前批次，并从真正显示时开始计算保持时间。
+ */
 void MultimediaDemo::appendRecognitionImage(const RecognitionImageItem &item)
 {
     if (!m_recognitionResultHost || item.image.isNull()) {
@@ -1353,7 +1433,9 @@ void MultimediaDemo::appendRecognitionImage(const RecognitionImageItem &item)
     emit recognitionResultDisplayStarted();
 }
 
-/** @return 新照片保持既定宽度后，是否仍能完整放入当前区域。 */
+/**
+ * @return 新照片保持既定宽度后，是否仍能完整放入当前区域。
+ */
 bool MultimediaDemo::canAppendRecognitionImage(const QImage &image) const
 {
     if (!m_recognitionResultHost || image.isNull()) {
@@ -1374,7 +1456,9 @@ bool MultimediaDemo::canAppendRecognitionImage(const QImage &image) const
             <= m_recognitionResultHost->width();
 }
 
-/** @brief 当前批次全部消失后，把等待队列中能放下的照片组成下一批。 */
+/**
+ * @brief 当前批次全部消失后，把等待队列中能放下的照片组成下一批。
+ */
 void MultimediaDemo::startNextRecognitionBatch()
 {
     while (!m_pendingRecognitionImages.isEmpty()) {
@@ -1388,7 +1472,9 @@ void MultimediaDemo::startNextRecognitionBatch()
     }
 }
 
-/** @return 卡片沿用人脸虚线框的肖像比例，高度受 pic 区域限制。 */
+/**
+ * @return 卡片沿用人脸虚线框的肖像比例，高度受 pic 区域限制。
+ */
 int MultimediaDemo::recognitionCardWidth(const QImage &image) const
 {
     if (!m_recognitionResultHost || image.isNull()) {
@@ -1417,7 +1503,9 @@ int MultimediaDemo::recognitionCardHeight() const
                   qMax(1, m_recognitionResultHost->height() - 4));
 }
 
-/** @brief 根据当前批次数量靠 pictureRect 最右侧排列，卡片不因新增人员而缩窄。 */
+/**
+ * @brief 根据当前批次数量靠 pictureRect 最右侧排列，卡片不因新增人员而缩窄。
+ */
 void MultimediaDemo::layoutRecognitionImages()
 {
     if (!m_recognitionResultHost) {
@@ -1457,7 +1545,9 @@ void MultimediaDemo::layoutRecognitionImages()
     }
 }
 
-/** @return 以圆角裁切图片，并在图片内部底部绘制姓名。 */
+/**
+ * @return 以圆角裁切图片，并在图片内部底部绘制姓名。
+ */
 QPixmap MultimediaDemo::renderRecognitionCard(const QImage &image,
                                                const QString &name,
                                                const QSize &size) const
@@ -1520,9 +1610,28 @@ void MultimediaDemo::clearRecognitionImages(bool restorePicturePlayback)
     }
 }
 
+/**
+ * @brief 结果照片清空后按识别状态恢复摄像头预览或 PIC 轮播。
+ * @note GUI 线程调用；识别活动期间保持 PIC 隐藏且定时器暂停，不更改识别状态或前台超时。
+ */
 void MultimediaDemo::restorePictureAfterRecognitionResult()
 {
     if (!m_picturePausedForFaceOverlay) {
+        return;
+    }
+    if (m_embeddedFaceRecognitionActive) {
+        if (pictureTimer) {
+            pictureTimer->stop();
+        }
+        if (label_picture) {
+            label_picture->hide();
+        }
+        if (m_facePreview) {
+            m_facePreview->setRecognitionGuideEnabled(true);
+            m_facePreview->show();
+            m_facePreview->raise();
+            raiseMovingTextOverlay();
+        }
         return;
     }
     if (m_facePreview) {
@@ -1544,53 +1653,6 @@ void MultimediaDemo::restorePictureAfterRecognitionResult()
     }
 }
 
-/** @brief 离开页面时停止全部播放器、探测和定时任务，避免后台占用解码资源。 */
-void MultimediaDemo::leaveAndStopVideo()
-{
-    m_localPlaybackEnabled = false;
-    stopEmptyVideoListWatch();
-
-    stopLiveWatchdog();
-
-    if (m_leaving) return;
-    m_leaving = true;
-
-    // 1) 断开 finished，避免 stop 过程中触发 playNextVideo（尤其是 QueuedConnection）
-    disconnect(mediaPlayer, &GstPlayerWidget::videoFinished,
-               this, &MultimediaDemo::playNextVideo);
-    if (nextVideoPlayer) {
-        disconnect(nextVideoPlayer, &GstPlayerWidget::videoFinished,
-                   this, &MultimediaDemo::playNextVideo);
-    }
-
-    // 2) 先断显示输出（非常重要：切页时立刻停止 UI 更新/绘制链路）
-//    if (mediaPlayer)  mediaPlayer->setVideoOutput(nullptr);
-//    if (nextVideoPlayer) nextVideoPlayer->setVideoOutput(nullptr);
-
-    // 2) 先停播放器，不要先 setVideoOutput(nullptr)
-    if (mediaPlayer) {
-        mediaPlayer->stop();
-    }
-    if (nextVideoPlayer) {
-        nextVideoPlayer->stop();
-    }
-
-
-    // 3) 隐藏视频窗口，避免还在 repaint
-    if (videoWidget) videoWidget->hide();
-
-    // 4) 用 singleShot(0) 异步 stop：不要把 stop 放在“切页那条调用栈”里
-    QTimer::singleShot(0, this, [this]() {
-        if (mediaPlayer) mediaPlayer->stop();           // GstPlayerWidget::stop 会停止管线并清空待显示帧。
-        if (nextVideoPlayer) nextVideoPlayer->stop();
-
-        m_leaving = false;
-
-        // 页面离开时，彻底取消直播目标
-        stopDesiredLive();
-        m_isLiveMode = false;
-    });
-}
 
 
 // 刷新播放列表
@@ -1647,9 +1709,12 @@ void MultimediaDemo::reloadVideoFileList()
     LOG_VIDEO("刷新后当前视频索引:" << currentVideoIndex);
 }
 
-/** @brief 按配置顺序重建 videoRect 视频/图片混播列表。 */
+/**
+ * @brief 按配置顺序重建 videoRect 视频/图片混播列表。
+ */
 void MultimediaDemo::rebuildVideoRectMediaList()
 {
+    m_adContentType = MediaContentPolicy::contentType(Rk3566Platform::netConfigPath());
     QString currentPath = m_currentVideoRectMediaPath;
 
     if (currentPath.isEmpty() &&
@@ -1673,71 +1738,19 @@ void MultimediaDemo::rebuildVideoRectMediaList()
         return;
     }
 
-    QStringList filters;
-
-    // 视频格式
-    filters << "*.mp4" << "*.MP4"
-            << "*.avi" << "*.AVI"
-            << "*.mov" << "*.MOV"
-            << "*.mkv" << "*.MKV"
-            << "*.wmv" << "*.WMV"
-            << "*.flv" << "*.FLV"
-            << "*.ts"  << "*.TS"
-            << "*.pls" << "*.PLS"
-            << "*.webm" << "*.WEBM"
-            << "*.rmvb" << "*.RMVB"
-            << "*.3gp" << "*.3GP";
-
-    // 图片格式
-    filters << "*.png" << "*.PNG"
-            << "*.jpg" << "*.JPG"
-            << "*.jpeg" << "*.JPEG"
-            << "*.bmp" << "*.BMP"
-            << "*.gif" << "*.GIF";
-
-    mediaDir.setNameFilters(filters);
-    mediaDir.setFilter(QDir::Files | QDir::Readable);
-    mediaDir.setSorting(QDir::Name | QDir::IgnoreCase);
-
-    const QFileInfoList infos = mediaDir.entryInfoList();
-
-    auto isImageFile = [](const QString &suffix) -> bool {
-        const QString s = suffix.toLower();
-        return s == "png" ||
-               s == "jpg" ||
-               s == "jpeg" ||
-               s == "bmp" ||
-               s == "gif";
-    };
-
-    auto isVideoFile = [](const QString &suffix) -> bool {
-        const QString s = suffix.toLower();
-        return s == "mp4"  ||
-               s == "avi"  ||
-               s == "mov"  ||
-               s == "mkv"  ||
-               s == "wmv"  ||
-               s == "flv"  ||
-               s == "ts"   ||
-               s == "pls"  ||
-               s == "webm" ||
-               s == "rmvb" ||
-               s == "3gp";
-    };
-
+    const QFileInfoList infos = mediaDir.entryInfoList(
+                QDir::Files | QDir::Readable, QDir::Name | QDir::IgnoreCase);
     for (const QFileInfo &info : infos) {
         const QString absPath = info.absoluteFilePath();
-        const QString suffix = info.suffix();
-
-        if (isVideoFile(suffix)) {
-            videoFileList << absPath;
-            videoRectMediaList << VideoRectMediaItem(VideoRectMedia_Video, absPath);
-        } else if (isImageFile(suffix)) {
+        if (!MediaContentPolicy::allows(m_adContentType, absPath)) continue;
+        if (MediaContentPolicy::isImage(absPath)) {
             videoRectPictureFileList << absPath;
             videoRectMediaList << VideoRectMediaItem(VideoRectMedia_Image, absPath);
+        } else {
+            videoFileList << absPath;
+            videoRectMediaList << VideoRectMediaItem(VideoRectMedia_Video, absPath);
         }
     }
-
     currentVideoIndex = videoFileList.isEmpty() ? -1 : 0;
     currentVideoRectMediaIndex = -1;
 
@@ -1773,7 +1786,9 @@ void MultimediaDemo::rebuildVideoRectMediaList()
     }
 }
 
-/** @brief 从混播列表移除运行期间已不存在的文件。 */
+/**
+ * @brief 从混播列表移除运行期间已不存在的文件。
+ */
 void MultimediaDemo::pruneMissingVideoRectMedia()
 {
     for (int i = videoRectMediaList.size() - 1; i >= 0; --i) {
@@ -1810,7 +1825,10 @@ void MultimediaDemo::pruneMissingVideoRectMedia()
     }
 }
 
-/** @brief 停止 videoRect 图片计时器并按需隐藏标签。 */
+/**
+ * @brief 停止 videoRect 图片计时器并按需隐藏标签。
+ * @param hideLabel 是否同时清空并隐藏图片标签。
+ */
 void MultimediaDemo::stopVideoRectPictureDisplay(bool hideLabel)
 {
     if (videoRectPictureTimer) {
@@ -1824,11 +1842,13 @@ void MultimediaDemo::stopVideoRectPictureDisplay(bool hideLabel)
 
     if (hideLabel) {
         m_currentVideoRectIsImage = false;
-        m_currentVideoRectImagePath.clear();
     }
 }
 
-/** @brief 按环形索引播放一个 videoRect 媒体项。 */
+/**
+ * @brief 按环形索引播放一个 videoRect 媒体项。
+ * @param index videoRect 混播列表中的零基索引；越界时直接返回。
+ */
 void MultimediaDemo::playVideoRectMediaAt(int index)
 {
     if (index < 0 || index >= videoRectMediaList.size()) {
@@ -1853,9 +1873,22 @@ void MultimediaDemo::playVideoRectMediaAt(int index)
     }
 }
 
-/** @brief 让主播放器播放 videoRect 视频项。 */
+/**
+ * @brief 让主播放器播放 videoRect 视频项。
+ * @param filePath 待读取的文件路径。
+ */
 void MultimediaDemo::playVideoRectVideo(const QString &filePath)
 {
+    // 即使旧列表或其他入口误传图片，也不能把图片送进硬件视频解码链路。
+    if (MediaContentPolicy::isImage(filePath)) {
+        if (MediaContentPolicy::allows(MediaContentPolicy::contentType(
+                                          Rk3566Platform::netConfigPath()), filePath)) {
+            playVideoRectImage(filePath);
+        } else {
+            resumeLocalPlaylistFromStart();
+        }
+        return;
+    }
     if (!m_startupPlaybackReleased) {
         LOG_VIDEO("启动页尚未结束，忽略提前的视频开播请求:" << filePath);
         return;
@@ -1872,7 +1905,6 @@ void MultimediaDemo::playVideoRectVideo(const QString &filePath)
     stopVideoRectPictureDisplay(true);
 
     m_currentVideoRectIsImage = false;
-    m_currentVideoRectImagePath.clear();
     m_currentVideoRectMediaPath = filePath;
 
     int videoIndex = videoFileList.indexOf(filePath);
@@ -1921,7 +1953,11 @@ void MultimediaDemo::playVideoRectVideo(const QString &filePath)
     LOG_VIDEO("videoRect 混播：开始播放视频:" << filePath);
 }
 
-/** @brief 隐藏视频画布并显示 videoRect 图片项。 */
+/**
+ * @brief 隐藏视频画布并显示 videoRect 图片项。
+ * @param filePath 待读取的文件路径。
+ * @note 通过 Qt 图片路径显示并按 videoRect 的图片间隔切换，避免把静态图片送入 DMA-BUF 视频解码链路。
+ */
 void MultimediaDemo::playVideoRectImage(const QString &filePath)
 {
     if (filePath.trimmed().isEmpty()) {
@@ -1996,10 +2032,9 @@ void MultimediaDemo::playVideoRectImage(const QString &filePath)
 
     currentVideoIndex = -1;
     m_currentVideoRectIsImage = true;
-    m_currentVideoRectImagePath = filePath;
     m_currentVideoRectMediaPath = filePath;
 
-    emit currentRecordedFileChanged(QString());
+    emit currentRecordedFileChanged(filePath);
 
     videoRectPictureTimer->start(qMax(1, VideoPic_disp_Time) * 1000);
 
@@ -2008,7 +2043,9 @@ void MultimediaDemo::playVideoRectImage(const QString &filePath)
 
 
 
-/** @brief 创建主/预加载播放器并连接状态信号。 */
+/**
+ * @brief 创建主/预加载播放器并连接状态信号。
+ */
 void MultimediaDemo::initVideoPlayer()
 {
     rebuildVideoRectMediaList();
@@ -2052,7 +2089,9 @@ void MultimediaDemo::initVideoPlayer()
     playVideoRectMediaAt(currentVideoRectMediaIndex);
 }
 
-/** @brief 按列表索引切换到下一段本地视频。 */
+/**
+ * @brief 按列表索引切换到下一段本地视频。
+ */
 void MultimediaDemo::playNextVideo()
 {
     if (m_downloadPauseActive) return;
@@ -2119,66 +2158,11 @@ void MultimediaDemo::playNextVideo()
     playVideoRectMediaAt(nextIndex);
 }
 
-// 预加载下一个视频
-void MultimediaDemo::preloadNextVideo()
-{
-    LOG_VIDEO("[preloadNextVideo] enter, currentVideoIndex=" << currentVideoIndex
-              << " size=" << videoFileList.size()
-              << " isPreloading=" << isPreloading);
 
-    if (!nextVideoPlayer || videoFileList.size() < 2 || isPreloading) {
-        return;
-    }
-
-    int nextIndex = (currentVideoIndex + 1) % videoFileList.size();
-    QString nextVideoPath = videoFileList.at(nextIndex);
-
-    isPreloading = true;
-
-    // 防止重复连接导致 lambda 累积
-    disconnect(nextVideoPlayer, &GstPlayerWidget::prepared, this, nullptr);
-    disconnect(nextVideoPlayer, &GstPlayerWidget::errorOccured, this, nullptr);
-
-    // ✅ 预加载完成后再把 isPreloading 置回 false
-    // 需要 GstPlayerWidget 有 prepared() 信号
-    connect(nextVideoPlayer, &GstPlayerWidget::prepared, this, [this]() {
-        isPreloading = false;
-        LOG_VIDEO("[preloadNextVideo] prepared done, next prepared=" << (nextVideoPlayer ? nextVideoPlayer->isPrepared() : false));
-    }, Qt::UniqueConnection);
-
-    // 预加载失败也要把 isPreloading 置回 false
-    connect(nextVideoPlayer, &GstPlayerWidget::errorOccured, this, [this](const QString&) {
-        isPreloading = false;
-        LOG_VIDEO("[preloadNextVideo] preload error, isPreloading=false");
-    }, Qt::UniqueConnection);
-
-
-    // 停止并清空预加载播放器
-    nextVideoPlayer->setPreloadMode(true);
-    nextVideoPlayer->setVideoOutput(nullptr);
-
-    nextVideoPlayer->stop();
-    nextVideoPlayer->setMedia(nextVideoPath);
-
-    // 应用与当前相同的质量设置
-    switch (currentQualityLevel) {
-    case 1: // 低质量
-        // 低质量设置（移除了setBufferMode调用）
-        break;
-    case 2: // 中等质量
-    case 3: // 高质量
-        // 中高质量设置（移除了setBufferMode调用）
-        break;
-    default:
-        break;
-    }
-
-    //LOG_VIDEO("开始预加载下一个视频:" << nextVideoPath);
-    isPreloading = false;
-
-}
-
-/** @brief 下载完成后更新列表并按当前模式决定是否立即播放。 */
+/**
+ * @brief 下载完成后更新列表并按当前模式决定是否立即播放。
+ * @param filePath 待读取的文件路径。
+ */
 void MultimediaDemo::onDownloadedVideoReady(const QString& filePath)
 {
     const QString absPath = QFileInfo(filePath).absoluteFilePath();
@@ -2187,6 +2171,10 @@ void MultimediaDemo::onDownloadedVideoReady(const QString& filePath)
     }
 
 
+    if (MediaContentPolicy::isImage(absPath) && MediaContentPolicy::isInDirectory(
+                absPath, MediaContentPolicy::pictureDir(Rk3566Platform::staticRoot()))) {
+        m_pictureRefreshPending = true;
+    }
     if (m_downloadPauseActive) {
         LOG_VIDEO("下载完成视频已落盘，等待下载结束后立即播放:" << absPath);
         return;
@@ -2197,85 +2185,97 @@ void MultimediaDemo::onDownloadedVideoReady(const QString& filePath)
 }
 
 
-/** @brief 把新视频插入当前项之后，使其成为下一播放项。 */
-void MultimediaDemo::insertVideoNext(const QString& filePath)
+/**
+ * @brief 删除文件后移除列表和缓存；仅当前播放项被删除时切换主区域。
+ * @param filePath 待读取的文件路径。
+ */
+void MultimediaDemo::onPlayFileDeleted(const QString &filePath)
 {
-    if (filePath.trimmed().isEmpty()) {
+    const QString path = QFileInfo(filePath).absoluteFilePath();
+    if (QFileInfo::exists(path)) return;
+
+    if (MediaContentPolicy::isInDirectory(path,
+                MediaContentPolicy::pictureDir(Rk3566Platform::staticRoot()))) {
+        // 直接移除已解码缓存，避免重新解码其余小图和干扰主区域播放。
+        for (int i = pictureFileList.size() - 1; i >= 0; --i) {
+            if (pictureFileList.at(i) != path) continue;
+            pictureFileList.removeAt(i);
+            picturePixmapCache.removeAt(i);
+            if (i < currentPictureIndex) --currentPictureIndex;
+        }
+        if (pictureFileList.isEmpty()) {
+            if (pictureTimer) pictureTimer->stop();
+            label_picture->clear();
+            label_picture->hide();
+            // 继续沿用外部资源为空时回退内置资源的规则。
+            m_pictureRefreshPending = true;
+            if (PicDisplay_en && !m_downloadPauseActive && !m_modulePlaybackSuspended && isVisible())
+                initPicturePlayer();
+        } else {
+            currentPictureIndex = qBound(0, currentPictureIndex, pictureFileList.size() - 1);
+            label_picture->setPixmap(picturePixmapCache.at(currentPictureIndex));
+            if (pictureFileList.size() == 1 && pictureTimer) {
+                pictureTimer->stop();
+                delete pictureTimer;
+                pictureTimer = nullptr;
+            }
+        }
+        return;
+    }
+    if (!MediaContentPolicy::isInDirectory(path, Rk3566Platform::videoDir())) return;
+
+    const bool deletingCurrent = m_currentVideoRectMediaPath == path;
+    videoFileList.removeAll(path);
+    videoRectPictureFileList.removeAll(path);
+    pruneMissingVideoRectMedia();
+    currentVideoIndex = videoFileList.indexOf(m_currentVideoRectMediaPath);
+    if (!deletingCurrent) return;
+    if (m_isLiveMode) {
+        // 直播仍可能保留上一次本地播放路径；只移除旧路径，不触碰直播管线。
+        m_currentVideoRectMediaPath.clear();
+        currentVideoRectMediaIndex = -1;
         return;
     }
 
-    const QString absPath = QFileInfo(filePath).absoluteFilePath();
-
-    // 先刷新目录，确保列表是最新的
-    reloadVideoFileList();
-
-    // 如果列表里已经有这个文件，先移除旧位置
-    int oldIndex = videoFileList.indexOf(absPath);
-    if (oldIndex >= 0) {
-        videoFileList.removeAt(oldIndex);
-
-        // 如果删掉的是当前索引前面的元素，要修正 currentVideoIndex
-        if (oldIndex < currentVideoIndex) {
-            currentVideoIndex--;
-        }
+    invalidatePendingLocalPlaybackStarts();
+    m_lastSnapshotMs = 0;
+    m_lastSnapshotBase64.clear();
+    stopVideoRectPictureDisplay(true);
+    if (mediaPlayer) {
+        disconnect(mediaPlayer, &GstPlayerWidget::videoFinished, this, &MultimediaDemo::playNextVideo);
+        mediaPlayer->stop();
     }
-
-    // 插到当前播放项的后一个位置
-    int insertPos = currentVideoIndex + 1;
-    if (insertPos < 0) insertPos = 0;
-    if (insertPos > videoFileList.size()) insertPos = videoFileList.size();
-
-    videoFileList.insert(insertPos, absPath);
-
-    // 插入后，旧的预加载内容已经不可信，清掉
     if (nextVideoPlayer) {
+        disconnect(nextVideoPlayer, &GstPlayerWidget::videoFinished, this, &MultimediaDemo::playNextVideo);
         nextVideoPlayer->stop();
-        nextVideoPlayer->setVideoOutput(nullptr);
-        nextVideoPlayer->setPreloadMode(true);
     }
     isPreloading = false;
+    if (videoWidget && !m_isLiveMode) videoWidget->hide();
+    m_currentVideoRectMediaPath.clear();
+    emit currentRecordedFileChanged(QString());
 
-    LOG_VIDEO("已插入到下一个播放位置:" << absPath);
-    LOG_VIDEO("插入位置:" << insertPos);
-    LOG_VIDEO("当前播放索引:" << currentVideoIndex);
-
-    // 同步插入到 videoRect 混播列表中，保证下载视频可以进入混播序列
-    VideoRectMediaItem item(VideoRectMedia_Video, absPath);
-
-    for (int i = videoRectMediaList.size() - 1; i >= 0; --i) {
-        if (videoRectMediaList.at(i).filePath == absPath) {
-            if (i < currentVideoRectMediaIndex) {
-                currentVideoRectMediaIndex--;
-            } else if (i == currentVideoRectMediaIndex) {
-                currentVideoRectMediaIndex--;
-            }
-
-            videoRectMediaList.removeAt(i);
-        }
-    }
-
-    int mediaInsertPos = currentVideoRectMediaIndex + 1;
-    if (mediaInsertPos < 0) {
-        mediaInsertPos = 0;
-    }
-    if (mediaInsertPos > videoRectMediaList.size()) {
-        mediaInsertPos = videoRectMediaList.size();
-    }
-
-    videoRectMediaList.insert(mediaInsertPos, item);
-
-    LOG_VIDEO("已插入到 videoRect 混播下一个位置:" << absPath);
+    const int nextIndex = (currentVideoRectMediaIndex + 1) % qMax(1, videoRectMediaList.size());
+    currentVideoRectMediaIndex = -1;
+    if (!m_startupPlaybackReleased || !m_localPlaybackEnabled || m_downloadPauseActive ||
+        m_modulePlaybackSuspended || m_leaving || m_isLiveMode || m_liveDesired || !isVisible()) return;
+    if (videoRectMediaList.isEmpty()) startEmptyVideoListWatch();
+    else playVideoRectMediaAt(nextIndex);
 }
 
 
-/** @brief 生成本地播放启动序号，用于识别异步回调所属启动。 */
+
+/**
+ * @brief 生成本地播放启动序号，用于识别异步回调所属启动。
+ */
 quint64 MultimediaDemo::issueLocalPlaybackStartSerial()
 {
     return ++m_localPlaybackStartSerial;
 }
 
 
-/** @brief 递增序号，使所有在途本地播放启动回调失效。 */
+/**
+ * @brief 递增序号，使所有在途本地播放启动回调失效。
+ */
 void MultimediaDemo::invalidatePendingLocalPlaybackStarts()
 {
     ++m_localPlaybackStartSerial;
@@ -2351,7 +2351,9 @@ void MultimediaDemo::pauseLocalPlaybackForDownload()
     LOG_VIDEO("下载期间已暂停本地视频播放与切换");
 }
 
-/** @brief 下载结束后按之前状态恢复本地轮播。 */
+/**
+ * @brief 下载结束后按之前状态恢复本地轮播。
+ */
 void MultimediaDemo::resumeLocalPlaybackAfterDownload()
 {
     if (!m_downloadPauseActive) {
@@ -2382,7 +2384,9 @@ void MultimediaDemo::resumeLocalPlaybackAfterDownload()
     resumeLocalPlaylistFromStart();
 }
 
-/** @brief 更新非模态下载进度提示。 */
+/**
+ * @brief 更新非模态下载进度提示。
+ */
 void MultimediaDemo::showDownloadProgressToast(const QString &title, int percent, const QString &detail)
 {
     if (!m_downloadToast) {
@@ -2392,7 +2396,9 @@ void MultimediaDemo::showDownloadProgressToast(const QString &title, int percent
     m_downloadToast->showProgress(title, percent, detail);
 }
 
-/** @brief 隐藏并重置下载进度提示。 */
+/**
+ * @brief 隐藏并重置下载进度提示。
+ */
 void MultimediaDemo::hideDownloadProgressToast()
 {
     if (m_downloadToast) {
@@ -2400,15 +2406,21 @@ void MultimediaDemo::hideDownloadProgressToast()
     }
 }
 
-/** @brief 下载开始时暂停本地播放并显示进度提示。 */
+/**
+ * @brief 下载开始时暂停本地播放并显示进度提示。
+ */
 void MultimediaDemo::onDownloadStarted(const QString& fileName)
 {
     m_downloadActiveFileName = QFileInfo(fileName).fileName();
     pauseLocalPlaybackForDownload();
-    showDownloadProgressToast(QStringLiteral("正在下载视频"), 0, m_downloadActiveFileName);
+    showDownloadProgressToast(MediaContentPolicy::isImage(m_downloadActiveFileName)
+                                 ? QStringLiteral("正在下载图片") : QStringLiteral("正在下载视频"),
+                             0, m_downloadActiveFileName);
 }
 
-/** @brief 更新当前下载文件的进度提示。 */
+/**
+ * @brief 更新当前下载文件的进度提示。
+ */
 void MultimediaDemo::onDownloadProgress(const QString& fileName, int percent)
 {
     if (!m_downloadPauseActive) {
@@ -2423,13 +2435,22 @@ void MultimediaDemo::onDownloadProgress(const QString& fileName, int percent)
             ? QStringLiteral("%1%").arg(percent)
             : QStringLiteral("%1    %2%").arg(m_downloadActiveFileName).arg(percent);
 
-    showDownloadProgressToast(QStringLiteral("正在下载视频"), percent, detail);
+    showDownloadProgressToast(MediaContentPolicy::isImage(m_downloadActiveFileName)
+                                 ? QStringLiteral("正在下载图片") : QStringLiteral("正在下载视频"),
+                             percent, detail);
 }
 
-/** @brief 下载成功后隐藏提示、更新媒体列表并恢复播放。 */
+/**
+ * @brief 下载成功后隐藏提示、更新媒体列表并恢复播放。
+ * @param filePath 待读取的文件路径。
+ */
 void MultimediaDemo::onDownloadFinished(const QString& filePath)
 {
     const QString absPath = QFileInfo(filePath).absoluteFilePath();
+    if (MediaContentPolicy::isImage(absPath) && MediaContentPolicy::isInDirectory(
+                absPath, MediaContentPolicy::pictureDir(Rk3566Platform::staticRoot()))) {
+        m_pictureRefreshPending = true;
+    }
     const QString name = QFileInfo(absPath).fileName();
     m_downloadActiveFileName = name;
     showDownloadProgressToast(QStringLiteral("下载完成"), 100, name);
@@ -2475,7 +2496,9 @@ void MultimediaDemo::onDownloadFinished(const QString& filePath)
     });
 }
 
-/** @brief 下载失败后显示原因并恢复被暂停的本地播放。 */
+/**
+ * @brief 下载失败后显示原因并恢复被暂停的本地播放。
+ */
 void MultimediaDemo::onDownloadFailed(const QString& fileName, const QString& reason)
 {
     Q_UNUSED(reason);
@@ -2492,14 +2515,6 @@ void MultimediaDemo::onDownloadFailed(const QString& fileName, const QString& re
     resumeLocalPlaybackAfterDownload();
 }
 
-// 恢复资源使用
-void MultimediaDemo::restoreResourcesOnPlay()
-{
-    // 恢复之前的视频质量设置
-    applyVideoQualitySettings();
-
-    LOG_VIDEO("视频恢复播放，已恢复资源使用");
-}
 
 // 测试视频优化功能
 void MultimediaDemo::testVideoOptimizations()
@@ -2538,50 +2553,22 @@ void MultimediaDemo::testVideoOptimizations()
 }
 
 
-// 提高视频质量
+/**
+ * @brief 递增内部质量等级计数，不改变播放器参数。
+ * @note 由原有质量监测定时器调用，保留等级上限和日志行为。
+ */
 void MultimediaDemo::increaseQuality()
 {
     if (currentQualityLevel < 3) {
         currentQualityLevel++;
         LOG_QUALITY("提高视频质量级别至:" << currentQualityLevel);
-        applyVideoQualitySettings();
     }
 }
 
-// 应用视频质量设置
-void MultimediaDemo::applyVideoQualitySettings()
-{
-    // 根据质量级别调整视频播放参数
-    switch (currentQualityLevel) {
-    case 1: // 低质量
-        // 降低缓冲时长，减少内存占用
-        maxBufferDuration = 5000;
-        // 设置较低的播放质量参数
-        //mediaPlayer->setPlaybackRate(0.85); // 稍微降低播放速度以提高流畅度
-        break;
-    case 2: // 中等质量
-        maxBufferDuration = 7000;
-        //mediaPlayer->setPlaybackRate(0.98);
-        break;
-    case 3: // 高质量
-        maxBufferDuration = 8000;
-        //mediaPlayer->setPlaybackRate(1);
-        break;
-    default:
-        break;
-    }
 
-    // 重新设置缓冲模式
-    if (currentQualityLevel == 1) {
-        // 低质量时使用最小缓冲模式（移除了setBufferMode调用）
-    } else {
-        // 中高质量时使用全缓冲模式（移除了setBufferMode调用）
-    }
-
-    //LOG_QUALITY("应用视频质量设置: 缓冲时长=" << maxBufferDuration << "ms, 播放速度=" << mediaPlayer->playbackRate());
-}
-
-/** @brief 停止播放器和工作线程后释放页面资源。 */
+/**
+ * @brief 停止播放器和工作线程后释放页面资源。
+ */
 MultimediaDemo::~MultimediaDemo()
 {
     clearDirectionMovie();
@@ -2940,7 +2927,9 @@ void MultimediaDemo::initializeComponents()
     LOG_INIT("初始显示状态: 楼层数字和状态标签已显示，方向/日期/星期标签根据配置显示");
 }
 
-/** @brief 从设备配置文件加载显示、媒体和功能参数。 */
+/**
+ * @brief 从设备配置文件加载显示、媒体和功能参数。
+ */
 void MultimediaDemo::readConfigurationFromFile()
 {
     const QString configPath = Rk3566Platform::uiConfigPath();
@@ -3262,7 +3251,9 @@ void MultimediaDemo::readConfigurationFromFile()
 }
 
 
-/** @brief 读取配置后初始化界面可见性和几何参数。 */
+/**
+ * @brief 读取配置后初始化界面可见性和几何参数。
+ */
 void MultimediaDemo::initializeConfiguration()
 {
     LOG_INIT("开始初始化配置参数");
@@ -3276,61 +3267,9 @@ void MultimediaDemo::initializeConfiguration()
     const QString backPathQrc = QDir(qrcRoot).filePath(backRel);
 
     if (backPic_en) {
-        QPixmap backPixmap;
-        QString usedPath;
-
-        bool loaded = false;
-
-        LOG_DEBUG("Qt支持的图片格式: " << QImageReader::supportedImageFormats());
-
-        auto tryLoadBackImage = [&](const QString &path, const QString &tag) -> bool {
-            QFileInfo fi(path);
-
-            LOG_DEBUG(tag << " 背景图片路径: " << path);
-//            LOG_DEBUG(tag << " exists=" << QFile::exists(path)
-//                          << ", isFile=" << fi.isFile()
-//                          << ", readable=" << fi.isReadable()
-//                          << ", size=" << fi.size());
-
-            QImageReader reader(path);
-//            LOG_DEBUG(tag << " reader.format=" << reader.format()
-//                          << ", canRead=" << reader.canRead());
-
-            QImage image = reader.read();
-            if (image.isNull()) {
-                LOG_DEBUG(tag << " 背景图片读取失败: "
-                              << reader.error()
-                              << ", errorString=" << reader.errorString());
-                return false;
-            }
-
-            backPixmap = QPixmap::fromImage(image);
-            if (backPixmap.isNull()) {
-                LOG_DEBUG(tag << " QImage读取成功，但转换QPixmap失败");
-                return false;
-            }
-
-            usedPath = path;
-            LOG_DEBUG(tag << " 背景图片读取成功: "
-                          << image.width() << "x" << image.height()
-                          << ", format=" << image.format());
-
-            return true;
-        };
-
-        // 先尝试外部
-        if (QFile::exists(backPathExt)) {
-            LOG_DEBUG("尝试从外部目录加载背景图片: " << backPathExt);
-            loaded = tryLoadBackImage(backPathExt, "外部");
-        } else {
-            LOG_DEBUG("外部背景图片不存在: " << backPathExt);
-        }
-
-        // 外部失败再用 qrc
-        if (!loaded) {
-            LOG_DEBUG("尝试从qrc加载背景图片: " << backPathQrc);
-            loaded = tryLoadBackImage(backPathQrc, "qrc");
-        }
+        // 外部按固定名称兼容不同图片格式；内置仍精确读取 back.bmp。
+        const QPixmap backPixmap = loadPixmapWithIgnoreWarnings(backPathQrc);
+        const bool loaded = !backPixmap.isNull();
 
         if (loaded) {
             label_back->setPixmap(backPixmap);
@@ -3339,7 +3278,7 @@ void MultimediaDemo::initializeConfiguration()
             label_back->show();
             label_back->lower(); // 确保back在最低层
 
-            LOG_DEBUG("背景图片加载成功: " << usedPath);
+            LOG_DEBUG("背景图片加载成功，资源名: back");
             LOG_DEBUG("背景图片大小: " << backPic_x_Size << "x" << backPic_y_Size);
         } else {
             LOG_DEBUG("警告: 无法加载背景图片");
@@ -3357,36 +3296,9 @@ void MultimediaDemo::initializeConfiguration()
 
     // 加载并显示BG01背景图，同时考虑BgDisplay_en配置
     if (bg01Pic_en && BgDisplay_en) {
-        QPixmap bg01Pixmap;
-        QString usedPath;
-        bool loaded = false;
-
-        // 1) 先尝试外部
-        LOG_CONFIG("尝试从外部目录加载BG01背景图: " << bg01PathExt);
-        {
-            const QFileInfo fi(bg01PathExt);
-            if (fi.exists() && fi.isFile() && fi.isReadable()) {
-                loaded = bg01Pixmap.load(bg01PathExt);
-                if (loaded) {
-                    usedPath = bg01PathExt;
-                } else {
-                    LOG_CONFIG("外部BG01存在但加载失败(可能损坏/格式不对): " << bg01PathExt);
-                }
-            } else {
-                LOG_CONFIG("外部BG01不可用(不存在/非文件/不可读): " << bg01PathExt);
-            }
-        }
-
-        // 2) 外部失败再用 qrc
-        if (!loaded) {
-            LOG_CONFIG("尝试从qrc加载BG01背景图: " << bg01PathQrc);
-            loaded = bg01Pixmap.load(bg01PathQrc);
-            if (loaded) {
-                usedPath = bg01PathQrc;
-            } else {
-                LOG_CONFIG("qrc BG01加载失败: " << bg01PathQrc);
-            }
-        }
+        // 外部按固定名称兼容不同图片格式；内置仍精确读取 BG01.jpg。
+        const QPixmap bg01Pixmap = loadPixmapWithIgnoreWarnings(bg01PathQrc);
+        const bool loaded = !bg01Pixmap.isNull();
 
         if (loaded) {
             label_bg01->setPixmap(bg01Pixmap);
@@ -3404,7 +3316,7 @@ void MultimediaDemo::initializeConfiguration()
             label_bg01->move(BgDisplay_x, BgDisplay_y);
             label_bg01->show();
 
-            LOG_CONFIG("BG01背景图加载成功: " << usedPath);
+            LOG_CONFIG("BG01背景图加载成功，资源名: BG01");
             LOG_CONFIG("BG01位置: (" << BgDisplay_x << ", " << BgDisplay_y << ")");
         } else {
             LOG_CONFIG("警告: 无法加载BG01背景图");
@@ -3630,7 +3542,9 @@ void MultimediaDemo::initializeConfiguration()
     // 动态新增控件也容易遗漏。
 }
 
-/** @brief 创建透明裁剪区域，并只读取 U 盘静态目录中的 notice.txt。 */
+/**
+ * @brief 创建透明裁剪区域，并只读取 U 盘静态目录中的 notice.txt。
+ */
 void MultimediaDemo::initializeMovingText()
 {
     if (!MoveTextDisplay_en) {
@@ -3719,7 +3633,9 @@ void MultimediaDemo::advanceMovingText()
     m_moveTextLabel->move(m_moveTextOffsetX, 0);
 }
 
-/** @brief 媒体内容动态切层后，恢复滚动通知的常驻叠加层级。 */
+/**
+ * @brief 媒体内容动态切层后，恢复滚动通知的常驻叠加层级。
+ */
 void MultimediaDemo::raiseMovingTextOverlay()
 {
     if (m_moveTextViewport) {
@@ -3727,7 +3643,9 @@ void MultimediaDemo::raiseMovingTextOverlay()
     }
 }
 
-/** @brief 创建并连接页面全部周期定时器。 */
+/**
+ * @brief 创建并连接页面全部周期定时器。
+ */
 void MultimediaDemo::initializeTimers()
 {
     LOG_INIT("开始初始化定时器");
@@ -3807,7 +3725,9 @@ void MultimediaDemo::initializeTimers()
     LOG_INIT("定时器初始化完成");
 }
 
-/** @brief 初始化信号板接收缓冲及电梯演示状态。 */
+/**
+ * @brief 初始化信号板接收缓冲及电梯演示状态。
+ */
 void MultimediaDemo::simulateBufferData()
 {
     LOG_BUFFER("开始初始化数据缓冲区");
@@ -3826,7 +3746,10 @@ void MultimediaDemo::simulateBufferData()
     LOG_BUFFER("数据缓冲区初始化完成，所有值设置为0");
 }
 
-/** @brief 在 -8～32 层之间往返运行，同步刷新箭头并轮换四种状态标志。 */
+/**
+ * @brief 在 -8～32 层之间往返运行，同步刷新箭头并轮换四种状态标志。
+ * @note 仅演示模式推进；每 1 秒变更楼层及方向，并按满载、超载、消防、检修循环状态。
+ */
 void MultimediaDemo::onElevatorDemoTimeout()
 {
     if (!RunMode) {
@@ -3860,6 +3783,9 @@ void MultimediaDemo::onElevatorDemoTimeout()
 
 // 信号板楼层、方向和状态显示。
 // 信号到达时立即调用；300ms定时器只作为兜底，相同数据不会重复绘制。
+/**
+ * @brief 刷新当前楼层、方向和状态标志，复用已缓存的界面资源。
+ */
 void MultimediaDemo::onTimeout()
 {
     if (!m_signalUiReady) {
@@ -4132,7 +4058,9 @@ static inline QString stripInlineComment(QString s)
     return s.trimmed();
 }
 
-/** @brief 兼容 1/0、true/false、yes/no 等配置布尔写法。 */
+/**
+ * @brief 兼容 1/0、true/false、yes/no 等配置布尔写法。
+ */
 static inline bool parseBoolLoose(const QString& s, bool defVal=false)
 {
     const QString v = stripInlineComment(s).toLower();
@@ -4141,7 +4069,10 @@ static inline bool parseBoolLoose(const QString& s, bool defVal=false)
     return defVal;
 }
 
-/** @brief 从 INI 加载特殊楼层数值到显示名称的映射。 */
+/**
+ * @brief 从 INI 加载特殊楼层数值到显示名称的映射。
+ * @param iniPath 广告播放配置 INI 的完整路径。
+ */
 void MultimediaDemo::loadFloorRemap(const QString& iniPath)
 {
     m_floorRemap.clear();
@@ -4185,7 +4116,11 @@ void MultimediaDemo::loadFloorRemap(const QString& iniPath)
 }
 
 
-/** @brief 尝试显示当前楼层对应的专用图片。 */
+/**
+ * @brief 尝试显示当前楼层对应的专用图片。
+ * @param Value 业务楼层号，按配置查找对应的特殊整层图片。
+ * @return 已找到并显示特殊整层图片时为 true，否则返回 false 供常规楼层渲染。
+ */
 bool MultimediaDemo::tryShowSpecialFloorImage(int Value)
 {
 
@@ -4245,14 +4180,18 @@ bool MultimediaDemo::tryShowSpecialFloorImage(int Value)
 }
 
 
-/** @brief 刷新日期、星期和时间文本。 */
+/**
+ * @brief 刷新日期、星期和时间文本。
+ */
 void MultimediaDemo::onTimeoutDate()
 {
     LOG_CONFIG("日期更新定时器触发");
     getTimeWithQt();
 }
 
-/** @brief 演示模式下轮换空调工作模式图标。 */
+/**
+ * @brief 演示模式下轮换空调工作模式图标。
+ */
 void MultimediaDemo::onAirCondiModeTimeout()
 {
     if (!AirCondi_en || !AirCondiMode_en || !label_airCondiMode) {
@@ -4339,7 +4278,9 @@ void MultimediaDemo::onAirCondiModeTimeout()
 
 }
 
-/** @brief 演示模式下轮换空调风速图标。 */
+/**
+ * @brief 演示模式下轮换空调风速图标。
+ */
 void MultimediaDemo::onAirCondiWindSpeedTimeout()
 {
     if (!AirCondi_en || !AirCondiWind_en || !label_airCondiWindSpeed) {
@@ -4432,7 +4373,9 @@ void MultimediaDemo::onAirCondiWindSpeedTimeout()
 
 }
 
-/** @brief 演示模式下按当前方向调整空调温度。 */
+/**
+ * @brief 演示模式下按当前方向调整空调温度。
+ */
 void MultimediaDemo::onAirCondiTempTimeout()
 {
     if (!AirCondi_en || !AirCondiTemp_en || !label_airCondiTemp) {
@@ -4459,7 +4402,9 @@ void MultimediaDemo::onAirCondiTempTimeout()
     LOG_AC("空调温度更新成功: " << currentAirCondiTemp << "°C, 方向=" << tempDirection << ", 颜色=" << airCondiTempColor);
 }
 
-/** @brief 将配置英文单词转换为界面使用的首字母大写形式。 */
+/**
+ * @brief 将配置英文单词转换为界面使用的首字母大写形式。
+ */
 static QString toTitleCase(const QString& s)
 {
     if (s.isEmpty()) return s;
@@ -4468,7 +4413,9 @@ static QString toTitleCase(const QString& s)
     return lower;
 }
 
-/** @brief 按配置样式格式化星期文本。 */
+/**
+ * @brief 按配置样式格式化星期文本。
+ */
 QString MultimediaDemo::formatWeekText(int dayOfWeek, int style)
 {
     // Qt: dayOfWeek 1=Mon ... 7=Sun
@@ -4505,7 +4452,9 @@ QString MultimediaDemo::formatWeekText(int dayOfWeek, int style)
     }
 }
 
-/** @brief 按配置的字号、颜色和粗体选项统一设置标签样式。 */
+/**
+ * @brief 按配置的字号、颜色和粗体选项统一设置标签样式。
+ */
 static void applyLabelStyle(QLabel* label,
                             int x, int y, int w, int h,
                             int textSize, int textStyleBold,
@@ -4528,7 +4477,9 @@ static void applyLabelStyle(QLabel* label,
         .arg(r).arg(g).arg(b));
 }
 
-/** @brief 从系统时钟刷新日期、星期和时间标签。 */
+/**
+ * @brief 从系统时钟刷新日期、星期和时间标签。
+ */
 void MultimediaDemo::getTimeWithQt()
 {
     // 如果系统时间是1970，先尝试用RTC拉起来
@@ -4610,7 +4561,9 @@ void MultimediaDemo::getTimeWithQt()
 }
 
 
-/** @brief 按配置区域缩放并显示楼层图片。 */
+/**
+ * @brief 按配置区域缩放并显示楼层图片。
+ */
 void MultimediaDemo::showFloor(const QPixmap &pixmap, QLabel *label, int x, int y, int width, int height)
 {
     LOG_UI("显示楼层标签 - 位置: (" << x << ", " << y << ") 大小: " << width << "x" << height);
@@ -4632,7 +4585,12 @@ void MultimediaDemo::showFloor(const QPixmap &pixmap, QLabel *label, int x, int 
 }
 
 
-/** @brief 用十位和个位标签显示普通数字楼层。 */
+/**
+ * @brief 用十位和个位标签显示普通数字楼层。
+ * @param floorNumber 实际业务楼层号，地下层为负值。
+ * @param tens 楼层十位数字。
+ * @param units 楼层个位数字。
+ */
 void MultimediaDemo::displayFloorAsText(int floorNumber, int tens, int units)
 {
     LOG_UI("使用文字模式显示楼层: " << floorNumber);
@@ -4684,7 +4642,10 @@ void MultimediaDemo::displayFloorAsText(int floorNumber, int tens, int units)
 }
 
 
-/** @brief 显示单字母楼层。 */
+/**
+ * @brief 显示单字母楼层。
+ * @param letter 单字母楼层字符。
+ */
 void MultimediaDemo::displaySingleLetterFloorAsText(char letter)
 {
     if (!isFloorUpperLetterAscii(letter)) {
@@ -4719,7 +4680,11 @@ void MultimediaDemo::displaySingleLetterFloorAsText(char letter)
 }
 
 
-/** @brief 显示带 B 或负号前缀的楼层。 */
+/**
+ * @brief 显示带 B 或负号前缀的楼层。
+ * @param prefix 负号或地下楼层前缀字符。
+ * @param one 个位楼层数字。
+ */
 void MultimediaDemo::displayPrefixedFloorAsText(char prefix, int one)
 {
     label_ten->setPixmap(QPixmap());
@@ -4742,56 +4707,32 @@ void MultimediaDemo::displayPrefixedFloorAsText(char prefix, int one)
 }
 
 
-/** @brief 优先解析外部资源路径，不存在时回退到 qrc。 */
-QString MultimediaDemo::resolveResourcePath(const QString &pathOrRel) const
+/**
+ * @brief 从缓存取得信号板 UI 图片，首次访问时加载。
+ * @param imagePath 原图片路径，可以是外部路径、相对路径或内置 qrc 路径。
+ * @param allowGif 是否允许 GIF 候选；关闭时继续查找同名静态图片。
+ * @return 已缓存图片或本次成功解码的图片；失败返回空 QPixmap。
+ * @note 使用逻辑路径和 GIF 许可作为缓存键；只缓存成功图片，失败不会阻止后续重试。
+ */
+QPixmap MultimediaDemo::cachedSignalUiPixmap(const QString &imagePath, bool allowGif)
 {
-    QString relPath;
-
-    // 传入 qrc 完整路径，例如 :/static/demoResources/images/tl/1.png
-    if (pathOrRel.startsWith(qrcRoot)) {
-        relPath = pathOrRel.mid(qrcRoot.length());
-
-        if (relPath.startsWith('/')) {
-            relPath.remove(0, 1);
-        }
-    }
-    // 传入相对路径，例如 demoResources/images/tl/1.png
-    else if (!pathOrRel.startsWith(":/") && !QDir::isAbsolutePath(pathOrRel)) {
-        relPath = pathOrRel;
-    }
-    // 传入普通绝对路径，直接返回
-    else {
-        return pathOrRel;
-    }
-
-    const QString extPath = QDir(extRoot).filePath(relPath);
-    const QString qrcPath = QDir(qrcRoot).filePath(relPath);
-
-    const QFileInfo extInfo(extPath);
-    if (extInfo.exists() && extInfo.isFile() && extInfo.isReadable()) {
-        return extPath;
-    }
-
-    return qrcPath;
-}
-
-/** @brief 从缓存取得信号板 UI 图片，首次访问时加载。 */
-QPixmap MultimediaDemo::cachedSignalUiPixmap(const QString &imagePath)
-{
-    const QString cacheKey = resolveResourcePath(imagePath);
+    // 使用逻辑路径作键，命中后不再扫描外部目录。
+    const QString cacheKey = imagePath + (allowGif ? QString() : QStringLiteral("|static"));
     const auto it = m_signalUiPixmapCache.constFind(cacheKey);
     if (it != m_signalUiPixmapCache.constEnd()) {
         return it.value();
     }
 
-    const QPixmap pixmap = loadPixmapWithIgnoreWarnings(imagePath);
+    const QPixmap pixmap = loadPixmapWithIgnoreWarnings(imagePath, allowGif);
     if (!pixmap.isNull()) {
         m_signalUiPixmapCache.insert(cacheKey, pixmap);
     }
     return pixmap;
 }
 
-/** @brief 停止动画并清除标签，延迟释放以兼容动画信号回调。 */
+/**
+ * @brief 停止动画并清除标签，延迟释放以兼容动画信号回调。
+ */
 void MultimediaDemo::clearDirectionMovie()
 {
     if (!m_directionMovie) {
@@ -4805,13 +4746,16 @@ void MultimediaDemo::clearDirectionMovie()
     movie->deleteLater();
 }
 
-/** @brief 保留原有外部 PNG 优先、内置 PNG 兜底的静态显示。 */
+/**
+ * @brief 外部方向静态图兼容不同格式，内置仍按原 PNG 路径兜底。
+ * @param direction 方向状态枚举；静态回退入口只用于上行或下行，无方向由 showDirectionImage 清空。
+ */
 void MultimediaDemo::showDirectionPng(DirectionStatus direction)
 {
     const QString path = direction == UP
             ? QStringLiteral(":/static/demoResources/images/tl/up.png")
             : QStringLiteral(":/static/demoResources/images/tl/down.png");
-    const QPixmap pixmap = cachedSignalUiPixmap(path);
+    const QPixmap pixmap = cachedSignalUiPixmap(path, false);
     if (pixmap.isNull()) {
         label_direction->hide();
         LOG_SYSTEM("方向图片加载失败，方向标签已隐藏: " << path);
@@ -4822,7 +4766,11 @@ void MultimediaDemo::showDirectionPng(DirectionStatus direction)
     label_direction->raise();
 }
 
-/** @brief GIF 优先于 PNG，同格式仍优先使用外部资源。 */
+/**
+ * @brief GIF 优先于静态图；同格式仍外部优先，qrc 使用原文件名。
+ * @param direction 方向状态枚举；静态回退入口只用于上行或下行，无方向由 showDirectionImage 清空。
+ * @note QMovie 由本页面持有；隐藏时暂停，损坏或无法播放的 GIF 排队回退到同名静态图片。
+ */
 void MultimediaDemo::showDirectionImage(DirectionStatus direction)
 {
     clearDirectionMovie();
@@ -4834,10 +4782,7 @@ void MultimediaDemo::showDirectionImage(DirectionStatus direction)
     const QString relativePath = direction == UP
             ? QStringLiteral("demoResources/images/tl/up.gif")
             : QStringLiteral("demoResources/images/tl/down.gif");
-    const QStringList candidates = {
-        QDir(extRoot).filePath(relativePath),
-        QDir(qrcRoot).filePath(relativePath)
-    };
+    const QStringList candidates = UiImageResources::candidates(relativePath, extRoot, qrcRoot);
     for (const QString &path : candidates) {
         const QFileInfo info(path);
         if (!info.exists() || !info.isFile() || !info.isReadable()) {
@@ -4845,7 +4790,11 @@ void MultimediaDemo::showDirectionImage(DirectionStatus direction)
         }
         // 先解码首帧，避免损坏 GIF 或设备缺少解码器时覆盖可用 PNG。
         // 使用独立读取器验证，避免预先推进 QMovie 而跳过动画首帧。
-        QImageReader reader(path, QByteArrayLiteral("gif"));
+        QImageReader reader(path);
+        reader.setDecideFormatFromContent(true);
+        if (reader.format().toLower() != QByteArrayLiteral("gif")) {
+            continue;
+        }
         if (reader.read().isNull()) {
             LOG_DEBUG("方向 GIF 不可用，尝试回退: " << path
                       << reader.errorString());
@@ -4870,7 +4819,7 @@ void MultimediaDemo::showDirectionImage(DirectionStatus direction)
                 if (m_directionMovie != movie) {
                     return;
                 }
-                LOG_DEBUG("方向 GIF 播放失败，回退 PNG: " << movie->fileName()
+                LOG_DEBUG("方向 GIF 播放失败，回退静态图片: " << movie->fileName()
                           << movie->lastErrorString());
                 clearDirectionMovie();
                 showDirectionPng(direction);
@@ -4885,7 +4834,9 @@ void MultimediaDemo::showDirectionImage(DirectionStatus direction)
     showDirectionPng(direction);
 }
 
-/** @brief 启动时预加载楼层、方向和状态图片，降低串口更新抖动。 */
+/**
+ * @brief 启动时预加载楼层、方向和状态图片，降低串口更新抖动。
+ */
 void MultimediaDemo::preloadSignalUiPixmaps()
 {
     m_signalUiPixmapCache.clear();
@@ -4909,7 +4860,8 @@ void MultimediaDemo::preloadSignalUiPixmaps()
 
     int loadedCount = 0;
     for (const QString &path : paths) {
-        if (!cachedSignalUiPixmap(path).isNull()) {
+        const bool direction = path.endsWith("/up.png") || path.endsWith("/down.png");
+        if (!cachedSignalUiPixmap(path, !direction).isNull()) {
             ++loadedCount;
         }
     }
@@ -4918,33 +4870,16 @@ void MultimediaDemo::preloadSignalUiPixmaps()
 }
 
 
-/** @brief 加载图片并屏蔽现场资源文件可能产生的非致命解码告警。 */
-QPixmap MultimediaDemo::loadPixmapWithIgnoreWarnings(const QString &imagePath)
+/**
+ * @brief 按候选顺序解码图片，失败时继续尝试并记录诊断。
+ * @param imagePath 原图片路径，可以是外部路径、相对路径或内置 qrc 路径。
+ * @param allowGif 是否允许 GIF 候选；关闭时继续查找同名静态图片。
+ * @return 首个成功解码的候选图片；所有候选均失败时返回空 QPixmap。
+ * @note QImageReader 按内容识别格式；仅外部 logo/tl 放宽扩展名，内置 qrc 使用完整原名称。
+ */
+QPixmap MultimediaDemo::loadPixmapWithIgnoreWarnings(const QString &imagePath, bool allowGif)
 {
-    QStringList candidates;
-
-    // 如果传入的是 qrc 路径，则自动增加外部路径作为第一候选
-    if (imagePath.startsWith(qrcRoot)) {
-        QString relPath = imagePath.mid(qrcRoot.length());
-
-        if (relPath.startsWith('/')) {
-            relPath.remove(0, 1);
-        }
-
-        candidates << QDir(extRoot).filePath(relPath);
-        candidates << imagePath;
-    }
-    // 如果传入的是资源相对路径，也按外部优先、qrc兜底处理
-    else if (!imagePath.startsWith(":/") && !QDir::isAbsolutePath(imagePath)) {
-        candidates << QDir(extRoot).filePath(imagePath);
-        candidates << QDir(qrcRoot).filePath(imagePath);
-    }
-    // 普通绝对路径保持原逻辑
-    else {
-        candidates << imagePath;
-    }
-
-    candidates.removeDuplicates();
+    const QStringList candidates = UiImageResources::candidates(imagePath, extRoot, qrcRoot);
 
     for (const QString &path : candidates) {
         // 外部文件不存在或不可读时，不尝试读取，直接下一个候选
@@ -4958,6 +4893,9 @@ QPixmap MultimediaDemo::loadPixmapWithIgnoreWarnings(const QString &imagePath)
         QImageReader reader(path);
         reader.setDecideFormatFromContent(true);
         reader.setAutoTransform(true);
+        if (!allowGif && reader.format().toLower() == QByteArrayLiteral("gif")) {
+            continue;
+        }
         QImage image = reader.read();
 
         if (!image.isNull()) {
@@ -4974,7 +4912,9 @@ QPixmap MultimediaDemo::loadPixmapWithIgnoreWarnings(const QString &imagePath)
     return QPixmap();
 }
 
-/** @brief 设置标签几何并显示指定图片。 */
+/**
+ * @brief 设置标签几何并显示指定图片。
+ */
 void MultimediaDemo::showImage(const QPixmap &pixmap, QLabel *label, const QString &imagePath, int x, int y, int width, int height)
 {
     LOG_UI("显示图像 - 路径: " << imagePath << " 位置: (" << x << ", " << y << ") 大小: " << width << "x" << height);
@@ -4992,10 +4932,21 @@ void MultimediaDemo::showImage(const QPixmap &pixmap, QLabel *label, const QStri
 }
 
 
-/** @brief 扫描图片目录并启动图片轮播。 */
+/**
+ * @brief 扫描图片目录并启动图片轮播。
+ * @note pic 使用任意名称的常见图片；仍遵循 pictureRect 开关及轮播间隔，不由 contentType 筛选。
+ */
 void MultimediaDemo::initPicturePlayer()
 {
     LOG_INIT("开始初始化图片播放器");
+
+    // 下载覆盖或新增图片后允许重新扫描，避免重复定时器和旧缓存。
+    if (pictureTimer) {
+        pictureTimer->stop();
+        delete pictureTimer;
+        pictureTimer = nullptr;
+    }
+    m_pictureRefreshPending = false;
 
     // 图片标签的几何属性只设置一次。图片会在预加载阶段缩放到该尺寸，
     // 运行期间不再由 QLabel 动态缩放。
@@ -5009,21 +4960,18 @@ void MultimediaDemo::initPicturePlayer()
     picturePixmapCache.clear();
     currentPictureIndex = 0;
 
-    // pic 图片同样按资源组整体选择来源。文件名必须是 01、02……这样的
-    // 两位编号，扩展名不限制；只要外部组有任意合规文件，就不混入 qrc 图片。
+    // pic接受任意文件名和常见图片扩展名；外部组存在时不混入qrc图片。
     const QString externalPictureDir =
             QDir(extRoot).filePath("demoResources/images/pic");
     const QString qrcPictureDir =
             QDir(qrcRoot).filePath("demoResources/images/pic");
-    const QRegExp pictureNamePattern(QStringLiteral("^([0-9]{2})$"));
-    const QMap<int, QString> externalPictureFiles =
-            scanIndexedImageFiles(externalPictureDir, pictureNamePattern);
+    const QStringList externalPictureFiles = MediaContentPolicy::imageFiles(externalPictureDir);
     const bool useExternalPictureGroup = !externalPictureFiles.isEmpty();
-    const QMap<int, QString> selectedPictureFiles = useExternalPictureGroup
+    const QStringList selectedPictureFiles = useExternalPictureGroup
             ? externalPictureFiles
-            : scanIndexedImageFiles(qrcPictureDir, pictureNamePattern);
+            : MediaContentPolicy::imageFiles(qrcPictureDir);
 
-    pictureFileList = selectedPictureFiles.values();
+    pictureFileList = selectedPictureFiles;
     LOG_IMAGE("图片资源组来源: "
               << (useExternalPictureGroup ? "外部目录" : "qrc内置资源"));
 
@@ -5073,7 +5021,7 @@ void MultimediaDemo::initPicturePlayer()
 
     // 第一张图片只设置一次。
     label_picture->setPixmap(picturePixmapCache.first());
-    label_picture->show();
+    label_picture->setVisible(!m_picturePausedForFaceOverlay);
     LOG_IMAGE("图片预加载完成，有效图片数量:" << picturePixmapCache.size());
 
     // 只有一张图片时永久显示，不创建、不启动轮播定时器。
@@ -5088,12 +5036,14 @@ void MultimediaDemo::initPicturePlayer()
     pictureTimer->setInterval(qMax(1, PicDisplay_Time) * 1000);
     connect(pictureTimer, &QTimer::timeout,
             this, &MultimediaDemo::playNextPicture);
-    pictureTimer->start();
+    if (!m_picturePausedForFaceOverlay) pictureTimer->start();
 
     LOG_IMAGE("图片轮播已启动，间隔秒数:" << qMax(1, PicDisplay_Time));
 }
 
-/** @brief 轮换普通图片显示区域中的下一张图片。 */
+/**
+ * @brief 轮换普通图片显示区域中的下一张图片。
+ */
 void MultimediaDemo::playNextPicture()
 {
     const int pictureCount = picturePixmapCache.size();
@@ -5107,10 +5057,13 @@ void MultimediaDemo::playNextPicture()
     LOG_IMAGE("切换到缓存图片:" << pictureFileList.value(currentPictureIndex));
 }
 
-/** @brief 页面显示时恢复定时器、网络监测和本地播放。 */
+/**
+ * @brief 页面显示时恢复定时器、网络监测和本地播放。
+ */
 void MultimediaDemo::showEvent(QShowEvent *e)
 {
     QWidget::showEvent(e);
+    if (m_pictureRefreshPending && PicDisplay_en) initPicturePlayer();
     if (m_directionMovie) {
         m_directionMovie->setPaused(false);
     }
@@ -5140,7 +5093,9 @@ void MultimediaDemo::showEvent(QShowEvent *e)
 
 }
 
-/** @brief 页面隐藏时暂停不应在后台运行的交互状态。 */
+/**
+ * @brief 页面隐藏时暂停不应在后台运行的交互状态。
+ */
 void MultimediaDemo::hideEvent(QHideEvent *e)
 {
     if (m_directionMovie) {
@@ -5196,7 +5151,9 @@ bool MultimediaDemo::isEventFromThisPage(QObject *watched, QEvent *event) const
 }
 
 
-/** @brief 出现模态窗口时暂停页面空闲隐藏逻辑。 */
+/**
+ * @brief 出现模态窗口时暂停页面空闲隐藏逻辑。
+ */
 void MultimediaDemo::suspendUiIdleForModal()
 {
     showCursorIfHidden();
@@ -5207,7 +5164,9 @@ void MultimediaDemo::suspendUiIdleForModal()
 }
 
 
-/** @brief 页面离开时停用空闲隐藏并恢复光标。 */
+/**
+ * @brief 页面离开时停用空闲隐藏并恢复光标。
+ */
 void MultimediaDemo::deactivateUiIdle()
 {
     if (m_panelAutoHideTimer) {
@@ -5225,7 +5184,9 @@ void MultimediaDemo::deactivateUiIdle()
     showCursorIfHidden();
 }
 
-/** @brief 释放前未达到五秒时，保持原有左键热点行为。 */
+/**
+ * @brief 释放前未达到五秒时，保持原有左键热点行为。
+ */
 bool MultimediaDemo::handleShortLeftClick(const QPoint &p)
 {
     const QRect dateRect(DateDisplay_x, DateDisplay_y,
@@ -5453,7 +5414,9 @@ bool MultimediaDemo::eventFilter(QObject *watched, QEvent *event)
     return false; // 默认放行
 }
 
-/** @brief 使用屏幕键盘请求退出密码并与配置值校验。 */
+/**
+ * @brief 使用屏幕键盘请求退出密码并与配置值校验。
+ */
 bool MultimediaDemo::requestPasswordAndCheck()
 {
     bool ok = false;
@@ -5696,7 +5659,11 @@ bool MultimediaDemo::setRtcFromLocal(const QDateTime& localDT, QString* err)
 }
 
 
-/** @brief 将完整信号板状态映射为楼层、方向和状态 UI。 */
+/**
+ * @brief 将完整信号板状态映射为楼层、方向和状态 UI。
+ * @param st 完整信号板状态，raw 应包含合法的 12 字节帧。
+ * @note 通过排队连接在 GUI 线程执行；普通模式立即刷新，演示模式保存串口状态但由独立 1 秒节拍推进显示。
+ */
 void MultimediaDemo::onSignalBoardState(const SignalBoardState& st)
 {
     if (st.raw.size() != 12) return;
@@ -5738,7 +5705,9 @@ void MultimediaDemo::onSignalBoardState(const SignalBoardState& st)
 
 
 
-/** @return 配置允许持久化在线播放状态时返回 true。 */
+/**
+ * @return 配置允许持久化在线播放状态时返回 true。
+ */
 bool MultimediaDemo::isOnlinePlaybackPersistEnabled() const
 {
     if (!QFile::exists(netCfgPath())) {
@@ -5756,7 +5725,9 @@ bool MultimediaDemo::isOnlinePlaybackPersistEnabled() const
     return !offlineV1 && (onlineV1 || onlineV2);
 }
 
-/** @brief 把期望模式、实际模式和切换原因写入网络配置。 */
+/**
+ * @brief 把期望模式、实际模式和切换原因写入网络配置。
+ */
 void MultimediaDemo::persistPlaybackStateToNetCfg(const QString &targetMode,
                                                   const QString &currentMode,
                                                   const QString &reason)
@@ -5832,7 +5803,9 @@ void MultimediaDemo::persistPlaybackStateToNetCfg(const QString &targetMode,
     }
 }
 
-/** @brief 启动时从网络配置恢复上次播放目标。 */
+/**
+ * @brief 启动时从网络配置恢复上次播放目标。
+ */
 void MultimediaDemo::restorePlaybackStateFromNetCfg()
 {
     if (!isOnlinePlaybackPersistEnabled()) {
@@ -5918,7 +5891,9 @@ void MultimediaDemo::restorePlaybackStateFromNetCfg()
 }
 
 
-/** @brief 保存直播地址和协议类型（如 rtsp、hls），但不立即切换。 */
+/**
+ * @brief 保存直播地址和协议类型（如 rtsp、hls），但不立即切换。
+ */
 void MultimediaDemo::setStreamUrl(const QString& url, const QString& kind)
 {
 
@@ -5989,7 +5964,9 @@ void MultimediaDemo::setStreamUrl(const QString& url, const QString& kind)
 }
 
 
-/** @brief 使用独立播放器预探测直播首帧，成功后再切换主播放器。 */
+/**
+ * @brief 使用独立播放器预探测直播首帧，成功后再切换主播放器。
+ */
 void MultimediaDemo::probeLiveStream(const QString& url)
 {
     const QString probeUrl = url.trimmed();
@@ -6530,7 +6507,7 @@ void MultimediaDemo::forceStopCurrentLivePlayerForFallback(const QString& reason
 
 /**
  * @brief 在压缩视频仍持续进入、但 MPP 长时间无输出时原地重建直播管线。
- *
+ * 
  * 该路径不启动本地 4K 轮播，也不再用仅能证明 RTP 可达的轻量探测作为
  * 恢复条件；完整销毁 playbin 后直接重新建立当前 LIVE 会话，以释放异常的
  * MPP 解码上下文和 DMA-BUF 池。
@@ -6652,7 +6629,9 @@ void MultimediaDemo::onLiveStreamInterrupted(const QString& reason, bool keepLiv
     }
 }
 
-/** @brief 从列表首项恢复本地轮播。 */
+/**
+ * @brief 从列表首项恢复本地轮播。
+ */
 void MultimediaDemo::resumeLocalPlaylistFromStart()
 {
     if (m_downloadPauseActive) {
@@ -6675,6 +6654,13 @@ void MultimediaDemo::resumeLocalPlaylistFromStart()
     if (videoRectMediaList.isEmpty()) {
         LOG_VIDEO("恢复混播失败：videoRect 混播列表为空，启动空列表监测");
 
+        // 类型切换可能使列表变空，不能让上一段视频继续在后台播放。
+        if (mediaPlayer) {
+            disconnect(mediaPlayer, &GstPlayerWidget::videoFinished, this, &MultimediaDemo::playNextVideo);
+            mediaPlayer->stop();
+        }
+        if (nextVideoPlayer) nextVideoPlayer->stop();
+
         currentVideoIndex = -1;
         currentVideoRectMediaIndex = -1;
 
@@ -6685,6 +6671,7 @@ void MultimediaDemo::resumeLocalPlaylistFromStart()
         }
 
         stopVideoRectPictureDisplay(true);
+        notifyCurrentRecordedFile();
         return;
     }
 
@@ -6724,7 +6711,9 @@ void MultimediaDemo::resumeLocalPlaylistFromStart()
 }
 
 
-/** @brief 本地列表为空时启动短周期目录观察。 */
+/**
+ * @brief 本地列表为空时启动短周期目录观察。
+ */
 void MultimediaDemo::startEmptyVideoListWatch()
 {
 
@@ -6741,7 +6730,9 @@ void MultimediaDemo::startEmptyVideoListWatch()
     }
 }
 
-/** @brief 有可播文件或页面退出时停止空列表观察。 */
+/**
+ * @brief 有可播文件或页面退出时停止空列表观察。
+ */
 void MultimediaDemo::stopEmptyVideoListWatch()
 {
     if (!m_emptyVideoListTimer) return;
@@ -6752,7 +6743,9 @@ void MultimediaDemo::stopEmptyVideoListWatch()
     }
 }
 
-/** @brief 重新扫描目录并在发现文件后启动首项。 */
+/**
+ * @brief 重新扫描目录并在发现文件后启动首项。
+ */
 void MultimediaDemo::onEmptyVideoListWatchTimeout()
 {
     if (m_downloadPauseActive) {
@@ -6792,40 +6785,50 @@ void MultimediaDemo::onEmptyVideoListWatchTimeout()
 // 开始播放本地首个视频
 void MultimediaDemo::playDownloadedVideoNow(const QString& filePath)
 {
-    const QString absPath = QFileInfo(filePath).absoluteFilePath();
-    if (absPath.isEmpty()) {
-        LOG_VIDEO("playDownloadedVideoNow失败：路径为空");
+    if (filePath.trimmed().isEmpty()) return;
+    const QFileInfo file(filePath);
+    const QString absPath = file.absoluteFilePath();
+    if (!file.isFile()) return;
+
+    // 小图有独立的pic区域、缓存和轮播，不进入videoRect媒体列表。
+    if (MediaContentPolicy::isImage(absPath) && MediaContentPolicy::isInDirectory(
+                absPath, MediaContentPolicy::pictureDir(Rk3566Platform::staticRoot()))) {
+        if (PicDisplay_en) {
+            initPicturePlayer();
+            const int pictureIndex = pictureFileList.indexOf(absPath);
+            if (pictureIndex >= 0) {
+                currentPictureIndex = pictureIndex;
+                label_picture->setPixmap(picturePixmapCache.at(pictureIndex));
+            }
+        }
+        // 下载期间原有本地轮播被暂停，恢复时仍按contentType筛选。
+        if (!m_isLiveMode && !m_liveDesired && m_localPlaybackEnabled && isVisible()) {
+            resumeLocalPlaylistFromStart();
+        }
         return;
     }
 
     rebuildVideoRectMediaList();
     pruneMissingVideoRectMedia();
-
-    int targetVideoIndex = videoFileList.indexOf(absPath);
-    if (targetVideoIndex < 0) {
-        videoFileList.append(absPath);
-        targetVideoIndex = videoFileList.size() - 1;
-    }
-
     int targetMediaIndex = -1;
     for (int i = 0; i < videoRectMediaList.size(); ++i) {
-        if (videoRectMediaList.at(i).type == VideoRectMedia_Video &&
-            videoRectMediaList.at(i).filePath == absPath) {
+        if (videoRectMediaList.at(i).filePath == absPath) {
             targetMediaIndex = i;
             break;
         }
     }
-
     if (targetMediaIndex < 0) {
-        videoRectMediaList << VideoRectMediaItem(VideoRectMedia_Video, absPath);
-        targetMediaIndex = videoRectMediaList.size() - 1;
+        // 下载与播放是独立结果：不符合当前contentType的文件只落盘，
+        // 不强行追加为视频；恢复当前类型允许的本地列表。
+        LOG_VIDEO("下载文件不在当前广告播放列表，按配置恢复轮播:" << absPath);
+        resumeLocalPlaylistFromStart();
+        return;
     }
 
     m_isLiveMode = false;
     m_leaving = false;
     stopEmptyVideoListWatch();
-
-    currentVideoIndex = targetVideoIndex;
+    currentVideoIndex = videoFileList.indexOf(absPath);
     currentVideoRectMediaIndex = targetMediaIndex;
 
     if (nextVideoPlayer) {
@@ -6835,29 +6838,29 @@ void MultimediaDemo::playDownloadedVideoNow(const QString& filePath)
         nextVideoPlayer->setVideoOutput(nullptr);
         nextVideoPlayer->setPreloadMode(true);
     }
-
     if (mediaPlayer) {
         disconnect(mediaPlayer, &GstPlayerWidget::videoFinished,
                    this, &MultimediaDemo::playNextVideo);
         mediaPlayer->stop();
         mediaPlayer->setPreloadMode(false);
     }
-
-    QTimer::singleShot(0, this, [this, targetMediaIndex]() {
-        if (m_downloadPauseActive) return;
-        if (!m_localPlaybackEnabled) return;
-        if (targetMediaIndex < 0 || targetMediaIndex >= videoRectMediaList.size()) return;
-
-        playVideoRectMediaAt(targetMediaIndex);
-
-        LOG_VIDEO("下载完成后立即开始播放 videoRect 混播项");
+    const quint64 startSerial = issueLocalPlaybackStartSerial();
+    QTimer::singleShot(0, this, [this, absPath, startSerial]() {
+        if (startSerial != m_localPlaybackStartSerial) return;
+        if (m_downloadPauseActive || !m_localPlaybackEnabled || !isVisible()) return;
+        for (int i = 0; i < videoRectMediaList.size(); ++i) {
+            if (videoRectMediaList.at(i).filePath == absPath) {
+                playVideoRectMediaAt(i);
+                LOG_VIDEO("下载完成后立即开始播放分类后的本地媒体项:" << absPath);
+                return;
+            }
+        }
     });
 }
 
-
-
-
-/** @brief 从当前列表首个可用文件启动本地轮播。 */
+/**
+ * @brief 从当前列表首个可用文件启动本地轮播。
+ */
 void MultimediaDemo::startFirstLocalVideoFromList()
 {
     if (m_downloadPauseActive) {
@@ -6921,7 +6924,9 @@ void MultimediaDemo::startFirstLocalVideoFromList()
     });
 }
 
-/** @brief 启动直播首帧/持续无帧 watchdog。 */
+/**
+ * @brief 启动直播首帧/持续无帧 watchdog。
+ */
 void MultimediaDemo::startLiveWatchdog()
 {
     if (m_liveWatchdogTimer && !m_liveWatchdogTimer->isActive()) {
@@ -6932,7 +6937,9 @@ void MultimediaDemo::startLiveWatchdog()
     }
 }
 
-/** @brief 停止直播 watchdog 并清空计时状态。 */
+/**
+ * @brief 停止直播 watchdog 并清空计时状态。
+ */
 void MultimediaDemo::stopLiveWatchdog()
 {
     if (m_liveWatchdogTimer && m_liveWatchdogTimer->isActive()) {
@@ -6942,7 +6949,9 @@ void MultimediaDemo::stopLiveWatchdog()
 }
 
 
-/** @brief 判定首帧或持续无帧超时并触发回退。 */
+/**
+ * @brief 判定首帧或持续无帧超时并触发回退。
+ */
 void MultimediaDemo::onLiveWatchdogTimeout()
 {
     if (!m_isLiveMode) return;
@@ -7008,7 +7017,9 @@ void MultimediaDemo::onLiveWatchdogTimeout()
 }
 
 
-/** @brief 在仍期望直播时启动定时重试。 */
+/**
+ * @brief 在仍期望直播时启动定时重试。
+ */
 void MultimediaDemo::startLiveRetry()
 {
     if (m_liveRetryTimer && !m_liveRetryTimer->isActive()) {
@@ -7017,7 +7028,9 @@ void MultimediaDemo::startLiveRetry()
     }
 }
 
-/** @brief 停止直播重试并清除重入标记。 */
+/**
+ * @brief 停止直播重试并清除重入标记。
+ */
 void MultimediaDemo::stopLiveRetry()
 {
     if (m_liveRetryTimer && m_liveRetryTimer->isActive()) {
@@ -7026,7 +7039,9 @@ void MultimediaDemo::stopLiveRetry()
     }
 }
 
-/** @brief 重试定时到达时重新探测期望直播源。 */
+/**
+ * @brief 重试定时到达时重新探测期望直播源。
+ */
 void MultimediaDemo::onLiveRetryTimeout()
 {
     // 只有“业务目标仍是LIVE”时才重试
@@ -7061,7 +7076,9 @@ void MultimediaDemo::onLiveRetryTimeout()
 }
 
 
-/** @brief 清除“期望直播”状态并停止后台探测和重试。 */
+/**
+ * @brief 清除“期望直播”状态并停止后台探测和重试。
+ */
 void MultimediaDemo::stopDesiredLive()
 {
     m_liveDesired = false;
@@ -7085,7 +7102,9 @@ void MultimediaDemo::stopDesiredLive()
 }
 
 
-/** @brief 仅停止主播放器中的直播，不清除业务期望状态。 */
+/**
+ * @brief 仅停止主播放器中的直播，不清除业务期望状态。
+ */
 void MultimediaDemo::stopCurrentLivePlaybackOnly()
 {
     LOG_VIDEO("仅停止当前前台LIVE播放");
@@ -7120,9 +7139,13 @@ void MultimediaDemo::stopCurrentLivePlaybackOnly()
     }
 }
 
-/** @brief 切换到录播模式；已在本地轮播时仅同步业务状态。 */
+/**
+ * @brief 切换到录播模式；已在本地轮播时仅同步业务状态。
+ */
 void MultimediaDemo::switchToRecordedMode()
 {
+    const bool selectionChanged = m_adContentType !=
+            MediaContentPolicy::contentType(Rk3566Platform::netConfigPath());
     // 重复收到RECORDED时只更新业务状态，不重启正在运行的本地轮播。
     const bool localImageRunning = m_currentVideoRectIsImage &&
                                    videoRectPictureTimer &&
@@ -7162,7 +7185,7 @@ void MultimediaDemo::switchToRecordedMode()
     }
     m_liveProbeRunning = false;
 
-    if (alreadyInLocalPlaylist) {
+    if (alreadyInLocalPlaylist && !selectionChanged) {
         LOG_VIDEO("当前已处于本地轮播，仅更新RECORDED状态，跳过播放器重启");
         return;
     }
@@ -7176,7 +7199,9 @@ void MultimediaDemo::switchToRecordedMode()
 }
 
 
-/** @brief 停止直播、本地轮播及预加载播放器。 */
+/**
+ * @brief 停止直播、本地轮播及预加载播放器。
+ */
 void MultimediaDemo::stopAllPlayback()
 {
     const bool localImageRunning = m_currentVideoRectIsImage &&
@@ -7267,7 +7292,10 @@ void MultimediaDemo::stopAllPlayback()
     LOG_VIDEO("当前直播和本地播放均已停止");
 }
 
-/** @brief 从实际播放器采集本地 Web 状态。 */
+/**
+ * @brief 从实际播放器采集本地 Web 状态。
+ * @return 实际播放状态与同一 INI 中保存的 contentType、smallImageMode；仅报告 video 区域。
+ */
 QJsonObject MultimediaDemo::localWebPlaybackState() const
 {
     const bool active = mediaPlayer && mediaPlayer->hasActiveMedia();
@@ -7289,19 +7317,25 @@ QJsonObject MultimediaDemo::localWebPlaybackState() const
                           : active                                  ? "PREPARING"
                                                                     : "STOPPED";
     return {{"videoType", type},
+            {"contentType", MediaContentPolicy::contentType(Rk3566Platform::netConfigPath())},
+            {"smallImageMode", MediaContentPolicy::smallImageMode(Rk3566Platform::netConfigPath()) ? 1 : 0},
             {"videoPath", file},
             {"videoUrl", type == "LIVE" ? m_desiredLiveUrl : QString()},
             {"name", type == "LIVE" ? m_desiredLiveUrl : file},
             {"videoVolume",
              m_ampCtrl ? QJsonValue(m_ampCtrl->currentVolume()) : QJsonValue(QJsonValue::Null)},
             {"playbackState", state},
+            {"localPlaylistEmpty", videoRectMediaList.isEmpty()},
             {"deviceLog", state},
             {"desiredVideoType", m_liveDesired ? "LIVE" : type},
             {"canStartLocalPlayback", m_startupPlaybackReleased && !m_modulePlaybackSuspended &&
                                       !m_downloadPauseActive && isVisible()}};
 }
 
-/** @brief 通过既有播放器入口执行本地 Web 设置，不经过 MQTT 消息处理。 */
+/**
+ * @brief 通过既有播放器入口执行本地 Web 设置，不经过 MQTT 消息处理。
+ * @param request 当前 HTTP 请求，身份由会话校验取得。
+ */
 void MultimediaDemo::applyLocalWebPlayback(const QJsonObject &request)
 {
     if (request.contains("videoVolume")) {
@@ -7322,7 +7356,9 @@ void MultimediaDemo::applyLocalWebPlayback(const QJsonObject &request)
             // 模式切换可能排队从首项开播；指定上传文件时取消旧启动回调，
             // 再沿用 FTP 完成入口停止旧主/预加载管线并播放新文件。
             invalidatePendingLocalPlaybackStarts();
-            playDownloadedVideoNow(QDir(Rk3566Platform::videoDir()).filePath(file));
+            const QString internalPath = request.value("_mediaPath").toString();
+            playDownloadedVideoNow(internalPath.isEmpty()
+                                   ? QDir(Rk3566Platform::videoDir()).filePath(file) : internalPath);
         }
     } else if (type == "LIVE") {
         const QString url = request.value("videoUrl").toString();
@@ -7338,7 +7374,9 @@ void MultimediaDemo::applyLocalWebPlayback(const QJsonObject &request)
     }
 }
 
-/** @brief 应用 MQTT 下发音量并回报执行结果。 */
+/**
+ * @brief 应用 MQTT 下发音量并回报执行结果。
+ */
 void MultimediaDemo::onMqttVolumeChanged(int volume)
 {
     if (volume < 0) volume = 0;
@@ -7356,7 +7394,9 @@ void MultimediaDemo::onMqttVolumeChanged(int volume)
 }
 
 
-/** @brief 合成 UI 与当前视频帧后异步编码为 Base64。 */
+/**
+ * @brief 合成 UI 与当前视频帧后异步编码为 Base64。
+ */
 void MultimediaDemo::captureCompositeSnapshot()
 {
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
@@ -7409,9 +7449,10 @@ void MultimediaDemo::captureCompositeSnapshot()
     }
 
 
-    // 当前 videoRect 播放的是图片时，图片属于 Qt QLabel，
-    // 直接抓 Qt 当前界面即可，不需要走 GStreamer 视频帧截图。
-    if (m_currentVideoRectIsImage) {
+    // videoRect图片或只有pic区域图片时，直接抓Qt界面，不向空闲视频管线请求帧。
+    const bool onlySmallPicture = !m_isLiveMode && m_currentVideoRectMediaPath.isEmpty() &&
+            PicDisplay_en && label_picture && !label_picture->isHidden() && !pictureFileList.isEmpty();
+    if (m_currentVideoRectIsImage || onlySmallPicture) {
         if (m_snapshotWorkerBusy) {
             qDebug() << "[截图] 当前为图片播放，后台处理仍在进行，返回缓存";
             if (!m_lastSnapshotBase64.isEmpty()) {
@@ -7423,31 +7464,6 @@ void MultimediaDemo::captureCompositeSnapshot()
         const QPixmap uiShot = this->grab();
         if (uiShot.isNull()) {
             qWarning() << "[截图] 当前为图片播放，this->grab() failed";
-
-            /*
-            // 备用逻辑：
-            // 如果实际验证发现 this->grab() 截不到完整图片，
-            // 可以启用下面逻辑，直接把当前播放图片缩放到 videoRect 尺寸后上传。
-
-            if (!m_currentVideoRectImagePath.isEmpty()) {
-                QPixmap fallbackPixmap = loadPixmapWithIgnoreWarnings(m_currentVideoRectImagePath);
-                if (!fallbackPixmap.isNull()) {
-                    QImage fallbackImage = fallbackPixmap
-                            .scaled(VideoDisplay_x_Size,
-                                    VideoDisplay_y_Size,
-                                    Qt::KeepAspectRatio,
-                                    Qt::SmoothTransformation)
-                            .toImage();
-
-                    if (!fallbackImage.isNull()) {
-                        m_snapshotWorkerBusy = true;
-                        m_snapshotRequestMs = now;
-                        emit processUiSnapshotAsync(fallbackImage);
-                        return;
-                    }
-                }
-            }
-            */
 
             if (!m_lastSnapshotBase64.isEmpty()) {
                 emit currentPlayImageChanged(m_lastSnapshotBase64);
@@ -7512,7 +7528,9 @@ void MultimediaDemo::captureCompositeSnapshot()
 }
 
 
-/** @brief 收到播放器视频帧后与 UI 图像一起提交后台编码。 */
+/**
+ * @brief 收到播放器视频帧后与 UI 图像一起提交后台编码。
+ */
 void MultimediaDemo::onVideoSnapshotReady(const QImage& videoImage)
 {
     if (m_snapshotTimeoutTimer) {
@@ -7577,7 +7595,9 @@ void MultimediaDemo::onVideoSnapshotReady(const QImage& videoImage)
 }
 
 
-/** @brief 结束失败的截图请求并上报原因。 */
+/**
+ * @brief 结束失败的截图请求并上报原因。
+ */
 void MultimediaDemo::onVideoSnapshotFailed(const QString& reason)
 {
     if (m_snapshotTimeoutTimer) {
@@ -7587,7 +7607,9 @@ void MultimediaDemo::onVideoSnapshotFailed(const QString& reason)
     qWarning() << "[截图] 视频帧抓取失败:" << reason;
 }
 
-/** @brief 向 MQTT 管理器上报当前录播文件或清除状态。 */
+/**
+ * @brief 向 MQTT 管理器上报当前录播文件或清除状态。
+ */
 void MultimediaDemo::notifyCurrentRecordedFile()
 {
     if (currentVideoRectMediaIndex >= 0 &&
@@ -7595,15 +7617,15 @@ void MultimediaDemo::notifyCurrentRecordedFile()
 
         const VideoRectMediaItem item = videoRectMediaList.at(currentVideoRectMediaIndex);
 
-        if (item.type == VideoRectMedia_Video) {
-            emit currentRecordedFileChanged(item.filePath);
-        } else {
-            emit currentRecordedFileChanged(QString());
-        }
+        emit currentRecordedFileChanged(item.filePath);
+    } else {
+        emit currentRecordedFileChanged(QString());
     }
 }
 
-/** @brief 保存后台生成的 Base64 快照并通知 MQTT 状态。 */
+/**
+ * @brief 保存后台生成的 Base64 快照并通知 MQTT 状态。
+ */
 void MultimediaDemo::onSnapshotProcessFinished(const QString &base64)
 {
     m_snapshotWorkerBusy = false;
@@ -7615,7 +7637,9 @@ void MultimediaDemo::onSnapshotProcessFinished(const QString &base64)
     emit currentPlayImageChanged(base64);
 }
 
-/** @brief 释放截图忙状态并记录后台处理失败。 */
+/**
+ * @brief 释放截图忙状态并记录后台处理失败。
+ */
 void MultimediaDemo::onSnapshotProcessFailed(const QString &reason)
 {
     m_snapshotWorkerBusy = false;
@@ -7624,7 +7648,9 @@ void MultimediaDemo::onSnapshotProcessFailed(const QString &reason)
 
 
 
-/** @brief 从配置读取并刷新网络/MQTT 信息面板字段。 */
+/**
+ * @brief 从配置读取并刷新网络/MQTT 信息面板字段。
+ */
 void MultimediaDemo::readNetConfiguration()
 {
     const QString cfgPath = netCfgPath();
@@ -7687,7 +7713,9 @@ void MultimediaDemo::readNetConfiguration()
 }
 
 
-/** @brief 根据 MQTT 连接标志刷新网络信息显示。 */
+/**
+ * @brief 根据 MQTT 连接标志刷新网络信息显示。
+ */
 void MultimediaDemo::onMqttConnMarkChanged(int mark)
 {
     if (!m_netInfoPanel) return;
@@ -7695,7 +7723,9 @@ void MultimediaDemo::onMqttConnMarkChanged(int mark)
 }
 
 
-/** @brief 隐藏音量、网络等临时信息面板。 */
+/**
+ * @brief 隐藏音量、网络等临时信息面板。
+ */
 void MultimediaDemo::hideInfoPanels()
 {
     bool volShown = (m_volPanel && m_volPanel->isShown());
@@ -7720,7 +7750,9 @@ void MultimediaDemo::hideInfoPanels()
     }
 }
 
-/** @brief 根据弹窗和用户活动刷新空闲计时状态。 */
+/**
+ * @brief 根据弹窗和用户活动刷新空闲计时状态。
+ */
 void MultimediaDemo::refreshUiIdleStateByActivity()
 {
     const bool volShown = (m_volPanel && m_volPanel->isShown());
@@ -7737,7 +7769,9 @@ void MultimediaDemo::refreshUiIdleStateByActivity()
 }
 
 
-/** @brief 按页面可见性和模态状态启停光标隐藏定时。 */
+/**
+ * @brief 按页面可见性和模态状态启停光标隐藏定时。
+ */
 void MultimediaDemo::updateIdleTimerState()
 {
     const bool volShown = (m_volPanel && m_volPanel->isShown());
@@ -7756,7 +7790,9 @@ void MultimediaDemo::updateIdleTimerState()
 }
 
 
-/** @brief 若软件光标已隐藏则恢复显示。 */
+/**
+ * @brief 若软件光标已隐藏则恢复显示。
+ */
 void MultimediaDemo::showCursorIfHidden()
 {
     if (m_cursorHidden) {
