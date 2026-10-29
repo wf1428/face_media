@@ -2,11 +2,11 @@
 # @brief Qt 稳定后启动可选 NetworkManager 热点和 Web；失败不影响 Qt。
 # @author Du lin
 # @date 2026-10-09
+# @note 最近修改：2026-10-26；修改人：Du lin；移除对 NM 的提前拉起依赖，热点在 Qt 就绪并异步启动 NM 后运行；保留 Web 失败隔离和原重试策略。
 
 [Unit]
 Description=Optional NetworkManager hotspot and local Web portal
-After=face-media.service NetworkManager.service
-Wants=NetworkManager.service
+After=face-media.service
 StartLimitIntervalSec=180
 StartLimitBurst=3
 

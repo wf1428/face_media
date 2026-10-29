@@ -2,8 +2,9 @@
  * @file settingsdialog.h
  * @brief 网络、蓝牙、MQTT、系统、显示、待机和 FTP 页面容器及信号中转器。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-10-24；修改人：Du lin；声明资源包版本进度信号，区分整包结束与重启调度结果。
  */
 
 #ifndef SETTINGSDIALOG_H
@@ -198,6 +199,14 @@ signals:
     void mqttConnMarkChanged(int mark);
     /** @brief 请求显示视频控制提示。 */
     void videoControlNotice(const QString &text);
+    /**
+     * @brief 转发资源包提示给主窗口和多媒体页。
+     * @param version 下发版本号。
+     * @param percent 整包进度，0~100。
+     * @param finished 是否已结束任务。
+     * @param success 结束时是否已覆盖资源并安排重启。
+     */
+    void multimediaUpdateProgress(const QString &version, int percent, bool finished, bool success);
 
 };
 

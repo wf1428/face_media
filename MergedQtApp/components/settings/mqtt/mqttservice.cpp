@@ -2,7 +2,8 @@
  * @file mqttservice.cpp
  * @brief 处理 MQTT 媒体命令、维护播放状态并构建协议响应包。
  *
- * @author Dulin
+ * @author Du lin
+ * @note 最近修改：2026-10-24；修改人：Du lin；复用播放信息字段构造高清响应元数据，允许跳过普通截图缓存并指定高清 method，普通 sendPlayInfo 默认行为不变。
  * @date 2026-07-25
  */
 
@@ -999,18 +1000,22 @@ QJsonObject MqttService::buildPlayFileListPublishPacket(const QString &reqTopic,
 /**
  * @brief 构造播放信息发布报文。
  *
- * 该函数会根据当前播放状态 playInfo_ 生成 sendPlayInfo 响应消息。
+ * 根据当前播放状态生成普通回执或不含缓存图像的高清回执元数据。
  *
  * @param reqTopic     请求 topic。
  * @param reqId        请求 ID。
  * @param deviceId     设备 ID。
  * @param respTopicOut 输出参数，返回响应 topic。
+ * @param method 回执方法，普通默认 sendPlayInfo，高清为 sendPlayInfoFromCompany。
+ * @param includeCachedImage 是否使用普通缓存图；高清传 false，等待后台编码补入。
  * @return 完整 publish 报文 JSON 对象。
  */
 QJsonObject MqttService::buildPlayInfoPublishPacket(const QString &reqTopic,
                                                     const QString &reqId,
                                                     const QString &deviceId,
-                                                    QString *respTopicOut)
+                                                    QString *respTopicOut,
+                                                    const QString &method,
+                                                    bool includeCachedImage)
 {
     const PlayInfoState &info = playInfo_;
     // 不以同名文件反查其他目录，避免pic下载状态或旧回调污染主区域文件信息。
@@ -1027,19 +1032,19 @@ QJsonObject MqttService::buildPlayInfoPublishPacket(const QString &reqTopic,
                             ? info.videoUrl
                             : QString();
     infoObj["name"] = reportRecordedFile ? info.name : QString();
-    infoObj["base64Image"] = info.base64Image;
+    infoObj["base64Image"] = includeCachedImage ? info.base64Image : QString();
     infoObj["deviceLog"] = info.deviceLog;
 
     QJsonObject dataObj;
     dataObj["info"] = infoObj;
 
     return buildEventPublishPacket(reqTopic,
-                                   "sendPlayInfo",
+                                   method,
                                    reqId,
                                    deviceId,
                                    dataObj,
                                    respTopicOut,
-                                   "sendPlayInfo");
+                                   method);
 }
 
 

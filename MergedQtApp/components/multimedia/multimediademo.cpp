@@ -4,8 +4,7 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-10-23；修改人：Du lin；通过人员照片到期后，仍在识别时恢复摄像头预览并保持 PIC 暂停；
- *       仅退出识别后恢复 PIC 轮播，保持原前台超时、摄像头和 LED 生命周期。
+ * @note 最近修改：2026-10-29；修改人：Du lin；统一按 VideoDisplay_en 阻止视频区域的本地/直播启动、模块与下载恢复及补播，关闭时停止视频资源并保持隐藏；识别退出仍恢复独立 PIC，保留原业务目标与下载流程。
  */
 
 #include "multimediademo.h"
@@ -979,9 +978,9 @@ MultimediaDemo::MultimediaDemo(QWidget *parent) :
     LOG_INIT("MultimediaDemo构造函数执行完成");
 }
 
-
 /**
  * @brief splash 隐藏后启动视频区域，并延续原有的播放状态恢复时序。
+ * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
  */
 void MultimediaDemo::startPlaybackAfterSplash()
 {
@@ -1008,7 +1007,7 @@ void MultimediaDemo::startPlaybackAfterSplash()
     }
 
     m_initialVideoPlaybackStarted = true;
-    m_localPlaybackEnabled = true;
+    m_localPlaybackEnabled = VideoDisplay_en;
 
     if (VideoDisplay_en) {
         initVideoPlayer();
@@ -1022,10 +1021,7 @@ void MultimediaDemo::startPlaybackAfterSplash()
             videoWidget->hide();
         }
     } else {
-        stopVideoRectPictureDisplay();
-        if (videoWidget) {
-            videoWidget->hide();
-        }
+        applyVideoDisplayPolicy();
     }
 }
 
@@ -1172,11 +1168,48 @@ void MultimediaDemo::suspendPlaybackForModuleSwitch()
 }
 
 /**
+ * @brief 应用 videoRect 总开关，禁止关闭的视频区域被异步恢复或补播重新启动。
+ * @return true 表示 VideoDisplay_en 已开启，调用方可继续原播放逻辑；false 表示已停止并隐藏视频区域。
+ * @note GUI 线程调用；关闭时使待执行本地开播失效，停止视频/预加载/探测及相关定时器。
+ *       不清除保存的 LIVE 目标、下载状态，不触及独立 pictureRect、摄像头和识别结果。
+ */
+bool MultimediaDemo::applyVideoDisplayPolicy()
+{
+    if (VideoDisplay_en)
+        return true;
+
+    m_localPlaybackEnabled = false;
+    invalidatePendingLocalPlaybackStarts();
+    stopEmptyVideoListWatch();
+    stopLiveWatchdog();
+    stopLiveRetry();
+    m_liveProbeRunning = false;
+    m_isLiveMode = false;
+    m_liveSwitching = false;
+    m_liveRecovering = false;
+    isPreloading = false;
+
+    if (mediaPlayer && mediaPlayer->hasActiveMedia())
+        mediaPlayer->stop();
+    if (nextVideoPlayer && nextVideoPlayer->hasActiveMedia())
+        nextVideoPlayer->stop();
+    if (m_liveProbePlayer && m_liveProbePlayer->hasActiveMedia())
+        m_liveProbePlayer->stop();
+    stopVideoRectPictureDisplay(true);
+    if (videoWidget)
+        videoWidget->hide();
+    return false;
+}
+
+/**
  * @brief 返回多媒体模块时恢复暂停前的 LIVE 目标，否则沿用原本的本地轮播恢复。
+ * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
  */
 void MultimediaDemo::resumePlaybackAfterModuleSwitch()
 {
     m_modulePlaybackSuspended = false;
+    if (!applyVideoDisplayPolicy())
+        return;
 
     if (!m_startupPlaybackReleased) {
         m_localPlaybackEnabled = false;
@@ -1217,7 +1250,7 @@ void MultimediaDemo::resumePlaybackAfterModuleSwitch()
 }
 
 /**
- * @brief 保持视频持续播放，在配置 pictureRect 内用摄像头替换 PIC 轮播。
+ * @brief 保持视频区域原状态，在配置 pictureRect 内用摄像头替换 PIC 轮播。
  */
 void MultimediaDemo::beginEmbeddedFaceRecognition()
 {
@@ -1254,6 +1287,7 @@ void MultimediaDemo::beginEmbeddedFaceRecognition()
 
 /**
  * @brief 停止 pictureRect 内的人脸展示并恢复 PIC 轮播，视频保持原状态。
+ * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
  */
 void MultimediaDemo::endEmbeddedFaceRecognition()
 {
@@ -1269,7 +1303,8 @@ void MultimediaDemo::endEmbeddedFaceRecognition()
         m_facePreview->setFaces(QVector<DetectedFace>());
     }
     clearRecognitionImages(true);
-    LOG_VIDEO("pictureRect 人脸识别预览已关闭，PIC 轮播已恢复；视频保持播放");
+    applyVideoDisplayPolicy();
+    LOG_VIDEO("pictureRect 人脸识别预览已关闭，PIC 轮播已恢复；视频按 VideoDisplay_en 保持原状态");
 }
 
 void MultimediaDemo::setEmbeddedFaceFrame(const QImage &image)
@@ -1848,9 +1883,12 @@ void MultimediaDemo::stopVideoRectPictureDisplay(bool hideLabel)
 /**
  * @brief 按环形索引播放一个 videoRect 媒体项。
  * @param index videoRect 混播列表中的零基索引；越界时直接返回。
+ * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
  */
 void MultimediaDemo::playVideoRectMediaAt(int index)
 {
+    if (!applyVideoDisplayPolicy())
+        return;
     if (index < 0 || index >= videoRectMediaList.size()) {
         return;
     }
@@ -1876,9 +1914,12 @@ void MultimediaDemo::playVideoRectMediaAt(int index)
 /**
  * @brief 让主播放器播放 videoRect 视频项。
  * @param filePath 待读取的文件路径。
+ * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
  */
 void MultimediaDemo::playVideoRectVideo(const QString &filePath)
 {
+    if (!applyVideoDisplayPolicy())
+        return;
     // 即使旧列表或其他入口误传图片，也不能把图片送进硬件视频解码链路。
     if (MediaContentPolicy::isImage(filePath)) {
         if (MediaContentPolicy::allows(MediaContentPolicy::contentType(
@@ -1957,9 +1998,12 @@ void MultimediaDemo::playVideoRectVideo(const QString &filePath)
  * @brief 隐藏视频画布并显示 videoRect 图片项。
  * @param filePath 待读取的文件路径。
  * @note 通过 Qt 图片路径显示并按 videoRect 的图片间隔切换，避免把静态图片送入 DMA-BUF 视频解码链路。
+ * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
  */
 void MultimediaDemo::playVideoRectImage(const QString &filePath)
 {
+    if (!applyVideoDisplayPolicy())
+        return;
     if (filePath.trimmed().isEmpty()) {
         playNextVideo();
         return;
@@ -2041,13 +2085,14 @@ void MultimediaDemo::playVideoRectImage(const QString &filePath)
     LOG_IMAGE("videoRect 混播：显示图片:" << filePath);
 }
 
-
-
 /**
  * @brief 创建主/预加载播放器并连接状态信号。
+ * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
  */
 void MultimediaDemo::initVideoPlayer()
 {
+    if (!applyVideoDisplayPolicy())
+        return;
     rebuildVideoRectMediaList();
 
     videoWidget->resize(VideoDisplay_x_Size, VideoDisplay_y_Size);
@@ -2283,6 +2328,10 @@ void MultimediaDemo::invalidatePendingLocalPlaybackStarts()
 
 
 // 下载时停止播放
+/**
+ * @brief 按视频区域开关约束原有 pauseLocalPlaybackForDownload 流程。
+ * @note VideoDisplay_en=false 时停止并隐藏 videoRect，不影响独立 PIC 或识别流程。
+ */
 void MultimediaDemo::pauseLocalPlaybackForDownload()
 {
     if (m_downloadPauseActive) {
@@ -2296,6 +2345,9 @@ void MultimediaDemo::pauseLocalPlaybackForDownload()
     stopEmptyVideoListWatch();
     stopLiveWatchdog();
     isPreloading = false;
+
+    if (!applyVideoDisplayPolicy())
+        return;
 
     // 多媒体模块已因人脸前台切换而释放播放器时，只记录下载状态。
     // 下载回调不能把隐藏的 GStreamer 管线重新拉到 PAUSED/PLAYING。
@@ -2353,6 +2405,7 @@ void MultimediaDemo::pauseLocalPlaybackForDownload()
 
 /**
  * @brief 下载结束后按之前状态恢复本地轮播。
+ * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
  */
 void MultimediaDemo::resumeLocalPlaybackAfterDownload()
 {
@@ -2361,7 +2414,7 @@ void MultimediaDemo::resumeLocalPlaybackAfterDownload()
     }
 
     m_downloadPauseActive = false;
-    m_localPlaybackEnabled = !m_modulePlaybackSuspended;
+    m_localPlaybackEnabled = VideoDisplay_en && !m_modulePlaybackSuspended;
     invalidatePendingLocalPlaybackStarts();
 
     if (m_modulePlaybackSuspended) {
@@ -2418,6 +2471,21 @@ void MultimediaDemo::onDownloadStarted(const QString& fileName)
                              0, m_downloadActiveFileName);
 }
 
+/** @brief 资源包只更新整包下载卡片；失败恢复原播放，成功留待重启重新读取全部 UI 资源。 */
+void MultimediaDemo::onResourcePackageProgress(const QString &version, int percent, bool finished, bool success)
+{
+    if (finished && !success) {
+        m_resourcePackageActive = false;
+        hideDownloadProgressToast();
+        resumeLocalPlaybackAfterDownload();
+        return;
+    }
+    m_resourcePackageActive = true;
+    if (!m_downloadPauseActive) pauseLocalPlaybackForDownload();
+    showDownloadProgressToast(QStringLiteral("正在下载资源包"), qBound(0, percent, 100),
+                              QStringLiteral("版本号：%1").arg(version));
+}
+
 /**
  * @brief 更新当前下载文件的进度提示。
  */
@@ -2441,8 +2509,9 @@ void MultimediaDemo::onDownloadProgress(const QString& fileName, int percent)
 }
 
 /**
- * @brief 下载成功后隐藏提示、更新媒体列表并恢复播放。
+ * @brief 下载成功后隐藏提示、更新媒体列表并恢复播放；资源包活动时忽略旧完成计时器。
  * @param filePath 待读取的文件路径。
+ * @note 延迟恢复仍服从 VideoDisplay_en，关闭时不恢复视频开播许可，独立 PIC 更新保留。
  */
 void MultimediaDemo::onDownloadFinished(const QString& filePath)
 {
@@ -2456,11 +2525,12 @@ void MultimediaDemo::onDownloadFinished(const QString& filePath)
     showDownloadProgressToast(QStringLiteral("下载完成"), 100, name);
 
     QTimer::singleShot(800, this, [this, absPath]() {
+        if (m_resourcePackageActive) return;
         hideDownloadProgressToast();
 
         const bool wasPaused = m_downloadPauseActive;
         m_downloadPauseActive = false;
-        m_localPlaybackEnabled = !m_modulePlaybackSuspended;
+        m_localPlaybackEnabled = VideoDisplay_en && !m_modulePlaybackSuspended;
 
         // 下载结束后清空下载态截图缓存
         m_lastSnapshotMs = 0;
@@ -4479,6 +4549,7 @@ static void applyLabelStyle(QLabel* label,
 
 /**
  * @brief 从系统时钟刷新日期、星期和时间标签。
+ * @note 仅在 GUI 线程调用，按配置设置区域、字号和字重，不执行字体诊断重绘或日志采集。
  */
 void MultimediaDemo::getTimeWithQt()
 {
@@ -5059,6 +5130,8 @@ void MultimediaDemo::playNextPicture()
 
 /**
  * @brief 页面显示时恢复定时器、网络监测和本地播放。
+  * @param e Qt 分派的显示事件，借用且仅在本次调用期间有效。
+ * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
  */
 void MultimediaDemo::showEvent(QShowEvent *e)
 {
@@ -5081,7 +5154,9 @@ void MultimediaDemo::showEvent(QShowEvent *e)
         m_initialCursorStateApplied = true;
     }
 
-    m_localPlaybackEnabled = m_startupPlaybackReleased && !m_modulePlaybackSuspended;
+    m_localPlaybackEnabled =
+        VideoDisplay_en && m_startupPlaybackReleased && !m_modulePlaybackSuspended;
+    applyVideoDisplayPolicy();
 
     // splash 结束之前即使底层页面已经可见，也不能启动扫描补播。
     if (m_localPlaybackEnabled &&
@@ -5963,12 +6038,15 @@ void MultimediaDemo::setStreamUrl(const QString& url, const QString& kind)
     startLiveRetry();
 }
 
-
 /**
  * @brief 使用独立播放器预探测直播首帧，成功后再切换主播放器。
+  * @param url 待探测的直播地址。
+ * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
  */
 void MultimediaDemo::probeLiveStream(const QString& url)
 {
+    if (!applyVideoDisplayPolicy())
+        return;
     const QString probeUrl = url.trimmed();
     if (probeUrl.isEmpty()) return;
     if (!m_startupPlaybackReleased || m_modulePlaybackSuspended) {
@@ -6358,8 +6436,16 @@ void MultimediaDemo::probeLiveStream(const QString& url)
 
 
 // 切换到直播流
+/**
+ * @brief 按视频区域开关约束原有 switchToLiveStream 流程。
+ * @param url 目标直播地址。
+ * @param kind 直播协议类型。
+ * @note VideoDisplay_en=false 时停止并隐藏 videoRect，不影响独立 PIC 或识别流程。
+ */
 void MultimediaDemo::switchToLiveStream(const QString& url, const QString& kind)
 {
+    if (!applyVideoDisplayPolicy())
+        return;
     if (url.trimmed().isEmpty()) return;
     if (!m_startupPlaybackReleased || m_modulePlaybackSuspended) {
         LOG_VIDEO("多媒体播放尚未放行或模块已暂停，暂不启动直播:" << url);
@@ -6475,8 +6561,15 @@ void MultimediaDemo::switchToLiveStream(const QString& url, const QString& kind)
 // 组播/UDP 断流专用：播放器底层不一定抛 TCP/RTSP 错误，
 // 必须先强制隐藏旧 LIVE 图层并 reset，避免最后一帧继续压在本地轮播上。
 // 这里只处理“当前前台播放器脱离直播”，不清 m_liveDesired，保持原有后台重试逻辑。
+/**
+ * @brief 按视频区域开关约束原有 forceStopCurrentLivePlayerForFallback 流程。
+ * @param reason 触发直播回退的诊断原因。
+ * @note VideoDisplay_en=false 时停止并隐藏 videoRect，不影响独立 PIC 或识别流程。
+ */
 void MultimediaDemo::forceStopCurrentLivePlayerForFallback(const QString& reason)
 {
+    if (!applyVideoDisplayPolicy())
+        return;
     LOG_VIDEO("强制脱离当前LIVE播放器: " << reason);
 
     if (mediaPlayer) {
@@ -6511,9 +6604,13 @@ void MultimediaDemo::forceStopCurrentLivePlayerForFallback(const QString& reason
  * 该路径不启动本地 4K 轮播，也不再用仅能证明 RTP 可达的轻量探测作为
  * 恢复条件；完整销毁 playbin 后直接重新建立当前 LIVE 会话，以释放异常的
  * MPP 解码上下文和 DMA-BUF 池。
+  * @param reason 触发重建的诊断原因。
+ * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
  */
 void MultimediaDemo::restartLivePipelineAfterDecoderStall(const QString& reason)
 {
+    if (!applyVideoDisplayPolicy())
+        return;
     const QString url = m_desiredLiveUrl.trimmed();
     if (!m_liveDesired || url.isEmpty() || !mediaPlayer) {
         m_liveRecovering = false;
@@ -6582,6 +6679,12 @@ void MultimediaDemo::restartLivePipelineAfterDecoderStall(const QString& reason)
 // RK3566 的 GStreamer 播放器可安全停止。首次播放始终没有真实视频帧，
 // 视为地址错误或直播源本身无数据，彻底回到本地轮播；只有已经正常出过帧
 // 后发生断流，才保留 LIVE 业务目标并继续后台探测。
+/**
+ * @brief 沿用直播中断后的业务回退规则，视频开播许可同时服从 videoRect 总开关。
+ * @param reason 触发中断的诊断原因。
+ * @param keepLiveRetry true 保留 LIVE 目标并允许原重试流程；false 沿用原无效源处理。
+ * @note VideoDisplay_en=false 时回退不启动视频资源，原业务目标和状态上报规则保持不变。
+ */
 void MultimediaDemo::onLiveStreamInterrupted(const QString& reason, bool keepLiveRetry)
 {
     stopLiveWatchdog();
@@ -6591,7 +6694,7 @@ void MultimediaDemo::onLiveStreamInterrupted(const QString& reason, bool keepLiv
     m_isLiveMode = false;
     m_liveRecovering = true;
     m_liveSwitching = false;
-    m_localPlaybackEnabled = true;
+    m_localPlaybackEnabled = VideoDisplay_en;
 
     if (!keepLiveRetry) {
         // 首帧从未到达：直播地址不可用或源端没有媒体数据。
@@ -6631,9 +6734,12 @@ void MultimediaDemo::onLiveStreamInterrupted(const QString& reason, bool keepLiv
 
 /**
  * @brief 从列表首项恢复本地轮播。
+ * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
  */
 void MultimediaDemo::resumeLocalPlaylistFromStart()
 {
+    if (!applyVideoDisplayPolicy())
+        return;
     if (m_downloadPauseActive) {
         LOG_VIDEO("下载进行中，忽略恢复本地轮播请求");
         return;
@@ -6710,12 +6816,14 @@ void MultimediaDemo::resumeLocalPlaylistFromStart()
     });
 }
 
-
 /**
  * @brief 本地列表为空时启动短周期目录观察。
+ * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
  */
 void MultimediaDemo::startEmptyVideoListWatch()
 {
+    if (!applyVideoDisplayPolicy())
+        return;
 
     if (!m_localPlaybackEnabled) {
         LOG_VIDEO("当前不允许本地播放，忽略空列表监测启动请求");
@@ -6745,9 +6853,12 @@ void MultimediaDemo::stopEmptyVideoListWatch()
 
 /**
  * @brief 重新扫描目录并在发现文件后启动首项。
+ * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
  */
 void MultimediaDemo::onEmptyVideoListWatchTimeout()
 {
+    if (!applyVideoDisplayPolicy())
+        return;
     if (m_downloadPauseActive) {
         return;
     }
@@ -7016,12 +7127,14 @@ void MultimediaDemo::onLiveWatchdogTimeout()
     }
 }
 
-
 /**
  * @brief 在仍期望直播时启动定时重试。
+ * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
  */
 void MultimediaDemo::startLiveRetry()
 {
+    if (!applyVideoDisplayPolicy())
+        return;
     if (m_liveRetryTimer && !m_liveRetryTimer->isActive()) {
         m_liveRetryTimer->start();
         LOG_VIDEO("直播重试定时器已启动");
@@ -7041,9 +7154,12 @@ void MultimediaDemo::stopLiveRetry()
 
 /**
  * @brief 重试定时到达时重新探测期望直播源。
+ * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
  */
 void MultimediaDemo::onLiveRetryTimeout()
 {
+    if (!applyVideoDisplayPolicy())
+        return;
     // 只有“业务目标仍是LIVE”时才重试
     if (!m_liveDesired) return;
     if (m_desiredLiveUrl.trimmed().isEmpty()) return;
@@ -7141,6 +7257,7 @@ void MultimediaDemo::stopCurrentLivePlaybackOnly()
 
 /**
  * @brief 切换到录播模式；已在本地轮播时仅同步业务状态。
+ * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
  */
 void MultimediaDemo::switchToRecordedMode()
 {
@@ -7191,9 +7308,8 @@ void MultimediaDemo::switchToRecordedMode()
     }
 
     // LIVE 会禁用本地播放；切回 RECORDED 时恢复许可，并保留现有暂停/可见性门控。
-    m_localPlaybackEnabled = m_startupPlaybackReleased &&
-                             !m_modulePlaybackSuspended &&
-                             !m_downloadPauseActive && isVisible();
+    m_localPlaybackEnabled = VideoDisplay_en && m_startupPlaybackReleased &&
+                             !m_modulePlaybackSuspended && !m_downloadPauseActive && isVisible();
     stopCurrentLivePlaybackOnly();
     resumeLocalPlaylistFromStart();
 }
@@ -7395,7 +7511,51 @@ void MultimediaDemo::onMqttVolumeChanged(int volume)
 
 
 /**
- * @brief 合成 UI 与当前视频帧后异步编码为 Base64。
+ * @brief 为高清协议采集原始像素；GUI 抓取为 Qt 必需操作，所有编码交给独立线程。
+ */
+void MultimediaDemo::captureCompanySnapshot(const QString &token)
+{
+    if (!m_companySnapshotToken.isEmpty() || m_snapshotPending) {
+        emit companySnapshotReady(token, QImage(), QImage(), QRect(),
+                                  QStringLiteral("高清截图失败：视频抓帧正在进行"));
+        return;
+    }
+    if (m_downloadPauseActive || m_currentVideoRectIsImage || !mediaPlayer ||
+            !mediaPlayer->isAvailable() || !mediaPlayer->hasActiveMedia()) {
+        deliverCompanySnapshot(token, QImage());
+        return;
+    }
+    m_companySnapshotToken = token;
+    mediaPlayer->requestSnapshot();
+    // 当前播放器在本次调用中发出成功/失败信号；若未发出，立即失败，不遗留令牌。
+    if (m_companySnapshotToken == token) {
+        m_companySnapshotToken.clear();
+        emit companySnapshotReady(token, QImage(), QImage(), QRect(),
+                                  QStringLiteral("高清截图失败：播放器未返回当前帧"));
+    }
+}
+
+/** @brief 捕获完整根界面，保留原始分辨率，将视频坐标从逻辑像素换算到实际像素。 */
+void MultimediaDemo::deliverCompanySnapshot(const QString &token, const QImage &videoImage)
+{
+    QWidget *host = ResponsiveUi::overlayHost(this);
+    const QPixmap shot = host ? host->grab() : QPixmap();
+    if (shot.isNull()) {
+        emit companySnapshotReady(token, QImage(), QImage(), QRect(),
+                                  QStringLiteral("高清截图失败：界面抓取失败"));
+        return;
+    }
+    const qreal dpr = shot.devicePixelRatio();
+    QImage ui = shot.toImage();
+    ui.setDevicePixelRatio(1.0);
+    const QPoint origin = mapTo(host, QPoint(VideoDisplay_x, VideoDisplay_y));
+    const QRect rect(qRound(origin.x() * dpr), qRound(origin.y() * dpr),
+                     qRound(VideoDisplay_x_Size * dpr), qRound(VideoDisplay_y_Size * dpr));
+    emit companySnapshotReady(token, ui, videoImage, rect, QString());
+}
+
+/**
+ * @brief 合成 UI 与当前视频帧后异步编码为普通缩略图 Base64。
  */
 void MultimediaDemo::captureCompositeSnapshot()
 {
@@ -7529,10 +7689,20 @@ void MultimediaDemo::captureCompositeSnapshot()
 
 
 /**
- * @brief 收到播放器视频帧后与 UI 图像一起提交后台编码。
+ * @brief 优先将独立高清令牌的帧交给高清链路，其他帧沿用普通截图后台编码。
+ * @note 高清分支在触碰普通超时、pending 或 workerBusy 状态之前返回，避免交叉回执。
  */
 void MultimediaDemo::onVideoSnapshotReady(const QImage& videoImage)
 {
+    if (!m_companySnapshotToken.isEmpty()) {
+        const QString token = m_companySnapshotToken;
+        m_companySnapshotToken.clear();
+        if (videoImage.isNull())
+            emit companySnapshotReady(token, QImage(), QImage(), QRect(), QStringLiteral("高清截图失败：视频帧为空"));
+        else
+            deliverCompanySnapshot(token, videoImage);
+        return;
+    }
     if (m_snapshotTimeoutTimer) {
         m_snapshotTimeoutTimer->stop();
     }
@@ -7596,10 +7766,17 @@ void MultimediaDemo::onVideoSnapshotReady(const QImage& videoImage)
 
 
 /**
- * @brief 结束失败的截图请求并上报原因。
+ * @brief 将高清抓帧失败只交给高清链路；其他失败沿用普通截图清理流程。
  */
 void MultimediaDemo::onVideoSnapshotFailed(const QString& reason)
 {
+    if (!m_companySnapshotToken.isEmpty()) {
+        const QString token = m_companySnapshotToken;
+        m_companySnapshotToken.clear();
+        emit companySnapshotReady(token, QImage(), QImage(), QRect(),
+                                  QStringLiteral("高清截图失败：") + reason);
+        return;
+    }
     if (m_snapshotTimeoutTimer) {
         m_snapshotTimeoutTimer->stop();
     }

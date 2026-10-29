@@ -2,8 +2,9 @@
  * @file mqttpage.cpp
  * @brief MQTT/IPC 配置、路由选择、连接操作和运行日志页面的实现。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-10-24；修改人：Du lin；将资源包的版本号、整包进度和结束状态从 MQTT 管理器转发给设置页，保持原视频信号语义。
  */
 
 #include "mqttpage.h"
@@ -266,6 +267,8 @@ MqttPage::MqttPage(QWidget *parent) : QWidget(parent)
             this, &MqttPage::mqttConnMarkChanged);
     connect(manager_, &MqttManager::videoControlNotice,
             this, &MqttPage::videoControlNotice);
+    connect(manager_, &MqttManager::multimediaUpdateProgress,
+            this, &MqttPage::multimediaUpdateProgress);
 
     updateIpcUiState(false);
 

@@ -2,8 +2,9 @@
  * @file mqttmanager.h
  * @brief 协调 mqttd IPC、业务服务、消息路由和 IC 在线网关。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-10-24；修改人：Du lin；声明资源包任务及提交屏障；新增高清播放信息的独立采集信号、原图提交入口和有界队列所有权，不复用普通截图等待状态。
  */
 
 #pragma once
@@ -19,6 +20,8 @@
 #include <QObject>
 #include <QTimer>
 #include <QJsonObject>
+#include <QImage>
+#include <QRect>
 #include <QStringList>
 
 #include "mqttipcclient.h"
@@ -30,6 +33,8 @@
 
 class IcMqttGateway;
 class QThread;
+class MultimediaUpdate;
+class CompanyPlayInfo;
 
 /** @brief mqttd IPC、Broker 路由和在线 IC 硬件参数的统一配置。 */
 struct MqttConfig
@@ -130,13 +135,16 @@ struct PendingFaceImageWork
  * @brief MQTT 页面、mqttd IPC、业务服务和消息路由的协调器。
  *
  * 负责下发连接配置、断线重连、解析 IPC JSON、按 method 分派业务，并统一发布响应。
+ * @details MQTT 与界面信号在对象所在线程处理；资源包文件/网络操作交给独立线程，
+ *          成功回执提交后才允许其覆盖资源。对象销毁时取消、唤醒并等待该线程退出。
  */
 class MqttManager : public QObject
 {
     Q_OBJECT
 public:
-    /** @brief 创建 IPC 客户端、业务服务、IC 网关和消息路由器。 */
+    /** @brief 创建 IPC、业务服务、IC 网关、消息路由器和独立高清截图控制器。 */
     explicit MqttManager(QObject *parent = nullptr);
+    /** @brief 取消并唤醒资源更新任务，等待文件/人员线程，并由子对象析构取消等待高清编码线程。 */
     ~MqttManager() override;
 
     /** @brief 注册一个可处理一组 method 的扩展处理器。 */
@@ -172,6 +180,17 @@ public:
                          const QString &reqId,
                          const QString &deviceId);
 
+    /**
+     * @brief 将 GUI 抓取的高清原图异步交给独立编码器，普通回执不等待该任务。
+     * @param token 本地采集令牌，必须原样回显；过期令牌由队列忽略。
+     * @param uiImage 完整 UI 原像素图，空值表示失败。
+     * @param videoImage 可为空的视频帧。
+     * @param videoRect 视频区域，单位为 UI 实际像素。
+     * @param reason 抓取失败说明，非空时不编码图像。
+     */
+    void submitCompanySnapshot(const QString &token, const QImage &uiImage, const QImage &videoImage,
+                               const QRect &videoRect, const QString &reason);
+
     /** @brief 更新当前播放音量。 */
     void updateCurrentPlayVolume(int volume);
 
@@ -199,6 +218,8 @@ public:
     bool publishJsonPacket(const QJsonObject &packet, const QString &tag = QString());
 
 signals:
+    /** @brief 请求主界面采集高清原图，接收方应排队执行，不进入普通截图缓存链路。 */
+    void companySnapshotRequested(const QString &token);
     /** @brief 输出统一业务日志。 */
     void logMessage(const QString &msg);
 
@@ -239,6 +260,15 @@ signals:
     /** @brief 请求显示视频控制结果提示。 */
     void videoControlNotice(const QString &text);
 
+    /**
+     * @brief 资源包提示状态，由界面主线程更新既有下载卡片。
+     * @param version 原样显示的 configVersion，不包含路径。
+     * @param percent 整包字节进度，范围 0~100。
+     * @param finished true 表示结束，false 表示下载、校验或应用中。
+     * @param success 结束时是否已覆盖资源并安排 Qt 重启。
+     */
+    void multimediaUpdateProgress(const QString &version, int percent, bool finished, bool success);
+
 
 
 private slots:
@@ -265,12 +295,19 @@ private:
 
     /** @brief 处理本地播放文件列表请求并发布响应。 */
     bool handleGetPlayFileList(const QString &topic, const QJsonObject &payloadObj, const QString &method);
-    /** @brief 请求媒体页刷新截图后发送播放信息。 */
+    /** @brief 分派普通播放信息或独立高清队列，高清不使用普通截图等待状态。 */
     bool handleGetPlayInfo(const QString &topic, const QJsonObject &payloadObj, const QString &method);
     /** @brief 删除指定本地播放文件并发布结果。 */
     bool handleDeletePlayFile(const QString &topic, const QJsonObject &payloadObj, const QString &method);
     /** @brief 处理播放、停止、音量和 FTP 下载控制。 */
     bool handleVideoControl(const QString &topic, const QJsonObject &payloadObj);
+    /**
+     * @brief 受理 online_v1 资源模板下发，按原始 id 发布四个分段进度及单个终态。
+     * @param topic 平台下行主题，必须与本机 online_v1 request 主题一致。
+     * @param payloadObj 下发信封；screen、rollback 不读取。
+     * @return 消息是否属于 multimediaControl；非法请求被消费但不修改正式资源。
+     */
+    bool handleMultimediaControl(const QString &topic, const QJsonObject &payloadObj);
     /** @brief 处理独立直播 URL 消息。 */
     bool handleStreamUrlMessage(const QString &topic, const QJsonObject &payloadObj);
     /** @brief 处理网络人员全量、哈希核对和凭证删除消息并发布业务回执。 */
@@ -451,6 +488,7 @@ private:
     MqttConfig cfg_;
     MqttIpcClient *ipc_ = nullptr;
     MqttService *service_ = nullptr;
+    CompanyPlayInfo *companyPlayInfo_ = nullptr; /**< 本管理器拥有；析构时取消并等待独立高清编码线程。 */
     IcMqttGateway *icGateway_ = nullptr;
     MqttMessageRouter *messageRouter_ = nullptr;
     NetworkPersonnelStore networkPersonnelStore_; /**< 统一 SQLite 中的网络人员聚合仓储。 */
@@ -504,4 +542,9 @@ private:
     PendingVideoControlAck pendingVideoCtrlAck_; /**< 等待 FTP 完成的延迟确认。 */
     bool recordedDownloadTaskActive_ = false;
     QString recordedDownloadTaskKey_;
+    MultimediaUpdate *multimediaUpdate_ = nullptr; /**< 主线程拥有；退出前取消、唤醒并 join 后台任务。 */
+    QString multimediaActiveId_; /**< 当前任务原始 id，即使有界历史被其他忙碌请求淘汰也保持去重。 */
+    bool multimediaRestartPending_ = false; /**< 成功安排重启后置 true，保持新下发/播放启动互斥至 Qt 退出，避免重启中断下一包。 */
+    QSet<QString> multimediaRequestIds_; /**< 本进程已受理的 id，阻止重复下发再次下载或产生终态。 */
+    QQueue<QString> multimediaRequestOrder_; /**< 最近 64 笔 id 的有界淘汰顺序。 */
 };

@@ -4,8 +4,7 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-10-23；修改人：Du lin；明确结果照片清理后的恢复契约：识别活动时恢复摄像头，
- *       退出识别后才恢复 PIC；未更改接口签名、配置或前台计时。
+ * @note 最近修改：2026-10-29；修改人：Du lin；声明统一视频区域开关检查，说明本地/直播及模块返回须服从 VideoDisplay_en；关闭视频不改变独立 PIC、识别和业务目标。
  */
 
 #ifndef MULTIMEDIADEMO_H
@@ -136,10 +135,15 @@ public:
 
     /**
      * @brief 使用独立播放器预探测直播首帧，成功后再切换主播放器。
+     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
+     * @param url 待探测的直播地址。
      */
     void probeLiveStream(const QString& url);
     /**
      * @brief 停止本地轮播并让主播放器进入指定直播源。
+     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
+     * @param url 目标直播地址。
+     * @param kind 直播协议类型。
      */
     void switchToLiveStream(const QString& url, const QString& kind);
 
@@ -163,6 +167,12 @@ public:
      * @brief 合成 UI 与当前视频帧后异步编码为 Base64。
      */
     void captureCompositeSnapshot();
+    /**
+     * @brief 为高清协议抓取原尺寸 UI/视频，原图通过 companySnapshotReady 提交后台。
+     * @param token 独立高清请求令牌；必须在 GUI 线程调用，不执行 JPEG/Base64/JSON 编码。
+     * @note 不复用普通截图缓存；普通视频抓帧未完成时返回失败，避免截获其回调。
+     */
+    void captureCompanySnapshot(const QString &token);
     /**
      * @brief 向 MQTT 管理器上报当前录播文件或清除状态。
      */
@@ -188,6 +198,7 @@ public:
 public slots:
     /**
      * @brief 启动页结束后放行首次媒体播放；重复调用保持幂等。
+     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
      */
     void startPlaybackAfterSplash();
     /**
@@ -196,19 +207,22 @@ public slots:
     void suspendPlaybackForModuleSwitch();
     /**
      * @brief 模块重新显示时恢复暂停前的 LIVE 或本地轮播状态。
+     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
      */
     void resumePlaybackAfterModuleSwitch();
     /**
      * @brief 从列表首项恢复本地轮播。
+     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
      */
     void resumeLocalPlaylistFromStart();
 
     /**
-     * @brief 保持视频播放，在 pictureRect 内以摄像头预览替换 PIC 轮播。
+     * @brief 保持视频区域原状态，在 pictureRect 内以摄像头预览替换 PIC 轮播。
      */
     void beginEmbeddedFaceRecognition();
     /**
      * @brief 关闭 pictureRect 内的人脸预览并恢复 PIC 轮播。
+     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
      */
     void endEmbeddedFaceRecognition();
     /**
@@ -243,6 +257,7 @@ public slots:
 
     /**
      * @brief 切换到录播模式；已在本地轮播时仅同步业务状态。
+     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
      */
     void switchToRecordedMode();
     /**
@@ -260,12 +275,22 @@ public slots:
      */
     void onDownloadStarted(const QString& fileName);
     /**
+     * @brief 复用下载提示显示整包进度，失败恢复轮播，成功保持暂停等待 Qt 重启。
+     * @param version 下发版本号；详情固定为“版本号：”加该值，不展示文件路径。
+     * @param percent 整包下载字节百分比，0~100。
+     * @param finished 是否已完成后台任务。
+     * @param success finished 时表示资源已替换并安排重启。
+     * @note 仅 UI 主线程调用；不把资源中的图片或配置文件逐个加入播放列表。
+     */
+    void onResourcePackageProgress(const QString &version, int percent, bool finished, bool success);
+    /**
      * @brief 更新当前下载文件的进度提示。
      */
     void onDownloadProgress(const QString& fileName, int percent);
     /**
      * @brief 下载成功后隐藏提示、更新媒体列表并恢复播放。
      * @param filePath 待读取的文件路径。
+     * @note 视频开播许可受 VideoDisplay_en 约束，原下载/PIC 更新或业务回退规则保留。
      */
     void onDownloadFinished(const QString& filePath);
     /**
@@ -332,14 +357,21 @@ private slots:
 
     /**
      * @brief 处理直播中断，并按业务期望决定回退本地或继续重试。
+     * @param reason 直播中断原因。
+     * @param keepLiveRetry true 保留 LIVE 目标重试；false 沿用无效源回退。
+     * @note 视频开播许可受 VideoDisplay_en 约束，原下载/PIC 更新或业务回退规则保留。
      */
     void onLiveStreamInterrupted(const QString& reason, bool keepLiveRetry);
     /**
      * @brief 强制释放当前直播播放器后回退本地轮播。
+     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
+     * @param reason 触发回退的诊断原因。
      */
     void forceStopCurrentLivePlayerForFallback(const QString& reason);
     /**
      * @brief 上游仍有压缩数据但无解码输出时，原地完整重建直播管线。
+     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
+     * @param reason 触发解码管线重建的诊断原因。
      */
     void restartLivePipelineAfterDecoderStall(const QString& reason);
 
@@ -366,6 +398,16 @@ private slots:
     void onSnapshotProcessFailed(const QString &reason);
 
 signals:
+    /**
+     * @brief 高清采集原图，不进入 currentPlayImageChanged 或普通回执链路。
+     * @param token 原样回传本地令牌。
+     * @param uiImage 完整 UI 原始像素图；失败时为空。
+     * @param videoImage 可为空的视频帧。
+     * @param videoRect 视频区域，单位为 uiImage 实际像素，已换算 DPR。
+     * @param reason 非空表示失败，后台应只构造空图失败回执。
+     */
+    void companySnapshotReady(const QString &token, const QImage &uiImage, const QImage &videoImage,
+                              const QRect &videoRect, const QString &reason);
     /**
      * @brief 退出密码正确后请求主窗口切回菜单。
      */
@@ -423,6 +465,8 @@ protected:
 
     /**
      * @brief 页面显示时恢复定时器、网络监测和本地播放。
+     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
+     * @param e Qt 分派的显示事件，借用且仅在本次调用期间有效。
      */
     void showEvent(QShowEvent *e) override;
     /**
@@ -431,6 +475,12 @@ protected:
     void hideEvent(QHideEvent *e) override;
 
 private:
+    /**
+     * @brief 主线程抓取根控件并提交原图，不执行图片合成和编码。
+     * @param token 需要原样回传的高清采集令牌。
+     * @param videoImage 可为空的视频帧；有帧时额外提交其目标矩形。
+     */
+    void deliverCompanySnapshot(const QString &token, const QImage &videoImage);
     struct RecognitionImageItem {
         QImage image;
         QString name;
@@ -478,6 +528,7 @@ private:
     qint64 m_lastSnapshotMs = 0;
     qint64 m_snapshotRequestMs = 0;
     QString m_lastSnapshotBase64;
+    QString m_companySnapshotToken; /**< 独立高清抓帧令牌；仅 GUI 线程读写，回调或失败后清空。 */
 
     bool m_liveDesired = false;          // MQTT当前是否要求播放直播
     QString m_desiredLiveUrl;
@@ -670,6 +721,7 @@ private:
     int MoveTextSpeed = 2;
 
     // 视频显示相关变量
+    /** ycest_cfg.ini [videoRect] 总开关，缺省 true；false 禁止视频区域视频/图片/直播及恢复补播，不影响独立 PIC。 */
     bool VideoDisplay_en;
     int VideoDisplay_x;
     int VideoDisplay_y;
@@ -838,6 +890,7 @@ private:
 
     DownloadProgressToast *m_downloadToast = nullptr;
     bool m_downloadPauseActive = false;
+    bool m_resourcePackageActive = false; /**< 收到资源包进度时置 true，失败清除；成功保持到重启，阻止旧视频完成计时器恢复播放。 */
     bool m_downloadResumeLocalAfterFinish = false;
     QString m_downloadActiveFileName;
     quint64 m_localPlaybackStartSerial = 0;
@@ -989,6 +1042,7 @@ private:
     void displayPrefixedFloorAsText(char prefix, int one);
     /**
      * @brief 创建主/预加载播放器并连接状态信号。
+     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
      */
     void initVideoPlayer();
     /**
@@ -1013,17 +1067,20 @@ private:
     /**
      * @brief 按环形索引播放一个 videoRect 媒体项。
      * @param index videoRect 混播列表中的零基索引；越界时直接返回。
+     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
      */
     void playVideoRectMediaAt(int index);
     /**
      * @brief 让主播放器播放 videoRect 视频项。
      * @param filePath 待读取的文件路径。
+     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
      */
     void playVideoRectVideo(const QString &filePath);
     /**
      * @brief 隐藏视频画布并显示 videoRect 图片项。
      * @param filePath 待读取的文件路径。
      * @note 通过 Qt 图片路径显示并按 videoRect 的图片间隔切换，避免把静态图片送入 DMA-BUF 视频解码链路。
+     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
      */
     void playVideoRectImage(const QString &filePath);
     /**
@@ -1064,6 +1121,7 @@ private:
 
     /**
      * @brief 在仍期望直播时启动定时重试。
+     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
      */
     void startLiveRetry();
     /**
@@ -1072,6 +1130,7 @@ private:
     void stopLiveRetry();
     /**
      * @brief 重试定时到达时重新探测期望直播源。
+     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
      */
     void onLiveRetryTimeout();
 
@@ -1097,6 +1156,7 @@ private:
 
     /**
      * @brief 本地列表为空时启动短周期目录观察。
+     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
      */
     void startEmptyVideoListWatch();
     /**
@@ -1105,6 +1165,7 @@ private:
     void stopEmptyVideoListWatch();
     /**
      * @brief 重新扫描目录并在发现文件后启动首项。
+     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
      */
     void onEmptyVideoListWatchTimeout();
     /**
@@ -1190,11 +1251,20 @@ private:
     void showPasswordErrorToast(const QString &text, int ms = 1800);
 
     /**
+     * @brief 将 videoRect 总开关应用到实际视频资源与可见性。
+     * @return 开启时为 true 并保持原状态；关闭时停止、隐藏视频区域并返回 false。
+     * @note GUI 线程调用；使排队开播失效并停止视频相关定时器，不修改 PIC、识别、下载状态或 LIVE 业务目标。
+     */
+    bool applyVideoDisplayPolicy();
+
+    /**
      * @brief 下载期间暂停本地轮播并记录是否需要恢复。
+     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
      */
     void pauseLocalPlaybackForDownload();
     /**
      * @brief 下载结束后按之前状态恢复本地轮播。
+     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
      */
     void resumeLocalPlaybackAfterDownload();
     /**

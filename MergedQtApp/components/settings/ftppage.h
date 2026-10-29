@@ -2,13 +2,15 @@
  * @file ftppage.h
  * @brief 提供 FTP 配置、空间预检、文件下载和流地址分类页面。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-10-24；修改人：Du lin；补充媒体传输共享锁的所有权、失败回执和持有周期声明，保留原视频下载接口。
  */
 
 #pragma once
 
 #include <memory>
+#include "common/resource_update_lock.h"
 #include <utility>
 
 #include <QWidget>
@@ -73,6 +75,7 @@ public:
  * - FTP 参数输入、连通性测试与文件下载；
  * - 从 MQTT 请求流地址并触发播放；
  * - 页面日志、状态提示、输入历史与配置加载。
+ * @note 媒体预检、列目录、下载和发布期间持有资源共享锁；更新任务持独占锁时拒绝新下载。
  */
 class FtpPage : public QWidget
 {
@@ -162,6 +165,13 @@ protected:
     void resizeEvent(QResizeEvent *event) override;
 
 private:
+    /**
+     * @brief 取得媒体下载共享锁，防止资源目录在预检或下载期间被清空。
+     * @param name 请求拒绝时返回的文件名。
+     * @return 已持有或成功取得锁时为 true；否则发送拒绝信号并返回 false。
+     */
+    bool acquireTransferLock(const QString &name);
+    std::unique_ptr<ResourceUpdateLock> transferLock_; /**< 从预检/列目录持有到全部下载及发布结束；空值表示未持锁。 */
     /** @brief 以代码方式创建页面控件和布局。 */
     void buildUi();
     /** @brief 应用适配触摸屏的页面样式。 */
@@ -231,7 +241,14 @@ private:
     /** @brief 显示页面顶部的非阻塞限时提示。 */
     void showToast(const QString& text, int ms = 3000);
 
-    /** @brief 构造带认证和编码路径的 FTP URL。 */
+    /**
+     * @brief 复用共用工具构造不含认证信息的 FTP URL，按需编码路径。
+     * @param host FTP 主机。
+     * @param port TCP 端口，1~65535。
+     * @param remotePath 远端文件或目录路径，缺少开头斜杠时自动补齐。
+     * @param usedEncodedMode 可为空；非空时输出是否进行了逐段百分号编码。
+     * @return 不含账号密码、可直接传给 curl 的 URL。
+     */
     QString buildFtpUrl(const QString& host, int port,
                         const QString& remotePath,
                         bool* usedEncodedMode = nullptr) const;

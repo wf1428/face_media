@@ -2,8 +2,9 @@
  * @file AdminPanel.cpp
  * @brief 人脸门禁管理员综合面板的实现。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-10-27；修改人：Du lin；将原 AdminToggleSwitch 实现提取至共用头文件并以别名复用，供网络页使用相同滑动外观；原管理页开关尺寸、动画及业务信号保持不变。
  */
 
 #include "AdminPanel.h"
@@ -16,6 +17,7 @@
 #include "UsbPersonExportTarget.h"
 #include "common/responsive_ui.h"
 #include "common/storage_policy.h"
+#include "common/toggle_switch.h"
 
 #include <QtQml/QQmlError>
 #include <QAbstractButton>
@@ -91,74 +93,8 @@
 #include <QVariantAnimation>
 
 namespace {
-/** @brief 与移动端一致的管理设置滑动开关。 */
-class AdminToggleSwitch final : public QCheckBox
-{
-public:
-    explicit AdminToggleSwitch(QWidget *parent = nullptr)
-        : QCheckBox(parent), animation_(this)
-    {
-        setText(QString());
-        setCursor(Qt::PointingHandCursor);
-        setFocusPolicy(Qt::StrongFocus);
-        setFixedSize(66, 38);
-
-        animation_.setDuration(190);
-        animation_.setEasingCurve(QEasingCurve::OutCubic);
-        connect(&animation_, &QVariantAnimation::valueChanged,
-                this, [this](const QVariant &value) {
-            position_ = value.toReal();
-            update();
-        });
-        connect(this, &QCheckBox::toggled, this, [this](bool checked) {
-            animation_.stop();
-            animation_.setStartValue(position_);
-            animation_.setEndValue(checked ? 1.0 : 0.0);
-            animation_.start();
-        });
-    }
-
-protected:
-    bool hitButton(const QPoint &position) const override
-    {
-        return rect().contains(position);
-    }
-
-    void paintEvent(QPaintEvent *) override
-    {
-        if (animation_.state() != QAbstractAnimation::Running) {
-            position_ = isChecked() ? 1.0 : 0.0;
-        }
-        QPainter painter(this);
-        painter.setRenderHint(QPainter::Antialiasing, true);
-
-        const QRectF trackRect(1.0, 2.0, width() - 2.0, height() - 4.0);
-        painter.setPen(Qt::NoPen);
-        const QColor offColor = isEnabled() ? QColor("#566477") : QColor("#3f4855");
-        const QColor onColor = isEnabled() ? QColor("#36d4c7") : QColor("#4a6770");
-        const auto blend = [this](int off, int on) {
-            return qRound(off + (on - off) * position_);
-        };
-        painter.setBrush(QColor(blend(offColor.red(), onColor.red()),
-                                blend(offColor.green(), onColor.green()),
-                                blend(offColor.blue(), onColor.blue())));
-        painter.drawRoundedRect(trackRect, trackRect.height() / 2.0,
-                                trackRect.height() / 2.0);
-
-        const qreal knobDiameter = trackRect.height() - 6.0;
-        const qreal knobStart = trackRect.left() + 3.0;
-        const qreal knobEnd = trackRect.right() - knobDiameter - 3.0;
-        const qreal knobX = knobStart + (knobEnd - knobStart) * position_;
-        const QRectF knobRect(knobX, trackRect.top() + 3.0,
-                              knobDiameter, knobDiameter);
-        painter.setBrush(QColor("#ffffff"));
-        painter.drawEllipse(knobRect);
-    }
-
-private:
-    QVariantAnimation animation_;
-    qreal position_ = 0.0;
-};
+// 复用同一控件实现，原管理页的尺寸、动画、颜色和点击行为保持不变。
+using AdminToggleSwitch = ToggleSwitch;
 
 /** @brief 创建管理员表格使用的只读单元格。 */
 QTableWidgetItem *tableItem(const QString &text, qint64 id = 0)

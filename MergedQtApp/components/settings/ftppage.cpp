@@ -2,11 +2,13 @@
  * @file ftppage.cpp
  * @brief 提供 FTP 配置、空间预检、文件下载和流地址分类页面。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-10-24；修改人：Du lin；提取视频与资源包共用的 FTP URL 和低优先级进程工具；媒体预检、下载及发布持共享锁，避免资源更新清理正在写入的文件。
  */
 
 #include "ftppage.h"
+#include "common/ftp_transfer.h"
 #include "common/media_content_policy.h"
 #include <QResizeEvent>
 
@@ -24,118 +26,29 @@ static const char* kStreamUrlHistoryKey = "stream/url_history";
 static const int kMaxUrlHistory = 8;
 
 
-/**
- * @brief 以较低的 CPU/I/O 调度优先级启动下载子进程。
- *
- * RK3566 同时进行摄像头采集、人脸推理和媒体落盘时，普通优先级的 curl
- * 容易持续占用存储与内存带宽。优先使用 ionice 的 idle 类，并叠加 nice；
- * 系统缺少这些工具时仍按原方式直接启动，不改变下载兼容性。
- */
-static void startBackgroundTransfer(QProcess *process,
-                                    const QString &program,
-                                    const QStringList &arguments)
-{
-    if (!process) return;
-
-#ifdef Q_OS_LINUX
-    const QString ionicePath = QFileInfo(QStringLiteral("/usr/bin/ionice")).isExecutable()
-            ? QStringLiteral("/usr/bin/ionice")
-            : (QFileInfo(QStringLiteral("/bin/ionice")).isExecutable()
-               ? QStringLiteral("/bin/ionice") : QString());
-    const QString nicePath = QFileInfo(QStringLiteral("/usr/bin/nice")).isExecutable()
-            ? QStringLiteral("/usr/bin/nice")
-            : (QFileInfo(QStringLiteral("/bin/nice")).isExecutable()
-               ? QStringLiteral("/bin/nice") : QString());
-
-    if (!ionicePath.isEmpty()) {
-        QStringList wrappedArguments;
-        wrappedArguments << QStringLiteral("-c") << QStringLiteral("3");
-        if (!nicePath.isEmpty()) {
-            wrappedArguments << nicePath << QStringLiteral("-n") << QStringLiteral("10");
-        }
-        wrappedArguments << program;
-        wrappedArguments << arguments;
-        process->start(ionicePath, wrappedArguments);
-        return;
-    }
-
-    if (!nicePath.isEmpty()) {
-        QStringList wrappedArguments;
-        wrappedArguments << QStringLiteral("-n") << QStringLiteral("10") << program;
-        wrappedArguments << arguments;
-        process->start(nicePath, wrappedArguments);
-        return;
-    }
-#endif
-
-    process->start(program, arguments);
-}
-
-
-/** @return FTP 路径含非 ASCII 或保留字符、需要逐段编码时返回 true。 */
-static bool needEncodeFtpPath(const QString& path)
-{
-    // 空格、#、% 以及非 ASCII 字符
-    for (const QChar& ch : path) {
-        ushort u = ch.unicode();
-        if (u > 127) return true; // 中文等非 ASCII
-
-        switch (ch.toLatin1()) {
-        case ' ':
-        case '#':
-        case '%':
-        case '?':
-        case '[':
-        case ']':
-        case '{':
-        case '}':
-        case '^':
-        case '|':
-        case '\\':
-        case '"':
-        case '<':
-        case '>':
-        case '`':
-            return true;
-        default:
-            break;
-        }
-    }
-    return false;
-}
-
-/** @brief 对 FTP 路径逐段百分号编码，同时保留目录分隔斜杠。 */
-static QString encodeFtpPathPreserveSlash(const QString& rawPath)
-{
-    QString path = rawPath.trimmed();
-    if (!path.startsWith('/')) path = "/" + path;
-
-    QStringList parts = path.split('/', QString::KeepEmptyParts);
-    for (QString& part : parts) {
-        if (part.isEmpty()) continue; // 保留路径分隔
-        part = QString::fromLatin1(QUrl::toPercentEncoding(part));
-    }
-    return parts.join('/');
-}
-
-/** @brief 构造带认证和编码路径的 FTP URL。 */
+/** @brief 复用视频和资源包共用的逐段 FTP URL 编码；encoded 输出是否编码。 */
 QString FtpPage::buildFtpUrl(const QString& host, int port,
                              const QString& remotePath,
                              bool* usedEncodedMode) const
 {
-    QString path = remotePath.trimmed();
-    if (!path.startsWith('/')) path = "/" + path;
-
-    const bool needEncode = needEncodeFtpPath(path);
-
-    if (usedEncodedMode) {
-        *usedEncodedMode = needEncode;
-    }
-
-    const QString finalPath = needEncode ? encodeFtpPathPreserveSlash(path) : path;
-    return QString("ftp://%1:%2%3").arg(host).arg(port).arg(finalPath);
+    return FtpTransfer::url(host, port, remotePath, usedEncodedMode);
 }
 
+/** @brief 从预检到文件发布持有媒体共享锁，资源替换持独占锁时拒绝启动。 */
+bool FtpPage::acquireTransferLock(const QString &name)
+{
+    if (transferLock_) return true;
+    auto lock = std::make_unique<ResourceUpdateLock>();
+    const QString root = QDir(Rk3566Platform::staticRoot()).filePath("demoResources/images");
+    if (!lock->acquire(root, false)) {
+        clearAutoDownloadState();
+        const QString reason = QStringLiteral("资源更新进行中，暂不能下载媒体");
+        emit ftpDownloadRequestRejected(name, reason);
+        return false;
+    }
+    transferLock_ = std::move(lock);
+    return true;
+}
 
 // ------------------------------
 // FtpPage UI + 业务
@@ -186,6 +99,16 @@ FtpPage::FtpPage(QWidget *parent) : QWidget(parent)
     });
 
 
+    // 同步发布回调结束且所有传输空闲后释放锁；目录队列仍在运行时保持持锁。
+    auto *transferLockTimer = new QTimer(this);
+    connect(transferLockTimer, &QTimer::timeout, this, [this]() {
+        if (!autoDownloadInProgress_ && curlMode == CurlMode::Idle &&
+            (!ftpProc || ftpProc->state() == QProcess::NotRunning) &&
+            (!httpProc || httpProc->state() == QProcess::NotRunning) &&
+            (!ftpPreflightProc_ || ftpPreflightProc_->state() == QProcess::NotRunning))
+            transferLock_.reset();
+    });
+    transferLockTimer->start(200);
     // ---------- ftpget 进程 ----------
     ftpProc = new QProcess(this);
 
@@ -813,6 +736,7 @@ void FtpPage::startFtpListDirByProcess(const QString &host, int port,
                                        const QString &user, const QString &pass,
                                        const QString &remoteDir)
 {
+    if (!acquireTransferLock(QFileInfo(remoteDir).fileName())) return;
     // remoteDir 要以 / 结尾
     QString dir = remoteDir.trimmed();
     if (!dir.endsWith('/')) dir += '/';
@@ -854,7 +778,7 @@ void FtpPage::startFtpListDirByProcess(const QString &host, int port,
     setStatusText(QStringLiteral("正在列目录..."));
     appendLog(QStringLiteral("列目录：%1 %2").arg(curlPath, args.join(' ')));
 
-    startBackgroundTransfer(ftpProc, curlPath, args);
+    FtpTransfer::start(ftpProc, curlPath, args);
 }
 
 /** @brief 顺序启动目录队列中的下一文件，避免并发写盘。 */
@@ -988,7 +912,7 @@ void FtpPage::startFtpDownloadByProcess(const QString &host, int port,
 
     emit ftpDownloadStarted(QFileInfo(localPath).fileName());
     emit ftpDownloadProgress(QFileInfo(localPath).fileName(), 0);
-    startBackgroundTransfer(ftpProc, curlPath, args);
+    FtpTransfer::start(ftpProc, curlPath, args);
 }
 
 /** @brief 使用短 TCP 连接测试 FTP 主机和端口。 */
@@ -1929,6 +1853,7 @@ QString FtpPage::pickHttpSaveFilePath(const QString& urlStr)
 /** @brief 通过 curl 子进程下载 HTTP 媒体文件。 */
 void FtpPage::startHttpMp4DownloadByProcess(const QString& urlStr, const QString& localFile)
 {
+    if (!acquireTransferLock(QFileInfo(localFile).fileName())) return;
     emit ftpDownloadStarted(QFileInfo(localFile).fileName());
 
     if (!httpProc) return;
@@ -2017,7 +1942,7 @@ void FtpPage::startHttpMp4DownloadByProcess(const QString& urlStr, const QString
     emit ftpDownloadProgress(QFileInfo(localFile).fileName(), 0);
 
     // 8) 开始
-    startBackgroundTransfer(httpProc, curlPath, args);
+    FtpTransfer::start(httpProc, curlPath, args);
 }
 
 /** @brief 从设置中加载最近使用的流地址。 */
@@ -2231,6 +2156,7 @@ void FtpPage::startAutoDownloadPreflight(const QString &host, int port,
                                          const QString &displayName,
                                          const QString &taskKey)
 {
+    if (!acquireTransferLock(displayName)) return;
     if (!ftpPreflightProc_) {
         failAutoDownloadPreflight(QStringLiteral("FTP preflight process is not initialized"));
         return;

@@ -3,6 +3,7 @@
  * @brief 网络配置源数据读取、IPv4 校验与原 INI 键持久化。
  * @author Du lin
  * @date 2026-10-20
+ * @note 最近修改：2026-10-27；修改人：Du lin；将缺省链路模式设为百兆，校验千兆/百兆与旧 auto，增加只保存速率的接口，避免改变 DHCP、Web 意图及其他配置字段。
  */
 
 #include "network_config.h"
@@ -66,7 +67,8 @@ QJsonObject NetworkConfig::read(const QString &path, QString *error)
     QJsonObject result{{"iface", ini.value("network/iface", "eth0").toString().trimmed()},
                        {"dhcp", ini.value("network/dhcp", true).toBool()},
                        {"useConfig", ini.value("network/use_config", false).toBool()},
-                       {"autoConnect", ini.value("network/auto_connect", false).toBool()}};
+                       {"autoConnect", ini.value("network/auto_connect", false).toBool()},
+                       {"linkMode", ini.value("network/link_mode", "100-full").toString()}};
     if (result.value("iface").toString().isEmpty())
         result["iface"] = "eth0";
     for (const auto &key : {"ip", "netmask", "gateway", "dns"})
@@ -85,7 +87,7 @@ QJsonObject NetworkConfig::read(const QString &path, QString *error)
  * @param[out] output 接收规范化结果，调用方应提供有效指针。
  * @param[out] error 接收失败原因；允许为空时不写入错误文本。
  * @return 全部字段合法时为 true；失败时为 false 且写入错误说明。
- * @note 网卡名取自 current；DHCP 模式清空静态字段，静态模式校验掩码、网关及 DNS。
+ * @note 网卡名取自 current；DHCP 模式清空静态字段，静态模式校验掩码、网关及 DNS；linkMode 缺省保留现有值。
  */
 bool NetworkConfig::normalize(const QJsonObject &input,
                               const QJsonObject &current,
@@ -97,7 +99,12 @@ bool NetworkConfig::normalize(const QJsonObject &input,
     const auto iface = current.value("iface").toString();
     if (!QRegularExpression("^[a-zA-Z0-9_.-]{1,15}$").match(iface).hasMatch() || iface == "lo")
         return fail(error, QStringLiteral("配置中的有线网卡名称无效"));
-    QJsonObject value{{"iface", iface},
+    const auto link =
+        input.value("linkMode").toString(current.value("linkMode").toString("100-full"));
+    if ((input.contains("linkMode") && !input.value("linkMode").isString()) ||
+        !isLinkModeValid(link))
+        return fail(error, QStringLiteral("有线速率只支持百兆、千兆全双工或旧自动协商模式"));
+    QJsonObject value{{"linkMode", link}, {"iface", iface},
                       {"dhcp", input.value("dhcp")},
                       {"useConfig", true},
                       {"autoConnect", true}};
@@ -157,9 +164,49 @@ bool NetworkConfig::save(const QString &path, const QJsonObject &value, QString 
     ini.setValue("network/web_managed", true);
     ini.setValue("network/iface", value.value("iface").toString());
     ini.setValue("network/dhcp", value.value("dhcp").toBool());
+    if (value.contains("linkMode")) ini.setValue("network/link_mode", value.value("linkMode").toString());
     for (const auto &key : {"ip", "netmask", "gateway", "dns"})
         ini.setValue("network/" + QString::fromLatin1(key), value.value(key).toString());
     ini.sync();
     return ini.status() == QSettings::NoError ||
            fail(error, QStringLiteral("网络已应用，但写入 net_cfg.ini 失败，请检查配置文件权限"));
+}
+
+/** @brief 校验有线协商模式，不将未知配置静默改成默认值。 */
+bool NetworkConfig::isLinkModeValid(const QString &mode)
+{
+    return mode == "100-full" || mode == "1000-full" || mode == "auto";
+}
+
+/**
+ * @brief 仅保存应用速率选择，不更新 IP、自动联网或 Web 权限字段。
+ * @param path 现有 net_cfg.ini 路径；不存在或不可写时失败。
+ * @param iface 与配置文件一致的目标有线接口，避免排队期间接口变化后写错选择。
+ * @param mode 百兆、千兆或兼容旧 auto 的模式值。
+ * @param[out] error 可空失败说明。
+ * @return QSettings 同步成功为 true；失败为 false，不宣称两份配置已一致。
+ */
+bool NetworkConfig::saveLinkMode(const QString &path,
+                                 const QString &iface,
+                                 const QString &mode,
+                                 QString *error)
+{
+    if (error)
+        error->clear();
+    if (!isLinkModeValid(mode))
+        return fail(error, QStringLiteral("有线速率配置无效"));
+    if (!QFileInfo(path).isFile())
+        return fail(error, QStringLiteral("net_cfg.ini 不存在或不是普通文件"));
+    QSettings ini(path, QSettings::IniFormat);
+    ini.setIniCodec("UTF-8");
+    ini.sync();
+    QString configuredIface = ini.value("network/iface", "eth0").toString().trimmed();
+    if (configuredIface.isEmpty())
+        configuredIface = "eth0";
+    if (ini.status() != QSettings::NoError || configuredIface != iface)
+        return fail(error, QStringLiteral("网络配置读取失败或目标接口已变化，请刷新设置"));
+    ini.setValue("network/link_mode", mode);
+    ini.sync();
+    return ini.status() == QSettings::NoError ||
+           fail(error, QStringLiteral("保存 net_cfg.ini 速率选择失败"));
 }

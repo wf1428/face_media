@@ -1,3 +1,10 @@
+/**
+ * @file AppShell.cpp
+ * @brief 初始化应用模块并协调人体感应、识别显示、模式切换和补光灯。
+ * @author Du lin
+ * @note 最近修改：2026-10-24；修改人：Du lin；启动时读取 net_cfg.ini 的 fillLight/enabled，
+ *       缺省启用，禁用时不执行识别及管理状态的开灯动作；保留原模式切换和关灯流程。
+ */
 #include "AppShell.h"
 
 #include "LedFillLight.h"
@@ -89,8 +96,10 @@ bool AppShell::initialize()
     }
 
     QSettings settings(shellConfigPath(), QSettings::IniFormat);
+    QSettings netSettings(Rk3566Platform::netConfigPath(), QSettings::IniFormat);
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
     settings.setIniCodec("UTF-8");
+    netSettings.setIniCodec("UTF-8");
 #endif
     const QString initialMode =
         settings.value(QStringLiteral("application/initialMode"), QStringLiteral("multimedia"))
@@ -109,6 +118,9 @@ bool AppShell::initialize()
     const QString fillLightDevice =
         settings.value(QStringLiteral("fillLight/device"), QStringLiteral("/dev/led"))
             .toString().trimmed();
+    // 仅在初始化时读取功能开关，缺省保留旧行为；配置不写回，修改后重启程序生效。
+    const bool fillLightEnabled =
+        netSettings.value(QStringLiteral("fillLight/enabled"), true).toBool();
     if (initialMode != QStringLiteral("multimedia")) {
         qWarning() << "[SHELL] unsupported initialMode; forcing multimedia" << initialMode;
     }
@@ -193,7 +205,7 @@ bool AppShell::initialize()
         }
     });
     connect(modeController_, &ModeController::stateChanged,
-            this, [this](ModeController::AppModeState state) {
+            this, [this, fillLightEnabled](ModeController::AppModeState state) {
                 if (quickUiRuntime_) {
                     switch (state) {
                     case ModeController::AppModeState::MultimediaActive:
@@ -220,7 +232,7 @@ bool AppShell::initialize()
                 }
                 if (state == ModeController::AppModeState::FaceGateActive
                         || state == ModeController::AppModeState::AdminActive) {
-                    if (fillLight_) {
+                    if (fillLight_ && fillLightEnabled) {
                         fillLight_->turnOn();
                     }
                 } else if (state == ModeController::AppModeState::MultimediaActive
@@ -248,6 +260,7 @@ bool AppShell::initialize()
             << "presenceDriver=sr505"
             << "sr505Device=" << sr505Device
             << "fillLightDevice=" << fillLightDevice
+            << "fillLightEnabled=" << fillLightEnabled
             << "recognitionReturnMs=" << recognitionReturnMs
             << "recognitionImageMs=" << recognitionImageMs
             << "facegateConfig=" << faceGateConfigPath();

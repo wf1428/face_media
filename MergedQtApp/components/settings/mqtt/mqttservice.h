@@ -2,7 +2,8 @@
  * @file mqttservice.h
  * @brief 处理 MQTT 媒体命令、维护播放状态并构建协议响应包。
  *
- * @author Dulin
+ * @author Du lin
+ * @note 最近修改：2026-10-24；修改人：Du lin；播放信息构包支持独立高清回执 method 和跳过普通截图缓存，其他字段及普通调用默认行为不变。
  * @date 2026-07-25
  */
 
@@ -54,11 +55,23 @@ public:
                                                const QString &deviceId,
                                                QString *respTopicOut = nullptr);
 
-    /** @brief 根据 playInfo_ 构建 sendPlayInfo 响应包。 */
+    /**
+     * @brief 根据当前播放状态构建普通或高清播放信息回执。
+     * @param[in] reqTopic 原请求主题，按既有规则生成响应主题。
+     * @param[in] reqId 原请求 id，交由既有信封规则回显。
+     * @param[in] deviceId 原设备标识，交由既有信封规则处理。
+     * @param[out] respTopicOut 可为空，非空时写入响应主题。
+     * @param[in] method 回执 method；默认 sendPlayInfo，高清调用为 sendPlayInfoFromCompany。
+     * @param[in] includeCachedImage 默认 true；高清请求传 false，避免混用普通低清截图。
+     * @return mqttd publish 信封；除 method 和是否带缓存图像外，播放字段保持一致。
+     * @note 在服务对象线程构造无高清图的状态快照，高清图和大 JSON 编码由后台补入。
+     */
     QJsonObject buildPlayInfoPublishPacket(const QString &reqTopic,
                                           const QString &reqId,
                                           const QString &deviceId,
-                                          QString *respTopicOut);
+                                          QString *respTopicOut,
+                                          const QString &method = QStringLiteral("sendPlayInfo"),
+                                          bool includeCachedImage = true);
 
     /** @brief 构建 videoControl 确认包，可选择包含状态和下载结果字段。 */
     QJsonObject buildVideoControlAckPublishPacket(const QString &reqTopic, const QJsonObject &reqPayload, bool status, bool ftpDownloaded,

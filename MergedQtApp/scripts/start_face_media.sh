@@ -2,8 +2,8 @@
 # @file start_face_media.sh
 # @brief 初始化运行环境并监督 mqttd、Qt 程序及看门狗。
 # @author Du lin
-# @note 最近修改：2026-10-23；修改人：Du lin；在 SR505 驱动加载后，
-#       复用 load_driver 加载同一 APP_DIR 下的 2h_led_drv.ko；沿用已有模块检查和失败退出行为。
+# @note 最近修改：2026-10-26；修改人：Du lin；将 Qt 的 Wayland 目录统一为 /run/face-media-wayland，
+#       加载 profile 后再次固定该目录，避免登录会话环境覆盖；保留原 Weston 等待、重启、看门狗和驱动加载逻辑。
 
 set -eu
 
@@ -11,7 +11,8 @@ APP_DIR=/home/cat/face_media
 APP_START_DELAY_SECONDS=${APP_START_DELAY_SECONDS:-5}
 APP_RESTART_DELAY_SECONDS=${APP_RESTART_DELAY_SECONDS:-2}
 WESTON_SERVICE=${WESTON_SERVICE:-weston-kiosk.service}
-XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/0}
+# 与 Weston 系统服务共用专用目录，不能跟随 SSH 会话目录。
+XDG_RUNTIME_DIR=/run/face-media-wayland
 WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}
 STATE_DIR=${FACE_MEDIA_STATE_DIR:-/run/face-media}
 APP_PID_FILE=${FACE_MEDIA_APP_PID_FILE:-$STATE_DIR/app.pid}
@@ -898,6 +899,8 @@ stop_stale_qt_instances()
     done
 }
 
+# @brief 加载既有图形环境，并固定 Qt 与 Weston 共用的系统运行目录。
+# @note 仍由原 wait_for_weston 检查依赖是否就绪，不创建显示目录或新增恢复操作。
 ensure_runtime_environment()
 {
     PROFILE_FILE=${FACE_MEDIA_PROFILE_FILE:-/etc/profile}
@@ -914,7 +917,8 @@ ensure_runtime_environment()
 
     # 服务依赖异常或配置块缺失时保留安全默认值，避免 Qt 因空变量无法连接 Weston。
     : "${QT_QPA_PLATFORM:=wayland-egl}"
-    : "${XDG_RUNTIME_DIR:=/run/user/0}"
+    # profile 可能残留旧会话路径；显示目录必须与 Weston 服务保持一致。
+    XDG_RUNTIME_DIR=/run/face-media-wayland
     : "${WAYLAND_DISPLAY:=wayland-0}"
     : "${QT_WAYLAND_SHELL_INTEGRATION:=wl-shell}"
     : "${QT_WAYLAND_DISABLE_WINDOWDECORATION:=1}"

@@ -1,10 +1,16 @@
 #!/bin/sh
+# @file weston_control.sh
+# @brief 管理 Weston 运行环境、显示旋转和维护后的 Qt 启停。
+# @author Du lin
+# @note 最近修改：2026-10-26；修改人：Du lin；将 Wayland 运行目录固定为 /run/face-media-wayland，
+#       同步生成的 /etc/profile 环境，避免继承 SSH 会话目录；不新增恢复策略，保留原就绪和旋转流程。
 set -eu
 
 CONFIG=${WESTON_CONFIG:-/etc/xdg/weston/weston.ini}
 SERVICE=${WESTON_SERVICE:-weston-kiosk.service}
 SOCKET=${WAYLAND_DISPLAY:-wayland-0}
-RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/0}
+# 与系统服务及 Qt 使用同一专用目录，不继承 SSH/PAM 的用户会话运行目录。
+RUNTIME_DIR=/run/face-media-wayland
 OUTPUT_NAME=${WESTON_OUTPUT_NAME:-DSI-1}
 TOUCH_NAME=${WESTON_TOUCH_NAME:-Goodix Capacitive TouchScreen}
 TOUCH_RULE=${WESTON_TOUCH_RULE:-/etc/udev/rules.d/99-goodix-weston-rotation.rules}
@@ -35,6 +41,8 @@ normalize_rotation()
     esac
 }
 
+# @brief 更新并加载唯一环境配置块；Wayland 目录与系统服务一致，覆盖旧会话目录。
+# @note 写入失败沿用 set -e 退出；本函数不负责启动或自动恢复 Weston。
 install_and_activate_runtime_environment()
 {
     profile_file=${FACE_MEDIA_PROFILE_FILE:-/etc/profile}
@@ -58,7 +66,7 @@ install_and_activate_runtime_environment()
     cat >> "$profile_file" <<'EOF'
 # BEGIN FACE_MEDIA_ENV
 export QT_QPA_PLATFORM=wayland-egl
-export XDG_RUNTIME_DIR=/run/user/0
+export XDG_RUNTIME_DIR=/run/face-media-wayland
 export WAYLAND_DISPLAY=wayland-0
 export QT_WAYLAND_SHELL_INTEGRATION=wl-shell
 export QT_WAYLAND_DISABLE_WINDOWDECORATION=1
@@ -331,6 +339,8 @@ set_rotation()
     echo "[weston] transform=$transform"
 }
 
+# @brief 在专用运行目录启动 Weston，保留原布局和触摸初始化。
+# @note 系统服务先通过 RuntimeDirectory 创建目录；直接调用时沿用原 install -d 兜底。
 start_weston()
 {
     install_and_activate_runtime_environment

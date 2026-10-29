@@ -1,3 +1,7 @@
+# @file qt_ycest.pro
+# @brief RK3566 融合 Qt 应用构建入口与模块登记。
+# @author Du lin
+# @note 最近修改：2026-10-27；修改人：Du lin；登记网络页与管理员页复用的动画滑动开关头文件，保证源码分发与工程浏览包含新控件，不改变其他构建选项。
 TARGET = MergedQtApp
 QT += core gui widgets opengl serialport network sql virtualkeyboard qml quick quickwidgets
 
@@ -118,6 +122,8 @@ SOURCES += \
     components/settings/mqtt/mqttmessagerouter.cpp \
     components/settings/mqtt/mqttipcclient.cpp \
     components/settings/mqtt/mqttmanager.cpp \
+    components/settings/mqtt/company_play_info.cpp \
+    components/settings/mqtt/multimedia_update.cpp \
     components/settings/mqtt/mqttservice.cpp \
     components/udisk_status/udisk_status.cpp \
     ic_board/core_migration_audit/core_migration_sync.cpp \
@@ -189,7 +195,10 @@ SOURCES += \
 HEADERS += \
     common/face_image_sync_bridge.h \
     common/responsive_ui.h \
+    common/toggle_switch.h \
     common/storage_policy.h \
+    common/ftp_transfer.h \
+    common/resource_update_lock.h \
     common/media_content_policy.h \
     common/ui_image_resources.h \
     common/clients/icboard_client.h \
@@ -232,6 +241,8 @@ HEADERS += \
     components/settings/mqtt/mqttmessagerouter.h \
     components/settings/mqtt/mqttipcclient.h \
     components/settings/mqtt/mqttmanager.h \
+    components/settings/mqtt/company_play_info.h \
+    components/settings/mqtt/multimedia_update.h \
     components/settings/mqtt/mqttservice.h \
     components/udisk_status/udisk_status.h \
     ic_board/core_migration_audit/core_migration_sync.h \

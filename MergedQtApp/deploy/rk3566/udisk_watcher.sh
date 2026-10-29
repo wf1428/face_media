@@ -1,4 +1,8 @@
 #!/bin/sh
+# @file udisk_watcher.sh
+# @brief 监听 U 盘并导入 UI、视频及协调人员导入导出。
+# @author Du lin
+# @note 最近修改：2026-10-24；修改人：Du lin；资源拷贝取得与 MQTT/Web 更新及媒体传输共用的独占锁，忙碌时留待下一轮重试。
 
 # 最终拷贝目的目录（视频仍然拷到这里的根目录）
 UDISK_DIR="/mnt/UDISK"
@@ -735,7 +739,17 @@ copy_video_with_progress() {
 
 
 
-do_job_once() {
+# 与 Qt/Web 的 .ycest-update.lock 使用同一 inode；锁只在本次拷贝子进程持有。
+# 忙碌返回 75，不清理任何目录；外层监听循环继续等待下一次重试。
+do_job_once() (
+    mkdir -p "$STATIC_DST_DIR" || return 1
+    exec 8>"$STATIC_DST_DIR/.ycest-update.lock" || return 1
+    flock -n 8 || return 75
+    do_job_once_locked "$1"
+)
+
+# 已持资源独占锁后执行原有清理、UI资源拷贝和视频处理。
+do_job_once_locked() {
     mountp="$1"
 
     res_src="${mountp}/${YCEST_SUBDIR}"

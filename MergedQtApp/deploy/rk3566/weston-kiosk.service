@@ -1,3 +1,7 @@
+# @file weston-kiosk.service
+# @brief 启动系统级 Weston，并持有不随登录会话退出而清理的 Wayland 目录。
+# @author Du lin
+# @note 最近修改：2026-10-26；修改人：Du lin；增加专用 RuntimeDirectory 和 0700 权限，统一 XDG_RUNTIME_DIR；保留原依赖及重启策略。
 [Unit]
 Description=Weston Wayland compositor for RK3566/RK3568 kiosk display
 Wants=disable-console-blank.service
@@ -7,7 +11,9 @@ Conflicts=display-manager.service getty@tty1.service
 
 [Service]
 Type=simple
-Environment=XDG_RUNTIME_DIR=/run/user/0
+RuntimeDirectory=face-media-wayland
+RuntimeDirectoryMode=0700
+Environment=XDG_RUNTIME_DIR=/run/face-media-wayland
 Environment=WAYLAND_DISPLAY=wayland-0
 ExecStartPre=/usr/local/sbin/weston-control prepare-environment
 ExecStart=/usr/local/sbin/weston-control start

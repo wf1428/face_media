@@ -2,8 +2,9 @@
  * @file mainwindow.cpp
  * @brief 管理融合应用页面、功能模块生命周期和跨模块信号路由。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-10-24；修改人：Du lin；保留资源包整包进度连接；将独立高清采集令牌和原图以排队连接交给媒体页和 MQTT 管理器，不经过普通截图状态转发链路。
  */
 
 #include "mainwindow.h"
@@ -15,6 +16,7 @@
 #include "components/dialogs/ui_message_box.h"
 #include "platform/rk3566_platform.h"
 #include "modules/web/web_local_runtime.h"
+#include "components/settings/mqtt/mqttmanager.h"
 #include "shell/QuickUiRuntime.h"
 #include "components/quick/QuickMainMenuWidget.h"
 
@@ -105,6 +107,7 @@ static QString normalizeProtocolModeValue(const QString &raw)
 /**
  * @brief 创建全部页面、运行模块并建立跨页面信号连接。
  * @param parent Qt 父对象；对象销毁由父子关系管理，空指针表示无父对象。
+ * @note 高清截图的令牌和原图使用排队连接；本窗口不合成、编码或序列化高清图像。
  */
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -236,6 +239,12 @@ MainWindow::MainWindow(QWidget *parent)
 
 
     if (cast && settingsDialog) {
+        if (auto *manager = settingsDialog->findChild<MqttManager *>()) {
+            connect(manager, &MqttManager::companySnapshotRequested,
+                    cast, &MultimediaDemo::captureCompanySnapshot, Qt::QueuedConnection);
+            connect(cast, &MultimediaDemo::companySnapshotReady,
+                    manager, &MqttManager::submitCompanySnapshot, Qt::QueuedConnection);
+        }
         // 播放状态先经设置对话框转交 MQTT 页面，保持主窗口只负责跨模块路由。
         connect(cast, &MultimediaDemo::currentRecordedFileChanged,
                 settingsDialog, &SettingsDialog::onCurrentRecordedFileChanged);
@@ -351,6 +360,12 @@ MainWindow::MainWindow(QWidget *parent)
                     player->onDownloadedVideoReady(filePath);
                 }
             });
+
+    connect(settingsDialog, &SettingsDialog::multimediaUpdateProgress,
+            this, [this](const QString &version, int percent, bool finished, bool success) {
+        if (auto *player = qobject_cast<MultimediaDemo*>(app3Page))
+            player->onResourcePackageProgress(version, percent, finished, success);
+    });
 
     connect(settingsDialog, &SettingsDialog::playFileDeleted,
             this, [this](const QString &filePath) {

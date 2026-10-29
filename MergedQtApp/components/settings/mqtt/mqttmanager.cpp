@@ -2,11 +2,14 @@
  * @file mqttmanager.cpp
  * @brief 协调 mqttd IPC、业务服务、消息路由和 IC 在线网关。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-10-24；修改人：Du lin；保留资源包更新及独立高清请求队列；移除高清请求和 IPC 提交的新增诊断打印及日志转接，继续非阻塞提交回执并保留原有 IPC 错误通道和普通请求日志。
  */
 
 #include "mqttmanager.h"
+#include "multimedia_update.h"
+#include "company_play_info.h"
 #include "common/media_content_policy.h"
 
 #include <QDebug>
@@ -29,6 +32,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
 
 #include "common/face_image_sync_bridge.h"
 #include "common/sql/dbstore.h"
@@ -1012,7 +1016,8 @@ bool MqttManager::persistCurrentMqttRouteToIni(QString *err) const
 /**
  * @brief 构造 MqttManager 对象。
  *
- * 创建 IPC 客户端与业务服务对象，并建立各类状态、日志及业务信号转发关系。
+ * 创建 IPC、业务服务及独立高清截图控制器，建立状态、日志和业务信号转发。
+ * 高清完整 JSON 由工作线程生成，本对象仅非阻塞提交原始 IPC 帧。
  *
  * @param parent 父对象指针。
  */
@@ -1022,6 +1027,14 @@ MqttManager::MqttManager(QObject *parent)
     // 创建 IPC 通信对象与 MQTT 业务服务对象
     ipc_ = new MqttIpcClient(this);
     service_ = new MqttService(this);
+    companyPlayInfo_ = new CompanyPlayInfo(this);
+    connect(companyPlayInfo_, &CompanyPlayInfo::captureRequested,
+            this, &MqttManager::companySnapshotRequested);
+    connect(companyPlayInfo_, &CompanyPlayInfo::publishReady, this, [this](const QByteArray &line) {
+        // 大图的 Base64/JSON 已在高清线程处理；此处不解析、不打印正文、不等待 socket。
+        if (ipc_)
+            ipc_->sendRawLine(line);
+    });
     icGateway_ = new IcMqttGateway(this);
     messageRouter_ = new MqttMessageRouter(this);
     registerBuiltinMessageHandlers();
@@ -1226,6 +1239,11 @@ MqttManager::MqttManager(QObject *parent)
 
 MqttManager::~MqttManager()
 {
+    if (multimediaUpdate_) {
+        multimediaUpdate_->requestInterruption();
+        multimediaUpdate_->authorizeCommit(false);
+        multimediaUpdate_->wait(); // 仅退出时等待；下载取消和清理仍由工作线程完成。
+    }
     if (personnelSyncThread_) {
         personnelSyncThread_->quit();
         personnelSyncThread_->wait();
@@ -1295,6 +1313,12 @@ void MqttManager::registerBuiltinMessageHandlers()
     });
 
     multimediaHandler->addMethod(
+                QStringLiteral("getPlayInfoFromCompany"),
+                [this](const QString &topic, const QJsonObject &payload, const QString &method) {
+        return handleGetPlayInfo(topic, payload, method);
+    });
+
+    multimediaHandler->addMethod(
                 QStringLiteral("deletePlayFile"),
                 [this](const QString &topic,
                        const QJsonObject &payload,
@@ -1308,6 +1332,11 @@ void MqttManager::registerBuiltinMessageHandlers()
                        const QJsonObject &payload,
                        const QString &) {
         return handleVideoControl(topic, payload);
+    });
+    multimediaHandler->addMethod(
+                QStringLiteral("multimediaControl"),
+                [this](const QString &topic, const QJsonObject &payload, const QString &) {
+        return handleMultimediaControl(topic, payload);
     });
     registerMessageHandler(multimediaHandler);
 
@@ -4640,20 +4669,21 @@ bool MqttManager::handleGetPlayFileList(const QString &topic, const QJsonObject 
 
 
 /**
- * @brief 处理 getPlayInfo 请求。
+ * @brief 分别处理普通 getPlayInfo 和高清 getPlayInfoFromCompany 请求。
  *
- * 仅当 payload 中的 method 为 "getPlayInfo" 时生效。
- * 命中后向上层发出 getPlayInfoRequested 信号，由其他组件组织响应内容。
+ * 普通请求沿用 getPlayInfoRequested；高清只捕获无图片的状态快照并进入独立队列，
+ * 后台完成后返回 sendPlayInfoFromCompany，不修改普通截图缓存和 pending 状态。
  *
  * @param topic      请求 topic。
  * @param payloadObj 请求 payload 对象。
  * @param method     已提取的 method 字段。
  * @return true  已识别并处理该请求，或处理失败但已消费该请求。
- * @return false 当前消息不是 getPlayInfo 请求。
+ * @return false 当前消息不是上述两类请求。
  */
 bool MqttManager::handleGetPlayInfo(const QString &topic, const QJsonObject &payloadObj, const QString &method)
 {
-    if (method != "getPlayInfo") {
+    const bool company = method == QLatin1String("getPlayInfoFromCompany");
+    if (method != "getPlayInfo" && !company) {
         return false;
     }
 
@@ -4662,13 +4692,24 @@ bool MqttManager::handleGetPlayInfo(const QString &topic, const QJsonObject &pay
         return true;
     }
 
-    const QString reqId = payloadObj.value("id").toString().trimmed();
+    const QString reqId = company ? payloadObj.value("id").toString()
+                                 : payloadObj.value("id").toString().trimmed();
     const QString deviceId = payloadObj.value("deviceId").toString().trimmed();
 
-    emit logMessage(QString("收到 getPlayInfo 请求：topic=%1 id=%2 deviceId=%3")
-                    .arg(topic, reqId, deviceId));
+    if (!company) {
+        emit logMessage(QString("收到 getPlayInfo 请求：topic=%1 id=%2 deviceId=%3")
+                        .arg(topic, reqId, deviceId));
+    }
 
-    emit getPlayInfoRequested(topic, reqId, deviceId);
+    if (company) {
+        if (companyPlayInfo_) {
+            companyPlayInfo_->enqueue(service_->buildPlayInfoPublishPacket(
+                                         topic, reqId, deviceId, nullptr,
+                                         QStringLiteral("sendPlayInfoFromCompany"), false));
+        }
+    } else {
+        emit getPlayInfoRequested(topic, reqId, deviceId);
+    }
     return true;
 }
 
@@ -4819,6 +4860,15 @@ bool MqttManager::handleVideoControl(const QString &topic,
     const bool isRecordedNoVideoPathRequest =
             (videoType == "RECORDED" && videoPath.isEmpty());
 
+    // 仅阻止会下载媒体或重新启动播放的请求；原有回执过滤、音量和停止命令继续沿用。
+    if ((multimediaUpdate_ || multimediaRestartPending_) &&
+        (videoType == "LIVE" || isRecordedDownloadRequest || isRecordedNoVideoPathRequest)) {
+        const QString reason = QStringLiteral("资源包更新进行中，请稍后重试");
+        sendVideoControlAckNow(topic, payloadObj, false, false, true, false,
+                              QStringLiteral("download_busy"), reason);
+        return true;
+    }
+
     if (videoType == "LIVE" && recordedDownloadTaskActive_) {
         const QString reason = QStringLiteral("RECORDED 下载进行中，暂不能切换到 LIVE");
         emit logMessage(reason);
@@ -4922,6 +4972,109 @@ bool MqttManager::handleVideoControl(const QString &topic,
     return true;
 }
 
+
+/** @brief 受理资源包并将工作线程状态转为四个进度回执及一次终态，提交 ok 后才放行覆盖。 */
+bool MqttManager::handleMultimediaControl(const QString &topic, const QJsonObject &payloadObj)
+{
+    if (payloadObj.value("method").toString() != "multimediaControl") return false;
+    const QString eventTopic = cfg_.publishTopic;
+    const QStringList parts = eventTopic.split('/');
+    if (parts.size() != 4 || parts.at(0) != "device" || parts.at(1) != "ycLinux" ||
+        parts.at(2).isEmpty() || parts.at(3) != "event") return true;
+    const QString deviceId = parts.at(2);
+    if (topic != QStringLiteral("device/ycLinux/%1/request").arg(deviceId) ||
+        payloadObj.value("deviceId").toString() != deviceId) {
+        emit logMessage(QStringLiteral("multimediaControl 主题或设备号不匹配，忽略请求"));
+        return true;
+    }
+    const QString id = payloadObj.value("id").toString();
+    if (id.trimmed().isEmpty()) {
+        emit logMessage(QStringLiteral("multimediaControl 缺少 id，忽略请求"));
+        return true;
+    }
+    // 回执只构造协议白名单字段，绝不复制下发 ftp 凭据。
+    const auto publish = [this, eventTopic, deviceId, id](const QJsonObject &data) {
+        const QJsonObject payload{{"method", "multimediaControl"}, {"id", id},
+                                  {"deviceId", deviceId}, {"data", data},
+                                  {"time", QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss")}};
+        return publishJsonPacket({{"cmd", "publish"}, {"topic", eventTopic}, {"payload", payload}},
+                                 QStringLiteral("multimediaControl"));
+    };
+    if (multimediaRequestIds_.contains(id) ||
+        ((multimediaUpdate_ || multimediaRestartPending_) && multimediaActiveId_ == id)) return true;
+    multimediaRequestIds_.insert(id);
+    multimediaRequestOrder_.enqueue(id);
+    while (multimediaRequestOrder_.size() > 64) multimediaRequestIds_.remove(multimediaRequestOrder_.dequeue());
+    if (multimediaUpdate_ || multimediaRestartPending_ || recordedDownloadTaskActive_) {
+        publish({{"status", "failed"}, {"ftpDownload", "0%"}, {"errorCode", "BUSY"},
+                 {"errorMsg", QStringLiteral("已有资源更新或视频下载任务")}});
+        return true;
+    }
+    const QJsonObject data = payloadObj.value("data").toObject();
+    const QString version = data.value("configVersion").toString();
+    const QString root = QDir(Rk3566Platform::staticRoot()).filePath(QStringLiteral("demoResources/images"));
+    const QString control = QStringLiteral("/usr/local/sbin/weston-control");
+    const QStringList restart{QStringLiteral("systemd-run"),
+                             QStringLiteral("--unit=ycest-mqtt-resource-") + QUuid::createUuid().toString(QUuid::Id128),
+                             QStringLiteral("--on-active=3s"), QStringLiteral("--timer-property=AccuracySec=100ms"),
+                             QStringLiteral("--timer-property=RemainAfterElapse=no"), QStringLiteral("--collect"),
+                             control, QStringLiteral("apply-layout"), QDir(root).filePath("logo/ycest_cfg.ini")};
+    auto *worker = new MultimediaUpdate({data, root, restart, QStringLiteral("/mnt/app/net_cfg.ini")}, this);
+    multimediaUpdate_ = worker;
+    multimediaActiveId_ = id;
+    auto *submitTimer = new QTimer(worker); // 对象亲和性仍属主线程，只有 run 在后台运行。
+    submitTimer->setInterval(1000);
+    auto bands = std::make_shared<MultimediaProgressBands>();
+    auto lastPercent = std::make_shared<int>(0);
+    connect(worker, &MultimediaUpdate::progress, this,
+            [this, version, publish, bands, lastPercent](int percent, const QString &current) {
+        *lastPercent = percent;
+        emit multimediaUpdateProgress(version, percent, false, false);
+        // 小文件可能一次采样跨过多个区间；补发已跨越的区间边界，每段严格一次。
+        for (const int progress : bands->advance(percent)) {
+            publish({{"status", "downloading"},
+                     {"ftpDownload", QStringLiteral("%1%").arg(progress)},
+                     {"current", current}});
+        }
+    });
+    const auto submit = [worker, submitTimer, publish, version]() {
+        const QJsonObject success{{"status", "ok"}, {"ftpDownload", "100%"},
+                                  {"configVersion", version}, {"errorCode", QJsonValue::Null},
+                                  {"errorMsg", QJsonValue::Null}};
+        if (publish(success)) {
+            submitTimer->stop();
+            worker->authorizeCommit(true);
+        }
+    };
+    connect(submitTimer, &QTimer::timeout, this, submit);
+    connect(worker, &MultimediaUpdate::prepared, this, [submitTimer, submit]() {
+        submitTimer->start();
+        submit();
+    });
+    connect(worker, &MultimediaUpdate::completed, this,
+            [this, submitTimer, version, publish, lastPercent](bool success, bool acknowledged,
+                                                                    const QString &code, const QString &message) {
+        submitTimer->stop();
+        if (success) multimediaRestartPending_ = true;
+        if (!success && !acknowledged)
+            publish({{"status", "failed"}, {"ftpDownload", QStringLiteral("%1%").arg(*lastPercent)},
+                     {"errorCode", code}, {"errorMsg", message.left(500)}});
+        if (!success) {
+            emit logMessage(QStringLiteral("multimediaControl 本地处理失败：%1 %2").arg(code, message));
+            emit videoControlNotice(message);
+        }
+        emit multimediaUpdateProgress(version, *lastPercent, true, success);
+    });
+    connect(worker, &QThread::finished, this, [this, worker]() {
+        if (multimediaUpdate_ == worker) {
+            multimediaUpdate_ = nullptr;
+            if (!multimediaRestartPending_) multimediaActiveId_.clear();
+        }
+        worker->deleteLater();
+    });
+    worker->start(QThread::LowPriority);
+    return true;
+}
 
 /** @brief 立即构建并发布 videoControl 确认包。 */
 void MqttManager::sendVideoControlAckNow(const QString &reqTopic, const QJsonObject &reqPayload, bool ok,
@@ -5378,6 +5531,14 @@ void MqttManager::sendPlayInfoNow(const QString &reqTopic,
     } else {
         emit logMessage("发送 sendPlayInfo 失败：IPC write 失败");
     }
+}
+
+/** @brief 在 MQTT 对象线程转交原图；独立队列核对 token 并启动后台编码。 */
+void MqttManager::submitCompanySnapshot(const QString &token, const QImage &uiImage,
+                                      const QImage &videoImage, const QRect &videoRect, const QString &reason)
+{
+    if (companyPlayInfo_)
+        companyPlayInfo_->submitFrame(token, uiImage, videoImage, videoRect, reason);
 }
 
 

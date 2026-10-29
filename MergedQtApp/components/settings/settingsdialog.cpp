@@ -2,8 +2,9 @@
  * @file settingsdialog.cpp
  * @brief 网络、蓝牙、MQTT、系统、显示、待机和 FTP 页面容器及信号中转器的实现。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-10-24；修改人：Du lin；转发资源包版本进度到主窗口，不将资源文件误送入原视频下载完成链路。
  */
 
 #include "settingsdialog.h"
@@ -334,6 +335,8 @@ void SettingsDialog::setupConnections()
             this, &SettingsDialog::mqttConnMarkChanged);
     connect(mqttPage, &MqttPage::videoControlNotice,
             this, &SettingsDialog::videoControlNotice);
+    connect(mqttPage, &MqttPage::multimediaUpdateProgress,
+            this, &SettingsDialog::multimediaUpdateProgress);
 
 
     connect(mqttPage, &MqttPage::liveStreamReady,

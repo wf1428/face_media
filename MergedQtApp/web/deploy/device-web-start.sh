@@ -3,6 +3,7 @@
 # @brief 等待 Qt 身份稳定后启动可选热点与 Web 子进程，失败不阻塞 Qt。
 # @author Du lin
 # @date 2026-10-16
+# @note 最近修改：2026-10-26；修改人：Du lin；在 Qt 身份稳定后等待 Qt 异步启用的 NM，避免镜像禁用 NM 自启后热点过早检测退出；不主动重启或启用全局服务。
 
 set -eu
 
@@ -68,6 +69,16 @@ if [ "$stable" -lt "$QT_STABLE_SECONDS" ]; then
     log 'Qt Web interface did not become stable before timeout; portal skipped'
     exit 0
 fi
+# Qt 网络线程负责按需启动 NM；等待不更改任何接口或全局服务配置。
+nm_waited=0
+while ! timeout 3 nmcli --wait 1 -t -f RUNNING general 2>/dev/null | grep -Fxq running; do
+    if [ "$nm_waited" -ge 30 ]; then
+        log 'NetworkManager did not become ready after Qt startup; optional portal skipped'
+        exit 0
+    fi
+    sleep 1
+    nm_waited=$((nm_waited + 1))
+done
 if ! "$NETWORK" detect > /dev/null; then
     log 'No usable WiFi hotspot interface; Web server not started'
     exit 0

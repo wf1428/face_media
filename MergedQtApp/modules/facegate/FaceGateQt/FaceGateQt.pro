@@ -1,3 +1,7 @@
+# @file FaceGateQt.pro
+# @brief 人脸门禁独立应用的 Qt 模块、硬件依赖与源码登记。
+# @author Du lin
+# @note 最近修改：2026-10-27；修改人：Du lin；登记管理员页复用的共用动画滑动开关头文件，不改变独立应用的依赖和业务编译选项。
 QT += core gui widgets opengl sql virtualkeyboard network qml quick quickwidgets
 
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
@@ -96,6 +100,7 @@ SOURCES += \
 HEADERS += \
     ../../../common/face_image_sync_bridge.h \
     ../../../common/responsive_ui.h \
+    ../../../common/toggle_switch.h \
     ../../../common/storage_policy.h \
     ../../../common/sql/dbstore.h \
     ../../../common/sql/network_personnel_store.h \
