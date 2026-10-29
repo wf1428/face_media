@@ -1,8 +1,15 @@
+/**
+ * @file mqttd.c
+ * @brief libmosquitto 网络连接、配置重建与 Qt 本地 IPC 的守护进程。
+ * @author Du lin
+ * @note 最近修改：2026-10-24；修改人：Du lin；重连和退出统一先 disconnect 再非强制停止网络线程，
+ *       避免 pthread_cancel 遗留发包互斥锁；记录线程启动状态，停止失败保留旧句柄，修正 apply 后周期发布的句柄读取时机并补充构建依赖说明。
+ */
 /*
  * mqttd.c - minimal MQTT daemon using libmosquitto
  *
  * Build:
- *   gcc -O2 -Wall -Wextra -o mqttd mqttd.c -lmosquitto -lpthread
+ *   gcc -O2 -Wall -Wextra -o mqttd mqttd.c $(pkg-config --cflags --libs libmosquitto libcjson) -lpthread
  *
  * Example (no TLS):
  *   ./mqttd -h 192.168.3.11 -p 1884 -i t113-001 -t test -v
@@ -83,7 +90,9 @@ typedef struct ipc_tx_item {
 } ipc_tx_item_t;
 
 
-/*
+/**
+ * @brief mqttd 运行配置、线程和 IPC 生命周期状态。
+ * @details 主线程在 mosq_lock 内启动/停止网络线程；回调仅使用独立状态/IPC 锁，不获取 mosq_lock。
  * mqttd_cfg_t：运行配置结构体（把命令行参数解析的结果都存这里）
  * - 回调函数（on_connect/on_message 等）只给 userdata 指针
  *   把 cfg 地址作为 userdata 传进去，回调里就能访问所有配置
@@ -148,6 +157,7 @@ typedef struct {
 
     /* ======== mosquitto 句柄（用于 apply 重建） ======== */
     struct mosquitto *mosq;
+    int mosq_loop_started; /**< 1 表示 loop_start 成功且尚未 join；仅主线程在 mosq_lock 内读写。 */
     pthread_mutex_t mosq_lock;  // apply 时保护 mosq 重建
 
     /* ======== MQTT 连接状态（给 Qt 显示/测试连接用） ======== */
@@ -1533,16 +1543,52 @@ static void on_message(struct mosquitto *mosq, void *userdata, const struct mosq
 }
 
 
+/**
+ * @brief 请求正常断开并等待网络线程退出，成功后释放当前客户端。
+ * @param cfg 非空运行配置，调用者已持有 mosq_lock；回调不能获取该锁。
+ * @return 成功或原本无客户端时为 MOSQ_ERR_SUCCESS；否则返回 disconnect/loop_stop 错误码。
+ * @note 仅主线程调用；loop_stop(false) 会等待网络线程退出，不设置硬超时。
+ *       禁止强制取消网络线程，避免遗留 libmosquitto 内部发包锁。
+ *       失败保留句柄和线程状态，调用者不得继续销毁句柄或释放其回调 userdata。
+ */
+static int mqtt_stop_and_destroy_locked(mqttd_cfg_t *cfg)
+{
+    if (!cfg->mosq) return MOSQ_ERR_SUCCESS;
+
+    if (cfg->verbose) fprintf(stderr, "[mqttd] stopping MQTT: disconnect begin loopStarted=%d\n", cfg->mosq_loop_started);
+    int rc = mosquitto_disconnect(cfg->mosq);
+    if (rc != MOSQ_ERR_SUCCESS && rc != MOSQ_ERR_NO_CONN) {
+        fprintf(stderr, "[mqttd] disconnect failed: %s; retaining client\n", mosquitto_strerror(rc));
+        return rc;
+    }
+
+    if (cfg->mosq_loop_started) {
+        if (cfg->verbose) fprintf(stderr, "[mqttd] stopping MQTT: graceful loop_stop begin\n");
+        rc = mosquitto_loop_stop(cfg->mosq, false);
+        if (rc != MOSQ_ERR_SUCCESS) {
+            fprintf(stderr, "[mqttd] graceful loop_stop failed: %s; retaining client\n", mosquitto_strerror(rc));
+            return rc;
+        }
+        cfg->mosq_loop_started = 0;
+    }
+
+    mosquitto_destroy(cfg->mosq);
+    cfg->mosq = NULL;
+    if (cfg->verbose) fprintf(stderr, "[mqttd] stopping MQTT: client destroyed\n");
+    return MOSQ_ERR_SUCCESS;
+}
+
+/**
+ * @brief 完成旧连接的安全退出后，按当前配置创建并启动新 MQTT 客户端。
+ * @param cfg 非空运行配置，调用者已持有 mosq_lock。
+ * @return MOSQ_ERR_SUCCESS 表示网络线程启动成功，不代表 Broker 已接受连接；其他值为具体失败码。
+ * @note 认证、TLS、异步连接或线程启动失败时保留尚未运行的句柄，由下一次 apply 或退出清理。
+ *       只有 loop_start 成功才置 mosq_loop_started，避免停止从未启动的线程。
+ */
 static int mqtt_build_and_start_locked(mqttd_cfg_t *cfg)
 {
-    // 调用者必须已经持有 cfg->mosq_lock
-
-    if (cfg->mosq) {
-        mosquitto_loop_stop(cfg->mosq, true);
-        mosquitto_disconnect(cfg->mosq);
-        mosquitto_destroy(cfg->mosq);
-        cfg->mosq = NULL;
-    }
+    int stopped = mqtt_stop_and_destroy_locked(cfg);
+    if (stopped != MOSQ_ERR_SUCCESS) return stopped;
 
     cfg->mosq = mosquitto_new(cfg->client_id, cfg->clean_session, cfg);
     if (!cfg->mosq) {
@@ -1562,13 +1608,12 @@ static int mqtt_build_and_start_locked(mqttd_cfg_t *cfg)
                                   NULL,          // capath
                                   cfg->certfile, // certfile
                                   cfg->keyfile,  // keyfile
-                                  NULL);         // pw_callback
+                                  NULL);
         if (r != MOSQ_ERR_SUCCESS) return r;
 
         mosquitto_tls_insecure_set(cfg->mosq, cfg->tls_insecure);
     }
 
-    // Callbacks
     mosquitto_connect_callback_set(cfg->mosq, on_connect);
     mosquitto_disconnect_callback_set(cfg->mosq, on_disconnect);
     mosquitto_message_callback_set(cfg->mosq, on_message);
@@ -1576,13 +1621,20 @@ static int mqtt_build_and_start_locked(mqttd_cfg_t *cfg)
     if (cfg->verbose) mosquitto_log_callback_set(cfg->mosq, on_log);
 
     mosquitto_reconnect_delay_set(cfg->mosq, 1, 60, true);
-
     int cr = mosquitto_connect_async(cfg->mosq, cfg->host, cfg->port, cfg->keepalive);
     if (cr != MOSQ_ERR_SUCCESS) return cr;
 
     int lr = mosquitto_loop_start(cfg->mosq);
+    if (lr == MOSQ_ERR_SUCCESS) cfg->mosq_loop_started = 1;
     return lr;
 }
+
+/**
+ * @brief 在主线程串行应用当前连接配置；等待旧线程正常退出后才建立新客户端。
+ * @param cfg 非空运行配置；状态变更由 state_lock 保护，客户端生命周期由 mosq_lock 保护。
+ * @return 网络线程启动结果；失败由原 apply 回执和重试机制处理。
+ * @note 本调用可能等待 libmosquitto 退出，期间 IPC 主循环不处理新命令；不承诺固定退出时限。
+ */
 
 static int mqtt_apply_reconnect(mqttd_cfg_t *cfg)
 {
@@ -1819,10 +1871,6 @@ int main(int argc, char **argv)
         // 如果 Qt 还没连上，尝试 accept
         ipc_accept_if_needed(&cfg);
 
-        pthread_mutex_lock(&cfg.mosq_lock);
-        struct mosquitto *m = cfg.mosq;
-        pthread_mutex_unlock(&cfg.mosq_lock);
-
         // 如果 Qt 已连上，读取它发来的命令并回复（test/status）
         ipc_read_loop(&cfg);
 
@@ -1852,6 +1900,11 @@ int main(int argc, char **argv)
             }
         }
 
+        // apply 或重试可能已销毁旧句柄，周期发布必须在它们之后读取当前句柄。
+        pthread_mutex_lock(&cfg.mosq_lock);
+        struct mosquitto *m = cfg.mosq;
+        pthread_mutex_unlock(&cfg.mosq_lock);
+
         if (cfg.pub_topic && cfg.pub_msg && cfg.pub_interval_sec > 0) {
             if(m){
                 // 周期性发布
@@ -1877,13 +1930,13 @@ int main(int argc, char **argv)
     }
     
     pthread_mutex_lock(&cfg.mosq_lock);
-    if (cfg.mosq) {
-        mosquitto_disconnect(cfg.mosq);
-        mosquitto_loop_stop(cfg.mosq, true);
-        mosquitto_destroy(cfg.mosq);
-        cfg.mosq = NULL;
-    }
+    int stop_rc = mqtt_stop_and_destroy_locked(&cfg);
     pthread_mutex_unlock(&cfg.mosq_lock);
+    if (stop_rc != MOSQ_ERR_SUCCESS) {
+        // 仍可能有网络线程使用 cfg，不能执行 free_cfg；进程退出由系统回收资源。
+        fprintf(stderr, "[mqttd] shutdown aborted after client stop failure: %s\n", mosquitto_strerror(stop_rc));
+        return 1;
+    }
 
     ipc_tx_stop(&cfg);
     
