@@ -104,6 +104,28 @@ PIR 触发后，pic显示摄像头识别界面。
 8、修复一些已知问题。
 
 
+############ r2.1.2  2026/10/29 ############
+1、新增multimediaControl多媒体屏模版协议，平台修改ui资源，通过multimediaControl下发资源，FTP进行下载。
+2、新增高清截图协议getPlayInfoFromCompany/sendPlayInfoFromCompany，与原getPlayInfo / sendPlayInfo不冲突
+      限制base64字节大小为1M。
+3、优化mqttd，在进行mqtt重连时，偶发性会造成死锁问题。
+4、优化参数判断，当设置VideoDisplay_en为false时，触发人脸识别后，视频正常播放，没有以这个参数为前提判断。
+      导致在设置为false下，部分情况会触发视频区域播放。
+5、优化qt内部独立DHCP网络相关配置，统一由NetworkManager管理，并且增加选择网卡速率开关link_mode，默认为百兆100-full。
+6、增加LED启用开关fillLight，无该参数项默认启用。
+7、在ALD1054-01中性_10.4寸这款1024x768高清屏，需要关掉ssc，不然屏幕下方会出现纹闪现象。涉及的设备树overlay文件有：
+      rk3568-lubancat-2h-lvds-hdmi-1024-768.dts、rk3568-lubancat-2h-YC-lvds-1024-768.dts
+8、修复一些已知问题。
+
+
+############ r2.1.3  2026/11/5 ############
+1、优化当设置VideoDisplay_en为false时，触发人脸识别后，视频正常播放，没有以这个参数为前提判断。
+2、新增轿厢远程通话协议call，优化通话质量，采用AEC、AGC、预处理降噪等方式提高语音质量。
+      解决音频卡顿现象，优化PCM上传数据帧耗时。
+3、优化参数判断，当设置VideoDisplay_en为false时，触发人脸识别后，视频正常播放，没有以这个参数为前提判断。
+      导致在设置为false下，部分情况会触发视频区域播放。
+4、优化udisk脚本，u盘更新ui资源时，先进行文件校验，下载到临时目录，文件校验通过后，再进行覆盖旧资源。
+5、修复一些已知问题。
 
 
 
