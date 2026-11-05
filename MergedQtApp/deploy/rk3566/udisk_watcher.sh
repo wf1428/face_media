@@ -2,7 +2,7 @@
 # @file udisk_watcher.sh
 # @brief 监听 U 盘并导入 UI、视频及协调人员导入导出。
 # @author Du lin
-# @note 最近修改：2026-10-24；修改人：Du lin；资源拷贝取得与 MQTT/Web 更新及媒体传输共用的独占锁，忙碌时留待下一轮重试。
+# @note 最近修改：2026-11-03；修改人：Du lin；保留UI整批暂存校验与回滚，按本批文件总量保留剩余空间检查、取消固定预留；兼容文件属性复制；日志不可写和提交后备份清理失败不再误判文件错误，任一UI文件最终失败仍禁止整批发布。
 
 # 最终拷贝目的目录（视频仍然拷到这里的根目录）
 UDISK_DIR="/mnt/UDISK"
@@ -114,6 +114,14 @@ restart_current_program() {
 }
 
 
+# 日志是辅助信息；不可打开时改用空设备，避免stderr重定向失败阻断实际文件操作。
+# 仅调整本进程的LOG_FILE，不影响状态JSON或文件完整性校验。
+prepare_update_log() {
+    if ! ( : >> "$LOG_FILE" ) 2>/dev/null; then
+        LOG_FILE="/dev/null"
+    fi
+}
+
 ulog() {
     ts="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
     [ -z "$ts" ] && ts="TIME"
@@ -143,6 +151,16 @@ write_status() {
     current_file="$9"
     error_code="${10}"
     task="${11:-video}"
+
+    # 同一批次只记住首个实际错误，后续复制进度不能把文件错误覆盖为成功。
+    if [ "${JOB_TRACKING:-0}" -eq 1 ] && [ "$error_code" -ne 0 ]; then
+        ulog "update file error: code=$error_code file=$current_file message=$message"
+        if [ "${JOB_ERROR_CODE:-0}" -eq 0 ]; then
+            JOB_ERROR_CODE="$error_code"
+            JOB_ERROR_TEXT="$message"
+            [ -z "$current_file" ] || JOB_ERROR_TEXT="$JOB_ERROR_TEXT：$current_file"
+        fi
+    fi
 
     ts="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
     [ -z "$ts" ] && ts="TIME"
@@ -332,202 +350,248 @@ has_non_video_dirs_under_ycest() {
 }
 
 
-# =========================
-# 0) U盘内自拷贝 Ycest 下除 video、person 外的目录 -> images（最先执行）
-#    从:  <mountp>/Ycest 下除 video、person 外的所有子目录
-#    到:  /mnt/UDISK/res/static/demoResources/images
-# =========================
+# 仅接受直接 UI 目录名；禁止让暂存/回滚路径越过 images 或进入 video/person。
+ui_resource_name_valid() {
+    ui_name_cr="$(printf '\r')"
+    case "$1" in
+        ''|.|..|.*|*/*|video|person|*'
+'*|*"$ui_name_cr"*) return 1 ;;
+    esac
+    return 0
+}
+
+# $1 为同一 images 文件系统内的固定工作目录。只删除带本脚本版本标记的暂存区。
+ui_remove_work() {
+    [ "$1" = "$STATIC_DST_DIR/.udisk-ui-update" ] && [ ! -L "$1" ] || return 1
+    [ "$(cat "$1/format" 2>/dev/null)" = "udisk-ui-v1" ] || return 1
+    rm -rf "$1" 2>>"$LOG_FILE"
+}
+
+# 持独占锁调用；根据发布前落盘的 plan/original 恢复未提交更新。
+# 返回非零时保留备份与日志，禁止后续覆盖；committed 只表示整批目录已发布，不重放 U 盘源。
+recover_ui_transaction() {
+    ur_work="$STATIC_DST_DIR/.udisk-ui-update"
+    [ -e "$ur_work" ] || [ -L "$ur_work" ] || return 0
+    [ -d "$ur_work" ] && [ ! -L "$ur_work" ] &&
+        [ "$(cat "$ur_work/format" 2>/dev/null)" = "udisk-ui-v1" ] || return 1
+    if [ -f "$ur_work/publishing" ] && [ ! -f "$ur_work/committed" ]; then
+        [ -f "$ur_work/plan" ] && [ ! -L "$ur_work/plan" ] || return 1
+        # 先校验完整计划，再执行任何删除或改名。
+        while IFS= read -r ur_name; do
+            ui_resource_name_valid "$ur_name" || return 1
+        done < "$ur_work/plan"
+        while IFS= read -r ur_name; do
+            ur_target="$STATIC_DST_DIR/$ur_name"
+            ur_backup="$ur_work/backup/$ur_name"
+            if [ -f "$ur_work/original/$ur_name" ]; then
+                if [ -e "$ur_backup" ] || [ -L "$ur_backup" ]; then
+                    rm -rf "$ur_target" 2>>"$LOG_FILE" || return 1
+                    mv "$ur_backup" "$ur_target" 2>>"$LOG_FILE" || return 1
+                else
+                    [ -e "$ur_target" ] || [ -L "$ur_target" ] || return 1
+                fi
+            elif [ ! -e "$ur_work/stage/$ur_name" ]; then
+                # 原先不存在且已发布的目录，回滚时移除；尚在 stage 的不动正式目录。
+                rm -rf "$ur_target" 2>>"$LOG_FILE" || return 1
+            fi
+        done < "$ur_work/plan"
+        sync || return 1
+        ulog "unfinished UI update rolled back: $ur_work"
+    fi
+    ui_remove_work "$ur_work"
+}
+
+# $1=错误码，$2=说明，$3=可选文件。只记录错误，待工作函数返回、清单句柄关闭后统一回滚。
+ui_update_failed() {
+    UI_FAILURE_CODE="$1"; UI_FAILURE_MESSAGE="$2"; UI_FAILURE_FILE="${3:-}"
+    ulog "UI update failed: code=$UI_FAILURE_CODE message=$UI_FAILURE_MESSAGE file=$UI_FAILURE_FILE"
+    return 1
+}
+
+# 清单重定向退出后才恢复/清理，避免回滚时仍持有正在读取的暂存文件。
+# 返回0表示更新或跳过成功；非零失败先尝试恢复，恢复失败保留备份与错误状态。
 copy_ycest_non_video_dirs_to_udisk_images_with_progress() {
-    mountp="$1"
-    src_root="${mountp}/${YCEST_SUBDIR}"       # <mountp>/Ycest
-    dst_dir="${UDISK_DIR}/${QRC_DST_SUBDIR}"   # /mnt/UDISK/res/static/demoResources/images
+    UI_FAILURE_CODE=603; UI_FAILURE_MESSAGE="暂存目录创建失败，设备原文件已保留"; UI_FAILURE_FILE=""
+    UI_KEEP_WORK=0
+    stage_and_publish_ui_resources "$1"
+    ui_copy_rc=$?
+    [ "$ui_copy_rc" -ne 0 ] || return 0
+    if [ "$UI_KEEP_WORK" -ne 0 ]; then
+        : # 新资源已完整发布，但完成标记无法清除；保留备份并报告错误。
+    elif ! recover_ui_transaction; then
+        UI_FAILURE_CODE=615
+        UI_FAILURE_MESSAGE="文件更新失败，旧资源恢复失败，请检查日志"
+    fi
+    write_status "error" "$UI_FAILURE_MESSAGE" "$1" "$1/$YCEST_SUBDIR" "$STATIC_DST_DIR" 0 0 0 "$UI_FAILURE_FILE" "$UI_FAILURE_CODE" "qrc"
+    return "$ui_copy_rc"
+}
 
-    if ! is_dir_readable "$src_root"; then
-        write_status "error" "U盘未找到Ycest目录或不可读" "$mountp" "$src_root" "$dst_dir" 0 0 0 "" 601 "qrc"
+# 先枚举/暂存/校验整批非空一级 UI 目录，再以备份改名发布；缺失和空目录保留设备原目录。
+# $1=U盘挂载点。返回0表示完成或无UI可更新，非零表示失败且已尝试回滚。
+# UI_PUBLISHED_COUNT 为本次真正替换的目录数；所有临时清单放在设备 images 文件系统。
+# 此工作函数只记录失败，外层负责在清单句柄关闭后执行回滚。
+stage_and_publish_ui_resources() {
+    UI_PUBLISHED_COUNT=0
+    ui_mount="$1"; ui_source="$1/$YCEST_SUBDIR"
+    ui_work="$STATIC_DST_DIR/.udisk-ui-update"
+    if ! recover_ui_transaction; then
+        write_status "error" "文件更新恢复失败，备份已保留，请检查设备日志" "$ui_mount" "$ui_source" "$STATIC_DST_DIR" 0 0 0 "" 615 "qrc"
         return 1
     fi
-
-    if ! is_dir_readable "$UDISK_DIR" || ! is_dir_writable "$UDISK_DIR"; then
-        write_status "error" "文件不可写，无法进行拷贝" "$mountp" "$src_root" "$dst_dir" 0 0 0 "" 602 "qrc"
+    [ -e "$ui_source" ] || return 0
+    if [ -L "$ui_source" ] || ! is_dir_readable "$ui_source"; then
+        write_status "error" "Ycest目录错误或不可读，设备原文件已保留" "$ui_mount" "$ui_source" "$STATIC_DST_DIR" 0 0 0 "" 601 "qrc"
         return 1
     fi
-
-    if ! ensure_dir_writable "$dst_dir"; then
-        write_status "error" "目标目录不可创建或不可写" "$mountp" "$src_root" "$dst_dir" 0 0 0 "" 603 "qrc"
-        return 1
-    fi
-
-    # 没有除 video、person 外的UI资源目录：直接跳过，不报错
-    if ! has_non_video_dirs_under_ycest "$mountp"; then
-        write_status "copying" "未找到文件夹，跳过资源拷贝..." \
-            "$mountp" "$src_root" "$dst_dir" 100 0 0 "" 0 "qrc"
-        return 0
-    fi
-
-    # 优先逐文件拷贝，支持进度与拔出检测
-    if command -v find >/dev/null 2>&1 && command -v wc >/dev/null 2>&1; then
-        tmp_dir_list="/tmp/ycest_dir_list.$$"
-        tmp_file_list="/tmp/ycest_file_list.$$"
-
-        : > "$tmp_dir_list"
-        : > "$tmp_file_list"
-
-        for d in "$src_root"/*; do
-            [ -d "$d" ] || continue
-            name="${d##*/}"
-            case "$name" in
-                video|person) continue ;;
-            esac
-
-            # 先记录一级目录本身
-            echo "$name" >> "$tmp_dir_list" 2>/dev/null
-
-            # 再记录该目录下的子目录（相对 Ycest）
-            find "$d" -mindepth 1 -type d 2>/dev/null | sed "s#^$src_root/##" >> "$tmp_dir_list" 2>/dev/null
-
-            # 记录该目录下所有文件（相对 Ycest）
-            find "$d" -type f 2>/dev/null | sed "s#^$src_root/##" >> "$tmp_file_list" 2>/dev/null
-        done
-
-        # 先创建目录结构
-        while IFS= read -r rel_dir; do
-            [ -n "$rel_dir" ] || continue
-            mkdir -p "$dst_dir/$rel_dir" 2>/dev/null || {
-                rm -f "$tmp_dir_list" "$tmp_file_list" 2>/dev/null
-                write_status "error" "目标目录创建失败" "$mountp" "$src_root" "$dst_dir" 0 0 0 "$rel_dir" 604 "qrc"
-                return 1
-            }
-        done < "$tmp_dir_list"
-
-        total="$(wc -l < "$tmp_file_list" 2>/dev/null)"
-        [ -z "$total" ] && total=0
-
-        # 只有目录没有文件，也算成功
-        if [ "$total" -le 0 ]; then
-            rm -f "$tmp_dir_list" "$tmp_file_list" 2>/dev/null
-            sync
-            write_status "copying" "资源目录已同步，未发现可拷贝文件..." "$mountp" "$src_root" "$dst_dir" 100 0 0 "" 0 "qrc"
-            return 0
-        fi
-
-        done_count=0
-        while IFS= read -r rel; do
-            [ -n "$rel" ] || continue
-
-            cur="$(find_mountpoint_under_base "$MOUNT_BASE" 2>/dev/null)"
-            if [ -z "$cur" ] || [ "$cur" != "$mountp" ]; then
-                prog=$((done_count * 100 / total))
-                write_status "error" "拷贝失败，U盘被拔出" "$mountp" "$src_root" "$dst_dir" "$prog" "$done_count" "$total" "" 611 "qrc"
-                rm -f "$tmp_dir_list" "$tmp_file_list" 2>/dev/null
-                return 2
-            fi
-
-            prog=$((done_count * 100 / total))
-            write_status "copying" "正在拷贝资源..." "$mountp" "$src_root" "$dst_dir" "$prog" "$done_count" "$total" "$rel" 0 "qrc"
-
-            subdir="$(dirname "$rel" 2>/dev/null)"
-            if [ -n "$subdir" ] && [ "$subdir" != "." ]; then
-                mkdir -p "$dst_dir/$subdir" 2>/dev/null
-            fi
-
-            cp -p -f "$src_root/$rel" "$dst_dir/$rel" 2>/dev/null
-            if [ $? -ne 0 ]; then
-                prog=$((done_count * 100 / total))
-                write_status "error" "拷贝失败，复制出错" "$mountp" "$src_root" "$dst_dir" "$prog" "$done_count" "$total" "$rel" 612 "qrc"
-                rm -f "$tmp_dir_list" "$tmp_file_list" 2>/dev/null
-                return 1
-            fi
-
-            done_count=$((done_count + 1))
-        done < "$tmp_file_list"
-
-        rm -f "$tmp_dir_list" "$tmp_file_list" 2>/dev/null
-        sync
-        write_status "copying" "资源拷贝完成，准备同步..." "$mountp" "$src_root" "$dst_dir" 100 "$done_count" "$total" "" 0 "qrc"
-        return 0
-    fi
-
-    # 降级方案：整体按目录拷贝
-    write_status "copying" "正在拷贝资源..." "$mountp" "$src_root" "$dst_dir" 0 0 1 "" 0 "qrc"
-
-    copied_any=0
-    for d in "$src_root"/*; do
-        [ -d "$d" ] || continue
-        name="${d##*/}"
-        case "$name" in
-            video|person) continue ;;
-        esac
-
-        cp -a "$d" "$dst_dir"/ 2>/dev/null || cp -R "$d" "$dst_dir"/ 2>/dev/null
-        if [ $? -ne 0 ]; then
-            write_status "error" "资源拷贝失败（cp出错）" "$mountp" "$src_root" "$dst_dir" 0 0 0 "$name" 613 "qrc"
+    # 只有视频/人员或根目录散文件时，跳过UI检查，不改变原媒体/人员入口。
+    has_non_video_dirs_under_ycest "$ui_mount" || return 0
+    for ui_tool in find cksum df awk; do
+        command -v "$ui_tool" >/dev/null 2>&1 || {
+            write_status "error" "文件检查工具缺失，设备原文件已保留" "$ui_mount" "$ui_source" "$STATIC_DST_DIR" 0 0 0 "$ui_tool" 602 "qrc"
             return 1
+        }
+    done
+    ensure_dir_writable "$STATIC_DST_DIR" || return 1
+    mkdir "$ui_work" 2>>"$LOG_FILE" || return 1
+    printf 'udisk-ui-v1\n' > "$ui_work/format" || return 1
+    mkdir "$ui_work/stage" "$ui_work/backup" "$ui_work/original" 2>>"$LOG_FILE" || {
+        ui_update_failed 603 "文件暂存目录创建失败，设备原文件已保留"; return 1;
+    }
+    : > "$ui_work/plan"; : > "$ui_work/files"; : > "$ui_work/checksums"
+    ui_bytes=0; ui_total=0
+    write_status "copying" "正在检查文件..." "$ui_mount" "$ui_source" "$STATIC_DST_DIR" 0 0 0 "" 0 "qrc"
+    for ui_item in "$ui_source"/*; do
+        [ -e "$ui_item" ] || [ -L "$ui_item" ] || continue
+        ui_name="${ui_item##*/}"
+        case "$ui_name" in video|person) continue ;; esac
+        [ -d "$ui_item" ] || [ -L "$ui_item" ] || continue
+        if ! ui_resource_name_valid "$ui_name" || [ -L "$ui_item" ]; then
+            ui_update_failed 606 "目录错误，设备原文件已保留" "$ui_name"; return 1
         fi
-        copied_any=1
+        # 单独检查 find 的退出码，不用管道的最后一条命令掩盖读取失败。
+        if ! find "$ui_item" ! -type f ! -type d -print > "$ui_work/special" 2>>"$LOG_FILE" ||
+           ! find "$ui_item" -type f -print > "$ui_work/current" 2>>"$LOG_FILE"; then
+            ui_update_failed 606 "文件读取失败，设备原文件已保留" "$ui_name"; return 1
+        fi
+        if [ -s "$ui_work/special" ]; then
+            ui_update_failed 606 "包含不支持的链接或文件，设备原文件已保留" "$ui_name"; return 1
+        fi
+        [ -s "$ui_work/current" ] || continue
+        printf '%s\n' "$ui_name" >> "$ui_work/plan" || { ui_update_failed 603 "清单写入失败"; return 1; }
+        while IFS= read -r ui_full; do
+            case "$ui_full" in "$ui_source"/*) ui_rel="${ui_full#"$ui_source"/}" ;; *) ui_update_failed 606 "文件路径错误"; return 1 ;; esac
+            [ -f "$ui_full" ] && [ ! -L "$ui_full" ] || { ui_update_failed 606 "文件不存在或名称不支持" "$ui_rel"; return 1; }
+            ui_sum="$(cksum < "$ui_full" 2>>"$LOG_FILE")" || { ui_update_failed 606 "文件校验失败" "$ui_rel"; return 1; }
+            printf '%s\n' "$ui_rel" >> "$ui_work/files" && printf '%s\n' "$ui_sum" >> "$ui_work/checksums" || {
+                ui_update_failed 603 "清单写入失败" "$ui_rel"; return 1;
+            }
+            set -- $ui_sum
+            ui_bytes=$((ui_bytes + $2)); ui_total=$((ui_total + 1))
+        done < "$ui_work/current"
+        if ! find "$ui_item" -type d -print > "$ui_work/directories" 2>>"$LOG_FILE"; then
+            ui_update_failed 606 "目录读取失败" "$ui_name"; return 1
+        fi
+        while IFS= read -r ui_full; do
+            case "$ui_full" in "$ui_source"/*) ui_rel="${ui_full#"$ui_source"/}" ;; *) ui_update_failed 606 "目录路径错误"; return 1 ;; esac
+            mkdir -p "$ui_work/stage/$ui_rel" 2>>"$LOG_FILE" || { ui_update_failed 604 "暂存目录创建失败" "$ui_rel"; return 1; }
+        done < "$ui_work/directories"
     done
-
-    sync
-
-    if [ "$copied_any" -eq 1 ]; then
-        write_status "copying" "资源已同步，准备同步..." "$mountp" "$src_root" "$dst_dir" 100 1 1 "" 0 "qrc"
-    else
-        write_status "copying" "未找到文件夹，跳过资源拷贝..." "$mountp" "$src_root" "$dst_dir" 100 0 0 "" 0 "qrc"
+    if [ "$ui_total" -eq 0 ]; then
+        ui_remove_work "$ui_work" || return 1
+        write_status "copying" "未提供非空UI资源目录，设备原资源已保留" "$ui_mount" "$ui_source" "$STATIC_DST_DIR" 100 0 0 "" 0 "qrc"
+        return 0
     fi
-
+    # 空间检查必做：按本批文件总字节数比较剩余空间，不额外强制预留64MiB。
+    # 读不到可靠空间信息就停止；实际复制写入和整批内容校验仍全部检查。
+    if ! df -Pk "$STATIC_DST_DIR" > "$ui_work/space" 2>>"$LOG_FILE"; then
+        ui_update_failed 607 "无法检查设备空间，原文件已保留"; return 1
+    fi
+    ui_free="$(awk 'NR > 1 { n=$4 } END { print n }' "$ui_work/space" 2>>"$LOG_FILE")"
+    case "$ui_free" in ''|*[!0-9]*) ui_update_failed 607 "设备空间信息错误，原文件已保留"; return 1 ;; esac
+    if [ "$ui_free" -lt "$(((ui_bytes + 1023) / 1024))" ]; then
+        ui_update_failed 607 "设备空间不足，原文件已保留"; return 1
+    fi
+    ui_done=0
+    while IFS= read -r ui_rel && IFS= read -r ui_expected <&3; do
+        ui_current_mount="$(find_mountpoint_under_base "$MOUNT_BASE" 2>/dev/null)"
+        if [ "$ui_current_mount" != "$ui_mount" ]; then
+            ui_update_failed 611 "U盘已移除，更新未完成，设备原文件已保留" "$ui_rel"; return 2
+        fi
+        write_status "copying" "正在校验..." "$ui_mount" "$ui_source" "$STATIC_DST_DIR" "$((ui_done * 100 / ui_total))" "$ui_done" "$ui_total" "$ui_rel" 0 "qrc"
+        if ! cp -p -f "$ui_source/$ui_rel" "$ui_work/stage/$ui_rel" 2>>"$LOG_FILE"; then
+            # 某些文件系统无法保留时间/权限；普通复制重试后仍必须通过全部内容校验。
+            ulog "UI attribute-preserving copy failed; retrying ordinary copy: $ui_rel"
+            if ! cp -f "$ui_source/$ui_rel" "$ui_work/stage/$ui_rel" 2>>"$LOG_FILE"; then
+                ui_update_failed 612 "文件复制失败，设备原文件已保留" "$ui_rel"; return 1
+            fi
+        fi
+        ui_actual="$(cksum < "$ui_work/stage/$ui_rel" 2>>"$LOG_FILE")" || { ui_update_failed 612 "暂存文件校验失败" "$ui_rel"; return 1; }
+        ui_source_sum="$(cksum < "$ui_source/$ui_rel" 2>>"$LOG_FILE")" || { ui_update_failed 611 "U盘文件读取失败" "$ui_rel"; return 1; }
+        if [ "$ui_actual" != "$ui_expected" ] || [ "$ui_source_sum" != "$ui_expected" ]; then
+            ui_update_failed 612 "文件不完整或复制期间已变化，原文件已保留" "$ui_rel"; return 1
+        fi
+        ui_done=$((ui_done + 1))
+    done < "$ui_work/files" 3< "$ui_work/checksums"
+    [ "$ui_done" -eq "$ui_total" ] || { ui_update_failed 612 "校验清单不完整"; return 1; }
+    # 在第一次改名之前，先完整落盘恢复计划；同一文件系统内只改名，不复制旧目录。
+    while IFS= read -r ui_name; do
+        if [ -e "$STATIC_DST_DIR/$ui_name" ] || [ -L "$STATIC_DST_DIR/$ui_name" ]; then
+            : > "$ui_work/original/$ui_name" || { ui_update_failed 614 "备份写入失败"; return 1; }
+        fi
+    done < "$ui_work/plan"
+    sync || { ui_update_failed 614 "暂存同步失败"; return 1; }
+    : > "$ui_work/publishing" && sync || { ui_update_failed 614 "发布计划同步失败"; return 1; }
+    write_status "copying" "文件校验通过，正在替换UI资源..." "$ui_mount" "$ui_source" "$STATIC_DST_DIR" 100 "$ui_total" "$ui_total" "" 0 "qrc"
+    while IFS= read -r ui_name; do
+        if [ -f "$ui_work/original/$ui_name" ]; then
+            mv "$STATIC_DST_DIR/$ui_name" "$ui_work/backup/$ui_name" 2>>"$LOG_FILE" || {
+                ui_update_failed 614 "旧备份失败，已尝试恢复原文件" "$ui_name"; return 1;
+            }
+        fi
+        mv "$ui_work/stage/$ui_name" "$STATIC_DST_DIR/$ui_name" 2>>"$LOG_FILE" || {
+            ui_update_failed 614 "替换失败，已尝试恢复原文件" "$ui_name"; return 1;
+        }
+    done < "$ui_work/plan"
+    sync || { ui_update_failed 614 "替换同步失败，已尝试恢复原文件"; return 1; }
+    if ! : > "$ui_work/committed" || ! sync; then
+        if ! rm -f "$ui_work/committed" 2>>"$LOG_FILE"; then
+            UI_KEEP_WORK=1
+            UI_PUBLISHED_COUNT="$(wc -l < "$ui_work/plan")"
+            ui_update_failed 615 "UI文件已更新，但完成状态写入失败，备份已保留"; return 1
+        fi
+        ui_update_failed 614 "完成状态写入失败"; return 1
+    fi
+    UI_PUBLISHED_COUNT="$(wc -l < "$ui_work/plan")"
+    if ! ui_remove_work "$ui_work"; then
+        # 已完成整批发布与同步，备份清理问题不代表UI文件错误，后续恢复入口再清理。
+        ulog "committed UI backup cleanup deferred; validated UI update remains successful"
+    fi
+    write_status "copying" "UI资源更新完成，未提供及空目录的原资源已保留" "$ui_mount" "$ui_source" "$STATIC_DST_DIR" 100 "$ui_total" "$ui_total" "" 0 "qrc"
     return 0
 }
 
-
-
-# 仅清空 U 盘 Ycest 中实际提供的资源目录；未提供的设备目录保持原样。
-# video 和 person 继续由原有的专用视频校验/人员导入流程处理。
-clear_udisk_images_dir() {
-    resource_source="$1/$YCEST_SUBDIR"
-    images_dir="${UDISK_DIR}/${QRC_DST_SUBDIR}"
-
-    [ -d "$resource_source" ] || return 0
-    mkdir -p "$images_dir" "$VIDEO_DST_DIR" 2>/dev/null || return 1
-
-    # 名称来自源目录的直接子项，不根据目标端已有目录推断清理范围。
-    for source_item in "$resource_source"/*; do
-        [ -d "$source_item" ] || continue
-        resource_name="${source_item##*/}"
-        case "$resource_name" in
-            video|person) continue ;;
-        esac
-        rm -rf "$images_dir/$resource_name" 2>/dev/null || return 1
-    done
-    return 0
-}
-
+# UI发布后沿用原配置同步入口；使用临时文件改名，失败记录为本批文件错误，继续视频流程。
 copy_net_cfg_to_app() {
-    mountp="$1"
-    src="$NET_CFG_SRC"
-    dst_dir="$NET_CFG_DST_DIR"
-    dst="$NET_CFG_DST"
-
-    # 源文件不存在：仅提示，不失败
-    if [ ! -f "$src" ] || [ ! -r "$src" ]; then
-        write_status "copying" "未找到net_cfg.ini，跳过同步..." "$mountp" "$src" "$dst_dir" 100 0 0 "" 0 "netcfg"
+    nc_mount="$1"; nc_source="$NET_CFG_SRC"; nc_target="$NET_CFG_DST"
+    if [ ! -f "$nc_source" ]; then
+        write_status "copying" "本次无可同步net_cfg.ini，设备原配置保留" "$nc_mount" "$nc_source" "$NET_CFG_DST_DIR" 100 0 0 "" 0 "netcfg"
         return 0
     fi
-
-    # 目标目录不可创建/不可写：仅提示，不失败
-    if ! ensure_dir_writable "$dst_dir"; then
-        write_status "copying" "目标目录不可写，跳过net_cfg.ini同步..." "$mountp" "$src" "$dst_dir" 100 0 0 "" 0 "netcfg"
+    if ! ensure_dir_writable "$NET_CFG_DST_DIR" || [ ! -r "$nc_source" ]; then
+        write_status "error" "配置文件读取或目标目录错误，原配置已保留" "$nc_mount" "$nc_source" "$NET_CFG_DST_DIR" 100 0 1 "net_cfg.ini" 621 "netcfg"
         return 0
     fi
-
-    write_status "copying" "正在同步net_cfg.ini..." "$mountp" "$src" "$dst" 0 0 1 "net_cfg.ini" 0 "netcfg"
-
-    cp -p -f "$src" "$dst" 2>/dev/null
-    if [ $? -ne 0 ]; then
-        write_status "copying" "net_cfg.ini复制失败，跳过..." "$mountp" "$src" "$dst" 100 0 1 "net_cfg.ini" 0 "netcfg"
+    nc_tmp="$NET_CFG_DST_DIR/.net_cfg.ini.udisk-$$"
+    write_status "copying" "正在同步net_cfg.ini..." "$nc_mount" "$nc_source" "$nc_target" 0 0 1 "net_cfg.ini" 0 "netcfg"
+    if ! cp -p -f "$nc_source" "$nc_tmp" 2>>"$LOG_FILE" ||
+       ! cmp -s "$nc_source" "$nc_tmp" 2>>"$LOG_FILE" ||
+       ! mv -f "$nc_tmp" "$nc_target" 2>>"$LOG_FILE"; then
+        rm -f "$nc_tmp" 2>>"$LOG_FILE"
+        write_status "error" "net_cfg.ini文件同步失败，原配置已保留" "$nc_mount" "$nc_source" "$nc_target" 100 0 1 "net_cfg.ini" 622 "netcfg"
         return 0
     fi
-
     sync
-    write_status "copying" "net_cfg.ini已同步，准备拷贝视频..." "$mountp" "$src" "$dst" 100 1 1 "net_cfg.ini" 0 "netcfg"
+    write_status "copying" "net_cfg.ini已同步，准备处理视频..." "$nc_mount" "$nc_source" "$nc_target" 100 1 1 "net_cfg.ini" 0 "netcfg"
     return 0
 }
 
@@ -557,7 +621,7 @@ copy_file_to_tmp_checked() {
     src="$1"
     tmp="$2"
 
-    cp -f "$src" "$tmp" 2>/dev/null || return 1
+    cp -f "$src" "$tmp" 2>>"$LOG_FILE" || return 1
 
     src_size="$(get_file_size "$src")"
     tmp_size="$(get_file_size "$tmp")"
@@ -577,6 +641,7 @@ copy_file_to_tmp_checked() {
 # 1) 视频拷贝（原逻辑，增加task=video）
 # =========================
 copy_video_with_progress() {
+    VIDEO_UPDATED_COUNT=0  # 已发布的有效媒体数，用于决定拔盘后是否需要原有重启流程。
     mountp="$1"
     src_dir="${mountp}/${VIDEO_SUBDIR}"
     dst_dir="$VIDEO_DST_DIR"
@@ -711,7 +776,7 @@ copy_video_with_progress() {
         tmp_name="$(basename "$tmp_file" 2>/dev/null)"
         final_name="${tmp_name%.copying}"
 
-        mv -f "$tmp_file" "${dst_dir}/${final_name}" 2>/dev/null
+        mv -f "$tmp_file" "${dst_dir}/${final_name}" 2>>"$LOG_FILE"
         if [ $? -ne 0 ]; then
             write_status "error" "可播放文件更新失败" \
                 "$mountp" "$src_dir" "$dst_dir" 100 "$done" "$total" "$final_name" 205 "video"
@@ -719,6 +784,7 @@ copy_video_with_progress() {
             rm -rf "$staging_dir" 2>/dev/null
             return 1
         fi
+        VIDEO_UPDATED_COUNT=$((VIDEO_UPDATED_COUNT + 1))
     done
 
     rm -rf "$staging_dir" 2>/dev/null
@@ -739,80 +805,95 @@ copy_video_with_progress() {
 
 
 
-# 与 Qt/Web 的 .ycest-update.lock 使用同一 inode；锁只在本次拷贝子进程持有。
-# 忙碌返回 75，不清理任何目录；外层监听循环继续等待下一次重试。
+# $1=是否有已发布文件需要重启，$2=错误码，$3=最终消息；原子写入本次运行结果。
+write_job_result() {
+    jr_tmp="${STATUS_FILE}.result.tmp.$$"
+    printf '%s\n%s\n%s\n' "$1" "$2" "$3" > "$jr_tmp" &&
+        mv -f "$jr_tmp" "${STATUS_FILE}.result"
+}
+
+# 汇总整批结果：有错误始终用error，不把已导入部分有效文件描述成全部成功。
+finish_update_job() {
+    fj_restart=0
+    [ "${UI_PUBLISHED_COUNT:-0}" -eq 0 ] && [ "${VIDEO_UPDATED_COUNT:-0}" -eq 0 ] || fj_restart=1
+    if [ "${JOB_ERROR_CODE:-0}" -ne 0 ]; then
+        if [ "$fj_restart" -eq 1 ]; then
+            fj_message="更新存在文件错误：$JOB_ERROR_TEXT；请拔出U盘重启后检查错误文件"
+        else
+            fj_message="文件更新失败：$JOB_ERROR_TEXT；请拔出U盘检查后重试"
+        fi
+        write_job_result "$fj_restart" "$JOB_ERROR_CODE" "$JOB_ERROR_TEXT" || return 1
+        write_status "error" "$fj_message" "$job_mount" "$job_mount/$YCEST_SUBDIR" "$UDISK_DIR" 100 0 0 "" "$JOB_ERROR_CODE" "all"
+        return 1
+    fi
+    if [ "$fj_restart" -eq 1 ]; then
+        fj_message="文件更新完成，请拔出U盘重启程序"
+    else
+        fj_message="未发现可更新文件，设备原文件已保留，请拔出U盘"
+    fi
+    write_job_result "$fj_restart" 0 "$fj_message" || return 1
+    write_status "done" "$fj_message" "$job_mount" "$job_mount/$YCEST_SUBDIR" "$UDISK_DIR" 100 0 0 "" 0 "all"
+    return 0
+}
+
+# 与 Qt/Web 共用独占锁；75仅表示忙碌，可重试，不清理或覆盖任何正式资源。
 do_job_once() (
+    prepare_update_log
     mkdir -p "$STATIC_DST_DIR" || return 1
     exec 8>"$STATIC_DST_DIR/.ycest-update.lock" || return 1
     flock -n 8 || return 75
     do_job_once_locked "$1"
 )
 
-# 已持资源独占锁后执行原有清理、UI资源拷贝和视频处理。
+# 持锁完成UI事务、原配置同步及原媒体复制。错误由统一终态汇总，不再预清理设备UI。
 do_job_once_locked() {
-    mountp="$1"
-
-    res_src="${mountp}/${YCEST_SUBDIR}"
-    qrc_dst="${UDISK_DIR}/${QRC_DST_SUBDIR}"
-
-    # 0) 仅清理 Ycest 实际提供的 UI 资源目录，缺失目录保留；video/person 走原专用流程。
-    if has_non_video_dirs_under_ycest "$mountp"; then
-        if ! clear_udisk_images_dir "$mountp"; then
-            write_status "error" "清理images目录失败" "$mountp" "$qrc_dst" "$qrc_dst" 0 0 0 "" 106 "qrc"
-            return 1
+    job_mount="$1"
+    JOB_TRACKING=1; JOB_ERROR_CODE=0; JOB_ERROR_TEXT=""
+    UI_PUBLISHED_COUNT=0; VIDEO_UPDATED_COUNT=0
+    if ! copy_ycest_non_video_dirs_to_udisk_images_with_progress "$job_mount"; then
+        if [ "$JOB_ERROR_CODE" -eq 0 ]; then
+            JOB_ERROR_CODE=603; JOB_ERROR_TEXT="目录创建或恢复失败，未完成UI更新"
         fi
-
-        # 做 U盘内 Ycest(除video、person外) -> images 拷贝
-        copy_ycest_non_video_dirs_to_udisk_images_with_progress "$mountp"
-        rc=$?
-        [ "$rc" -eq 0 ] || return "$rc"
-
-        # 资源拷贝成功后，额外同步 logo/net_cfg.ini 到 /mnt/app
-        copy_net_cfg_to_app "$mountp"
-    else
-        write_status "copying" "未找到文件夹，跳过资源拷贝，准备处理视频..." \
-            "$mountp" "$res_src" "$qrc_dst" 100 0 0 "" 0 "qrc"
+        finish_update_job
+        return 1
     fi
-
-    # 视频拷贝
-    copy_video_with_progress "$mountp"
-    rc=$?
-
-    # 3 = 所有新视频都有问题，没有导入新文件。
-    # 状态已经写成 error，这里返回 0，避免 daemon 反复重试。
-    if [ "$rc" -eq 3 ]; then
-        return 0
+    # 缺失或空UI目录不触发配置覆盖；UI有实际更新后沿用原同步顺序。
+    [ "$UI_PUBLISHED_COUNT" -eq 0 ] || copy_net_cfg_to_app "$job_mount"
+    copy_video_with_progress "$job_mount"
+    job_video_rc=$?
+    if [ "$job_video_rc" -ne 0 ] && [ "$JOB_ERROR_CODE" -eq 0 ]; then
+        JOB_ERROR_CODE=202; JOB_ERROR_TEXT="视频或图片文件更新失败"
     fi
-
-    # 4 = 有效文件已导入，但部分视频异常被跳过。
-    if [ "$rc" -eq 4 ]; then
-        write_status "done" "拷贝完成，部分视频文件错误，请拔出U盘重启程序" \
-            "$mountp" "$mountp" "$UDISK_DIR" 100 0 0 "" 0 "all"
-        return 0
-    fi
-
-    [ "$rc" -eq 0 ] || return "$rc"
-
-    # 拷贝完成后不立即重启，等待用户拔出U盘
-    write_status "done" "拷贝完成，请拔出U盘重启程序" \
-        "$mountp" "$mountp" "$UDISK_DIR" 100 0 0 "" 0 "all"
-
-    return 0
-
-
+    finish_update_job
 }
+
+# 脚本启动时先恢复本脚本未完成事务；锁忙不抢占，下一次资源更新仍会先恢复。
+recover_ui_on_startup() (
+    prepare_update_log
+    [ -e "$STATIC_DST_DIR/.udisk-ui-update" ] || return 0
+    exec 8>"$STATIC_DST_DIR/.ycest-update.lock" || return 1
+    flock -n 8 || return 75
+    if ! recover_ui_transaction; then
+        write_status "error" "上次UI文件更新恢复失败，备份已保留，请检查日志" "" "" "$STATIC_DST_DIR" 0 0 0 "" 615 "qrc"
+        return 1
+    fi
+)
+
 
 
 
 daemon_loop() {
+    prepare_update_log
     ulog "===== watcher started pid=$$ ====="
     running=1
     trap 'running=0' INT TERM
 
     inserted=0
     last_mount=""
-    job_done=0   # 0=未完成；1=完成后等待拔出
+    job_done=0   # 0=待处理/锁忙；1=本次结束（含文件错误），等待拔出
     restart_needed=0
+    job_error_code=0
+    job_error_message=""
     person_session=0
     person_token=""
     person_request_active=0
@@ -824,6 +905,7 @@ daemon_loop() {
     rm -f "$PERSON_EXPORT_READY" 2>/dev/null
 
     write_status "idle" "等待插入U盘" "" "" "$UDISK_DIR" 0 0 0 "" 0 "all"
+    recover_ui_on_startup
 
     while [ "$running" -eq 1 ]; do
         mountp="$(find_mountpoint_under_base "$MOUNT_BASE" 2>/dev/null)"
@@ -838,6 +920,8 @@ daemon_loop() {
                 last_mount="$mountp"
                 job_done=0
                 restart_needed=0
+                job_error_code=0
+                job_error_message=""
                 person_session=0
                 person_token=""
                 person_request_active=0
@@ -940,14 +1024,30 @@ daemon_loop() {
                && is_dir_readable "$mountp" && is_dir_writable "$mountp"; then
 
                 copy_started=1
+                rm -f "${STATUS_FILE}.result" 2>/dev/null
                 do_job_once "$mountp"
                 rc=$?
 
-                if [ "$rc" -eq 0 ]; then
-                    job_done=1
-                    restart_needed=1
-                else
+                if [ "$rc" -eq 75 ]; then
+                    # 锁忙可以等待，不是文件错误；其他终态本次插入不重复清理/复制。
                     job_done=0
+                else
+                    job_done=1
+                    restart_needed=0
+                    if [ -f "${STATUS_FILE}.result" ]; then
+                        restart_needed="$(sed -n '1p' "${STATUS_FILE}.result")"
+                        job_error_code="$(sed -n '2p' "${STATUS_FILE}.result")"
+                        job_error_message="$(sed -n '3,$p' "${STATUS_FILE}.result")"
+                        case "$restart_needed" in 0|1) ;; *) restart_needed=0 ;; esac
+                        case "$job_error_code" in ''|*[!0-9]*) job_error_code=699 ;; esac
+                    elif [ "$rc" -eq 0 ]; then
+                        # 保留旧部署/隔离替身的成功返回约定；实际入口总会写结果文件。
+                        restart_needed=1
+                    else
+                        job_error_code=699
+                        job_error_message="文件更新异常中断，请检查U盘文件和设备日志"
+                        write_status "error" "$job_error_message" "$mountp" "$mountp/$YCEST_SUBDIR" "$UDISK_DIR" 0 0 0 "" "$job_error_code" "all"
+                    fi
                 fi
             else
 
@@ -964,6 +1064,8 @@ daemon_loop() {
             if [ "$inserted" -eq 1 ]; then
                 was_done="$job_done"
                 was_restart_needed="$restart_needed"
+                was_error_code="$job_error_code"
+                was_error_message="$job_error_message"
                 was_person_session="$person_session"
                 was_export_session="$export_session"
 
@@ -975,15 +1077,23 @@ daemon_loop() {
                 if [ "$was_done" -eq 1 ] && [ "$was_restart_needed" -eq 1 ]; then
                     write_status "restarting" "U盘已拔出，正在重启程序..." \
                         "" "" "$UDISK_DIR" 100 0 0 "" 0 "all"
-                    # 只在整批文件复制成功且U盘已经拔出后读取目标配置。
+                    # 只在本批有实际发布的有效文件且U盘已拔出后读取目标配置；文件错误另行保留。
                     # sync 完成后再交给 Weston，避免读到半写入的 ini 或在
                     # 资源复制过程中重启 Qt/Weston。
                     sync
 
                     restart_current_program
                     if [ $? -ne 0 ]; then
-                        write_status "error" "U盘已拔出，程序重启失败" \
-                            "" "" "$UDISK_DIR" 100 0 0 "" 701 "all"
+                        if [ "$was_error_code" -ne 0 ]; then
+                            write_status "error" "U盘已拔出，程序重启失败；文件错误：$was_error_message" \
+                                "" "" "$UDISK_DIR" 100 0 0 "" 701 "all"
+                        else
+                            write_status "error" "U盘已拔出，程序重启失败" \
+                                "" "" "$UDISK_DIR" 100 0 0 "" 701 "all"
+                        fi
+                    elif [ "$was_error_code" -ne 0 ]; then
+                        write_status "error" "U盘已拔出，程序已重启；本次更新存在文件错误：$was_error_message" \
+                            "" "" "$UDISK_DIR" 100 0 0 "" "$was_error_code" "all"
                     else
                         write_status "done" "U盘已拔出，程序重启完成" \
                             "" "" "$UDISK_DIR" 100 0 0 "" 0 "all"
@@ -992,12 +1102,17 @@ daemon_loop() {
                     write_status "removed" "人员导出U盘已拔出" "" "" "$UDISK_DIR" 0 0 0 "" 0 "person"
                 elif [ "$was_person_session" -eq 1 ]; then
                     write_status "removed" "人员导入U盘已拔出" "" "" "$UDISK_DIR" 0 0 0 "" 0 "person"
+                elif [ "$was_error_code" -ne 0 ]; then
+                    write_status "error" "U盘已拔出，本次文件更新未完成：$was_error_message" \
+                        "" "" "$UDISK_DIR" 0 0 0 "" "$was_error_code" "all"
                 else
-                    write_status "removed" "U盘已拔出" "" "" "$UDISK_DIR" 0 0 0 "" 0 "all"
+                    write_status "removed" "U盘已拔出，未更新文件，设备原文件已保留" "" "" "$UDISK_DIR" 0 0 0 "" 0 "all"
                 fi
 
                 job_done=0
                 restart_needed=0
+                job_error_code=0
+                job_error_message=""
                 person_session=0
                 person_token=""
                 person_request_active=0

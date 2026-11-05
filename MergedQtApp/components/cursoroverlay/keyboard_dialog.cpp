@@ -2,8 +2,9 @@
  * @file keyboard_dialog.cpp
  * @brief 支持字母/数字模式、大小写和密码回显的屏幕键盘对话框的实现。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-11-03；修改人：Du lin；启动时只读缓存showPropertyCallButton，缺项隐藏按钮；独立保留物理键关闭密码键盘能力，不改确认、取消及输入语义。
  */
 
 // keyboard_dialog.cpp
@@ -29,8 +30,10 @@
 #include <QPropertyAnimation>
 #include <QGuiApplication>
 #include <QScreen>
+#include <QSettings>
 
 namespace {
+bool showPropertyCallButton=false; /**< GUI线程启动时加载的显示开关，缺项false；打开键盘不读盘。 */
 constexpr int kDialogHeight = 340;   // 更紧凑
 constexpr int kPadH = 12;
 constexpr int kPadV = 10;
@@ -84,24 +87,49 @@ KeyboardDialog::KeyboardDialog(QWidget *parent)
     setUpdatesEnabled(true);
 }
 
-/** @brief 模态弹出键盘并返回文本，通过 accepted 输出是否确认。 */
+/** @brief 模态输入并区分确认、取消与呼叫；动作语义见声明。 */
 QString KeyboardDialog::getText(QWidget *parent,
                                const QString &title,
                                const QString &initialText,
                                QLineEdit::EchoMode echo,
                                int maxLen,
-                               bool *accepted)
+                               bool *accepted,
+                               bool *callRequested,
+                               bool callEnabled)
 {
     KeyboardDialog dlg(parent);
     dlg.setTitle(title);
     dlg.setEchoMode(echo);
     dlg.setMaxLength(maxLen);
     dlg.setText(initialText);
+    dlg.propertyCallSupported_ = callRequested != nullptr;
+    dlg.callButton_->setVisible(dlg.propertyCallSupported_ && showPropertyCallButton);
+    dlg.callButton_->setEnabled(callEnabled);
 
     const int ret = dlg.exec();
     const bool ok = (ret == QDialog::Accepted);
     if (accepted) *accepted = ok;
+    if (callRequested) *callRequested = (ret == CallRequestedResult);
     return ok ? dlg.text() : QString();
+}
+
+void KeyboardDialog::loadPropertyCallButtonVisibility(const QString &configPath)
+{
+    QSettings settings(configPath,QSettings::IniFormat);
+#if (QT_VERSION < QT_VERSION_CHECK(6,0,0))
+    settings.setIniCodec("UTF-8");
+#endif
+    const bool enabled=settings.value(QStringLiteral("VoiceCallDsp/showPropertyCallButton"),false).toBool();
+    showPropertyCallButton=settings.status()==QSettings::NoError && enabled;
+}
+
+/** @brief 供按钮和已校验可用性的物理键复用；按钮隐藏不禁用物理键，普通输入拒绝。 */
+bool KeyboardDialog::requestPropertyCall()
+{
+    if (!isVisible() || !propertyCallSupported_ || !callButton_) return false;
+    edit->clear();
+    done(CallRequestedResult); // 独立结果码，不发 accepted，也不返回密码。
+    return true;
 }
 
 /** @brief 设置标题。 */
@@ -197,6 +225,12 @@ void KeyboardDialog::buildUi()
     auto *btnRow = new QHBoxLayout();
     btnRow->setSpacing(8);
 
+    callButton_ = new QPushButton(QStringLiteral("呼叫物业"), panel);
+    callButton_->setObjectName("kbdCallProperty");
+    callButton_->setFixedHeight(40);
+    callButton_->setFocusPolicy(Qt::NoFocus);
+    callButton_->hide();
+    connect(callButton_, &QPushButton::clicked, this, &KeyboardDialog::requestPropertyCall);
     auto *cancel = new QPushButton(QStringLiteral("取消"), panel);
     auto *ok = new QPushButton(QStringLiteral("确认"), panel);
     cancel->setObjectName("kbdAction");
@@ -211,6 +245,7 @@ void KeyboardDialog::buildUi()
     connect(ok, &QPushButton::clicked, this, &QDialog::accept);
     connect(cancel, &QPushButton::clicked, this, &QDialog::reject);
 
+    btnRow->addWidget(callButton_);
     btnRow->addWidget(cancel);
     btnRow->addWidget(ok);
     lay->addLayout(btnRow);
@@ -259,6 +294,9 @@ void KeyboardDialog::buildUi()
         }
         QPushButton#kbdActionPrimary:hover { background: rgba(62, 150, 255, 255); }
         QPushButton#kbdActionPrimary:pressed { background: rgba(54, 135, 235, 255); }
+        QPushButton#kbdCallProperty { background: #168976; color: white; font-weight: bold; }
+        QPushButton#kbdCallProperty:pressed { background: #106958; }
+        QPushButton#kbdCallProperty:disabled { background: #c4d3d0; color: #6c7976; }
     )");
 }
 

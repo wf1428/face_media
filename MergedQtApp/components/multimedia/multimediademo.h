@@ -4,7 +4,7 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-10-29；修改人：Du lin；声明统一视频区域开关检查，说明本地/直播及模块返回须服从 VideoDisplay_en；关闭视频不改变独立 PIC、识别和业务目标。
+ * @note 最近修改：2026-11-04；修改人：Du lin；普通/高清截图恢复一次根render，隐藏视频不读帧且不作特殊处理；可见视频仅截图期间禁用更新并恢复，保留后台编码、尺寸/缓存及有界异步上传。
  */
 
 #ifndef MULTIMEDIADEMO_H
@@ -40,6 +40,7 @@
 #include "disk_usage_monitor.h"
 #include "network_status_monitor.h"
 #include "snapshot_processor.h"
+#include "common/media_selection_cache.h"
 #include "gst_player_widget.h"
 #include "netinfo_popup.h"
 #include "vol_ctrl.h"
@@ -112,7 +113,7 @@ class QMovie;
  *
  * 本类同时维护“期望播放模式”和“实际播放器状态”：直播首帧 watchdog、重试播放器
  * 与本地切片保护窗口共同避免网络断流或旧异步回调破坏本地轮播。截图编码放在独立
- * 工作线程，UI 合成仍在主线程完成。
+ * 工作线程；主线程一次根render绘制普通小图或高清原尺寸UI像素，仅截图栈内排除可见视频更新并恢复；视频转换/合成/编码共用后台。
  */
 class MultimediaDemo : public QDialog
 {
@@ -163,14 +164,14 @@ public:
      */
     void stopDesiredLive();
 
-    /**
-     * @brief 合成 UI 与当前视频帧后异步编码为 Base64。
+    /** @brief UI只返回当前内容的2秒缓存或排队一次刷新；重复/重入请求合并，不同步抓图。
+     * @note GUI只记录命令与帧值，栅格化/合成/编码共用后台线程；源变化不得复用旧结果。
      */
     void captureCompositeSnapshot();
     /**
-     * @brief 为高清协议抓取原尺寸 UI/视频，原图通过 companySnapshotReady 提交后台。
-     * @param token 独立高清请求令牌；必须在 GUI 线程调用，不执行 JPEG/Base64/JSON 编码。
-     * @note 不复用普通截图缓存；普通视频抓帧未完成时返回失败，避免截获其回调。
+     * @brief 为高清协议直接绘制原DPR尺寸UI像素或取得原生图像后备，通过既有信号提交共享后台。
+     * @param token 独立高清请求令牌；必须在GUI调用，只绘制UI像素/交接值，视频转换/JPEG/Base64/JSON编码在后台。
+     * @note 不复用普通截图缓存；普通视频抓帧或Qt界面抓取未完成时返回失败，避免交叉抓图及截获回调。
      */
     void captureCompanySnapshot(const QString &token);
     /**
@@ -185,7 +186,7 @@ public:
 
     /**
      * @brief 为本地 Web 读取实际播放器和音量状态。
-     * @return 实际播放状态与同一 INI 中保存的 contentType、smallImageMode；仅报告 video 区域。
+     * @return 实际播放状态及后台每秒刷新的contentType、smallImageMode快照；UI不读取INI，仅报告video区域。
      */
     QJsonObject localWebPlaybackState() const;
 
@@ -196,6 +197,12 @@ public:
     void applyLocalWebPlayback(const QJsonObject &request);
 
 public slots:
+    /** @brief 更新右键密码键盘的呼叫可用性；只在 GUI 线程调用。
+     * @param[in] available true 表示在线且空闲，下一次弹出的键盘允许呼叫。
+     * @note 键盘使用弹出时快照；真正发送前仍由通话控制器复核状态。
+     */
+    void setPropertyCallAvailable(bool available);
+
     /**
      * @brief 启动页结束后放行首次媒体播放；重复调用保持幂等。
      * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
@@ -344,7 +351,9 @@ private slots:
     void testVideoOptimizations();
 
     /**
-     * @brief 使用屏幕键盘请求退出密码并与配置值校验。
+     * @brief 使用屏幕键盘校验退出密码，或关闭键盘后发出独立呼叫请求。
+     * @return 仅原退出密码匹配时为 true；取消、呼叫和错误密码均为 false。
+     * @note 呼叫不校验密码；接收者须排队执行，等外层模态标志复原后启动通话。
      */
     bool requestPasswordAndCheck();
 
@@ -398,6 +407,11 @@ private slots:
     void onSnapshotProcessFailed(const QString &reason);
 
 signals:
+    /** @brief 用户从右键密码键盘请求呼叫物业；键盘已退出，不含密码。
+     * @note 主窗口以排队连接转交通话控制器，不触发返回菜单。
+     */
+    void callPropertyRequested();
+
     /**
      * @brief 高清采集原图，不进入 currentPlayImageChanged 或普通回执链路。
      * @param token 原样回传本地令牌。
@@ -440,6 +454,15 @@ signals:
      * @brief 无视频帧时请求工作线程仅编码 UI 快照。
      */
     void processUiSnapshotAsync(const QImage &uiImage);
+    /** @brief 普通小图像素及NV12值Queued到GUI门面后交共享后台。
+     * @param[in] scene 已完成记录的自有只读值，不含控件指针。
+     */
+    void processSceneSnapshotAsync(const SnapshotScene &scene);
+    /** @brief 高清原尺寸UI像素及NV12值交共享后台，失败沿用原协议回执。
+     * @param[in] token 原样关联本地请求的令牌。
+     * @param[in] scene 原尺寸UI像素及视频值，可能携带失败原因。
+     */
+    void companySceneReady(const QString &token,const SnapshotScene &scene);
 
     /**
      * @brief 请求页面外层显示指定时长的状态提示。
@@ -511,21 +534,37 @@ private:
     int m_liveTimeoutMs = 10000;         /**< 连续 10 秒无新帧判定直播中断。 */
     int m_liveStartupGraceMs = 10000;   /**< 启动后 10 秒仍无首帧则回退本地轮播。 */
     int m_liveDecoderInputActiveWindowMs = 3000; /**< 此窗口内仍有解码输入则判为解码器停滞。 */
+    quint64 m_playbackPersistRevision=0; /**< UI独占的配置快照代次；旧落盘完成不得回写新界面字段。 */
     bool m_liveSourceValidated = false;  // 当前LIVE地址是否曾经输出过真实解码视频帧
     bool m_liveRecovering = false;
 
     MqttManager *mqttManager_ = nullptr;
+    /** @return 当前媒体/图片/下载状态和几何的纯内存键；仅UI读取，不访问文件或管线。 */
+    QByteArray snapshotCacheKey() const;
+    /** @brief 下轮UI事件只执行一次必要抓图，抓取期间禁止重入；缓存命中不抓图，编码在原工作线程。 */
+    void captureCompositeSnapshotNow();
+    /** @brief UI一次根render绘制560x360以内小图；隐藏视频不取帧，可见视频更新状态在截图后恢复；后台合成编码及原生后备保持。
+     * @param[in] host UI根控件，可空，空/尺寸无效返回false。
+     * @param[in] videoImage 可空的原生视频后备帧。
+     * @param[in] videoRect 后备视频实际像素区域，提交时同步缩放。
+     * @return true已提交后台，false分配/绘制失败且不设置忙门。
+     */
+    bool submitScaledSnapshot(QWidget *host,const QImage &videoImage={},const QRect &videoRect={});
+    MediaSelectionCache *m_mediaSelectionCache=nullptr; /**< UI所有的后台配置快照，子对象销毁后忽略迟到刷新；状态查询不读INI。 */
+    bool m_snapshotRefreshQueued=false,m_snapshotCaptureInProgress=false; /**< 仅UI读写的排队刷新/Qt抓取重入门，不等待工作线程。 */
+    quint64 m_snapshotContentRevision=0; /**< 文件删除/下载刷新时递增，使同路径内容替换前的编码结果失效；仅UI读写。 */
+    QByteArray m_snapshotCacheKey,m_snapshotWorkKey; /**< 当前缓存内容键、后台编码所属键；不匹配的完成值不得发布。 */
     bool m_snapshotPending = false;         /**< 防止播放器抓图请求重入。 */
 
-    // 截图线程
-    QThread *m_snapshotThread = nullptr;
+    // GUI截图门面，共用后台队列执行视频合成和编码
+
     SnapshotProcessor *m_snapshotProcessor = nullptr;
 
     QTimer *m_snapshotTimeoutTimer = nullptr;
 
     //截图工作对象
-    bool m_snapshotWorkerBusy = false;
-    qint64 m_lastSnapshotMs = 0;
+    bool m_snapshotWorkerBusy = false; /**< 从提交编码到完成/失败为true，只允许一个后台截图任务在途。 */
+    qint64 m_lastSnapshotMs = 0; /**< 最近有效抓取的墙钟毫秒，原2秒缓存窗口，时间回退时不复用。 */
     qint64 m_snapshotRequestMs = 0;
     QString m_lastSnapshotBase64;
     QString m_companySnapshotToken; /**< 独立高清抓帧令牌；仅 GUI 线程读写，回调或失败后清空。 */
@@ -545,6 +584,7 @@ private:
     VolumePanel *m_volPanel = nullptr;
 
     // 弹窗交互锁
+    bool m_propertyCallAvailable = false; /**< GUI 线程保存的下次键盘呼叫可用性，默认禁用。 */
     bool m_uiModalActive = false;   // 只要有任何“上层窗口”在，就置 true
     QRect m_volumeRect;   /**< 音量弹窗点击热区。 */
 
@@ -1180,7 +1220,7 @@ private:
     void startFirstLocalVideoFromList();
 
     /**
-     * @brief 从配置读取并刷新网络/MQTT 信息面板字段。
+     * @brief 从配置读取网络/MQTT字段，并复用启动INI值建立后台媒体选择缓存。
      */
     void readNetConfiguration();
 

@@ -4,13 +4,16 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-10-24；修改人：Du lin；保留资源包更新及独立高清请求队列；移除高清请求和 IPC 提交的新增诊断打印及日志转接，继续非阻塞提交回执并保留原有 IPC 错误通道和普通请求日志。
+ * @note 最近修改：2026-11-04；修改人：Du lin；图片上传采用2项预算，普通回执按容量延迟/过载保留ID的小回执，高清只保留唯一已编码值后重试；接入高清场景共享后台，协议/音频/DSP不变。
  */
 
 #include "mqttmanager.h"
+#include "src/call/CallManager.h"
 #include "multimedia_update.h"
 #include "company_play_info.h"
 #include "common/media_content_policy.h"
+#include "common/configuration_work.h"
+#include "common/debug/ui_performance.h"
 
 #include <QDebug>
 #include <QCryptographicHash>
@@ -695,163 +698,16 @@ static QString recordedDownloadTaskKey(const QJsonObject &dataObj)
 }
 
 /**
- * @brief 从格式损坏的 mqttd 消息中尝试提取 topic 与 payload 对象。
- *
- * 该函数用于处理类似如下“坏格式”消息：
- * @code
- * {"type":"msg",...,"payload":"{...}"}
- * @endcode
- *
- * 其中 payload 本应是标准 JSON 对象，但实际上被包装成了字符串，
- * 因此需要通过字符串扫描和大括号配对方式手动抠出 JSON 对象部分。
- *
- * @param raw        原始输入字节流。
- * @param topicOut   输出参数，返回提取到的 topic。
- * @param payloadOut 输出参数，返回提取到的 payload JSON 对象。
- * @param errOut     输出参数，返回失败原因。
- * @return true  提取并解析成功。
- * @return false 提取失败或 payload 解析失败。
- *
- * @note 该函数属于容错 fallback 逻辑，仅用于处理非标准格式输入。
- */
-static bool extractPayloadObjectFromBrokenMsg(const QByteArray& raw,
-                                              QString& topicOut,
-                                              QJsonObject& payloadOut,
-                                              QString& errOut)
-{
-    topicOut.clear();
-    payloadOut = QJsonObject{};
-    errOut.clear();
-
-    // 1) 粗略提取 topic：查找 "topic":"..."
-    const QByteArray key = "\"topic\":\"";
-    int t0 = raw.indexOf(key);
-    if (t0 >= 0) {
-        t0 += key.size();
-        int t1 = raw.indexOf('"', t0);
-        if (t1 > t0) {
-            topicOut = QString::fromUtf8(raw.mid(t0, t1 - t0));
-        }
-    }
-
-    // 2) 定位 payload 字段起始位置："payload":"{...}"
-    const QByteArray pkey = "\"payload\":\"";
-    int p0 = raw.indexOf(pkey);
-    if (p0 < 0) {
-        errOut = "找不到 payload 字段";
-        return false;
-    }
-    p0 += pkey.size();
-
-    int lb = raw.indexOf('{', p0);
-    if (lb < 0) {
-        errOut = "payload 里找不到 '{'";
-        return false;
-    }
-
-    // 3) 从 payload 内部第一个 '{' 开始进行 brace matching
-    bool inString = false;
-    bool escape = false;
-    int depth = 0;
-    int endPos = -1;
-
-    for (int i = lb; i < raw.size(); ++i) {
-        char c = raw[i];
-
-        if (escape) { escape = false; continue; }
-        if (c == '\\') { if (inString) escape = true; continue; }
-        if (c == '"') { inString = !inString; continue; }
-        if (inString) continue;
-
-        if (c == '{') depth++;
-        else if (c == '}') {
-            depth--;
-            if (depth == 0) {
-                endPos = i;
-                break;
-            }
-        }
-    }
-
-    if (endPos < 0) {
-        errOut = "payload JSON 未闭合（找不到配对的 '}'）";
-        return false;
-    }
-
-    QByteArray payloadJson = raw.mid(lb, endPos - lb + 1);
-
-    // 4) 对截取出的 payload JSON 进行标准解析
-    QJsonParseError e2;
-    QJsonDocument d2 = QJsonDocument::fromJson(payloadJson, &e2);
-    if (e2.error != QJsonParseError::NoError || !d2.isObject()) {
-        errOut = QString("payload JSON 解析失败：%1").arg(e2.errorString());
-        return false;
-    }
-
-    payloadOut = d2.object();
-    return true;
-}
-
-
-/**
- * @brief 解析“topic + JSON”格式的一行消息。
- *
- * 输入格式示例：
- * @code
- * device/xxx/request {"method":"getPlayInfo",...}
- * @endcode
- *
- * 该函数会从原始字节流中提取 topic 部分和后续 JSON payload。
- *
- * @param raw        原始输入字节流。
- * @param topicOut   输出参数，返回解析出的 topic。
- * @param payloadOut 输出参数，返回解析出的 JSON 对象。
- * @return true  成功解析出 topic 与 payload。
- * @return false 输入格式不合法或 JSON 解析失败。
- */
-static bool parseTopicJsonLine(const QByteArray &raw,
-                               QString &topicOut,
-                               QJsonObject &payloadOut)
-{
-    topicOut.clear();
-    payloadOut = QJsonObject{};
-
-    int lb = raw.indexOf('{');
-    int rb = raw.lastIndexOf('}');
-    if (lb < 0 || rb <= lb) {
-        return false;
-    }
-
-    topicOut = QString::fromUtf8(raw.left(lb).trimmed());
-    if (topicOut.isEmpty()) {
-        return false;
-    }
-
-    const QByteArray payloadJson = raw.mid(lb, rb - lb + 1).trimmed();
-
-    QJsonParseError e;
-    QJsonDocument doc = QJsonDocument::fromJson(payloadJson, &e);
-    if (e.error != QJsonParseError::NoError || !doc.isObject()) {
-        return false;
-    }
-
-    payloadOut = doc.object();
-    return true;
-}
-
-
-/**
  * @brief 从标准 mqttd msg 对象中提取 topic 与 payload JSON 对象。
  *
- * 支持以下两种 payload 形式：
- * - payload 本身就是 JSON object；
- * - payload 为字符串，且字符串内容为 JSON object。
+ * payload本身为对象，或已在后台由字符串转换为对象；此处只读取标准化结果，
+ * 不遍历大正文、不在UI二次解析。
  *
  * @param obj        mqttd 标准消息对象。
  * @param topicOut   输出参数，返回消息 topic。
  * @param payloadOut 输出参数，返回解析后的 payload JSON 对象。
  * @return true  成功提取 payload 对象。
- * @return false payload 不存在、格式不合法或解析失败。
+ * @return false payload不是对象；输出空payload及原错误日志。
  */
 bool MqttManager::extractPayloadObjectFromMsgObject(const QJsonObject &obj,
                                                     QString &topicOut,
@@ -869,24 +725,6 @@ bool MqttManager::extractPayloadObjectFromMsgObject(const QJsonObject &obj,
         return true;
     }
 
-    // payload 是字符串时，尝试二次解析 JSON 对象
-    if (pv.isString()) {
-        const QString payloadStr = pv.toString().trimmed();
-        if (!payloadStr.startsWith('{') || !payloadStr.endsWith('}')) {
-            emit logMessage("msg payload 不是 JSON object 字符串，已忽略");
-            return false;
-        }
-
-        QJsonParseError e;
-        QJsonDocument doc = QJsonDocument::fromJson(payloadStr.toUtf8(), &e);
-        if (e.error != QJsonParseError::NoError || !doc.isObject()) {
-            emit logMessage(QString("msg payload 二次解析失败：%1").arg(e.errorString()));
-            return false;
-        }
-
-        payloadOut = doc.object();
-        return true;
-    }
 
     emit logMessage("msg payload 不是 object/string，已忽略");
     return false;
@@ -1016,7 +854,7 @@ bool MqttManager::persistCurrentMqttRouteToIni(QString *err) const
 /**
  * @brief 构造 MqttManager 对象。
  *
- * 创建 IPC、业务服务及独立高清截图控制器，建立状态、日志和业务信号转发。
+ * 创建IPC、业务服务及高清请求控制器，普通/高清共用截图后台，建立原业务信号转发。
  * 高清完整 JSON 由工作线程生成，本对象仅非阻塞提交原始 IPC 帧。
  *
  * @param parent 父对象指针。
@@ -1026,14 +864,18 @@ MqttManager::MqttManager(QObject *parent)
 {
     // 创建 IPC 通信对象与 MQTT 业务服务对象
     ipc_ = new MqttIpcClient(this);
+    callManager_ = new CallManager(ipc_,this);
     service_ = new MqttService(this);
     companyPlayInfo_ = new CompanyPlayInfo(this);
     connect(companyPlayInfo_, &CompanyPlayInfo::captureRequested,
             this, &MqttManager::companySnapshotRequested);
-    connect(companyPlayInfo_, &CompanyPlayInfo::publishReady, this, [this](const QByteArray &line) {
-        // 大图的 Base64/JSON 已在高清线程处理；此处不解析、不打印正文、不等待 socket。
-        if (ipc_)
-            ipc_->sendRawLine(line);
+    companyPlayInfo_->setPublisher([this](const QByteArray &line) {
+        // 断线沿用原失败即结束，不在重连后回放过期图片；容量忙才暂存唯一编码结果。
+        if(!ipc_ || !ipc_->isConnected())return true;
+        return ipc_->sendSnapshotRawLine(line);
+    });
+    connect(companyPlayInfo_,&CompanyPlayInfo::overflowReplyReady,this,[this](const QByteArray &line) {
+        if(ipc_ && ipc_->isConnected()) ipc_->sendRawLine(line);
     });
     icGateway_ = new IcMqttGateway(this);
     messageRouter_ = new MqttMessageRouter(this);
@@ -1183,8 +1025,8 @@ MqttManager::MqttManager(QObject *parent)
             this, &MqttManager::onIpcConnected);
     connect(ipc_, &MqttIpcClient::disconnected,
             this, &MqttManager::onIpcDisconnected);
-    connect(ipc_, &MqttIpcClient::frameReceived,
-            this, &MqttManager::onIpcFrameReceived);
+    connect(ipc_, &MqttIpcClient::packetReceived,
+            this, &MqttManager::onIpcPacketReceived);
     connect(ipc_, &MqttIpcClient::errorOccurred,
             this, &MqttManager::onIpcError);
     connect(ipc_, &MqttIpcClient::logMessage,
@@ -1239,6 +1081,8 @@ MqttManager::MqttManager(QObject *parent)
 
 MqttManager::~MqttManager()
 {
+    delete callManager_; callManager_=nullptr;
+
     if (multimediaUpdate_) {
         multimediaUpdate_->requestInterruption();
         multimediaUpdate_->authorizeCommit(false);
@@ -4281,6 +4125,15 @@ bool MqttManager::publishFaceImagesResult(
 void MqttManager::setConfig(const MqttConfig &cfg)
 {
     cfg_ = cfg;
+    // 主题是平台权威身份；仅当前 ycLinux 精确 event 路由开放通话。
+    const QString callEvent=cfg_.publishTopic.trimmed();
+    const QString prefix=QStringLiteral("device/ycLinux/");
+    QString callDevice;
+    if (callEvent.startsWith(prefix) && callEvent.endsWith("/event")) {
+        callDevice=callEvent.mid(prefix.size(),callEvent.size()-prefix.size()-6);
+        if (callDevice.contains('/') || callDevice.contains('+') || callDevice.contains('#')) callDevice.clear();
+    }
+    callManager_->configure(callDevice);
     const bool onlineV1Active = cfg_.publishTopic.trimmed()
             .startsWith(QStringLiteral("device/ycLinux/"))
             && cfg_.publishTopic.trimmed().endsWith(QStringLiteral("/event"));
@@ -4333,10 +4186,9 @@ bool MqttManager::publishJsonPacket(const QJsonObject &packet, const QString &ta
                                      QStringLiteral("faceImage"))
                                      .toString().size())));
         } else {
-            emit logMessage(QString("TX publish[%1]: %2")
-                            .arg(tag,
-                                 QString::fromUtf8(QJsonDocument(packet).toJson(
-                                     QJsonDocument::Compact))));
+            const auto payload=packet.value(QStringLiteral("payload")).toObject();
+            emit logMessage(QStringLiteral("TX publish[%1]: method=%2 id=%3（已进入后台发送队列）")
+                            .arg(tag,payload.value(QStringLiteral("method")).toString(),payload.value(QStringLiteral("id")).toString()));
         }
     }
     return ok;
@@ -4455,6 +4307,7 @@ void MqttManager::onIpcConnected()
 void MqttManager::onIpcDisconnected()
 {
     mqttBrokerConnected_ = false;
+    if (callManager_) callManager_->setOnline(false);
     emit ipcStateChanged(false);
     emit mqttStateTextChanged("未知");
     emit subTopicsTextChanged("");
@@ -4475,6 +4328,7 @@ void MqttManager::onIpcDisconnected()
 void MqttManager::onIpcError(const QString &err)
 {
     mqttBrokerConnected_ = false;
+    if (callManager_) callManager_->setOnline(false);
     emit ipcStateChanged(false);
     emit mqttStateTextChanged("未知");
     emit subTopicsTextChanged("");
@@ -4486,22 +4340,13 @@ void MqttManager::onIpcError(const QString &err)
 }
 
 /**
- * @brief IPC 收到完整帧后的槽函数。
- *
- * @param frame 已完成组帧的一条原始消息。
- */
-void MqttManager::onIpcFrameReceived(const QByteArray &frame)
-{
-    handleIpcLine(frame);
-}
-
-/**
  * @brief 通过 mqttd IPC 下发 MQTT 配置及订阅主题。
  *
  * 该函数会构造如下信息并发送给 mqttd：
  * - 基础 MQTT 连接参数；
  * - 订阅 topic 列表；
- * - 可选的 apply 指令。
+ * - 可选的 apply 指令；ycLinux 精确设备路由额外订阅 request 和 QoS0 audio，
+ *   通话仍复用当前 mqttd/IPC，不修改其他模式的订阅来源。
  *
  * @param applyNow 是否在发送配置后立即发送 apply 命令。
  */
@@ -4531,6 +4376,10 @@ void MqttManager::sendConfigToMqttd(bool applyNow)
 //    if (!cfg_.streamUrlTopic.isEmpty() && !topics.contains(cfg_.streamUrlTopic))
 //        topics << cfg_.streamUrlTopic;
 
+    if (callManager_ && !callManager_->deviceId().isEmpty()) {
+        const QString base=QStringLiteral("device/ycLinux/%1").arg(callManager_->deviceId());
+        topics << base+"/request" << base+"/audio";
+    }
     topics.removeDuplicates();
 
     QJsonArray subs;
@@ -4573,6 +4422,7 @@ void MqttManager::sendConfigToMqttd(bool applyNow)
  */
 bool MqttManager::dispatchPayloadMessage(const QString &topic, const QJsonObject &payloadObj)
 {
+    if (callManager_ && callManager_->handleSignal(topic,payloadObj)) return true;
     if (payloadObj.isEmpty()) {
         emit logMessage(QString("消息 payload 为空：topic=%1").arg(topic));
         return false;
@@ -4582,43 +4432,10 @@ bool MqttManager::dispatchPayloadMessage(const QString &topic, const QJsonObject
             ? payloadObj.value("methon").toString().trimmed()
             : payloadObj.value("method").toString().trimmed();
 
-    if (method == QStringLiteral("face.responseImages")) {
-        const QJsonObject data = payloadObj.value(QStringLiteral("data")).toObject();
-        const QJsonArray faces = data.value(QStringLiteral("faces")).toArray();
-        QStringList faceHashes;
-        qint64 base64Chars = 0;
-        for (const QJsonValue &value : faces) {
-            const QJsonObject face = value.toObject();
-            const QString faceHash = face.value(QStringLiteral("faceHash"))
-                    .toString().trimmed();
-            if (!faceHash.isEmpty()) faceHashes.append(faceHash);
-
-            const QString encoded = face.value(QStringLiteral("faceBase64")).toString();
-            const int comma = encoded.indexOf(QLatin1Char(','));
-            base64Chars += comma >= 0 ? encoded.size() - comma - 1 : encoded.size();
-        }
-        emit logMessage(QStringLiteral(
-                            "消息摘要：topic=%1 method=%2 personId=%3 "
-                            "faceCount=%4 base64Chars=%5 faceHashes=%6")
-                        .arg(topic,
-                             method,
-                             data.value(QStringLiteral("personId")).toString().trimmed())
-                        .arg(faces.size())
-                        .arg(base64Chars)
-                        .arg(faceHashes.join(QLatin1Char(','))));
-    } else {
-        const QByteArray compactPayload = QJsonDocument(payloadObj)
-                .toJson(QJsonDocument::Compact);
-        if (compactPayload.size() > 16384) {
-            emit logMessage(QStringLiteral(
-                                "消息摘要：topic=%1 method=%2 payloadBytes=%3")
-                            .arg(topic, method)
-                            .arg(compactPayload.size()));
-        } else {
-            emit logMessage(QString("消息：topic=%1 payload=%2")
-                            .arg(topic, QString::fromUtf8(compactPayload)));
-        }
-    }
+    const auto methodTag=method.toLatin1();
+    UiPerformance::OperationScope performance(UiPerformance::Operation::MqttBusiness,this,methodTag.constData());
+    emit logMessage(QStringLiteral("消息：topic=%1 method=%2 id=%3（正文已在后台解析）")
+                    .arg(topic,method,payloadObj.value(QStringLiteral("id")).toString()));
 
     return messageRouter_
             && messageRouter_->dispatch(topic, payloadObj, method);
@@ -4642,6 +4459,7 @@ bool MqttManager::handleGetPlayFileList(const QString &topic, const QJsonObject 
     if (method != "getPlayFileList") {
         return false;
     }
+    UiPerformance::OperationScope performance(UiPerformance::Operation::FileList,this);
 
     if (!service_ || !ipc_) {
         emit logMessage("处理 getPlayFileList 失败：内部对象未初始化");
@@ -4686,6 +4504,8 @@ bool MqttManager::handleGetPlayInfo(const QString &topic, const QJsonObject &pay
     if (method != "getPlayInfo" && !company) {
         return false;
     }
+    const auto methodTag=method.toLatin1();
+    UiPerformance::OperationScope performance(UiPerformance::Operation::GetPlayInfo,this,methodTag.constData());
 
     if (!service_ || !ipc_) {
         emit logMessage("处理 getPlayInfo 失败：内部对象未初始化");
@@ -4913,8 +4733,40 @@ bool MqttManager::handleVideoControl(const QString &topic,
         pendingVideoCtrlAck_.reqPayload = payloadObj;
     }
 
+    const auto revision=++videoControlRevision_;
+    const QPointer<MqttManager> alive(this);
+    ConfigurationWork::queue().enqueue([alive,topic,payloadObj,revision,isRecordedDownloadRequest]() -> SerialWorkQueue::Task {
+        if(!alive || !alive->service_) return {};
+        auto result=std::make_shared<VideoControlPreparation>();
+        result->playbackObsolete=!isRecordedDownloadRequest && revision!=alive->videoControlRevision_;
+        // 下载任务仍按原占用/最终回执规则执行；普通旧源跳过尚未开始的配置读写。
+        auto complete=[alive,topic,payloadObj,result,revision,isRecordedDownloadRequest](const QString &error) {
+            if(!alive || !alive->service_) return;
+            result->playbackObsolete=!isRecordedDownloadRequest && revision!=alive->videoControlRevision_;
+            if(!error.isEmpty()) { result->failed=VideoControlPreparation::Selection;result->error=error; }
+            alive->finishVideoControl(topic,payloadObj,*result);
+        };
+        if(result->playbackObsolete) return {{},complete};
+        const auto prepare=alive->service_->configurationPreparation(payloadObj);
+        return {[result,prepare]() -> QString { *result=prepare();return {}; },complete};
+    });
+    return true;
+}
+
+/** @brief 配置后台准备完成后在UI延续原播放控制和回执流程，不重复读写INI。 */
+bool MqttManager::finishVideoControl(const QString &topic,const QJsonObject &payloadObj,
+                                    const VideoControlPreparation &preparation)
+{
+    if(!service_) return false;
+    const auto dataObj=payloadObj.value("data").toObject();
+    const auto videoType=dataObj.value("videoType").toString().trimmed().toUpper();
+    const auto videoPath=QFileInfo(dataObj.value("videoPath").toString().trimmed()).fileName().trimmed();
+    const bool isRecordedDownloadRequest=videoType=="RECORDED" && !videoPath.isEmpty();
+    const bool isRecordedNoVideoPathRequest=videoType=="RECORDED" && videoPath.isEmpty();
+    const auto vv=dataObj.value("videoVolume");bool hasVideoVolume=vv.isDouble();
+    if(vv.isString()) { bool ok=false;vv.toString().trimmed().toInt(&ok);hasVideoVolume=ok; }
     bool ok = false;
-    const bool handled = service_->handleVideoControlMessage(topic, payloadObj, &ok);
+    const bool handled = service_->handleVideoControlMessage(topic, payloadObj, preparation, &ok);
     if (!handled) {
         if (isRecordedDownloadRequest) {
             recordedDownloadTaskActive_ = false;
@@ -5171,99 +5023,30 @@ bool MqttManager::handleStreamUrlMessage(const QString &topic,
 
 
 /**
- * @brief 解析并处理来自 mqttd IPC 的一条完整消息。
- *
- * 支持以下几类输入：
- * - mqttd 普通日志行；
- * - topic + JSON 形式的消息；
- * - 标准 mqttd JSON 协议消息；
- * - 损坏格式的 fallback JSON 消息。
- *
- * @param line 原始输入数据。
+ * @brief 消费工作任务完成解析的IPC信封，UI只沿原路径分派业务及显示小摘要。
+ * @param[in] obj 已标准化对象，msg.payload若有效已经是对象。
+ * @param[in] display 后台生成的原RX摘要，大包不含正文。
+ * @param[in] error 后台原格式/容错解析错误；有错误时仅通知并返回。
+ * @note 不重新序列化/解析JSON；媒体帧不会进入本槽，耗时业务仍投递既有工作线程。
  */
-void MqttManager::handleIpcLine(const QByteArray &line)
+void MqttManager::onIpcPacketReceived(const QJsonObject &obj,const QString &display,const QString &error)
 {
-    QByteArray raw = line.trimmed();
-    if (raw.size() > 16384) {
-        emit logMessage(QStringLiteral("RX: large MQTT frame, bytes=%1")
-                        .arg(raw.size()));
-    } else {
-        emit logMessage(QString("RX: %1").arg(QString::fromUtf8(raw)));
-    }
-
-    if (raw.isEmpty()) return;
-    if (raw.startsWith('[')) return;
-
-    // 1) topic + JSON
-    if (!raw.startsWith('{')) {
-        QString topic;
-        QJsonObject payloadObj;
-        if (parseTopicJsonLine(raw, topic, payloadObj)) {
-            if (!dispatchPayloadMessage(topic, payloadObj)) {
-                emit logMessage(QString("未处理的 payload 消息：topic=%1").arg(topic));
-            }
-        } else {
-            emit logMessage("不是有效的 topic+JSON 行");
-        }
+    if(!display.isEmpty()) emit logMessage(display);
+    if(!error.isEmpty()) { emit logMessage(error);return; }
+    if(obj.isEmpty()) return;
+    const QString type=obj.value("type").toString();
+    if(type=="hello" || type=="status" || type=="test_result") { handleStatusLikeMessage(obj);return; }
+    if(type=="conn") { handleConnMessage(obj);return; }
+    if(type=="ack") { handleAckMessage(obj);return; }
+    if(type=="msg") {
+        QString topic;QJsonObject payload;
+        if(extractPayloadObjectFromMsgObject(obj,topic,payload) && !dispatchPayloadMessage(topic,payload))
+            emit logMessage(QString("未处理的 payload 消息：topic=%1").arg(topic));
         return;
     }
-
-    // 2) 标准 JSON
-    QJsonParseError e;
-    QJsonDocument doc = QJsonDocument::fromJson(raw, &e);
-
-    if (e.error != QJsonParseError::NoError || !doc.isObject()) {
-        QString topic;
-        QJsonObject payloadObj;
-        QString err2;
-        if (extractPayloadObjectFromBrokenMsg(raw, topic, payloadObj, err2)) {
-            if (!dispatchPayloadMessage(topic, payloadObj)) {
-                emit logMessage(QString("未处理的 payload 消息：topic=%1").arg(topic));
-            }
-        } else {
-            emit logMessage(QString("JSON 解析失败：%1；fallback也失败：%2")
-                            .arg(e.errorString(), err2));
-        }
-        return;
-    }
-
-    const QJsonObject obj = doc.object();
-    const QString type = obj.value("type").toString();
-
-    if (type == "hello" || type == "status" || type == "test_result") {
-        handleStatusLikeMessage(obj);
-        return;
-    }
-
-    if (type == "conn") {
-        handleConnMessage(obj);
-        return;
-    }
-
-    if (type == "ack") {
-        handleAckMessage(obj);
-        return;
-    }
-
-    if (type == "msg") {
-        QString topic;
-        QJsonObject payloadObj;
-        if (extractPayloadObjectFromMsgObject(obj, topic, payloadObj)) {
-            if (!dispatchPayloadMessage(topic, payloadObj)) {
-                emit logMessage(QString("未处理的 payload 消息：topic=%1").arg(topic));
-            }
-        }
-        return;
-    }
-
-    if (type == "error") {
-        emit logMessage(QString("mqttd error：%1").arg(obj.value("msg").toString()));
-        return;
-    }
-
+    if(type=="error") { emit logMessage(QString("mqttd error：%1").arg(obj.value("msg").toString()));return; }
     emit logMessage(QString("未知类型 type=%1").arg(type));
 }
-
 
 /**
  * @brief 处理 hello / status / test_result 类型的状态类消息。
@@ -5276,6 +5059,7 @@ void MqttManager::handleIpcLine(const QByteArray &line)
  * 若类型为 test_result，还会输出一次连接测试结果日志。
  *
  * @param obj mqttd 状态类 JSON 对象。
+ * @note 同步通话在线门；断线立即请求音频后台收尾，不在本槽等待声卡。
  */
 void MqttManager::handleStatusLikeMessage(const QJsonObject &obj)
 {
@@ -5283,6 +5067,7 @@ void MqttManager::handleStatusLikeMessage(const QJsonObject &obj)
     const bool connected = obj.value("connected").toBool(false);
     const int lastRc = obj.value("last_rc").toInt(-1);
     mqttBrokerConnected_ = connected;
+    if (callManager_) callManager_->setOnline(connected);
     if (connected) {
         if (IcEventBridge::instance()->networkAvailable()) {
             mqttReconnectRequiredAfterNetworkLoss_ = false;
@@ -5310,6 +5095,12 @@ void MqttManager::handleStatusLikeMessage(const QJsonObject &obj)
         ipcConfigApplyPending_ = false;
         QStringList configuredTopics = cfg_.subTopics;
         if (configuredTopics.isEmpty()) configuredTopics.append(QStringLiteral("test"));
+        if (callManager_) {
+            if (!callManager_->deviceId().isEmpty()) {
+                const QString base=QStringLiteral("device/ycLinux/%1").arg(callManager_->deviceId());
+                configuredTopics << base+"/request" << base+"/audio";
+            }
+        }
         configuredTopics.removeDuplicates();
         configuredTopics.sort();
 
@@ -5383,6 +5174,7 @@ void MqttManager::handleStatusLikeMessage(const QJsonObject &obj)
  * - failed
  *
  * @param obj mqttd 连接状态 JSON 对象。
+ * @note 失败/断开时同步关闭通话媒体门；原业务重连流程继续执行。
  */
 void MqttManager::handleConnMessage(const QJsonObject &obj)
 {
@@ -5390,6 +5182,7 @@ void MqttManager::handleConnMessage(const QJsonObject &obj)
 
     if (state == "connected") {
         mqttBrokerConnected_ = true;
+        if (callManager_) callManager_->setOnline(true);
         if (IcEventBridge::instance()->networkAvailable()) {
             mqttReconnectRequiredAfterNetworkLoss_ = false;
         }
@@ -5412,6 +5205,7 @@ void MqttManager::handleConnMessage(const QJsonObject &obj)
 
     if (state == "disconnected") {
         mqttBrokerConnected_ = false;
+        if (callManager_) callManager_->setOnline(false);
         if (faceImageReconnectResponseTimer_) {
             faceImageReconnectResponseTimer_->stop();
         }
@@ -5440,6 +5234,7 @@ void MqttManager::handleConnMessage(const QJsonObject &obj)
 
     if (state == "failed") {
         mqttBrokerConnected_ = false;
+        if (callManager_) callManager_->setOnline(false);
         if (faceImageReconnectResponseTimer_) {
             faceImageReconnectResponseTimer_->stop();
         }
@@ -5505,7 +5300,8 @@ void MqttManager::updateCurrentPlayImage(const QString &base64Image)
 /**
  * @brief 立即发送一次播放信息响应消息。
  *
- * 该接口通常用于收到 getPlayInfo 请求后，主动构造并回发当前播放信息。
+ * 该接口用于getPlayInfo回执，UI仅构造状态值，序列化/写入在IPC后台。
+ * 图片预算满时通常由MqttPage保留请求等待；元数据队列溢出提前回执沿用原字段返回空图忙说明。
  *
  * @param reqTopic 请求 topic。
  * @param reqId    请求 ID。
@@ -5524,9 +5320,25 @@ void MqttManager::sendPlayInfoNow(const QString &reqTopic,
     }
 
     QString respTopic;
-    QJsonObject packet = service_->buildPlayInfoPublishPacket(reqTopic, reqId, deviceId, &respTopic);
+    QJsonObject packet=[&] {
+        UiPerformance::OperationScope performance(UiPerformance::Operation::PlayInfoBuild,this);
+        return service_->buildPlayInfoPublishPacket(reqTopic,reqId,deviceId,&respTopic);
+    }();
 
-    if (ipc_->sendJsonLine(packet)) {
+    const bool submitted=[&] {
+        UiPerformance::OperationScope performance(UiPerformance::Operation::PlayInfoSubmit,this);
+        auto payload=packet.value("payload").toObject();auto data=payload.value("data").toObject();auto info=data.value("info").toObject();
+        bool ok=false;
+        if(info.value("base64Image").toString().isEmpty()) ok=ipc_->sendJsonLine(packet);
+        else if(!snapshotUploadBusy()) ok=ipc_->sendSnapshotJsonLine(packet);
+        else {
+            // 仅普通请求元数据溢出提前回执会到这里；保留ID/主题，用原字段说明忙，不积压重复图片。
+            info["base64Image"]=QString();info["deviceLog"]=info.value("deviceLog").toString()+QStringLiteral("\n截图上传忙，请稍后重试");
+            data["info"]=info;payload["data"]=data;packet["payload"]=payload;ok=ipc_->sendJsonLine(packet);
+        }
+        performance.setResult(ok);return ok;
+    }();
+    if (submitted) {
         emit logMessage(QString("sendPlayInfo 已提交到 mqttd，respTopic=%1").arg(respTopic));
     } else {
         emit logMessage("发送 sendPlayInfo 失败：IPC write 失败");
@@ -5671,3 +5483,8 @@ void MqttManager::notifyVolumeSetFinished(bool ok, const QString &reason)
         service_->notifyVolumeSetFinished(ok, reason);
     }
 }
+
+void MqttManager::submitCompanyScene(const QString &token,const SnapshotScene &scene) {
+    if(companyPlayInfo_) companyPlayInfo_->submitScene(token,scene);
+}
+bool MqttManager::snapshotUploadBusy() const {return ipc_ && ipc_->pendingSnapshotPublishes()>=2;}

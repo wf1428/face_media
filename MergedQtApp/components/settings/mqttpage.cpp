@@ -4,7 +4,7 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-10-24；修改人：Du lin；将资源包的版本号、整包进度和结束状态从 MQTT 管理器转发给设置页，保持原视频信号语义。
+ * @note 最近修改：2026-11-04；修改人：Du lin；普通截图回执按图片2项预算延迟提交，只保留原32项请求元数据；等待时不重复抓图/编码，不改ID/主题/音频逻辑。
  */
 
 #include "mqttpage.h"
@@ -1265,40 +1265,41 @@ void MqttPage::onCurrentRecordedFileChanged(const QString &fullPath)
     manager_->setCurrentRecordedFile(fullPath);
 }
 
-/** @brief 将最新播放截图同步到 MQTT 播放状态。 */
+/** @brief 同步截图并标记所有在途普通请求就绪；响应分轮投递，不同步批量构造。 */
 void MqttPage::onCurrentPlayImageChanged(const QString &base64Image)
 {
-    if (!manager_) return;
-
+    if(!manager_) return;
     manager_->updateCurrentPlayImage(base64Image);
-
-    if (pendingPlayInfoReply_) {
-        pendingPlayInfoReply_ = false;
-
-        manager_->sendPlayInfoNow(pendingPlayInfoTopic_,
-                                  pendingPlayInfoId_,
-                                  pendingPlayInfoDeviceId_);
-
-        pendingPlayInfoTopic_.clear();
-        pendingPlayInfoId_.clear();
-        pendingPlayInfoDeviceId_.clear();
-    }
+    for(auto &request:pendingPlayInfo_) request.imageReady=true;
+    drainPlayInfoReplies();
 }
-
-
-/** @brief 收到播放信息请求后触发截图，随后发布响应。 */
-void MqttPage::onGetPlayInfoRequested(const QString &topic,
-                                      const QString &reqId,
-                                      const QString &deviceId)
+/** @brief 有界保存原请求字段，允许一张截图满足多个ID；溢出只提前回最旧项，不丢请求。 */
+void MqttPage::onGetPlayInfoRequested(const QString &topic,const QString &reqId,const QString &deviceId)
 {
-    pendingPlayInfoReply_ = true;
-    pendingPlayInfoTopic_ = topic;
-    pendingPlayInfoId_ = reqId;
-    pendingPlayInfoDeviceId_ = deviceId;
-
-    emit requestCapturePlayImage();
+    if(!manager_) return;
+    if(pendingPlayInfo_.size()>=32) {
+        const auto oldest=pendingPlayInfo_.takeFirst();
+        manager_->sendPlayInfoNow(oldest.topic,oldest.id,oldest.deviceId);
+    }
+    pendingPlayInfo_.append({topic,reqId,deviceId,false});
+    if(manager_->snapshotUploadBusy()) drainPlayInfoReplies();
+    else emit requestCapturePlayImage();
 }
-
+/** @brief UI按序每轮只提交一个已获截图的响应；上传忙时50ms重查，容量释放后才发起所需抓图，避免图片积压。 */
+void MqttPage::drainPlayInfoReplies()
+{
+    if(playInfoDrainQueued_ || pendingPlayInfo_.isEmpty()) return;
+    playInfoDrainQueued_=true;
+    QTimer::singleShot(manager_ && manager_->snapshotUploadBusy()?50:0,this,[this] {
+        playInfoDrainQueued_=false;
+        if(!manager_ || pendingPlayInfo_.isEmpty()) return;
+        if(manager_->snapshotUploadBusy()) {drainPlayInfoReplies();return;}
+        if(!pendingPlayInfo_.first().imageReady) {emit requestCapturePlayImage();return;}
+        const auto request=pendingPlayInfo_.takeFirst();
+        manager_->sendPlayInfoNow(request.topic,request.id,request.deviceId);
+        drainPlayInfoReplies();
+    });
+}
 
 /** @brief 同步播放器当前音量到 MQTT 状态。 */
 void MqttPage::onCurrentPlayVolumeChanged(int volume)

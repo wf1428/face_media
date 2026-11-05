@@ -1,17 +1,20 @@
 /**
  * @file snapshot_processor.cpp
- * @brief 在工作线程中合成并编码媒体抓拍的处理器的实现。
- *
- * @author Dulin
- * @date 2026-07-25
+ * @brief 普通截图后台视频转换/合成/JPEG编码，复用高清单一执行线程。
+ * @author Du lin
+ * @note 最近修改：2026-11-04；修改人：Du lin；普通截图继续在共享后台转换视频/合成/编码，输入改为UI已绘制的小图像素；同步取消命令回放的文档约定，编码参数及信号保持。
  */
-
 #include "snapshot_processor.h"
-
-
+#include "common/snapshot_work.h"
+#include <QPointer>
+#include <memory>
 namespace {
-
-/** @brief 将图像编码为 JPEG Base64，失败时返回具体原因。 */
+/** @brief 后台JPEG/Base64编码，保留原普通截图尺寸和质量。
+ * @param[in] sourceImage 只读源图像，空图失败。
+ * @param[out] base64String 可空，成功写完整data URI，失败保持原值。
+ * @param[out] reason 可空，失败写具体原因。
+ * @return true完整编码，false空图/缩放/缓冲打开/JPEG失败。
+ */
 static bool encodeSnapshotToBase64(const QImage &sourceImage, QString *base64String, QString *reason)
 {
     if (sourceImage.isNull()) {
@@ -50,67 +53,26 @@ static bool encodeSnapshotToBase64(const QImage &sourceImage, QString *base64Str
     return true;
 }
 
-} // namespace
 
-
-/** @brief 将视频图像绘制到 UI 指定区域后编码为 Base64。 */
-void SnapshotProcessor::processSnapshot(const QImage &uiImage,
-                     const QImage &videoImage,
-                     const QRect &videoRect)
-{
-    if (uiImage.isNull()) {
-        emit failed(QStringLiteral("uiImage is null"));
-        return;
-    }
-
-    if (videoImage.isNull()) {
-        emit failed(QStringLiteral("videoImage is null"));
-        return;
-    }
-
-    if (!videoRect.isValid()) {
-        emit failed(QStringLiteral("videoRect is invalid"));
-        return;
-    }
-
-    // 1) 合成：把视频帧贴回整屏截图中的视频区域
-    QImage finalImage(uiImage.size(), QImage::Format_ARGB32_Premultiplied);
-    finalImage.fill(Qt::transparent);
-    if (finalImage.isNull()) {
-        emit failed(QStringLiteral("finalImage copy failed"));
-        return;
-    }
-
-    {
-        QPainter painter(&finalImage);
-
-        // 1. 先画视频到底层
-        painter.drawImage(videoRect, videoImage);
-        // 2. 再画 UI 到上层
-        painter.drawImage(0, 0, uiImage);
-        painter.end();
-    }
-
-    QString base64String;
-    QString reason;
-    if (!encodeSnapshotToBase64(finalImage, &base64String, &reason)) {
-        emit failed(reason);
-        return;
-    }
-
-    emit finished(base64String);
+/** @brief GUI提交一个只操作值的后台动作，完成/失败回到仍存活的处理器。
+ * @param[in] owner GUI所有的处理器，排队及完成时检查寿命。
+ * @param[in] create 后台生成图像，空图走原编码失败，不访问QWidget。
+ */
+void submit(SnapshotProcessor *owner,std::function<QImage()> create) {
+    auto result=std::make_shared<QString>();const QPointer<SnapshotProcessor> alive(owner);
+    SnapshotWork::queue().enqueue([alive,result,create] {
+        SerialWorkQueue::Task task;task.reportSlow=false;
+        task.run=[result,create]() mutable {auto work=std::move(create);QString error;encodeSnapshotToBase64(work(),result.get(),&error);work={};return error;};
+        task.done=[alive,result](const QString &error) {if(!alive)return;if(error.isEmpty())emit alive->finished(*result);else emit alive->failed(error);};return task;
+    },QStringLiteral("normal-%1").arg(quintptr(owner)),[alive]{return !alive;});
 }
-
-/** @brief 仅编码完整 UI 图像为 Base64。 */
-void SnapshotProcessor::processUiOnlySnapshot(const QImage &uiImage)
-{
-    QString base64String;
-    QString reason;
-
-    if (!encodeSnapshotToBase64(uiImage, &base64String, &reason)) {
-        emit failed(reason);
-        return;
-    }
-
-    emit finished(base64String);
+}
+void SnapshotProcessor::processUiOnlySnapshot(const QImage &uiImage) { submit(this,[uiImage]{return uiImage;}); }
+void SnapshotProcessor::processScene(const SnapshotScene &scene) { submit(this,[scene]{return scene.rasterize(QSize(560,360));}); }
+void SnapshotProcessor::processSnapshot(const QImage &uiImage,const QImage &videoImage,const QRect &videoRect) {
+    submit(this,[uiImage,videoImage,videoRect] {
+        if(uiImage.isNull() || videoImage.isNull() || !videoRect.isValid())return QImage();
+        QImage image(uiImage.size(),QImage::Format_ARGB32_Premultiplied);if(image.isNull())return QImage();image.fill(Qt::transparent);
+        {QPainter p(&image);p.drawImage(videoRect,videoImage);p.drawImage(0,0,uiImage);}return image;
+    });
 }

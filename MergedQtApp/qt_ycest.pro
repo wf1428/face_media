@@ -1,7 +1,7 @@
 # @file qt_ycest.pro
 # @brief RK3566 融合 Qt 应用构建入口与模块登记。
 # @author Du lin
-# @note 最近修改：2026-10-27；修改人：Du lin；登记网络页与管理员页复用的动画滑动开关头文件，保证源码分发与工程浏览包含新控件，不改变其他构建选项。
+# @note 最近修改：2026-11-04；修改人：Du lin；登记截图场景记录/后台回放及共享队列，保留原构建依赖、C++17与单mqttd/音频配置。
 TARGET = MergedQtApp
 QT += core gui widgets opengl serialport network sql virtualkeyboard qml quick quickwidgets
 
@@ -82,6 +82,7 @@ INCLUDEPATH += \
 unix: LIBS += -lpthread -lz
 
 SOURCES += \
+    common/debug/ui_performance.cpp \
     common/face_image_sync_bridge.cpp \
     common/storage_policy.cpp \
     common/clients/icboard_client.cpp \
@@ -193,6 +194,7 @@ SOURCES += \
     components/multimedia/multimediademo.cpp
 
 HEADERS += \
+    common/debug/ui_performance.h \
     common/face_image_sync_bridge.h \
     common/responsive_ui.h \
     common/toggle_switch.h \
@@ -338,3 +340,24 @@ RESOURCES += \
 qnx: target.path = /tmp/$${TARGET}/bin
 else: unix:!android: target.path = /opt/$${TARGET}/bin
 !isEmpty(target.path): INSTALLS += target
+
+# 通话复用原mqttd；ALSA仍由sysroot提供，SpeexDSP运行时可选加载，缺库回退V1。
+PKGCONFIG += alsa
+SOURCES += src/call/AudioProcessing.cpp src/call/SpeexDsp.cpp src/call/CallGpioButton.cpp src/call/AlsaAudioDevice.cpp src/call/AudioEngine.cpp src/call/MqttCallAdapter.cpp src/call/CallManager.cpp src/call/CallPanel.cpp
+HEADERS += src/call/PlaybackReference.h src/call/SpeexDsp.h src/call/CallGpioButton.h src/call/AudioOutputFocus.h src/call/CallProtocol.h src/call/AudioProcessing.h src/call/AlsaAudioDevice.h src/call/AudioEngine.h src/call/MqttCallAdapter.h src/call/CallManager.h src/call/CallPanel.h
+
+# IPC独立线程与原媒体逻辑的音频调度线程；业务JSON解析由工作任务执行。
+SOURCES += components/settings/mqtt/mqttpacketparser.cpp src/call/CallAudioTransport.cpp
+HEADERS += components/settings/mqtt/mqttpacketparser.h src/call/CallAudioTransport.h
+HEADERS += src/call/AudioDiagnostics.h src/call/RealtimeAudio.h
+
+HEADERS += src/call/ConcurrentJitterBuffer.h src/call/CaptureContinuity.h
+
+HEADERS += common/serial_work_queue.h common/configuration_work.h
+HEADERS += common/fixed_mailbox.h common/media_selection_cache.h
+
+HEADERS += common/debug/thread_observation.h src/call/PcmDiagnostics.h src/call/PcmDiagnosticRecorder.h src/call/SchedulingDiagnostics.h
+
+# 普通/高清共用只读场景和单一后台，视频不经截图GPU读回。
+SOURCES += common/snapshot_scene.cpp
+HEADERS += common/snapshot_scene.h common/snapshot_work.h

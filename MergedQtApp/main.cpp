@@ -2,8 +2,9 @@
  * @file main.cpp
  * @brief 应用程序入口及启动环境初始化。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-11-03；修改人：Du lin；以保持原事件分发的诊断应用观察通话期间UI长事件；分别计时原Qt日志编码和write输出，不改变输出、过滤及错误处理。
  */
 
 #include <unistd.h>
@@ -46,6 +47,7 @@
 #include "components/multimedia/multimediademo.h"
 #include "components/splash/splashscreen.h"
 #include "common/sql/dbstore.h"
+#include "common/debug/ui_performance.h"
 #include "ic_board/ic_board.h"
 #include "platform/rk3566_platform.h"
 
@@ -170,6 +172,10 @@ static bool shouldDropPngWarning(QtMsgType type, const QString &msg)
  * @brief 将 Qt 日志统一编码为 UTF-8 并直接写入 stderr。
  * 
  * Fatal 消息写出后立即终止进程；已知噪声由 shouldDropPngWarning() 提前过滤。
+ * 诊断仅对未过滤消息采样格式化和原write耗时，不重试短写、不新增日志锁。
+ * @param[in] type 原Qt日志级别。
+ * @param[in] ctx 原Qt日志上下文，本实现不输出。
+ * @param[in] msg 原Qt消息正文，诊断不保存其内容。
  */
 static void myUtf8MessageHandler(QtMsgType type,
                                  const QMessageLogContext &ctx,
@@ -181,6 +187,7 @@ static void myUtf8MessageHandler(QtMsgType type,
     if (shouldDropPngWarning(type, msg)) {
         return;
     }
+    UiPerformance::LogMeasurement measurement;
 
     // 直接以 UTF-8 写入 stderr，绕开设备系统 locale 不一致造成的中文乱码。
     const char* t = "";
@@ -196,7 +203,9 @@ static void myUtf8MessageHandler(QtMsgType type,
     out.append('['); out.append(t); out.append("] ");
     out.append(msg.toUtf8());
     out.append('\n');
-    ::write(2, out.constData(), out.size());
+    measurement.beforeWrite();
+    const auto written=::write(2, out.constData(), out.size());
+    measurement.finish(out.size(),written);
 
     // 如需同时进入 Qt 默认日志链，可恢复以下转发；当前关闭以避免同一消息输出两次。
     // if (g_oldHandler) g_oldHandler(type, ctx, msg);
@@ -237,6 +246,7 @@ static void setupQtHeartbeat(QCoreApplication *app)
     updateHeartbeat();
 
     QTimer *heartbeatTimer = new QTimer(app);
+    heartbeatTimer->setObjectName(QStringLiteral("app.heartbeat"));
     QObject::connect(heartbeatTimer, &QTimer::timeout, app, updateHeartbeat);
     heartbeatTimer->start(10000);   // 每 10 秒更新一次
 }
@@ -244,7 +254,7 @@ static void setupQtHeartbeat(QCoreApplication *app)
 /**
  * @brief 融合应用入口。
  * 
- * 在 QApplication 创建前完成 Wayland/OpenGL ES、虚拟键盘和日志环境配置，
+ * 在保持原分发语义的诊断QApplication创建前完成Wayland/OpenGL ES、虚拟键盘和日志环境配置，
  * 随后初始化外壳、启动页、数据库退出清理及 IC 板 I/O。
  * @param argc 命令行参数个数。
  * @param argv 命令行参数数组。
@@ -315,7 +325,7 @@ int main(int argc, char *argv[])
     g_oldHandler = qInstallMessageHandler(myUtf8MessageHandler);
     QTextCodec::setCodecForLocale(QTextCodec::codecForName("UTF-8"));
 
-    QApplication a(argc, argv);
+    UiDiagnosticApplication a(argc, argv);
     UsbPersonImportSource::clearImportRequestOnStartup();
     UsbPersonExportTarget::clearExportRequestOnStartup();
     QApplication::setQuitOnLastWindowClosed(false);

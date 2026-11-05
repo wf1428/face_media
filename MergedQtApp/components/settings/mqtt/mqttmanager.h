@@ -4,10 +4,11 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-10-24；修改人：Du lin；声明资源包任务及提交屏障；新增高清播放信息的独立采集信号、原图提交入口和有界队列所有权，不复用普通截图等待状态。
+ * @note 最近修改：2026-11-04；修改人：Du lin；接入高清场景值和有界异步图片上传接口，保留原图像接口/请求ID/单mqttd；图片容量满时延迟后继抓图。
  */
 
 #pragma once
+#include "common/snapshot_scene.h"
 
 #include <QDir>
 #include <QByteArray>
@@ -31,6 +32,7 @@
 #include "ic_board/network_access_service.h"
 #include "platform/rk3566_platform.h"
 
+class CallManager;
 class IcMqttGateway;
 class QThread;
 class MultimediaUpdate;
@@ -142,15 +144,25 @@ class MqttManager : public QObject
 {
     Q_OBJECT
 public:
-    /** @brief 创建 IPC、业务服务、IC 网关、消息路由器和独立高清截图控制器。 */
+    /** @brief 创建 IPC、业务服务、通话控制器、IC 网关和独立高清截图控制器。
+     * @param[in] parent QObject 所有者；通话控制器复用本对象创建的唯一 IPC。
+     */
     explicit MqttManager(QObject *parent = nullptr);
-    /** @brief 取消并唤醒资源更新任务，等待文件/人员线程，并由子对象析构取消等待高清编码线程。 */
+    /** @brief 先禁止通话媒体并等待音频后台释放设备，再按既有流程等待文件/人员线程和高清任务。
+     * @note 仅在应用/模块销毁时等待；正常通话挂断通过异步 finished 完成。
+     */
     ~MqttManager() override;
+
+    /** @return 本管理器拥有的唯一通话控制器，仅在 UI 线程调用其业务接口。 */
+    CallManager *callManager() const { return callManager_; }
 
     /** @brief 注册一个可处理一组 method 的扩展处理器。 */
     bool registerMessageHandler(IMqttMessageHandler *handler);
 
-    /** @brief 替换 MQTT/IC 配置并同步给网关。 */
+    /** @brief 替换 MQTT/IC 配置并同步给网关及通话控制器。
+     * @param[in] cfg 现有工程路由；只从精确 ycLinux event 主题提取通话设备身份。
+     * @note 通话身份改变先请求异步挂断，不改原协议模式或配置持久化规则。
+     */
     void setConfig(const MqttConfig &cfg);
 
     /** @return 当前配置常量引用。 */
@@ -180,16 +192,22 @@ public:
                          const QString &reqId,
                          const QString &deviceId);
 
-    /**
-     * @brief 将 GUI 抓取的高清原图异步交给独立编码器，普通回执不等待该任务。
-     * @param token 本地采集令牌，必须原样回显；过期令牌由队列忽略。
-     * @param uiImage 完整 UI 原像素图，空值表示失败。
-     * @param videoImage 可为空的视频帧。
-     * @param videoRect 视频区域，单位为 UI 实际像素。
-     * @param reason 抓取失败说明，非空时不编码图像。
+    /** @brief GUI交接高清不可变场景，后台处理；旧token由高清队列拒绝。
+     * @param[in] token 原样返回的本地抓取令牌。
+     * @param[in] scene 自有只读场景，不含控件指针。
      */
-    void submitCompanySnapshot(const QString &token, const QImage &uiImage, const QImage &videoImage,
-                               const QRect &videoRect, const QString &reason);
+    void submitCompanyScene(const QString &token,const SnapshotScene &scene);
+    /** @return Qt侧图片提交预算已满时true；UI只读原子值，不访问文件/套接字。 */
+    bool snapshotUploadBusy() const;
+    /** @brief 兼容高清原图接口，图像异步交共享队列，不等待编码。
+     * @param[in] token 原样返回的本地令牌，过期值由队列忽略。
+     * @param[in] uiImage 完整UI实际像素图，空值表示失败。
+     * @param[in] videoImage 可空的视频后备帧。
+     * @param[in] videoRect 视频实际像素区域。
+     * @param[in] reason 非空为已有抓取失败原因。
+     */
+    void submitCompanySnapshot(const QString &token,const QImage &uiImage,const QImage &videoImage,
+                               const QRect &videoRect,const QString &reason);
 
     /** @brief 更新当前播放音量。 */
     void updateCurrentPlayVolume(int volume);
@@ -276,8 +294,12 @@ private slots:
     void onIpcConnected();
     /** @brief IPC 断开后按策略启动重连。 */
     void onIpcDisconnected();
-    /** @brief 解析一帧 mqttd JSON 并分派状态或业务消息。 */
-    void onIpcFrameReceived(const QByteArray &frame);
+    /** @brief 消费后台解析值，UI仅沿原业务路径分派。
+     * @param[in] obj 标准化信封，payload已解析。
+     * @param[in] display 小型RX摘要。
+     * @param[in] error 后台解析错误，成功为空。
+     */
+    void onIpcPacketReceived(const QJsonObject &obj,const QString &display,const QString &error);
     /** @brief 记录 IPC 错误并更新页面状态。 */
     void onIpcError(const QString &err);
 
@@ -285,8 +307,6 @@ private slots:
 private:
     /** @brief 将当前 Broker 配置写入 mqttd，applyNow 控制是否立即应用。 */
     void sendConfigToMqttd(bool applyNow);
-    /** @brief 解析一行 IPC JSON 并按消息类型处理。 */
-    void handleIpcLine(const QByteArray &line);
     /** @brief 注册媒体服务和 IC 网关等内置处理器。 */
     void registerBuiltinMessageHandlers();
 
@@ -301,6 +321,13 @@ private:
     bool handleDeletePlayFile(const QString &topic, const QJsonObject &payloadObj, const QString &method);
     /** @brief 处理播放、停止、音量和 FTP 下载控制。 */
     bool handleVideoControl(const QString &topic, const QJsonObject &payloadObj);
+    /** @brief 后台配置完成后的UI业务/回执延续；准备失败保留原错误回执路径。
+     * @param[in] topic 原请求主题。
+     * @param[in] payloadObj 原请求值快照。
+     * @param[in] preparation 配置结果及普通旧播放源过期标志；下载不按此取消。
+     * @return true已消费结果（含失败），false为服务已失效或请求未识别。
+     */
+    bool finishVideoControl(const QString &topic,const QJsonObject &payloadObj,const VideoControlPreparation &preparation);
     /**
      * @brief 受理 online_v1 资源模板下发，按原始 id 发布四个分段进度及单个终态。
      * @param topic 平台下行主题，必须与本机 online_v1 request 主题一致。
@@ -468,7 +495,12 @@ private:
     /** @brief 处理 mqttd 配置确认消息。 */
     void handleAckMessage(const QJsonObject &obj);
 
-    /** @brief 兼容不同 IPC envelope，提取主题和 payload 对象。 */
+    /** @brief 从后台已标准化的msg信封提取主题和对象，不在UI再次解析字符串。
+     * @param[in] obj 后台解析器输出的msg信封。
+     * @param[out] topicOut 原主题；缺失时为空。
+     * @param[out] payloadOut 成功时为payload对象，失败为空对象。
+     * @return true存在对象payload，false无对象payload并输出原错误日志。
+     */
     bool extractPayloadObjectFromMsgObject(const QJsonObject &obj, QString &topicOut, QJsonObject &payloadOut);
 
     /** @brief 在允许自动重连时启动固定间隔定时器。 */
@@ -486,7 +518,9 @@ private:
 
 private:
     MqttConfig cfg_;
+    CallManager *callManager_ = nullptr; /**< 通话子对象；先于 IPC 销毁，异步管理声卡交接。 */
     MqttIpcClient *ipc_ = nullptr;
+    quint64 videoControlRevision_=0; /**< UI递增的已受理播放指令代次；旧准备完成不重启旧源，下载保留原处理。 */
     MqttService *service_ = nullptr;
     CompanyPlayInfo *companyPlayInfo_ = nullptr; /**< 本管理器拥有；析构时取消并等待独立高清编码线程。 */
     IcMqttGateway *icGateway_ = nullptr;

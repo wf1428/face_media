@@ -4,7 +4,7 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-10-24；修改人：Du lin；补充资源包版本提示信号及进度、结束、重启状态含义。
+ * @note 最近修改：2026-11-04；修改人：Du lin；播放信息回执遵守两笔截图上传预算，忙时50ms异步等待并暂停新抓图；补充请求顺序和满队列说明，其他接口保持。
  */
 
 #pragma once
@@ -21,6 +21,7 @@
 #include <QEvent>
 #include <QTimer>
 #include <QJsonObject>
+#include <QList>
 
 #include "components/settings/mqtt/mqttmanager.h"
 #include "components/cursoroverlay/keyboard_dialog.h"
@@ -53,10 +54,18 @@ public:
 public slots:
     /** @brief 将当前录播文件同步到 MQTT 播放状态。 */
     void onCurrentRecordedFileChanged(const QString &fullPath);
-    /** @brief 将最新播放截图同步到 MQTT 播放状态。 */
+    /** @brief 同步最新截图并使当前等待请求就绪，各ID逐UI事件回执，不重复抓图。
+     * @param[in] base64Image 原截图编码字符串，可为空，沿用原状态同步语义。
+     * @note 仅UI线程调用，不在此回调批量提交响应。
+     */
     void onCurrentPlayImageChanged(const QString &base64Image);
 
-    /** @brief 收到播放信息请求后触发截图，随后发布响应。 */
+    /** @brief 有界保存请求原字段并请求可复用截图，随后逐项回执。
+     * @param[in] topic 原请求主题。
+     * @param[in] reqId 原请求ID，合并截图不合并该字段。
+     * @param[in] deviceId 原设备标识。
+     * @note 仅UI线程调用；上传预算忙时保存元数据，容量释放后才请求抓图；满32项先回复最旧项后接收新项，不静默覆盖ID。
+     */
     void onGetPlayInfoRequested(const QString &topic,
                                 const QString &reqId,
                                 const QString &deviceId);
@@ -202,10 +211,12 @@ private:
     QCheckBox *sslCheckBox = nullptr;
 
 
-    bool pendingPlayInfoReply_ = false; /**< 正在等待媒体页截图后响应播放信息。 */
-    QString pendingPlayInfoTopic_;
-    QString pendingPlayInfoId_;
-    QString pendingPlayInfoDeviceId_;
+    /** @brief 一次普通播放信息请求；UI独占，截图合并不能覆盖其他请求ID。 */
+    struct PendingPlayInfo { QString topic,id,deviceId;bool imageReady=false; /**< 请求原字段及是否已获得一次截图完成通知。 */ };
+    QList<PendingPlayInfo> pendingPlayInfo_; /**< 最多32项；满时先用已有状态回复最旧项，不无限积压或丢请求。 */
+    bool playInfoDrainQueued_=false; /**< true已有一个逐事件回执任务，避免同一轮UI批量构造大响应。 */
+    /** @brief 每个UI事件最多发送一个已就绪回执，保留请求顺序；上传忙时50ms重查，容量释放后按需请求抓图。 */
+    void drainPlayInfoReplies();
 
     // 日志区
     QCheckBox *showLogCheckBox = nullptr;

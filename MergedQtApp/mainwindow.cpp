@@ -4,10 +4,13 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-10-24；修改人：Du lin；保留资源包整包进度连接；将独立高清采集令牌和原图以排队连接交给媒体页和 MQTT 管理器，不经过普通截图状态转发链路。
+ * @note 最近修改：2026-11-04；修改人：Du lin；新增高清截图场景值异步接线，普通/高清图像后台处理共享队列，保留原高清图像信号兼容路径和协议。
  */
 
 #include "mainwindow.h"
+#include "src/call/CallPanel.h"
+#include "src/call/CallManager.h"
+#include "src/call/CallGpioButton.h"
 #include "ui_mainwindow.h"
 #include <QKeyEvent>
 #include <QDebug>
@@ -108,6 +111,7 @@ static QString normalizeProtocolModeValue(const QString &raw)
  * @brief 创建全部页面、运行模块并建立跨页面信号连接。
  * @param parent Qt 父对象；对象销毁由父子关系管理，空指针表示无父对象。
  * @note 高清截图的令牌和原图使用排队连接；本窗口不合成、编码或序列化高清图像。
+ *       通话面板为主窗口子控件，操作只投递非阻塞业务请求，不暂停当前视频或改变页面。
  */
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -234,6 +238,39 @@ MainWindow::MainWindow(QWidget *parent)
     featuresDialog = new FeaturesDialog(this);
     featuresDialog->hide();
 
+    if (auto *manager=settingsDialog->findChild<MqttManager *>()) {
+        auto *calls=manager->callManager();
+        KeyboardDialog::loadPropertyCallButtonVisibility(Rk3566Platform::netConfigPath());
+        new CallPanel(calls,this);
+#ifdef Q_OS_LINUX
+        auto *callKey=new CallGpioButton(QStringLiteral("/sys/class/gpio"),calls);
+        callKey->setCallAvailable(calls->canUseCallButton());
+        connect(calls,&CallManager::changed,callKey,[calls,callKey](const QString &) {
+            callKey->setCallAvailable(calls->canUseCallButton());
+        });
+        connect(callKey,&CallGpioButton::logMessage,calls,&CallManager::logMessage);
+        connect(callKey,&CallGpioButton::callRequested,calls,[this,calls]() {
+            if (!calls->canUseCallButton()) return;
+            if (calls->state()!=CallManager::Idle) { calls->pressCallButton(); return; }
+            // 物理键若在密码键盘显示时按下，复用该键盘的退出结果及原排队连接。
+            for (auto *keyboard:findChildren<KeyboardDialog *>())
+                if (keyboard->requestPropertyCall()) return;
+            calls->requestCall(); // UI 串行检查；与键盘竞争时只有首个有效请求能发出。
+        });
+        connect(qApp,&QCoreApplication::aboutToQuit,callKey,&CallGpioButton::stopAsync);
+        callKey->start();
+#endif
+        if (cast) {
+            cast->setPropertyCallAvailable(calls->canRequestCall());
+            connect(calls,&CallManager::changed,cast,[calls,cast](const QString &) {
+                cast->setPropertyCallAvailable(calls->canRequestCall());
+            });
+            // 等键盘 exec 返回、页面模态标志复原后再显示通话面板。
+            connect(cast,&MultimediaDemo::callPropertyRequested,
+                    calls,&CallManager::requestCall,Qt::QueuedConnection);
+        }
+    }
+
     cmdDialog = new CommandDialog(this);
     cmdDialog->hide();
 
@@ -242,6 +279,8 @@ MainWindow::MainWindow(QWidget *parent)
         if (auto *manager = settingsDialog->findChild<MqttManager *>()) {
             connect(manager, &MqttManager::companySnapshotRequested,
                     cast, &MultimediaDemo::captureCompanySnapshot, Qt::QueuedConnection);
+            connect(cast,&MultimediaDemo::companySceneReady,
+                    manager,&MqttManager::submitCompanyScene,Qt::QueuedConnection);
             connect(cast, &MultimediaDemo::companySnapshotReady,
                     manager, &MqttManager::submitCompanySnapshot, Qt::QueuedConnection);
         }

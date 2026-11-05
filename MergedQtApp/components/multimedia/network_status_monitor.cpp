@@ -2,13 +2,21 @@
  * @file network_status_monitor.cpp
  * @brief 网络链路、外网和直播源可用性的分阶段监测告警控件的实现。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-11-04；修改人：Du lin；公网探测配置、ping进程启动/超时/重试及取消迁入独立网络事件线程；UI只收代次有效结果并显示告警，析构异步终止进程，不新增日志。
  */
 
 #include "network_status_monitor.h"
+#include "common/debug/ui_performance.h"
 
 #include <QApplication>
+#include <QProcess>
+#include <QThread>
+#include <QElapsedTimer>
+#include <atomic>
+#include <mutex>
+#include <functional>
 #include <QPainter>
 #include <QFontMetrics>
 #include <QScreen>
@@ -30,7 +38,128 @@
 #include "ic_board/ic_event_bridge.h"
 #include "platform/rk3566_platform.h"
 
-/** @brief 创建网络检查、告警闪现和探测超时定时器。 */
+/** @brief 后台检测只通过短锁门向仍存活的UI投递，不等待UI或持有控件引用。 */
+struct NetworkCheckGuard {
+    std::mutex mutex;QObject *target=nullptr; /**< mutex仅保护投递地址，不覆盖文件或进程操作。 */
+    std::atomic<quint64> generation{0}; /**< stop/新检测递增，使旧任务结果无效。 */
+};
+/** @brief 网络事件线程独占的路由/公网探测器，不访问控件。
+ * @details QProcess与超时定时器是本对象子对象，随moveToThread迁移；配置和同步路由回退也只在此线程执行。
+ * 新请求只保留最新代次，先异步终止旧ping再启动；stop通过共享原子代次立即阻止旧结果回到UI。
+ * 最终关闭先kill，收到finished/FailedToStart且进程退出后才quit，避免在UI析构QProcess等待子进程。
+ */
+class NetworkProbeWorker final:public QObject {
+public:
+    /** @brief 创建可迁移的进程/定时器子对象；实际启动等待request进入工作线程。
+     * @param[in] guard UI生命周期及取消代次，不持有控件所有权。
+     * @param[in] path 原配置路径，只在工作线程读取。
+     * @param[in] timeoutMs 原每目标超时毫秒。
+     */
+    NetworkProbeWorker(std::shared_ptr<NetworkCheckGuard> guard,QString path,int timeoutMs)
+        :guard_(std::move(guard)),path_(std::move(path)),timeoutMs_(timeoutMs),process_(new QProcess(this)),timeout_(new QTimer(this)) {
+        timeout_->setSingleShot(true);
+        connect(timeout_,&QTimer::timeout,this,[this] {
+            if(!current()) return;
+            if(process_->state()!=QProcess::NotRunning) process_->kill();else advance();
+        });
+        connect(process_,QOverload<int,QProcess::ExitStatus>::of(&QProcess::finished),this,[this](int code,QProcess::ExitStatus status) {
+            timeout_->stop();
+            if(closing_) { thread()->quit();return; }
+            if(!current()) { startPending();return; }
+            if(status==QProcess::NormalExit && code==0) complete(true);else advance();
+        });
+        connect(process_,&QProcess::started,this,[this] { if(!current()) process_->kill(); });
+        connect(process_,&QProcess::errorOccurred,this,[this](QProcess::ProcessError) {
+            if(closing_ && process_->state()==QProcess::NotRunning) thread()->quit();
+        });
+    }
+    /** @brief 工作线程接受最新检查；运行中的旧子进程退出前不复用QProcess。
+     * @param[in] generation UI提交时保存的共享代次，已过期则忽略。
+     */
+    void request(quint64 generation) {
+        if(closing_ || guard_->generation.load()!=generation) return;
+        pending_=generation;active_=0;timeout_->stop();
+        if(process_->state()!=QProcess::NotRunning) process_->kill();else startPending();
+    }
+    /** @brief 工作线程取消探测，不做同步等待。
+     * @param[in] closing true为最终释放，进程退出后终止所属事件循环；false保留线程供重启。
+     */
+    void cancel(bool closing=false) {
+        closing_|=closing;pending_=active_=0;timeout_->stop();
+        if(process_->state()!=QProcess::NotRunning) process_->kill();else if(closing_) thread()->quit();
+    }
+private:
+    /** @return 当前目标仍属于有效轮次，关闭或UI取消立即返回false。 */
+    bool current() const { return !closing_ && active_ && active_==guard_->generation.load(); }
+    /** @brief 将值结果安全投递UI；短锁只覆盖QObject地址校验与排队，不执行探测。
+     * @param[in] generation 结果所属轮次。
+     * @param[in] action UI收到后应用结果，不能携带后台可变对象引用。
+     */
+    void publish(quint64 generation,std::function<void(NetworkStatusMonitor*)> action) {
+        const auto guard=guard_;std::lock_guard<std::mutex> lock(guard->mutex);
+        QObject *target=guard->target;if(!target || guard->generation.load()!=generation) return;
+        QMetaObject::invokeMethod(target,[guard,generation,target,action=std::move(action)] {
+            if(guard->generation.load()==generation) action(static_cast<NetworkStatusMonitor*>(target));
+        },Qt::QueuedConnection);
+    }
+    /** @brief 后台读取在线开关，保持offline优先规则，不触及UI QSettings。 */
+    bool onlineEnabled() const {
+        QSettings ini(path_,QSettings::IniFormat);
+        return !ini.value("feature/offline_v1",false).toBool() &&
+            (ini.value("feature/online_v1",false).toBool() || ini.value("feature/online_v2",false).toBool());
+    }
+    /** @brief 启动待处理最新轮次；原路由等待留在此线程，取消通过代次而非等待UI实现。 */
+    void startPending() {
+        if(closing_ || !pending_) return;
+        active_=pending_;pending_=0;if(!current()) { active_=0;return; }
+        const auto generation=active_;QElapsedTimer elapsed;elapsed.start();
+        const bool enabled=onlineEnabled();bool carrierValid=false;
+        const bool linkUp=enabled ? NetworkStatusMonitor::isWiredLinkUp(&carrierValid) : true;
+        if(!current()) return;
+        const bool route=enabled && (!carrierValid || linkUp) ? NetworkStatusMonitor::hasDefaultRoute() : false;
+        if(!current()) return;
+        const auto spent=elapsed.elapsed();const auto workerId=quintptr(QThread::currentThreadId());
+        publish(generation,[enabled,carrierValid,linkUp,route,spent,workerId](NetworkStatusMonitor *ui) {
+            ui->checkState_=NetworkStatusMonitor::CheckState::Idle;
+            qInfo().noquote()<<QStringLiteral("[network-check] worker=%1 elapsedMs=%2 defaultRoute=%3").arg(workerId,0,16).arg(spent).arg(route);
+            if(!enabled) { IcEventBridge::instance()->updateNetworkAvailability(true);ui->clearWarning();return; }
+            if(carrierValid && !linkUp) { IcEventBridge::instance()->updateNetworkAvailability(false);ui->setWarning(NetworkStatusMonitor::WarningKind::LinkDown);return; }
+            ui->lastDefaultRouteOk_=route;ui->checkState_=NetworkStatusMonitor::CheckState::Pinging;
+        });
+        if(!enabled || (carrierValid && !linkUp)) { active_=0;return; }
+        targets_=QStringList()<<QStringLiteral("223.5.5.5")<<QStringLiteral("8.8.8.8")<<QStringLiteral("119.29.29.29");
+        QSettings ini(path_,QSettings::IniFormat);ini.setIniCodec("UTF-8");
+        const auto dns=ini.value("network/dns").toString().trimmed();QHostAddress address;
+        if(address.setAddress(dns) && address.protocol()==QAbstractSocket::IPv4Protocol && !targets_.contains(dns)) targets_<<dns;
+        index_=0;startTarget();
+    }
+    /** @brief 工作线程启动原ping参数并启用原超时；FailedToStart仍由原超时策略推进。 */
+    void startTarget() {
+        if(!current()) return;
+        if(index_>=targets_.size()) { complete(false);return; }
+        process_->start(QStringLiteral("ping"),QStringList()<<QStringLiteral("-c")<<QStringLiteral("1")<<QStringLiteral("-W")<<QStringLiteral("2")<<targets_.at(index_));
+        timeout_->start(timeoutMs_);
+    }
+    /** @brief 当前目标失败/超时后尝试下一个；仅工作线程的finished或timeout调用。 */
+    void advance() { if(current()) { ++index_;startTarget(); } }
+    /** @brief 发布最终公网结果；再次后台读取在线开关，停用配置仍清除原告警。
+     * @param[in] ok 当前轮次是否有成功目标。
+     */
+    void complete(bool ok) {
+        const auto generation=active_;timeout_->stop();const bool enabled=onlineEnabled();
+        publish(generation,[ok,enabled](NetworkStatusMonitor *ui) {
+            if(ui->checkState_==NetworkStatusMonitor::CheckState::Pinging) ui->finishInternetProbe(ok,enabled);
+        });active_=0;
+    }
+    std::shared_ptr<NetworkCheckGuard> guard_;QString path_;int timeoutMs_; /**< 借用取消门、自有配置路径与目标超时毫秒。 */
+    QProcess *process_;QTimer *timeout_;QStringList targets_;int index_=0; /**< 工作线程独占，QObject持有子对象；原目标顺序不变。 */
+    quint64 active_=0,pending_=0;bool closing_=false; /**< 活动/最新待处理代次，0无任务；最终关闭后拒绝新请求。 */
+};
+
+/** @brief 创建UI告警定时器与独立网络事件线程；进程/超时随worker归后台线程所有。
+ * @param[in] mainWindow 借用并作为父对象的主窗口，可为空，沿用原覆盖层行为。
+ * @param[in] configPath 原网络配置路径；为空时使用平台netConfigPath。
+ */
 NetworkStatusMonitor::NetworkStatusMonitor(QWidget *mainWindow,
                                            const QString &configPath)
     : QWidget(mainWindow),
@@ -42,6 +171,7 @@ NetworkStatusMonitor::NetworkStatusMonitor(QWidget *mainWindow,
     setAttribute(Qt::WA_TranslucentBackground, true);
     setAutoFillBackground(false);
 
+    networkGuard_=std::make_shared<NetworkCheckGuard>();networkGuard_->target=this;
     baseFont_ = QApplication::font();
 
     if (main_) {
@@ -49,7 +179,10 @@ NetworkStatusMonitor::NetworkStatusMonitor(QWidget *mainWindow,
         setGeometry(main_->rect());
     }
 
+    checkTimer_.setObjectName(QStringLiteral("network.status.check"));
     checkTimer_.setInterval(checkIntervalMs_);
+    blinkTimer_.setObjectName(QStringLiteral("network.blink"));
+    autoHideTimer_.setObjectName(QStringLiteral("network.hide"));
     connect(&checkTimer_, &QTimer::timeout,
             this, &NetworkStatusMonitor::checkNetworkStatus);
 
@@ -62,14 +195,24 @@ NetworkStatusMonitor::NetworkStatusMonitor(QWidget *mainWindow,
         hideWarningNow();
     });
 
-    pingTimeoutTimer_.setSingleShot(true);
-    connect(&pingTimeoutTimer_, &QTimer::timeout,
-            this, &NetworkStatusMonitor::onPingTimeout);
-
-    connect(&pingProcess_, SIGNAL(finished(int,QProcess::ExitStatus)),
-            this, SLOT(onPingFinished(int,QProcess::ExitStatus)));
+    networkThread_=new QThread;
+    networkThread_->setObjectName(QStringLiteral("network.probe"));
+    networkWorker_=new NetworkProbeWorker(networkGuard_,configPath_,pingTimeoutMs_);
+    networkWorker_->moveToThread(networkThread_);
+    connect(networkThread_,&QThread::finished,networkWorker_,&QObject::deleteLater);
+    connect(networkThread_,&QThread::finished,networkThread_,&QObject::deleteLater);
+    networkThread_->start();
 
     hide();
+}
+
+/** @brief 销毁前关闭UI投递门，异步取消后台进程并回收线程；不在UI等待进程或join。 */
+NetworkStatusMonitor::~NetworkStatusMonitor()
+{
+    stop();
+    { std::lock_guard<std::mutex> lock(networkGuard_->mutex);networkGuard_->target=nullptr; }
+    auto *worker=networkWorker_;
+    QMetaObject::invokeMethod(worker,[worker] { worker->cancel(true); },Qt::QueuedConnection);
 }
 
 /** @brief 启动周期检查并立即执行首轮检测。 */
@@ -82,15 +225,13 @@ void NetworkStatusMonitor::start()
 /** @brief 停止定时器、进程和所有进行中的流探测。 */
 void NetworkStatusMonitor::stop()
 {
+    networkGuard_->generation.fetch_add(1);
+    checkState_=CheckState::Idle;
     checkTimer_.stop();
     blinkTimer_.stop();
     autoHideTimer_.stop();
-    pingTimeoutTimer_.stop();
-
-    if (pingProcess_.state() != QProcess::NotRunning) {
-        pingProcess_.kill();
-        pingProcess_.waitForFinished(100);
-    }
+    auto *worker=networkWorker_;
+    QMetaObject::invokeMethod(worker,[worker] { worker->cancel(); },Qt::QueuedConnection);
 
     cancelStreamProbe();
 
@@ -120,7 +261,7 @@ bool NetworkStatusMonitor::isOnlineFeatureEnabled() const
 }
 
 /** @brief 读取有线网卡 carrier；valid 表示系统节点是否可读。 */
-bool NetworkStatusMonitor::isWiredLinkUp(bool *valid) const
+bool NetworkStatusMonitor::isWiredLinkUp(bool *valid)
 {
     if (valid) {
         *valid = false;
@@ -196,14 +337,16 @@ bool NetworkStatusMonitor::isWiredLinkUp(bool *valid) const
 }
 
 /** @return 路由表中存在默认路由时返回 true。 */
-bool NetworkStatusMonitor::hasDefaultRoute() const
+bool NetworkStatusMonitor::hasDefaultRoute()
 {
     // /proc/net/route 是最轻量的判断方式，但不同 BusyBox/内核裁剪环境下，
     // 路由信息可能显示不完整；所以这里只作为“参考状态”，不能在 ping 前直接判死。
     QFile f(QStringLiteral("/proc/net/route"));
     if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        while (!f.atEnd()) {
-            const QString line = QString::fromLatin1(f.readLine()).trimmed();
+        // proc文件常报告size=0，不能在首次读取前用atEnd判空。
+        const auto contents=f.readAll();
+        for (const auto &bytes:contents.split('\n')) {
+            const QString line = QString::fromLatin1(bytes).trimmed();
             if (line.isEmpty() || line.startsWith(QStringLiteral("Iface"))) {
                 continue;
             }
@@ -259,131 +402,22 @@ bool NetworkStatusMonitor::hasDefaultRoute() const
     return false;
 }
 
-/** @brief 启动一轮非重入的分阶段网络检查。 */
+/** @brief UI仅提交非重入检查代次；配置、路由与ping均由网络事件线程处理。 */
 void NetworkStatusMonitor::checkNetworkStatus()
 {
-    if (checkState_ == CheckState::Pinging || checkState_ == CheckState::StreamProbing) {
-        return;
-    }
-
-    if (!isOnlineFeatureEnabled()) {
-        // offline_v1 不参与本次 online_v1 断线通行判定。
-        IcEventBridge::instance()->updateNetworkAvailability(true);
-        clearWarning();
-        return;
-    }
-
-    bool carrierValid = false;
-    const bool linkUp = isWiredLinkUp(&carrierValid);
-    if (carrierValid && !linkUp) {
-        IcEventBridge::instance()->updateNetworkAvailability(false);
-        setWarning(WarningKind::LinkDown);
-        return;
-    }
-
-    // 注意：不能因为“默认网关检测失败”就立刻弹网络异常。
-    // 实测 TinaLinux 上可能出现 /proc/net/route/route 命令解析不到默认网关，
-    // 但实际 ping 223.5.5.5/8.8.8.8 正常的情况。
-    // 所以默认网关只作为失败时的附加原因，最终以外网探测结果为准。
-    lastDefaultRouteOk_ = hasDefaultRoute();
-
-    beginInternetProbe();
-}
-
-/** @brief 依次异步 ping 配置的外网目标。 */
-void NetworkStatusMonitor::beginInternetProbe()
-{
-    // 保留原有公网探测顺序，并在每轮读取配置中的路由器 DNS 地址。
-    // 只接受 IP，避免将无效配置传给 ping 或触发域名解析。
-    pingTargets_ = QStringList() << QStringLiteral("223.5.5.5")
-                                 << QStringLiteral("8.8.8.8")
-                                 << QStringLiteral("119.29.29.29");
-    QSettings ini(configPath_, QSettings::IniFormat);
-    ini.setIniCodec("UTF-8");
-    const QString configuredDns = ini.value(QStringLiteral("network/dns")).toString().trimmed();
-    QHostAddress dnsAddress;
-    if (dnsAddress.setAddress(configuredDns) &&
-        dnsAddress.protocol() == QAbstractSocket::IPv4Protocol &&
-        !pingTargets_.contains(configuredDns)) {
-        pingTargets_ << configuredDns;
-    }
-
-    if (pingTargets_.isEmpty()) {
-        finishInternetProbe(false);
-        return;
-    }
-
-    checkState_ = CheckState::Pinging;
-    pingTargetIndex_ = 0;
-
-    const QString target = pingTargets_.at(pingTargetIndex_);
-    QStringList args;
-    args << QStringLiteral("-c") << QStringLiteral("1")
-         << QStringLiteral("-W") << QStringLiteral("2")
-         << target;
-
-    pingProcess_.start(QStringLiteral("ping"), args);
-    pingTimeoutTimer_.start(pingTimeoutMs_);
-}
-
-/** @brief 处理当前 ping 目标结果并决定重试或进入直播探测。 */
-void NetworkStatusMonitor::onPingFinished(int exitCode, QProcess::ExitStatus exitStatus)
-{
-    pingTimeoutTimer_.stop();
-
-    const bool ok = (exitStatus == QProcess::NormalExit && exitCode == 0);
-    if (ok) {
-        finishInternetProbe(true);
-        return;
-    }
-
-    ++pingTargetIndex_;
-    if (pingTargetIndex_ >= pingTargets_.size()) {
-        finishInternetProbe(false);
-        return;
-    }
-
-    const QString target = pingTargets_.at(pingTargetIndex_);
-    QStringList args;
-    args << QStringLiteral("-c") << QStringLiteral("1")
-         << QStringLiteral("-W") << QStringLiteral("2")
-         << target;
-
-    pingProcess_.start(QStringLiteral("ping"), args);
-    pingTimeoutTimer_.start(pingTimeoutMs_);
-}
-
-/** @brief 终止超时的 ping 并尝试下一个目标。 */
-void NetworkStatusMonitor::onPingTimeout()
-{
-    if (pingProcess_.state() != QProcess::NotRunning) {
-        // kill 后 QProcess 会发 finished，统一在 onPingFinished() 里按失败处理并切到下一个目标。
-        pingProcess_.kill();
-        return;
-    }
-
-    ++pingTargetIndex_;
-    if (pingTargetIndex_ >= pingTargets_.size()) {
-        finishInternetProbe(false);
-        return;
-    }
-
-    const QString target = pingTargets_.at(pingTargetIndex_);
-    QStringList args;
-    args << QStringLiteral("-c") << QStringLiteral("1")
-         << QStringLiteral("-W") << QStringLiteral("2")
-         << target;
-
-    pingProcess_.start(QStringLiteral("ping"), args);
-    pingTimeoutTimer_.start(pingTimeoutMs_);
+    if(checkState_!=CheckState::Idle) return;
+    checkState_=CheckState::CheckingRoute;
+    const auto generation=networkGuard_->generation.fetch_add(1)+1;
+    auto *worker=networkWorker_;
+    QMetaObject::invokeMethod(worker,[worker,generation] { worker->request(generation); },Qt::QueuedConnection);
 }
 
 /** @brief 结束外网探测并继续直播源检查或设置告警。 */
-void NetworkStatusMonitor::finishInternetProbe(bool internetOk)
+void NetworkStatusMonitor::finishInternetProbe(bool internetOk,bool onlineEnabled)
 {
     checkState_ = CheckState::Idle;
 
-    if (!isOnlineFeatureEnabled()) {
+    if (!onlineEnabled) {
         IcEventBridge::instance()->updateNetworkAvailability(true);
         clearWarning();
         return;

@@ -3,7 +3,7 @@
  * @brief 处理 MQTT 媒体命令、维护播放状态并构建协议响应包。
  *
  * @author Du lin
- * @note 最近修改：2026-10-24；修改人：Du lin；播放信息构包支持独立高清回执 method 和跳过普通截图缓存，其他字段及普通调用默认行为不变。
+ * @note 最近修改：2026-11-04；修改人：Du lin；拆分后台配置准备与UI业务，后台使用已初始化路径快照避免重复补种媒体；过滤过期播放源并保留原音量/下载处理及协议。
  * @date 2026-07-25
  */
 
@@ -12,6 +12,7 @@
 #include <QObject>
 #include <QJsonObject>
 #include <QList>
+#include <QStringList>
 #include <QMap>
 #include <functional>
 #include <QDateTime>
@@ -30,12 +31,21 @@ struct PlayInfoState
     QString deviceLog;             /**< 最近设备状态或错误信息。 */
 };
 
-/**
- * @brief MQTT 媒体业务命令处理和响应包构建服务。
- *
- * 不直接发送 MQTT；所有方法只更新本地状态、触发播放器信号或返回待发布 JSON，
- * 实际 IPC 发布由 MqttManager 完成。
- */
+/** @brief 后台准备的纯值结果；失败阶段供UI在原控制流程位置报告错误。 */
+struct VideoControlPreparation {
+    enum Stage {
+        Ready, /**< 全部准备成功。 */
+        Selection, /**< 广告类型保存失败。 */
+        Ftp, /**< FTP连接参数保存失败。 */
+        Directory, /**< 下载目录创建失败。 */
+        Paths, /**< FTP路径保存失败。 */
+        Stream /**< 流地址保存失败。 */
+    }; /**< 失败所处原处理步骤，Ready表示全部准备成功。 */
+    bool playbackObsolete=false; /**< UI确认被后续指令替代；只保留原音量处理，不启动/改写旧播放源。 */
+    Stage failed=Ready;QString error;QStringList notices; /**< 错误文本及时间同步日志；不保存FTP凭据。 */
+};
+
+/** @brief 主实例在UI维护媒体业务；后台局部实例仅执行配置准备，不共享QObject状态。 */
 class MqttService : public QObject
 {
     Q_OBJECT
@@ -43,8 +53,25 @@ public:
     /** @brief 初始化为空闲播放状态。 */
     explicit MqttService(QObject *parent = nullptr);
 
-    /** @brief 处理播放、音量、停止和下载等 videoControl 命令。 */
-    bool handleVideoControlMessage(const QString& topic, const QJsonObject& payloadObj, bool *status = nullptr);
+    /** @brief 后台准备广告选择、FTP/流配置、目录及原时间同步；必须在后台线程创建局部服务调用。
+     * @param[in] payloadObj 原videoControl值快照，不访问UI或主服务的共享状态。
+     * @return 准备结果及原失败阶段；失败时不会继续后续写入。
+     */
+    VideoControlPreparation prepareVideoControlConfiguration(const QJsonObject &payloadObj);
+    /** @brief 在主服务线程捕获配置路径，返回后台准备函数；不重复初始化/补种媒体目录。
+     * @param[in] payloadObj 待处理请求的值快照。
+     * @return 仅在后台执行的准备函数，不持有主服务QObject或可变状态。
+     */
+    std::function<VideoControlPreparation()> configurationPreparation(const QJsonObject &payloadObj) const;
+    /** @brief UI消费已完成的配置准备结果，更新状态并发出原播放/音量/下载信号。
+     * @param[in] topic 请求主题。
+     * @param[in] payloadObj 原请求对象。
+     * @param[in] preparation 已串行执行的后台准备结果。
+     * @param[out] status 可空；保持原业务成功/等待音量回执语义。
+     * @return true为已识别videoControl；false为其他方法。
+     */
+    bool handleVideoControlMessage(const QString& topic, const QJsonObject& payloadObj,
+                                  const VideoControlPreparation &preparation, bool *status = nullptr);
 
     /** @brief 校验并删除指定本地播放文件。 */
     bool handleDeletePlayFileMessage(const QString &topic, const QJsonObject &payloadObj);
@@ -145,6 +172,12 @@ signals:
     void volumeControlResultReady(bool ok, const QString &reqTopic, const QJsonObject &reqPayload);
 
 private:
+    /** @brief 后台局部服务使用已初始化的路径快照，避免再次补种默认媒体文件。
+     * @param[in] configurationPath 主服务已确定的INI路径；不在构造时重新解析平台目录。
+     * @param[in] mediaDirectory 主服务已确定的媒体目录；仅保存值，不创建或复制文件。
+     * @note 对象只在创建它的后台线程使用、销毁，不连接主服务可变状态。
+     */
+    MqttService(const QString &configurationPath,const QString &mediaDirectory);
     /** @brief 将 FTP 连接参数写入网络配置。 */
     bool writeFtpIni(const QString& host, const QString& portStr, const QString& user, const QString& pwd, QString* err = nullptr);
 

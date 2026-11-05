@@ -2,8 +2,9 @@
  * @file gst_player_widget.h
  * @brief 实现 GStreamer 播放管线、三槽帧邮箱和 Qt OpenGL 视频画布。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-11-04；修改人：Du lin；新增按需tryLock复用NV12邮箱值和UI画布查询，截图不触发GL读回、不延长播放租约、不修改管线/录放。
  */
 
 #ifndef GST_PLAYER_WIDGET_H
@@ -17,6 +18,10 @@
 #include <QAtomicInteger>
 #include <QByteArray>
 #include <QColor>
+#include <atomic>
+#include <memory>
+#include "common/serial_work_queue.h"
+#include "common/snapshot_scene.h"
 #include <QElapsedTimer>
 #include <QImage>
 #include <QHash>
@@ -54,7 +59,9 @@ public:
                       const std::function<void()> &frameConsumedCallback);
     /** @brief 清除待显示帧并释放关联的帧租约。 */
     void clearVideoFrame();
-    /** @return 当前已提交视频帧的 RGB 快照。 */
+    /** @return 当前画布抓取的RGB快照；原UI抓取耗时单独统计，后台编码不在此范围。
+     * @note 沿用原GUI线程调用约束，不因诊断改变抓取方式。
+     */
     QImage videoSnapshot();
 
     /** @brief 兼容旧 TPlayer 画布接口；OpenGL 画布不使用测试颜色。 */
@@ -63,7 +70,7 @@ public:
 protected:
     /** @brief 初始化着色器、纹理和顶点缓冲。 */
     void initializeGL() override;
-    /** @brief 上传最新 NV12 帧并完成 YUV 到 RGB 绘制。 */
+    /** @brief 上传NV12并绘制；通话期间统计完整UI作用域及嵌套上传耗时，二者不可相加。 */
     void paintGL() override;
 
 private:
@@ -114,24 +121,40 @@ class GstPlayerWidget : public QWidget
 {
     Q_OBJECT
 public:
-    /** @brief 创建管线轮询、位置和诊断定时器。 */
+    /** @brief 创建原管线轮询、位置和诊断定时器，并命名供UI长事件定位。
+     * @param[in] parent 原QWidget父对象，可为空，不改变所有权。
+     */
     explicit GstPlayerWidget(QWidget *parent = nullptr);
-    /** @brief 阻止新回调后停止并释放 GStreamer 管线。 */
+    /** @brief 阻止新回调、等待后台停止后释放回调目标；仅最终析构允许等待，不用于正常停止/切源。 */
     ~GstPlayerWidget() override;
+
+    /** @brief 在音频后台线程切换通话独占模式，释放/恢复共享 ALSA 输出。
+     * @param[in] exclusive true 丢弃媒体和提示 PCM 并关闭共享 sink；false 恢复现有分支。
+     * @return true 已释放声卡或成功提交恢复；false 为共享管线状态切换失败。
+     * @note 不触碰视频 playbin；不得从 UI 线程调用；释放时最多等待 1 秒状态确认，切换本身耗时由 GStreamer 决定。
+     */
+    static bool setCallAudioExclusive(bool exclusive);
 
     /** @brief 指定承载视频画布或硬件 overlay 的目标控件。 */
     void setVideoOutput(QWidget *widget);
-    /** @brief 设置本地路径或网络 URL，并使旧异步帧失效。 */
+    /** @brief 设置本地路径或网络URL并使旧源失效；耗时停止、切源和预卷在后台串行执行。
+     * @param[in] path 原媒体路径或URL，沿用既有校验及状态转换。
+     * @note UI立即使旧源失效；后台串行NULL/URI/PAUSED，过期结果不重启定时器或报错。
+     */
     void setMedia(const QString &path);
-    /** @brief 请求播放；预加载尚未完成时会在 prepared 后继续。 */
+    /** @brief 异步请求播放；与切源/停止串行，预加载或提示音准备未完成时沿原prepared路径继续。 */
     void play();
-    /** @brief 暂停当前管线。 */
+    /** @brief UI立即撤销播放意图，后台串行暂停并移除普通媒体混音分支。 */
     void pause();
-    /** @brief 停止播放并清除画布中的最后一帧。 */
+    /** @brief 立即清除画布和播放意图，异步停止；不等待GStreamer。 */
     void stop();
-    /** @brief 完整释放并重新创建 playbin，用于清除硬件解码器异常上下文。 */
+    /** @brief 排队完整释放并重建 playbin；后续 setMedia/play 按序执行。
+     * @return true 表示重建请求已受理；异步创建失败通过 errorOccured 报告。
+     */
     bool recreatePipeline();
-    /** @brief 跳转到指定毫秒位置。 */
+    /** @brief 串行提交当前源的跳转请求，切源后不执行旧请求。
+     * @param[in] ms 非负毫秒；负值忽略。
+     */
     void seekMs(int ms);
 
     /** @return playbin 已成功创建时返回 true。 */
@@ -146,7 +169,9 @@ public:
     /** @return 当前播放器绑定了视频画布，而不是纯音频提示播放器。 */
     bool hasVideoOutput() const { return !videoWidget_.isNull(); }
 
-    /** @brief 设置归一化音量，取值范围为 0.0～1.0。 */
+    /** @brief UI更新音量缓存并串行提交playbin属性，预卷/播放前应用当前有效值。
+     * @param[in] value01 输入限制到0.0～1.0；0为媒体静音。
+     */
     void setVolume(float value01);
     /** @return 当前归一化音量。 */
     float volume() const { return volume01_; }
@@ -157,7 +182,10 @@ public:
     /** @brief 启用短提示音静音预卷，使共享音频链路在首个语音采样前就绪。 */
     void setPromptAudioMode(bool on);
 
-    /** @brief 设置仅准备不自动播放的预加载模式。 */
+    /** @brief 改变预加载角色并提交不可合并的旧图销毁屏障。
+     * @param[in] on true只准备，false为正常输出；角色不变时不重建。
+     * @note UI控件设置保持UI归属，后续setMedia/play排在销毁屏障之后。
+     */
     void setPreloadMode(bool on);
     /** @return 管线已完成异步准备时返回 true。 */
     bool isPrepared() const { return prepared_; }
@@ -177,6 +205,15 @@ public:
     void setSourceVideoSize(int width, int height);
     /** @brief 请求从最新解码样本生成一张快照。 */
     void requestSnapshot();
+    /** @return 当前是否由Qt合成视频；UI只读，不查询管线/设备。普通截图可直接包含画布。 */
+    bool snapshotIncludesVideo() const { return useQtCompositedVideo(); }
+    /** @brief GUI按需复用最新可安全读取的NV12值，不查询管线或等待锁。
+     * @return 有效帧持有只读副本引用；锁忙/切源/无帧返回空；不改变正常播放租约。
+     * @note 只在GUI调用，已发布但未绘制帧可能比当前画布早一帧；后续解码写入通过QByteArray分离。
+     */
+    SnapshotVideoFrame snapshotVideoFrame() const;
+    /** @return GUI视频画布的借用指针；不交后台，非Qt输出可为空。 */
+    QWidget *snapshotVideoWidget() const;
 
 signals:
     /** @brief 媒体正常播放到末尾。 */
@@ -209,7 +246,7 @@ protected:
 private slots:
     /** @brief 拉取并处理 GStreamer 总线上的状态、EOS 和错误消息。 */
     void pollBus();
-    /** @brief 周期读取播放位置和时长。 */
+    /** @brief 沿用原周期投递一次后台位置/时长查询；忙碌时跳过，UI只发出仍属于当前源的结果。 */
     void pollPosition();
     /** @brief 周期输出 RTSP/RTP、解码、RGA 和 GUI 端到端诊断数据。 */
     void pollPlaybackDiagnostics();
@@ -242,8 +279,14 @@ private:
 
     /** @brief 延迟创建 playbin、sink、总线和探针。 */
     void ensurePipeline();
-    /** @brief 停止并释放全部 GStreamer 对象和帧邮箱。 */
+    /** @brief 提交不可合并的后台停止/销毁屏障；后继创建须等待完成，普通调用不等待。 */
     void releasePipeline();
+    /** @brief 仅最终析构在后台退出后清理尚未移交的引用；普通释放已在后台销毁旧图。 */
+    void releasePipelineResources();
+    std::unique_ptr<SerialWorkQueue> pipelineQueue_; /**< 每播放器专用串行队列；析构先等待，再释放回调目标。 */
+    std::atomic<uint64_t> pipelineFrameRevision_{0}; /**< 后台已配置源对应代次，必须与意图代次相同才放行，避免旧任务重新打开新代次入口。 */
+    std::atomic_bool pipelineFramesEnabled_{false}; /**< 停止/切源关闭旧帧入口；新源NULL及URI完成后才放行解码样本。 */
+    std::atomic<uint64_t> pipelineRevision_{0}; /**< UI递增的播放意图代次；后台只读，淘汰旧URI/播放请求。 */
     /** @brief 根据平台和配置选择视频 sink。 */
     GstElement *createVideoSink();
     /** @brief 创建 appsink，使解码帧进入 Qt 合成路径。 */
@@ -298,16 +341,33 @@ private:
     void resetPlaybackDiagnostics();
     /** @brief 清除提示音 preroll 引用和本次静音前导状态。 */
     void resetPromptPrerollState();
-    /** @brief 把业务音量和所有临时压低系数合成为 playbin 的实际音量。 */
+    /** @brief 在UI计算音量快照，后台串行写入playbin，合并尚未执行的旧音量任务。 */
     void applyEffectiveVolume();
+    /** @return UI线程计算的归一化有效音量，包含全部临时压低，供后台状态任务捕获。 */
+    float effectiveVolume01() const;
 
     /** @brief 在同步总线回调中绑定硬件视频窗口句柄。 */
     static GstBusSyncReply busSyncHandler(GstBus *bus, GstMessage *message, gpointer userData);
-    /** @brief 记录视频帧到达时间并节流发送监测信号。 */
+    /** @brief 记录当前有效源的帧信息；延迟GUI信号按源代次过滤。
+     * @param[in] pad GStreamer借用的探针pad；音频探针不使用此参数。
+     * @param[in] info GStreamer借用的探针信息，仅buffer参与统计。
+     * @param[in] userData 受管线停止/析构屏障保护的播放器指针。
+     * @return GST_PAD_PROBE_OK，保持原数据流；不等待GUI。
+     */
     static GstPadProbeReturn videoPadProbe(GstPad *pad, GstPadProbeInfo *info, gpointer userData);
-    /** @brief 记录音频帧到达时间并节流发送监测信号。 */
+    /** @brief 记录当前有效源的帧信息；延迟GUI信号按源代次过滤。
+     * @param[in] pad GStreamer借用的探针pad；音频探针不使用此参数。
+     * @param[in] info GStreamer借用的探针信息，仅buffer参与统计。
+     * @param[in] userData 受管线停止/析构屏障保护的播放器指针。
+     * @return GST_PAD_PROBE_OK，保持原数据流；不等待GUI。
+     */
     static GstPadProbeReturn audioPadProbe(GstPad *pad, GstPadProbeInfo *info, gpointer userData);
-    /** @brief 统计送入视频解码器的压缩帧、关键帧和损坏标志。 */
+    /** @brief 统计压缩帧及信用失速；故障通知按源代次过滤，避免重建新源。
+     * @param[in] pad GStreamer借用pad。
+     * @param[in] info GStreamer借用的buffer信息。
+     * @param[in] userData 受停止/析构屏障保护的播放器。
+     * @return 保持原探针放行/丢弃策略，不等待GUI。
+     */
     static GstPadProbeReturn decoderInputPadProbe(GstPad *pad,
                                                   GstPadProbeInfo *info,
                                                   gpointer userData);
@@ -319,7 +379,11 @@ private:
     static GstPadProbeReturn rtpInputPadProbe(GstPad *pad,
                                               GstPadProbeInfo *info,
                                               gpointer userData);
-    /** @brief 接收 appsink 样本，RGA 转换后写入帧邮箱。 */
+    /** @brief 处理当前源样本；旧代次入口及延迟通知被过滤，不跨线程访问控件。
+     * @param[in] sink GStreamer借用的appsink。
+     * @param[in] userData 受停止/析构屏障保护的播放器。
+     * @return 原GstFlowReturn；无效旧入口返回FLUSHING，提示preroll沿原OK语义。
+     */
     static GstFlowReturn appSinkNewSample(GstElement *sink, gpointer userData);
     /** @brief 把音频 appsink 样本送入进程内共享混音器。 */
     static GstFlowReturn sharedAudioAppSinkNewSample(GstElement *sink, gpointer userData);
@@ -361,7 +425,7 @@ private:
     bool prepared_ = false;
     bool playing_ = false;
     bool playRequested_ = false;
-    bool preloadMode_ = false;
+    std::atomic_bool preloadMode_{false}; /**< UI设置、解码回调读取的预加载标志。 */
     bool invalidRtcpDestinationWarningLogged_ = false;
     std::atomic_bool shuttingDown_ {false}; /**< 析构期间阻止回调继续投递。 */
     float volume01_ = 1.0f;

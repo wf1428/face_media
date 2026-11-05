@@ -3,20 +3,13 @@
  * @brief 处理 MQTT 媒体命令、维护播放状态并构建协议响应包。
  *
  * @author Du lin
- * @note 最近修改：2026-10-24；修改人：Du lin；复用播放信息字段构造高清响应元数据，允许跳过普通截图缓存并指定高清 method，普通 sendPlayInfo 默认行为不变。
+ * @note 最近修改：2026-11-04；修改人：Du lin；拆分后台配置准备与UI业务，后台使用已初始化路径快照避免重复补种媒体；过滤过期播放源并保留原音量/下载处理及协议。
  * @date 2026-07-25
  */
 
 #include "mqttservice.h"
 #include "common/media_content_policy.h"
 
-#include <errno.h>
-#include <fcntl.h>
-#include <linux/rtc.h>
-#include <string.h>
-#include <sys/ioctl.h>
-#include <time.h>
-#include <unistd.h>
 
 #include <QDateTime>
 #include <QDir>
@@ -597,6 +590,58 @@ QJsonObject MqttService::buildEventPublishPacket(const QString &reqTopic, const 
 }
 
 
+/** @brief 后台对象采用路径快照，覆盖成员默认初始化，避免LIVE等请求再次补种媒体目录。 */
+MqttService::MqttService(const QString &configurationPath,const QString &mediaDirectory)
+    :QObject(nullptr),iniPath(configurationPath),videoDir(mediaDirectory)
+{
+}
+
+/** @brief 捕获常量路径和请求值；返回函数不引用主服务对象，可在配置后台线程执行。 */
+std::function<VideoControlPreparation()> MqttService::configurationPreparation(const QJsonObject &payloadObj) const
+{
+    const auto configurationPath=iniPath,mediaDirectory=videoDir;
+    return [configurationPath,mediaDirectory,payloadObj] {
+        MqttService local(configurationPath,mediaDirectory);
+        return local.prepareVideoControlConfiguration(payloadObj);
+    };
+}
+
+/** @brief 后台局部服务串行完成原配置读写，结果只含状态/日志，不触发播放信号。 */
+VideoControlPreparation MqttService::prepareVideoControlConfiguration(const QJsonObject &payloadObj)
+{
+    VideoControlPreparation result;
+    const QJsonObject dataObj=payloadObj.value("data").toObject();
+    const QString videoType=dataObj.value("videoType").toString().trimmed().toUpper();
+    if(videoType==QLatin1String("RECORDED") || dataObj.contains("contentType") || dataObj.contains("smallImageMode")) {
+        QSettings ini(iniPath,QSettings::IniFormat);ini.setIniCodec("UTF-8");
+        ini.setValue("playback/contentType",MediaContentPolicy::normalizeContentType(dataObj.value("contentType").toString()));
+        ini.setValue("playback/smallImageMode",MediaContentPolicy::smallImageMode(dataObj.value("smallImageMode")) ? 1 : 0);
+        ini.sync();
+        if(ini.status()!=QSettings::NoError) { result.failed=VideoControlPreparation::Selection;result.error=QStringLiteral("保存广告播放类型失败");return result; }
+    }
+    // 局部QObject只在本后台线程使用；日志收集为值，UI完成后再按原信号输出。
+    const auto connection=connect(this,&MqttService::logMessage,this,[&result](const QString &text){result.notices.append(text);},Qt::DirectConnection);
+    const QString serverTime=payloadObj.value("time").toString().trimmed();QString error;
+    if(!serverTime.isEmpty() && !syncSystemTimeFromServerString(serverTime,&error))
+        result.notices.append(QStringLiteral("根据服务端 time 同步系统时间失败：%1").arg(error));
+    disconnect(connection);
+    const QString file=QFileInfo(dataObj.value("videoPath").toString().trimmed()).fileName().trimmed();
+    if(videoType==QLatin1String("RECORDED") && !file.isEmpty()) {
+        QString password=dataObj.value("ftpPwd").toString().trimmed();if(password.compare("null",Qt::CaseInsensitive)==0) password.clear();
+        if(!writeFtpIni(dataObj.value("ftpPath").toString().trimmed(),dataObj.value("ftpPort").toString().trimmed(),
+                        dataObj.value("ftpUser").toString().trimmed(),password,&result.error)) { result.failed=VideoControlPreparation::Ftp;return result; }
+        const bool small=MediaContentPolicy::isImage(file) && MediaContentPolicy::smallImageMode(dataObj.value("smallImageMode"));
+        const QString local=small ? MediaContentPolicy::pictureDir(Rk3566Platform::staticRoot()) : Rk3566Platform::videoDir();
+        if(!QDir().mkpath(local)) { result.failed=VideoControlPreparation::Directory;return result; }
+        QString remote=file;if(!remote.startsWith('/')) remote.prepend('/');
+        if(!writeIniFtpPaths(remote,local,QString(),&result.error)) result.failed=VideoControlPreparation::Paths;
+    } else if(videoType==QLatin1String("LIVE")) {
+        const QString url=dataObj.value("videoUrl").toString().trimmed();
+        if(!url.isEmpty() && !writeIniFtpPaths(QString(),QString(),url,&result.error)) result.failed=VideoControlPreparation::Stream;
+    }
+    return result;
+}
+
 /**
  * @brief 处理 videoControl 类型的控制消息。
  *
@@ -608,14 +653,18 @@ QJsonObject MqttService::buildEventPublishPacket(const QString &reqTopic, const 
  *
  * @param topic      消息 topic。
  * @param payloadObj 消息 payload 对象。
+ * @param preparation 后台配置准备结果，不在UI同步落盘。
+ * @param status 可空，返回原业务结果。
  * @return true  已识别并处理 videoControl 请求。
  * @return false 当前消息不是 videoControl 请求。
  */
-bool MqttService::handleVideoControlMessage(const QString& topic, const QJsonObject& payloadObj, bool *status)
+bool MqttService::handleVideoControlMessage(const QString& topic, const QJsonObject& payloadObj,
+                                           const VideoControlPreparation &preparation, bool *status)
 {
     Q_UNUSED(topic);
 
     if (status) *status = false;
+    const QString previousStatus=playInfo_.status;
     playInfo_.status = "error";
 
     // 只处理 videoControl
@@ -625,28 +674,9 @@ bool MqttService::handleVideoControlMessage(const QString& topic, const QJsonObj
     const QJsonObject dataObj = payloadObj.value("data").toObject();
     const QString videoType = dataObj.value("videoType").toString().trimmed().toUpper();
 
-    // 仅新增广告选择项，不修改音量、直播和FTP其他参数的语义。
-    if (videoType == QLatin1String("RECORDED") || dataObj.contains("contentType") ||
-        dataObj.contains("smallImageMode")) {
-        QSettings ini(iniPath, QSettings::IniFormat);
-        ini.setIniCodec("UTF-8");
-        ini.setValue("playback/contentType", MediaContentPolicy::normalizeContentType(
-                         dataObj.value("contentType").toString()));
-        ini.setValue("playback/smallImageMode",
-                     MediaContentPolicy::smallImageMode(dataObj.value("smallImageMode")) ? 1 : 0);
-        ini.sync();
-        if (ini.status() != QSettings::NoError) {
-            emit logMessage(QStringLiteral("保存广告播放类型失败"));
-            return true;
-        }
-    }
-
-    const QString serverTime = payloadObj.value("time").toString().trimmed();
-    if (!serverTime.isEmpty()) {
-        QString terr;
-        if (!syncSystemTimeFromServerString(serverTime, &terr)) {
-            emit logMessage(QString("根据服务端 time 同步系统时间失败：%1").arg(terr));
-        }
+    for(const auto &notice:preparation.notices) emit logMessage(notice);
+    if(preparation.failed==VideoControlPreparation::Selection) {
+        emit logMessage(preparation.error);return true;
     }
 
     // 先清理上一次挂起的音量回执状态
@@ -714,6 +744,14 @@ bool MqttService::handleVideoControlMessage(const QString& topic, const QJsonObj
         emit logMessage("本次 videoControl 未携带 videoVolume，不等待音量回执");
     }
 
+    if(preparation.playbackObsolete) {
+        // 旧源已被后续指令替代；音量仍按原请求处理和回执，不回滚当前播放字段。
+        if(hasVideoVolume) playInfo_.videoVolume=videoVolume;
+        playInfo_.status=previousStatus;
+        emit logMessage(QStringLiteral("videoControl播放操作已被后续指令替代，跳过旧源"));
+        return true;
+    }
+
     // 记录当前播放状态
     playInfo_.videoType = videoType.isEmpty() ? "NONE" : videoType;
     if (hasVideoVolume) {
@@ -760,7 +798,8 @@ bool MqttService::handleVideoControlMessage(const QString& topic, const QJsonObj
         if (ftpPwd.compare("null", Qt::CaseInsensitive) == 0) ftpPwd.clear();
 
         QString werr;
-        if (!writeFtpIni(ftpHost, ftpPort, ftpUser, ftpPwd, &werr)) {
+        if (preparation.failed==VideoControlPreparation::Ftp) {
+            werr=preparation.error;
             emit logMessage(QString("RECORDED：写入 FTP 配置失败：%1").arg(werr));
 
             // FTP 没启动成功，直接立即回 error
@@ -784,7 +823,7 @@ bool MqttService::handleVideoControlMessage(const QString& topic, const QJsonObj
         localDir = smallPicture
                 ? MediaContentPolicy::pictureDir(Rk3566Platform::staticRoot())
                 : Rk3566Platform::videoDir();
-        if (!QDir().mkpath(localDir)) {
+        if (preparation.failed==VideoControlPreparation::Directory) {
             emit logMessage(QString("RECORDED：无法创建下载目录：%1").arg(localDir));
 
             pendingVolumeAck_ = false;
@@ -807,7 +846,8 @@ bool MqttService::handleVideoControlMessage(const QString& topic, const QJsonObj
         }
 
         // 写回 ini；local_path 始终保存目录，不保存完整文件名
-        if (!writeIniFtpPaths(remotePath, localDir, QString(), &err)) {
+        if (preparation.failed==VideoControlPreparation::Paths) {
+            err=preparation.error;
             emit logMessage(QString("RECORDED：写入 remote/local path 失败：%1").arg(err));
 
             pendingVolumeAck_ = false;
@@ -857,7 +897,8 @@ bool MqttService::handleVideoControlMessage(const QString& topic, const QJsonObj
         }
 
         QString err;
-        if (!writeIniFtpPaths(QString(), QString(), url, &err)) {
+        if (preparation.failed==VideoControlPreparation::Stream) {
+            err=preparation.error;
             emit logMessage(QString("LIVE：写入 stream.url 失败：%1").arg(err));
             playInfo_.status = "error";
             return true;

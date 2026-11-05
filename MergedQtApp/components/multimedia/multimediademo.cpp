@@ -4,10 +4,13 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-10-29；修改人：Du lin；统一按 VideoDisplay_en 阻止视频区域的本地/直播启动、模块与下载恢复及补播，关闭时停止视频资源并保持隐藏；识别退出仍恢复独立 PIC，保留原业务目标与下载流程。
+ * @note 最近修改：2026-11-04；修改人：Du lin；普通/高清均恢复一次根控件render，隐藏或非当前宿主视频不取帧、不走视频排除；可见视频在截图栈内禁用更新并恢复，保留尺寸、后台编码、缓存和有界上传。
  */
 
 #include "multimediademo.h"
+#include "common/configuration_work.h"
+#include "common/debug/ui_performance.h"
+#include <memory>
 #include "common/media_content_policy.h"
 #include "common/ui_image_resources.h"
 #include "ui_multimediademo.h"
@@ -21,6 +24,8 @@
 #include <QWidget>
 #include <QPalette>
 #include <QTimer>
+#include <QDataStream>
+#include <QScopedValueRollback>
 #include <QImageReader>
 #include <QMovie>
 #include <QPainter>
@@ -936,7 +941,7 @@ MultimediaDemo::MultimediaDemo(QWidget *parent) :
     // 读取上次保存的音量和amp_flag，并按文件内容恢复一次硬件状态
     int v = m_ampCtrl->loadVolumeFromFile();
 
-    // 全局音量只由 RK809 numid=3 的 60~200 原始值控制，正常业务播放器
+    // 系统音量由 RK809 numid=3 控制：0% 静音，1~100% 对应100~230；正常业务播放器
     // 保持 GStreamer 软件音量为 1.0，避免百分比在软硬件两端重复衰减。
     if (mediaPlayer) mediaPlayer->setVolume(1.0f);
     if (nextVideoPlayer) nextVideoPlayer->setVolume(1.0f);
@@ -2283,6 +2288,7 @@ void MultimediaDemo::onPlayFileDeleted(const QString &filePath)
     }
 
     invalidatePendingLocalPlaybackStarts();
+    ++m_snapshotContentRevision;
     m_lastSnapshotMs = 0;
     m_lastSnapshotBase64.clear();
     stopVideoRectPictureDisplay(true);
@@ -2533,6 +2539,7 @@ void MultimediaDemo::onDownloadFinished(const QString& filePath)
         m_localPlaybackEnabled = VideoDisplay_en && !m_modulePlaybackSuspended;
 
         // 下载结束后清空下载态截图缓存
+        ++m_snapshotContentRevision;
         m_lastSnapshotMs = 0;
         m_lastSnapshotBase64.clear();
 
@@ -2579,7 +2586,8 @@ void MultimediaDemo::onDownloadFailed(const QString& fileName, const QString& re
 
     hideDownloadProgressToast();
 
-    // 下载失败时清空缓存
+    // 下载失败同样废弃同路径旧内容的后台截图结果。
+    ++m_snapshotContentRevision;
     m_lastSnapshotMs = 0;
     m_lastSnapshotBase64.clear();
     resumeLocalPlaybackAfterDownload();
@@ -2643,10 +2651,7 @@ MultimediaDemo::~MultimediaDemo()
 {
     clearDirectionMovie();
 
-    if (m_snapshotThread) {
-        m_snapshotThread->quit();
-        m_snapshotThread->wait();
-    }
+
 
     delete ui;
     delete label_back;
@@ -2901,9 +2906,7 @@ void MultimediaDemo::initializeComponents()
     // =========================
     // 截图后台处理线程
     // =========================
-    m_snapshotThread = new QThread(this);
-    m_snapshotProcessor = new SnapshotProcessor();
-    m_snapshotProcessor->moveToThread(m_snapshotThread);
+    m_snapshotProcessor = new SnapshotProcessor(this);
 
     m_snapshotTimeoutTimer = new QTimer(this);
     m_snapshotTimeoutTimer->setSingleShot(true);
@@ -2932,10 +2935,9 @@ void MultimediaDemo::initializeComponents()
             this, &MultimediaDemo::onSnapshotProcessFailed,
             Qt::QueuedConnection);
 
-    connect(m_snapshotThread, &QThread::finished,
-            m_snapshotProcessor, &QObject::deleteLater);
-
-    m_snapshotThread->start();
+    qRegisterMetaType<SnapshotScene>("SnapshotScene");
+    connect(this,&MultimediaDemo::processSceneSnapshotAsync,
+            m_snapshotProcessor,&SnapshotProcessor::processScene,Qt::QueuedConnection);
 
     // 空列表监测
     m_emptyVideoListTimer = new QTimer(this);
@@ -4523,7 +4525,17 @@ QString MultimediaDemo::formatWeekText(int dayOfWeek, int style)
 }
 
 /**
- * @brief 按配置的字号、颜色和粗体选项统一设置标签样式。
+ * @brief 只在配置值变化时设置标签区域/字体/QSS，避免定时刷新重复StyleChange。
+ * @param[in] label GUI标签，可空；空时无动作。
+ * @param[in] x 标签横坐标，逻辑像素。
+ * @param[in] y 标签纵坐标，逻辑像素。
+ * @param[in] w 标签宽度，逻辑像素。
+ * @param[in] h 标签高度，逻辑像素。
+ * @param[in] textSize 原配置字号，点。
+ * @param[in] textStyleBold 非零为粗体。
+ * @param[in] r 原配置红色分量。
+ * @param[in] g 原配置绿色分量。
+ * @param[in] b 原配置蓝色分量。
  */
 static void applyLabelStyle(QLabel* label,
                             int x, int y, int w, int h,
@@ -4533,18 +4545,19 @@ static void applyLabelStyle(QLabel* label,
     if (!label) return;
 
     // 位置 + 尺寸
-    label->setGeometry(x, y, w, h);
+    const QRect geometry(x,y,w,h);
+    if(label->geometry()!=geometry) label->setGeometry(geometry);
 
     // 字体
     QFont f = label->font();
     f.setPointSize(textSize);
     f.setBold(textStyleBold != 0);
-    label->setFont(f);
+    if(label->font()!=f) label->setFont(f);
 
     // 颜色
     //用QSS锁死颜色，防止用palette被覆盖导致初始化重置为黑色
-    label->setStyleSheet(QString("color: rgb(%1,%2,%3);")
-        .arg(r).arg(g).arg(b));
+    const QString style=QString("color: rgb(%1,%2,%3);").arg(r).arg(g).arg(b);
+    if(label->styleSheet()!=style) label->setStyleSheet(style);
 }
 
 /**
@@ -4574,7 +4587,7 @@ void MultimediaDemo::getTimeWithQt()
 
     if (TimeDisplay_en) {
         // 文本
-        label_time->setText(current24Time);
+        if(label_time->text()!=current24Time) label_time->setText(current24Time);
 
         applyLabelStyle(label_time,
                         TimeDisplay_x, TimeDisplay_y, TimeDisplay_x_Size, TimeDisplay_y_Size,
@@ -4593,7 +4606,7 @@ void MultimediaDemo::getTimeWithQt()
 
     // ===== 日期显示 =====
     if (DateDisplay_en) {
-        label_date->setText(currentDateText);
+        if(label_date->text()!=currentDateText) label_date->setText(currentDateText);
 
         applyLabelStyle(label_date,
                         DateDisplay_x, DateDisplay_y, DateDisplay_x_Size, DateDisplay_y_Size,
@@ -4613,7 +4626,7 @@ void MultimediaDemo::getTimeWithQt()
     if (WeekDisplay_en) {
         // week 文本按 WeekTextDispay 决定格式
         const QString weekText = formatWeekText(dayOfWeek, WeekTextDispay);
-        label_week->setText(weekText);
+        if(label_week->text()!=weekText) label_week->setText(weekText);
 
         applyLabelStyle(label_week,
                         WeekDisplay_x, WeekDisplay_y, WeekDisplay_x_Size, WeekDisplay_y_Size,
@@ -5490,20 +5503,33 @@ bool MultimediaDemo::eventFilter(QObject *watched, QEvent *event)
 }
 
 /**
- * @brief 使用屏幕键盘请求退出密码并与配置值校验。
+ * @brief 记录下一次密码键盘的呼叫可用性；不改变现有键盘或播放器状态。
  */
+void MultimediaDemo::setPropertyCallAvailable(bool available)
+{
+    m_propertyCallAvailable = available;
+}
+
+/** @brief 关闭键盘后报告呼叫；只有原密码匹配才允许返回菜单。 */
 bool MultimediaDemo::requestPasswordAndCheck()
 {
     bool ok = false;
+    bool callRequested = false;
     const QString entered = KeyboardDialog::getText(
         this,
         QStringLiteral("请输入密码"),
         QString(),                 // 初始文本
         QLineEdit::Password,        // ✅ 密码回显模式
         32,                        // 最大长度
-        &ok
+        &ok,
+        &callRequested,
+        m_propertyCallAvailable
     );
 
+    if (callRequested) {
+        emit callPropertyRequested();
+        return false; // 独立动作：外层恢复模态标志，不返回菜单、不检验密码。
+    }
     if (!ok) return false; // 用户取消
 
     const QString correct = "123456"; // 或从配置读取
@@ -5801,81 +5827,60 @@ bool MultimediaDemo::isOnlinePlaybackPersistEnabled() const
 }
 
 /**
- * @brief 把期望模式、实际模式和切换原因写入网络配置。
+ * @brief 异步保存期望/实际模式及原因；所有文件检查与读写在配置串行线程执行。
+ * @param targetMode 期望LIVE/RECORDED/NONE。
+ * @param currentMode 实际LIVE/RECORDED/NONE。
+ * @param reason 原切换原因，作为值快照写入。
  */
 void MultimediaDemo::persistPlaybackStateToNetCfg(const QString &targetMode,
                                                   const QString &currentMode,
                                                   const QString &reason)
 {
-    if (!isOnlinePlaybackPersistEnabled()) {
-        LOG_CONFIG("当前不是 online_v1/online_v2 模式，跳过播放状态持久化");
-        return;
-    }
-
-    const QString target = normalizePlaybackModeForCfg(targetMode);
-    const QString current = normalizePlaybackModeForCfg(currentMode);
-    if (target.isEmpty() || current.isEmpty()) {
-        LOG_CONFIG("播放状态持久化失败：非法模式 target=" << targetMode << " current=" << currentMode);
-        return;
-    }
-
-    QFileInfo fi(netCfgPath());
-    if (!fi.exists() || !fi.isFile()) {
-        LOG_CONFIG("播放状态持久化失败：net_cfg.ini 不存在");
-        return;
-    }
-    if (!fi.isWritable()) {
-        LOG_CONFIG("播放状态持久化失败：net_cfg.ini 不可写");
-        return;
-    }
-
-    const QString liveUrl = !m_desiredLiveUrl.trimmed().isEmpty()
-            ? m_desiredLiveUrl.trimmed()
-            : m_streamUrl.trimmed();
-    QString liveKind = !m_desiredLiveKind.trimmed().isEmpty()
-            ? m_desiredLiveKind.trimmed().toLower()
-            : detectLiveKindFromUrlForCfg(liveUrl);
-
-    QSettings ini(netCfgPath(), QSettings::IniFormat);
-    ini.setIniCodec("UTF-8");
-
-    ini.beginGroup("playback");
-    ini.setValue("command_received", true);          // 只有收到 LIVE/RECORDED/NONE 后才会创建该标记
-    ini.setValue("target_mode", target);             // 云端期望状态：LIVE/RECORDED/NONE
-    ini.setValue("current_mode", current);           // 当前实际状态：LIVE/RECORDED/NONE
-    ini.setValue("fallback_from_live", target == QStringLiteral("LIVE") && current == QStringLiteral("RECORDED"));
-    ini.setValue("live_source_validated", m_liveSourceValidated);
-    ini.setValue("last_reason", reason);
-    ini.setValue("updated_at", QDateTime::currentDateTime().toString(Qt::ISODate));
-    if (!liveUrl.isEmpty()) {
-        ini.setValue("live_url", liveUrl);
-        ini.setValue("live_kind", liveKind);
-    }
-    ini.endGroup();
-
-    // LIVE 指令下同步维护 [stream].url，保证重启恢复时即使 MQTT 未重新下发也能拉回原直播流。
-    if (target == QStringLiteral("LIVE") && !liveUrl.isEmpty()) {
-        ini.beginGroup("stream");
-        ini.setValue("url", liveUrl);
-        ini.endGroup();
-    }
-
-    ini.sync();
-    if (ini.status() != QSettings::NoError) {
-        LOG_CONFIG("播放状态持久化失败：QSettings sync error=" << ini.status());
-        return;
-    }
-
-    LOG_CONFIG("播放状态已写入 net_cfg.ini target=" << target
-               << " current=" << current
-               << " fallback_from_live=" << (target == QStringLiteral("LIVE") && current == QStringLiteral("RECORDED"))
-               << " reason=" << reason);
-
-    readNetConfiguration();
-    if (m_netInfoPanel) {
-        m_netInfoPanel->setInfo(m_netIp, m_mqttClientId, m_mqttRouteName,
-                                m_mqttHost, m_mqttSubTopics, m_streamUrl);
-    }
+    const QString target=normalizePlaybackModeForCfg(targetMode),current=normalizePlaybackModeForCfg(currentMode);
+    if(target.isEmpty() || current.isEmpty()) { LOG_CONFIG("播放状态持久化失败：非法模式");return; }
+    const QString liveUrl=!m_desiredLiveUrl.trimmed().isEmpty() ? m_desiredLiveUrl.trimmed() : m_streamUrl.trimmed();
+    const QString liveKind=!m_desiredLiveKind.trimmed().isEmpty() ? m_desiredLiveKind.trimmed().toLower() : detectLiveKindFromUrlForCfg(liveUrl);
+    const bool validated=m_liveSourceValidated;const auto path=netCfgPath();
+    const auto updated=QDateTime::currentDateTime().toString(Qt::ISODate);
+    const auto revision=++m_playbackPersistRevision;const QPointer<MultimediaDemo> alive(this);
+    // 完整状态快照可合并同文件未执行的旧状态；正在落盘的任务不强行中断。
+    ConfigurationWork::queue().enqueue([alive,path,target,current,reason,liveUrl,liveKind,validated,updated,revision]() -> SerialWorkQueue::Task {
+        auto result=std::make_shared<QVariantMap>();
+        return {[path,target,current,reason,liveUrl,liveKind,validated,updated,result]() -> QString {
+            const QFileInfo file(path);
+            if(!file.exists() || !file.isFile() || !file.isWritable()) return QStringLiteral("net_cfg.ini 不存在或不可写");
+            QSettings ini(path,QSettings::IniFormat);ini.setIniCodec("UTF-8");
+            if(ini.value("feature/offline_v1",false).toBool() ||
+               !(ini.value("feature/online_v1",false).toBool() || ini.value("feature/online_v2",false).toBool())) {
+                result->insert("skipped",true);return {};
+            }
+            ini.setValue("playback/command_received",true);ini.setValue("playback/target_mode",target);
+            ini.setValue("playback/current_mode",current);
+            ini.setValue("playback/fallback_from_live",target=="LIVE" && current=="RECORDED");
+            ini.setValue("playback/live_source_validated",validated);ini.setValue("playback/last_reason",reason);
+            ini.setValue("playback/updated_at",updated);
+            if(!liveUrl.isEmpty()) { ini.setValue("playback/live_url",liveUrl);ini.setValue("playback/live_kind",liveKind); }
+            if(target=="LIVE" && !liveUrl.isEmpty()) ini.setValue("stream/url",liveUrl);
+            ini.sync();if(ini.status()!=QSettings::NoError) return QStringLiteral("QSettings sync失败");
+            // 后台读回同一次配置快照，完成回调不重新打开文件或等待下一次写入。
+            const auto route=resolveActiveMqttRoute(ini);
+            result->insert("ip",ini.value("network/ip","").toString().trimmed());
+            result->insert("clientId",ini.value("mqtt/client_id","").toString().trimmed());
+            result->insert("route",route.routeName);result->insert("host",route.host);
+            result->insert("topics",route.subTopics);result->insert("url",ini.value("stream/url","").toString().trimmed());
+            return {};
+        },[alive,result,revision,target,current,reason](const QString &error) {
+            if(!alive || revision!=alive->m_playbackPersistRevision) return;
+            if(!error.isEmpty()) { LOG_CONFIG("播放状态持久化失败："<<error);return; }
+            if(result->value("skipped").toBool()) return;
+            alive->m_netIp=result->value("ip").toString();alive->m_mqttClientId=result->value("clientId").toString();
+            alive->m_mqttRouteName=result->value("route").toString();alive->m_mqttHost=result->value("host").toString();
+            alive->m_mqttSubTopics=result->value("topics").toString();alive->m_streamUrl=result->value("url").toString();
+            LOG_CONFIG("播放状态已写入 net_cfg.ini target="<<target<<" current="<<current<<" reason="<<reason);
+            if(alive->m_netInfoPanel) alive->m_netInfoPanel->setInfo(alive->m_netIp,alive->m_mqttClientId,
+                alive->m_mqttRouteName,alive->m_mqttHost,alive->m_mqttSubTopics,alive->m_streamUrl);
+        }};
+    },QStringLiteral("playback-state:")+path);
 }
 
 /**
@@ -7410,10 +7415,11 @@ void MultimediaDemo::stopAllPlayback()
 
 /**
  * @brief 从实际播放器采集本地 Web 状态。
- * @return 实际播放状态与同一 INI 中保存的 contentType、smallImageMode；仅报告 video 区域。
+ * @return 实际播放状态及每秒后台刷新的配置快照；UI不执行INI读取。
  */
 QJsonObject MultimediaDemo::localWebPlaybackState() const
 {
+    UiPerformance::OperationScope performance(UiPerformance::Operation::WebMediaRead,this,"player-state");
     const bool active = mediaPlayer && mediaPlayer->hasActiveMedia();
     const bool image = m_currentVideoRectIsImage && !m_currentVideoRectMediaPath.isEmpty();
     const QString type =
@@ -7433,8 +7439,8 @@ QJsonObject MultimediaDemo::localWebPlaybackState() const
                           : active                                  ? "PREPARING"
                                                                     : "STOPPED";
     return {{"videoType", type},
-            {"contentType", MediaContentPolicy::contentType(Rk3566Platform::netConfigPath())},
-            {"smallImageMode", MediaContentPolicy::smallImageMode(Rk3566Platform::netConfigPath()) ? 1 : 0},
+            {"contentType", m_mediaSelectionCache ? m_mediaSelectionCache->contentType() : QStringLiteral("VIDEO_IMAGE")},
+            {"smallImageMode", m_mediaSelectionCache && m_mediaSelectionCache->smallImageMode() ? 1 : 0},
             {"videoPath", file},
             {"videoUrl", type == "LIVE" ? m_desiredLiveUrl : QString()},
             {"name", type == "LIVE" ? m_desiredLiveUrl : file},
@@ -7511,20 +7517,23 @@ void MultimediaDemo::onMqttVolumeChanged(int volume)
 
 
 /**
- * @brief 为高清协议采集原始像素；GUI 抓取为 Qt 必需操作，所有编码交给独立线程。
+ * @brief 为高清请求直接绘制原DPR尺寸UI像素并复用现成NV12，后台合成/编码；原生输出保留图像后备。
+ * @param[in] token 高清队列生成的本地请求令牌，随场景或失败值原样返回。
  */
 void MultimediaDemo::captureCompanySnapshot(const QString &token)
 {
-    if (!m_companySnapshotToken.isEmpty() || m_snapshotPending) {
+    if (!m_companySnapshotToken.isEmpty() || m_snapshotPending || m_snapshotCaptureInProgress) {
         emit companySnapshotReady(token, QImage(), QImage(), QRect(),
                                   QStringLiteral("高清截图失败：视频抓帧正在进行"));
         return;
     }
+    QScopedValueRollback<bool> captureGuard(m_snapshotCaptureInProgress,true);
     if (m_downloadPauseActive || m_currentVideoRectIsImage || !mediaPlayer ||
             !mediaPlayer->isAvailable() || !mediaPlayer->hasActiveMedia()) {
         deliverCompanySnapshot(token, QImage());
         return;
     }
+    if(mediaPlayer->snapshotIncludesVideo()) { deliverCompanySnapshot(token,QImage());return; }
     m_companySnapshotToken = token;
     mediaPlayer->requestSnapshot();
     // 当前播放器在本次调用中发出成功/失败信号；若未发出，立即失败，不遗留令牌。
@@ -7535,11 +7544,25 @@ void MultimediaDemo::captureCompanySnapshot(const QString &token)
     }
 }
 
-/** @brief 捕获完整根界面，保留原始分辨率，将视频坐标从逻辑像素换算到实际像素。 */
+/** @brief Qt路径一次根render交接原尺寸UI像素；只为可见视频取得NV12值，原生输出后备保持原图像/坐标路径。
+ * @param[in] token 本地高清请求令牌。
+ * @param[in] videoImage 可空；为空时直接绘制UI像素，非空沿用原生输出兼容合成。
+ */
 void MultimediaDemo::deliverCompanySnapshot(const QString &token, const QImage &videoImage)
 {
+    QScopedValueRollback<bool> captureGuard(m_snapshotCaptureInProgress,true);
     QWidget *host = ResponsiveUi::overlayHost(this);
-    const QPixmap shot = host ? host->grab() : QPixmap();
+    if(videoImage.isNull()) {
+        UiPerformance::OperationScope grab(UiPerformance::Operation::UiGrab,host,"company-root");
+        auto *video=mediaPlayer?mediaPlayer->snapshotVideoWidget():nullptr;
+        if(video && (!host || !video->isVisible() || !host->isAncestorOf(video))) video=nullptr;
+        const auto frame=video?mediaPlayer->snapshotVideoFrame():SnapshotVideoFrame();
+        const auto scene=SnapshotScene::capture(host,video,frame);
+        emit companySceneReady(token,scene);return;
+    }
+    const QPixmap shot=[&] {
+        UiPerformance::OperationScope grab(UiPerformance::Operation::UiGrab,host,"company-root");return host ? host->grab() : QPixmap();
+    }();
     if (shot.isNull()) {
         emit companySnapshotReady(token, QImage(), QImage(), QRect(),
                                   QStringLiteral("高清截图失败：界面抓取失败"));
@@ -7554,13 +7577,96 @@ void MultimediaDemo::deliverCompanySnapshot(const QString &token, const QImage &
     emit companySnapshotReady(token, ui, videoImage, rect, QString());
 }
 
-/**
- * @brief 合成 UI 与当前视频帧后异步编码为普通缩略图 Base64。
- */
+/** @brief 缓存身份只取现有UI状态，源/下载/图片/几何切换不能复用旧合成图。 */
+QByteArray MultimediaDemo::snapshotCacheKey() const
+{
+    QByteArray key;QDataStream stream(&key,QIODevice::WriteOnly);
+    const auto *host=ResponsiveUi::overlayHost(const_cast<MultimediaDemo*>(this));
+    stream<<m_snapshotContentRevision<<m_currentVideoRectMediaPath<<m_desiredLiveUrl<<m_isLiveMode<<m_currentVideoRectIsImage<<m_downloadPauseActive
+          <<size()<<(host ? host->size():QSize())<<qreal(host ? host->devicePixelRatioF():devicePixelRatioF())
+          <<VideoDisplay_x<<VideoDisplay_y<<VideoDisplay_x_Size<<VideoDisplay_y_Size<<PicDisplay_en
+          <<currentPictureIndex<<(pictureFileList.value(currentPictureIndex))
+          <<quint64(reinterpret_cast<quintptr>(mediaPlayer))<<bool(mediaPlayer && mediaPlayer->hasActiveMedia());
+    return key;
+}
+/** @brief 返回有效普通截图缓存或合并投递一次GUI刷新；本入口不进行控件抓取。 */
 void MultimediaDemo::captureCompositeSnapshot()
 {
+    const auto key=snapshotCacheKey();
+    if(key!=m_snapshotCacheKey) { m_snapshotCacheKey=key;m_lastSnapshotMs=0;m_lastSnapshotBase64.clear(); }
+    const auto age=QDateTime::currentMSecsSinceEpoch()-m_lastSnapshotMs;
+    if(age>=0 && age<2000 && !m_lastSnapshotBase64.isEmpty()) { emit currentPlayImageChanged(m_lastSnapshotBase64);return; }
+    if(m_snapshotRefreshQueued || m_snapshotCaptureInProgress || m_snapshotWorkerBusy || m_snapshotPending) {
+        if(!m_lastSnapshotBase64.isEmpty()) emit currentPlayImageChanged(m_lastSnapshotBase64);
+        return;
+    }
+    m_snapshotRefreshQueued=true;
+    QTimer::singleShot(0,this,[this] { m_snapshotRefreshQueued=false;captureCompositeSnapshotNow(); });
+}
+/** @brief GUI直接绘制普通截图小图并复用现成NV12，后台合成/编码；原生视频后备保持原图像路径。
+ * @param[in] host GUI抓取根控件；空或尺寸无效返回false。
+ * @param[in] videoImage 可空的原生视频后备帧，自有QImage值。
+ * @param[in] videoRect 后备视频实际像素区域。
+ * @return true已交共享截图后台；false分配/绘制失败，不设置在途状态。
+ * @note Qt路径一次根render绘制560x360以内UI像素；只对可见视频排除更新并恢复，隐藏视频直接绘制；NV12转换/编码在后台。
+ */
+bool MultimediaDemo::submitScaledSnapshot(QWidget *host,const QImage &videoImage,const QRect &videoRect)
+{
+    if(!host || host->size().isEmpty()) return false;
+    if(videoImage.isNull()) {
+        UiPerformance::OperationScope grab(UiPerformance::Operation::UiGrab,host,"app-root");
+        auto *video=mediaPlayer?mediaPlayer->snapshotVideoWidget():nullptr;
+        if(video && (!host || !video->isVisible() || !host->isAncestorOf(video))) video=nullptr;
+        const auto frame=video?mediaPlayer->snapshotVideoFrame():SnapshotVideoFrame();
+        const auto scene=SnapshotScene::capture(host,video,frame,QSize(560,360));
+        if(!scene.valid()) return false;
+        m_snapshotWorkerBusy=true;emit processSceneSnapshotAsync(scene);return true;
+    }
+    const qreal dpr=host->devicePixelRatioF();
+    const QSize full(qRound(host->width()*dpr),qRound(host->height()*dpr));
+    const QSize target=full.scaled(560,360,Qt::KeepAspectRatio);
+    if(target.isEmpty()) return false;
+    QImage image(target,QImage::Format_ARGB32_Premultiplied);
+    if(image.isNull()) return false;
+    image.fill(Qt::transparent);
+    {
+        UiPerformance::OperationScope grab(UiPerformance::Operation::UiGrab,host,"app-root");
+        QPainter painter(&image);if(!painter.isActive()) return false;
+        painter.scale(qreal(target.width())/host->width(),qreal(target.height())/host->height());
+        host->render(&painter,QPoint(),QRegion(),QWidget::DrawWindowBackground|QWidget::DrawChildren);
+    }
+    m_snapshotWorkerBusy=true;
+    if(videoImage.isNull()) emit processUiSnapshotAsync(image);
+    else {
+        const qreal sx=qreal(target.width())/full.width(),sy=qreal(target.height())/full.height();
+        const QRect scaledRect(qRound(videoRect.x()*sx),qRound(videoRect.y()*sy),
+                               qRound(videoRect.width()*sx),qRound(videoRect.height()*sy));
+        emit processSnapshotAsync(image,videoImage,scaledRect);
+    }
+    return true;
+}
+
+/** @brief 在UI刷新轮次绘制必要小图；Qt可能嵌套分发事件，重入门覆盖视频抓帧和界面绘制全过程。 */
+void MultimediaDemo::captureCompositeSnapshotNow()
+{
+    if(m_snapshotCaptureInProgress || !m_companySnapshotToken.isEmpty()) {
+        // 高清/Qt嵌套抓取尚未退出时保留一次普通刷新；定时回调有间隔，避免0ms重试占满事件循环。
+        m_snapshotRefreshQueued=true;
+        QTimer::singleShot(20,this,[this] { m_snapshotRefreshQueued=false;captureCompositeSnapshotNow(); });
+        return;
+    }
+    if(m_snapshotWorkerBusy || m_snapshotPending) return;
+    QScopedValueRollback<bool> captureGuard(m_snapshotCaptureInProgress,true);
+    const auto key=snapshotCacheKey();
+    if(key!=m_snapshotCacheKey) { m_snapshotCacheKey=key;m_lastSnapshotMs=0;m_lastSnapshotBase64.clear(); }
+    m_snapshotWorkKey=key;
+
+    UiPerformance::OperationScope performance(UiPerformance::Operation::SnapshotRequest,this,"composite");
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
 
+    // 全部分支共用原2秒缓存；下载态也不再绕过缓存重复抓图。
+    if(now-m_lastSnapshotMs>=0 && now-m_lastSnapshotMs<2000 && !m_lastSnapshotBase64.isEmpty()) { emit currentPlayImageChanged(m_lastSnapshotBase64);return; }
+    m_snapshotRequestMs=now; // 延续原缓存年龄：从抓取起点计时，不从后台完成时重新开始。
     // 下载态：播放器保持暂停，直接抓 Qt 当前界面
     if (m_downloadPauseActive) {
         if (m_snapshotTimeoutTimer) {
@@ -7576,37 +7682,15 @@ void MultimediaDemo::captureCompositeSnapshot()
             return;
         }
 
-        const QPixmap uiShot = this->grab();
-        if (uiShot.isNull()) {
-            qWarning() << "[截图] 下载态 this->grab() failed";
-            if (!m_lastSnapshotBase64.isEmpty()) {
-                emit currentPlayImageChanged(m_lastSnapshotBase64);
-            }
+        if(!submitScaledSnapshot(this)) {
+            if(!m_lastSnapshotBase64.isEmpty()) emit currentPlayImageChanged(m_lastSnapshotBase64);
             return;
         }
-
-        const QImage uiImage = uiShot.toImage();
-        if (uiImage.isNull()) {
-            qWarning() << "[截图] 下载态 uiShot.toImage() failed";
-            if (!m_lastSnapshotBase64.isEmpty()) {
-                emit currentPlayImageChanged(m_lastSnapshotBase64);
-            }
-            return;
-        }
-
-        m_snapshotWorkerBusy = true;
-        m_snapshotRequestMs = now;
-        emit processUiSnapshotAsync(uiImage);
         qDebug() << "[截图] 下载态：已请求抓取 Qt 当前界面";
         return;
     }
 
 
-    // 1) 2秒内直接返回缓存，避免频繁重复抓图
-    if (now - m_lastSnapshotMs < 2000 && !m_lastSnapshotBase64.isEmpty()) {
-        emit currentPlayImageChanged(m_lastSnapshotBase64);
-        return;
-    }
 
 
     // videoRect图片或只有pic区域图片时，直接抓Qt界面，不向空闲视频管线请求帧。
@@ -7621,28 +7705,10 @@ void MultimediaDemo::captureCompositeSnapshot()
             return;
         }
 
-        const QPixmap uiShot = this->grab();
-        if (uiShot.isNull()) {
-            qWarning() << "[截图] 当前为图片播放，this->grab() failed";
-
-            if (!m_lastSnapshotBase64.isEmpty()) {
-                emit currentPlayImageChanged(m_lastSnapshotBase64);
-            }
+        if(!submitScaledSnapshot(this)) {
+            if(!m_lastSnapshotBase64.isEmpty()) emit currentPlayImageChanged(m_lastSnapshotBase64);
             return;
         }
-
-        const QImage uiImage = uiShot.toImage();
-        if (uiImage.isNull()) {
-            qWarning() << "[截图] 当前为图片播放，uiShot.toImage() failed";
-            if (!m_lastSnapshotBase64.isEmpty()) {
-                emit currentPlayImageChanged(m_lastSnapshotBase64);
-            }
-            return;
-        }
-
-        m_snapshotWorkerBusy = true;
-        m_snapshotRequestMs = now;
-        emit processUiSnapshotAsync(uiImage);
 
         qDebug() << "[截图] 当前为图片播放：已抓取 Qt 当前界面";
         return;
@@ -7676,6 +7742,10 @@ void MultimediaDemo::captureCompositeSnapshot()
         return;
     }
 
+    if(mediaPlayer->snapshotIncludesVideo()) {
+        // 复用现成NV12帧，跳过GL画布绘制，后台合成；不调用requestSnapshot/grabFramebuffer。
+        submitScaledSnapshot(ResponsiveUi::overlayHost(this));return;
+    }
     m_snapshotPending = true;
     if (m_snapshotTimeoutTimer) {
         m_snapshotTimeoutTimer->start();
@@ -7694,6 +7764,7 @@ void MultimediaDemo::captureCompositeSnapshot()
  */
 void MultimediaDemo::onVideoSnapshotReady(const QImage& videoImage)
 {
+    UiPerformance::OperationScope performance(UiPerformance::Operation::SnapshotReady,this,"composite-callback");
     if (!m_companySnapshotToken.isEmpty()) {
         const QString token = m_companySnapshotToken;
         m_companySnapshotToken.clear();
@@ -7724,43 +7795,20 @@ void MultimediaDemo::onVideoSnapshotReady(const QImage& videoImage)
         return;
     }
 
+    if(m_snapshotWorkKey!=snapshotCacheKey()) { QTimer::singleShot(0,this,[this] { captureCompositeSnapshot(); });return; }
+    QScopedValueRollback<bool> captureGuard(m_snapshotCaptureInProgress,true);
+
     QWidget *captureHost = ResponsiveUi::overlayHost(this);
     if (!captureHost) {
         qWarning() << "[截图] application root is null";
         return;
     }
 
-    // Wayland 客户端不能依赖抓取 compositor 的全局输出。应用本身全屏运行，
-    // 直接抓取现有根控件即可得到同样的 UI 底图，视频帧仍在后台单独合成。
-    QPixmap uiShot = captureHost->grab();
-    if (uiShot.isNull()) {
-        qWarning() << "[截图] application root grab failed";
-        return;
-    }
-
-    const qreal captureDpr = uiShot.devicePixelRatio();
-    QImage finalImage = uiShot.toImage();
-    if (finalImage.isNull()) {
-        qWarning() << "[截图] uiShot.toImage() failed";
-        return;
-    }
-    // 后台合成统一使用实际像素坐标，避免 QPainter 再按 DPR 缩小一次图像。
-    finalImage.setDevicePixelRatio(1.0);
-
-    // QWidget 坐标使用逻辑像素，而 QPixmap::toImage() 保存的是实际像素。
-    // Weston scale 不为 1 时同步换算视频区域，保证整幅 Qt 画面中的视频
-    // 补帧位置和大小仍与屏幕显示完全一致。
-    const QPoint videoTopLeft = this->mapTo(
-                captureHost, QPoint(VideoDisplay_x, VideoDisplay_y));
-    const QRect videoRect(qRound(videoTopLeft.x() * captureDpr),
-                          qRound(videoTopLeft.y() * captureDpr),
-                          qRound(VideoDisplay_x_Size * captureDpr),
-                          qRound(VideoDisplay_y_Size * captureDpr));
-
-    m_snapshotWorkerBusy = true;
-
-    // 把整屏图、视频帧、视频区域交给后台线程处理
-    emit processSnapshotAsync(finalImage, videoImage, videoRect);
+    const qreal captureDpr=captureHost->devicePixelRatioF();
+    const QPoint videoTopLeft=this->mapTo(captureHost,QPoint(VideoDisplay_x,VideoDisplay_y));
+    const QRect videoRect(qRound(videoTopLeft.x()*captureDpr),qRound(videoTopLeft.y()*captureDpr),
+                          qRound(VideoDisplay_x_Size*captureDpr),qRound(VideoDisplay_y_Size*captureDpr));
+    submitScaledSnapshot(captureHost,videoImage,videoRect);
 
 }
 
@@ -7806,7 +7854,8 @@ void MultimediaDemo::notifyCurrentRecordedFile()
 void MultimediaDemo::onSnapshotProcessFinished(const QString &base64)
 {
     m_snapshotWorkerBusy = false;
-    m_lastSnapshotMs = QDateTime::currentMSecsSinceEpoch();
+    if(m_snapshotWorkKey!=snapshotCacheKey()) { captureCompositeSnapshot();return; }
+    m_lastSnapshotMs = m_snapshotRequestMs;
     m_lastSnapshotBase64 = base64;
 
     qDebug() << "[截图] Base64长度 =" << base64.length();
@@ -7826,7 +7875,8 @@ void MultimediaDemo::onSnapshotProcessFailed(const QString &reason)
 
 
 /**
- * @brief 从配置读取并刷新网络/MQTT 信息面板字段。
+ * @brief 从配置读取网络/MQTT字段；首次复用同一INI对象种子建立媒体选择后台刷新。
+ * @note 该既有启动/信息面板入口保持原调用时序；周期Web状态不再调用配置读盘。
  */
 void MultimediaDemo::readNetConfiguration()
 {
@@ -7840,12 +7890,17 @@ void MultimediaDemo::readNetConfiguration()
     m_streamUrl.clear();
 
     if (!QFile::exists(cfgPath )) {
+        if(!m_mediaSelectionCache) m_mediaSelectionCache=new MediaSelectionCache(cfgPath,QStringLiteral("VIDEO_IMAGE"),false,this);
         LOG_CONFIG("net_cfg.ini 不存在: " << cfgPath);
         return;
     }
 
     QSettings netSettings(cfgPath, QSettings::IniFormat);
     netSettings.setIniCodec("UTF-8");
+    // 复用启动时已读取的INI种子；后续周期刷新仅在后台执行。
+    if(!m_mediaSelectionCache) m_mediaSelectionCache=new MediaSelectionCache(cfgPath,
+        MediaContentPolicy::normalizeContentType(netSettings.value("playback/contentType").toString()),
+        netSettings.value("playback/smallImageMode",0).toInt()==1,this);
 
     netSettings.beginGroup("network");
     m_netIp = netSettings.value("ip", "").toString().trimmed();

@@ -2,19 +2,23 @@
  * @file network_status_monitor.h
  * @brief 网络链路、外网和直播源可用性的分阶段监测告警控件。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-11-04；修改人：Du lin；声明独立网络事件线程与探测器；ping配置/进程/超时/重试全部后台，UI仅告警与应用有效代次结果，stop及析构不等待工作线程。
  */
 
 #ifndef NETWORK_STATUS_MONITOR_H
 #define NETWORK_STATUS_MONITOR_H
 
 #include <QWidget>
+#include <memory>
+struct NetworkCheckGuard;
+class NetworkProbeWorker;
+class QThread;
 #include <QTimer>
 #include <QRect>
 #include <QString>
 #include <QFont>
-#include <QProcess>
 #include <QUrl>
 #include <QAbstractSocket>
 
@@ -29,6 +33,8 @@ class QUdpSocket;
  * 每轮检查先判断网线和默认路由，再异步 ping 外网；仅当业务期望直播但播放器
  * 尚未进入 LIVE 时，才按 HTTP、RTSP、RTMP 或 UDP 协议探测直播源。所有探测均
  * 带超时，并通过短时闪现提示避免长期遮挡主界面。
+ * @details UI只管理覆盖层、检查节拍和结果应用；独立网络事件线程拥有路由/公网配置读取、ping进程与超时重试。
+ * 停止/析构通过共享代次取消，最终进程和线程异步退出，不在UI等待子进程。
  */
 class NetworkStatusMonitor : public QWidget
 {
@@ -37,15 +43,17 @@ public:
     /**
      * @brief 创建网络告警控件并配置分阶段探测所需的定时器和异步对象。
      * @param mainWindow 告警覆盖层跟随并定位的主窗口。
-     * @param parent Qt 父对象。
      * @param configPath 业务配置文件路径；为空时使用平台默认路径。
      */
     explicit NetworkStatusMonitor(QWidget *mainWindow,
                                   const QString &configPath = QString());
 
-    /** @brief 启动周期检查并立即执行首轮检测。 */
+    /** @brief 销毁前取消旧查询结果，普通stop不等待后台查询。 */
+    ~NetworkStatusMonitor() override;
+
+    /** @brief 启动周期检查并立即异步提交首轮检测。 */
     void start();
-    /** @brief 停止定时器、进程和所有进行中的流探测。 */
+    /** @brief UI停止告警并取消代次，异步终止后台ping；不等待网络线程，直播探测沿用原取消流程。 */
     void stop();
 
     /** @return 当前存在网络或直播源告警时返回 true。 */
@@ -62,17 +70,14 @@ private slots:
     void checkNetworkStatus();
     /** @brief 告警持续存在时周期显示提示框。 */
     void onBlinkTimeout();
-    /** @brief 处理当前 ping 目标结果并决定重试或进入直播探测。 */
-    void onPingFinished(int exitCode, QProcess::ExitStatus exitStatus);
-    /** @brief 终止超时的 ping 并尝试下一个目标。 */
-    void onPingTimeout();
 
 private:
     /** @brief 一轮异步检查所处阶段。 */
     enum class CheckState {
-        Idle,
-        Pinging,
-        StreamProbing
+        Idle, /**< 无在途检测。 */
+        CheckingRoute, /**< 后台只读初检，禁止周期重复提交。 */
+        Pinging, /**< 原异步外网ping阶段。 */
+        StreamProbing /**< 原异步直播源探测阶段。 */
     };
 
     /** @brief 需要向用户区分显示的故障类型。 */
@@ -120,14 +125,17 @@ private:
     /** @return 配置允许联网业务时返回 true。 */
     bool isOnlineFeatureEnabled() const;
     /** @brief 读取有线网卡 carrier；valid 表示系统节点是否可读。 */
-    bool isWiredLinkUp(bool *valid = nullptr) const;
-    /** @return 路由表中存在默认路由时返回 true。 */
-    bool hasDefaultRoute() const;
+    static bool isWiredLinkUp(bool *valid = nullptr);
+    /** @brief 仅后台任务读取/proc并执行原有限等待的命令回退，禁止从UI调用。
+     * @return 路由表或原命令回退发现默认路由时true，否则false。
+     */
+    static bool hasDefaultRoute();
 
-    /** @brief 依次异步 ping 配置的外网目标。 */
-    void beginInternetProbe();
-    /** @brief 结束外网探测并继续直播源检查或设置告警。 */
-    void finishInternetProbe(bool internetOk);
+    /** @brief UI应用网络线程返回的公网结果，保持原直播检查和告警规则。
+     * @param[in] internetOk 是否探测成功。
+     * @param[in] onlineEnabled 后台重新读取的在线配置结果；false清除告警，不在UI读取INI。
+     */
+    void finishInternetProbe(bool internetOk,bool onlineEnabled);
 
     /** @brief 从共享配置读取“期望直播/实际模式/URL/类型”。 */
     LiveProbeTarget readLiveProbeTargetFromConfig() const;
@@ -201,14 +209,16 @@ private:
     void moveBoxToScreenCenter();
 
 private:
+    friend class NetworkProbeWorker; /**< 仅允许后台通过值结果投递访问原UI判定，不直接操作控件。 */
+    QThread *networkThread_=nullptr; /**< 无UI父对象，最终由finished异步deleteLater；UI不join。 */
+    NetworkProbeWorker *networkWorker_=nullptr; /**< 网络线程独占，随线程退出删除，UI只排队调用。 */
+    std::shared_ptr<NetworkCheckGuard> networkGuard_; /**< 短锁生命周期门及原子代次；取消不等待任务，后台结果不回读已销毁控件。 */
     QWidget *main_ = nullptr;
     QString configPath_;
 
     QTimer checkTimer_;
     QTimer blinkTimer_;
     QTimer autoHideTimer_;
-    QTimer pingTimeoutTimer_;
-    QProcess pingProcess_;
 
     CheckState checkState_ = CheckState::Idle; /**< 防止周期定时器重入正在执行的异步检查。 */
     WarningKind warningKind_ = WarningKind::None;
@@ -227,8 +237,6 @@ private:
     QRect boxRect_;
     QFont baseFont_;
 
-    QStringList pingTargets_;
-    int pingTargetIndex_ = 0;
     int maxWidth_ = 520;
     int padX_ = 12;
     int padY_ = 16;
