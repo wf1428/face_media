@@ -4,7 +4,7 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-04；修改人：Du lin；播放信息回执遵守两笔截图上传预算，忙时50ms异步等待并暂停新抓图；补充请求顺序和满队列说明，其他接口保持。
+ * @note 最近修改：2026-11-12；修改人：Du lin；公开普通截图失效入口，下载卡片变化后待发请求需重新获得图像。
  */
 
 #pragma once
@@ -59,6 +59,8 @@ public slots:
      * @note 仅UI线程调用，不在此回调批量提交响应。
      */
     void onCurrentPlayImageChanged(const QString &base64Image);
+    /** @brief 在 UI 线程清空普通截图缓存，使等待上传的请求重新取得当前画面。 */
+    void invalidatePlayImage();
 
     /** @brief 有界保存请求原字段并请求可复用截图，随后逐项回执。
      * @param[in] topic 原请求主题。

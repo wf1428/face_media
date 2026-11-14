@@ -2,7 +2,8 @@
  * @file ic_board.cpp
  * @brief 启动 IC 设备链路工作线程，并桥接主线程 UI 提示。
  *
- * @author Dulin
+ * @author Du lin
+ * @note 最近修改：2026-11-10；修改人：Du lin；将提示来源传给界面，供即时关闭 IC 播报。
  * @date 2026-07-25
  */
 
@@ -57,13 +58,13 @@ void IcIoBootstrap::startAll(QObject* parent, const IcSerialConfig& io)
     auto toast = IcToast::instance(qobject_cast<QWidget*>(parent));
 
     QObject::connect(IcEventBridge::instance(), &IcEventBridge::toastPassRequested,
-                     parent, [toast]() {
-        toast->showPass();
+                     parent, [toast](bool fromCard) {
+        toast->showPass(1200,fromCard);
     }, static_cast<Qt::ConnectionType>(Qt::QueuedConnection | Qt::UniqueConnection));
 
     QObject::connect(IcEventBridge::instance(), &IcEventBridge::toastFailRequested,
-                     parent, [toast](const QString &reason, int resultCode) {
-        toast->showFail(reason, 5000, resultCode);
+                     parent, [toast](const QString &reason, int resultCode, bool fromCard) {
+        toast->showFail(reason,5000,resultCode,fromCard);
     }, static_cast<Qt::ConnectionType>(Qt::QueuedConnection | Qt::UniqueConnection));
 
     auto *thread = new QThread(parent);

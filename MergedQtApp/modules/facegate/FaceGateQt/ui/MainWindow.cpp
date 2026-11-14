@@ -1,12 +1,14 @@
 /**
  * @file MainWindow.cpp
- * @brief 管理融合应用页面、功能模块生命周期和跨模块信号路由。
+ * @brief 管理人脸门禁前台、识别服务及共享摄像头后台截图需求。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-11-10；修改人：Du lin；刷脸验证提示走独立开关入口，密码提示和识别业务不变。
  */
 
 #include "MainWindow.h"
+#include "common/camera_screenshot_source.h"
 #include "modules/web/web_face_bridge.h"
 
 #include "AccessPasswordDialog.h"
@@ -67,6 +69,15 @@ FaceGateMainWindow::FaceGateMainWindow(const AppConfig &config, QWidget *parent)
     config_.audioEnabled = AmpVolumeController::isPromptPlaybackEnabled();
     buildUi();
     startServices();
+    CameraScreenshotSource::instance().bind(this,[this](bool wanted) {
+        if(shutdown_)return;
+        screenshotCameraNeeded_=wanted;
+        camera_.setScreenshotEnabled(wanted);
+        // 截图仅改变采集占用，不复位录入活体/识别上下文。
+        camera_.requestRunning(config_.activeCameraProfile(),
+            wanted || (moduleActive_ && currentUiNeedsCamera()),
+            moduleActive_ && currentUiNeedsCamera());
+    },[this](QImage *image,qint64 *ts) {return !shutdown_ && camera_.takeScreenshot(image,ts);});
 }
 
 /** @brief 销毁前执行幂等模块关闭。 */
@@ -127,11 +138,11 @@ bool FaceGateMainWindow::activateModule()
     moduleActive_ = true;
     updateCameraPowerState();
 
-    const bool cameraReady = !currentUiNeedsCamera() || camera_.isRunning();
+    const bool cameraReady = !currentUiNeedsCamera() || camera_.requestedRunning();
     if (!cameraReady) {
         qWarning() << "[FACEGATE-ADAPTER] camera activation failed";
         moduleActive_ = false;
-        camera_.stop();
+        camera_.requestRunning(config_.activeCameraProfile(),screenshotCameraNeeded_,false);
         if (faceInferenceWorker_ && faceInferenceThread_.isRunning()) {
             FaceInferenceWorker *worker = faceInferenceWorker_;
             QMetaObject::invokeMethod(
@@ -150,7 +161,7 @@ bool FaceGateMainWindow::activateModule()
     return true;
 }
 
-/** @brief 暂停摄像头和验证，但保留后台服务以便恢复。 */
+/** @brief 停止前台验证与预览，独立截图仍占用时保留采集；原推理/活体停用顺序不变。 */
 void FaceGateMainWindow::deactivateModule()
 {
     if (virtualKeyboard_) {
@@ -171,7 +182,7 @@ void FaceGateMainWindow::deactivateModule()
 #endif
         adminPanel_->close();
     }
-    camera_.stop();
+    camera_.requestRunning(config_.activeCameraProfile(),screenshotCameraNeeded_,false);
     if (faceInferenceWorker_ && faceInferenceThread_.isRunning()) {
         FaceInferenceWorker *worker = faceInferenceWorker_;
         QMetaObject::invokeMethod(
@@ -208,7 +219,10 @@ void FaceGateMainWindow::shutdownModule()
         return;
     }
     shutdown_ = true;
+    CameraScreenshotSource::instance().unbind(this);
+    screenshotCameraNeeded_=false;
     deactivateModule();
+    camera_.stop();
     if (personImportWorker_) {
         personImportWorker_->cancel();
     }
@@ -446,7 +460,7 @@ void FaceGateMainWindow::buildUi()
         faceAccessPending_ = false;
         pendingFaceAccessLog_ = VerifyLog();
 
-        audio_.playPrompt(AudioService::Prompt::FaceAccessTimeout);
+        audio_.playFacePrompt(AudioService::Prompt::FaceAccessTimeout);
         recognitionLabel_->setText(completedLog.failReason);
         gateLabel_->setText(QStringLiteral("权限校验超时"));
         preview_->setState(VerifyState::Failed);
@@ -846,6 +860,7 @@ void FaceGateMainWindow::startServices()
         if (!camera_.takeLatestFrame(&frame)) {
             return;
         }
+        if(!moduleActive_ || !currentUiNeedsCamera())return;
         latestFrame_ = frame.image;
         latestEnrollmentPreview_ = frame.enrollmentPreview;
         emit previewFrameChanged(frame.image);
@@ -874,11 +889,12 @@ void FaceGateMainWindow::startServices()
     });
 
     connect(&camera_, &CameraService::cameraStatus, this, [this](const QString &message) {
-        cameraLabel_->setText("摄像头 " + message);
+        if(moduleActive_ && currentUiNeedsCamera())cameraLabel_->setText("摄像头 " + message);
     });
     connect(&camera_, &CameraService::cameraError, this, [this](const QString &message) {
         const QString userMessage = QStringLiteral("请检查摄像头是否连接");
         qWarning().noquote() << "摄像头错误：" << message;
+        if(!moduleActive_ || !currentUiNeedsCamera())return;
         cameraLabel_->setText("摄像头 " + message);
         latestFrame_ = QImage();
         latestEnrollmentPreview_ = QImage();
@@ -1094,15 +1110,15 @@ void FaceGateMainWindow::startServices()
             }
             qInfo().noquote() << "验证失败：" << enriched.result << enriched.personNo << enriched.cosine << enriched.liveScore;
             if (enriched.result == QStringLiteral("stranger")) {
-                audio_.playPrompt(AudioService::Prompt::Stranger);
+                audio_.playFacePrompt(AudioService::Prompt::Stranger);
             } else if (enriched.result == QStringLiteral("liveness_failed")) {
                 const AudioService::Prompt prompt =
                         enriched.failReason == QStringLiteral("活体工作线程未就绪")
                         ? AudioService::Prompt::FaceLivenessUnavailable
                         : AudioService::Prompt::LivenessFailed;
-                audio_.playPrompt(prompt);
+                audio_.playFacePrompt(prompt);
             } else if (enriched.result == QStringLiteral("failed")) {
-                audio_.playPrompt(AudioService::Prompt::VerifyFailed);
+                audio_.playFacePrompt(AudioService::Prompt::VerifyFailed);
             }
             recognitionLabel_->setText(enriched.failReason);
             emit recognitionFinished();
@@ -1183,7 +1199,7 @@ void FaceGateMainWindow::startServices()
         if (success) {
             if (matchesPending) {
                 rememberSuccessfulAccess(completedLog);
-                audio_.playPrompt(AudioService::Prompt::VerifyPassed);
+                audio_.playFacePrompt(AudioService::Prompt::VerifyPassed);
                 const QString successText = config_.privacyMode
                         ? QStringLiteral("验证通过  已授权人员")
                         : QStringLiteral("验证通过  %1").arg(
@@ -1218,7 +1234,7 @@ void FaceGateMainWindow::startServices()
             preview_->setStateText(failureText);
             emit previewStateChanged(VerifyState::Failed, failureText);
             if (matchesPending) {
-                audio_.playAccessFailure(resultCode);
+                audio_.playFaceAccessFailure(resultCode);
             }
             writeSystemEvent(QStringLiteral("face_elevator"),
                              QStringLiteral("warning"),
@@ -2004,17 +2020,13 @@ bool FaceGateMainWindow::currentUiNeedsCamera() const
     return adminPanel_ && adminPanel_->cameraRequired();
 }
 
-/** @brief 根据模块活动态和当前页面需求启停摄像头。 */
+/** @brief 根据原UI需求更新识别通道，并与截图占用合并；设备停止异步执行。 */
 void FaceGateMainWindow::updateCameraPowerState()
 {
     const bool needCamera = moduleActive_ && currentUiNeedsCamera();
+    if(needCamera && !camera_.isRunning() && cameraLabel_)cameraLabel_->setText("摄像头 启动中");
+    camera_.requestRunning(config_.activeCameraProfile(),needCamera || screenshotCameraNeeded_,needCamera);
     if (needCamera) {
-        if (!camera_.isRunning()) {
-            if (cameraLabel_) {
-                cameraLabel_->setText("摄像头 启动中");
-            }
-            camera_.start(config_.activeCameraProfile());
-        }
         if (adminModeActive_) {
             adminLivenessPending_ = false;
             adminLivenessLastFrame_ = -1000000;
@@ -2043,9 +2055,7 @@ void FaceGateMainWindow::updateCameraPowerState()
             cameraLabel_->setText("摄像头 正在停止");
         }
     }
-    // 即使采集线程因初始化错误自行把 running_ 置为 false，也必须 join，
-    // 否则后续进入新增人员页重新启动时会覆盖 joinable 的 std::thread。
-    camera_.stop();
+    // 仅清理原UI图像；截图仍占用时相机继续后台运行，退出线程由服务异步回收。
     clearCameraFrames();
     if (cameraLabel_) {
         cameraLabel_->setText("摄像头 已停止");

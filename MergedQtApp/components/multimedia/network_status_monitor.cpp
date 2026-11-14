@@ -4,16 +4,15 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-04；修改人：Du lin；公网探测配置、ping进程启动/超时/重试及取消迁入独立网络事件线程；UI只收代次有效结果并显示告警，析构异步终止进程，不新增日志。
+ * @note 最近修改：2026-11-13；修改人：Du lin；播放器与告警的直播源探测在现有网络线程共用 HTTP 管理器；配置读取、超时和清理在后台，UI 仅应用有效结果。
  */
 
 #include "network_status_monitor.h"
-#include "common/debug/ui_performance.h"
+#include <utility>
 
 #include <QApplication>
 #include <QProcess>
 #include <QThread>
-#include <QElapsedTimer>
 #include <atomic>
 #include <mutex>
 #include <functional>
@@ -27,13 +26,7 @@
 #include <QDir>
 #include <QRegExp>
 #include <QDebug>
-#include <QUrl>
 #include <QHostAddress>
-#include <QNetworkAccessManager>
-#include <QNetworkRequest>
-#include <QNetworkReply>
-#include <QTcpSocket>
-#include <QUdpSocket>
 #include <QDateTime>
 #include "ic_board/ic_event_bridge.h"
 #include "platform/rk3566_platform.h"
@@ -41,12 +34,14 @@
 /** @brief 后台检测只通过短锁门向仍存活的UI投递，不等待UI或持有控件引用。 */
 struct NetworkCheckGuard {
     std::mutex mutex;QObject *target=nullptr; /**< mutex仅保护投递地址，不覆盖文件或进程操作。 */
-    std::atomic<quint64> generation{0}; /**< stop/新检测递增，使旧任务结果无效。 */
+    std::atomic<quint64> generation{0}; /**< 告警检查代次，stop 或新轮次使旧结果无效。 */
+    std::atomic<quint64> playbackGeneration{0}; /**< 播放器独立代次；取消告警不会影响它。 */
 };
 /** @brief 网络事件线程独占的路由/公网探测器，不访问控件。
  * @details QProcess与超时定时器是本对象子对象，随moveToThread迁移；配置和同步路由回退也只在此线程执行。
  * 新请求只保留最新代次，先异步终止旧ping再启动；stop通过共享原子代次立即阻止旧结果回到UI。
- * 最终关闭先kill，收到finished/FailedToStart且进程退出后才quit，避免在UI析构QProcess等待子进程。
+ * 直播探测作为此对象的子对象，复用 HTTP 管理器；独立代次控制告警和播放请求。
+ * 最终关闭先取消直播探测并 kill ping，子进程退出后才 quit；UI 不等待。
  */
 class NetworkProbeWorker final:public QObject {
 public:
@@ -56,7 +51,7 @@ public:
      * @param[in] timeoutMs 原每目标超时毫秒。
      */
     NetworkProbeWorker(std::shared_ptr<NetworkCheckGuard> guard,QString path,int timeoutMs)
-        :guard_(std::move(guard)),path_(std::move(path)),timeoutMs_(timeoutMs),process_(new QProcess(this)),timeout_(new QTimer(this)) {
+        :guard_(std::move(guard)),path_(std::move(path)),timeoutMs_(timeoutMs),process_(new QProcess(this)),timeout_(new QTimer(this)), liveProbe_(new LiveStreamProbe(this)) {
         timeout_->setSingleShot(true);
         connect(timeout_,&QTimer::timeout,this,[this] {
             if(!current()) return;
@@ -81,11 +76,79 @@ public:
         pending_=generation;active_=0;timeout_->stop();
         if(process_->state()!=QProcess::NotRunning) process_->kill();else startPending();
     }
-    /** @brief 工作线程取消探测，不做同步等待。
+    /** @brief 启动播放器直播探测，在网络线程完成后向 UI 排队。
+     * @param[in] generation 播放器提交时的独立代次。
+     * @param[in] url 直播源 URL。
+     * @param[in] kind 业务协议类型。
+     * @param[in] completion 仅 UI 执行的值结果回调。
+     */
+    void requestPlaybackProbe(quint64 generation, const QString &url, const QString &kind,
+                              LiveStreamProbe::Completion completion)
+    {
+        if (closing_ || guard_->playbackGeneration.load() != generation) return;
+        liveProbe_->start(LiveStreamProbe::Purpose::PlaybackRetry, url, kind,
+                          [this, generation, completion=std::move(completion)](LiveStreamProbe::Result result) {
+            publish(generation, [completion, result=std::move(result)](NetworkStatusMonitor *) {
+                if (completion) completion(result);
+            }, true);
+        });
+    }
+
+    /** @brief 取消播放器的探测；告警请求与管理器继续使用。
+     * @param[in] generation UI 发起取消时递增后的播放代次。
+     */
+    void cancelPlaybackProbe(quint64 generation)
+    {
+        if (guard_->playbackGeneration.load() == generation)
+            liveProbe_->cancel(LiveStreamProbe::Purpose::PlaybackRetry);
+    }
+
+    /** @brief 外网检查通过后，在网络线程读取直播目标并按原告警规则检查。
+     * @param[in] generation 当前告警轮次，过期时跳过请求或结果。
+     */
+    void requestWarningProbe(quint64 generation)
+    {
+        if (closing_ || guard_->generation.load() != generation) return;
+
+        QSettings ini(path_, QSettings::IniFormat);
+        ini.setIniCodec("UTF-8");
+        ini.beginGroup(QStringLiteral("playback"));
+        const bool commandReceived = ini.value(QStringLiteral("command_received"), false).toBool();
+        const auto target = ini.value(QStringLiteral("target_mode")).toString().trimmed().toUpper();
+        const auto current = ini.value(QStringLiteral("current_mode")).toString().trimmed().toUpper();
+        const bool fallback = ini.value(QStringLiteral("fallback_from_live"), false).toBool();
+        auto url = ini.value(QStringLiteral("live_url")).toString().trimmed();
+        const auto kind = ini.value(QStringLiteral("live_kind")).toString();
+        ini.endGroup();
+
+        if (!commandReceived || target != QStringLiteral("LIVE") ||
+            (current == QStringLiteral("LIVE") && !fallback)) {
+            publish(generation, [](NetworkStatusMonitor *ui) { ui->finishStreamProbe(true, {}); });
+            return;
+        }
+        if (url.isEmpty()) url = ini.value(QStringLiteral("stream/url")).toString().trimmed();
+        if (url.isEmpty()) {
+            publish(generation, [](NetworkStatusMonitor *ui) {
+                ui->finishStreamProbe(false, QStringLiteral("未配置直播地址"));
+            });
+            return;
+        }
+        liveProbe_->start(LiveStreamProbe::Purpose::NetworkWarning, url, kind,
+                          [this, generation](LiveStreamProbe::Result result) {
+            const bool enabled = onlineEnabled();
+            publish(generation, [enabled, result=std::move(result)](NetworkStatusMonitor *ui) {
+                ui->finishStreamProbe(!enabled || result.available, result.detail);
+            });
+        });
+    }
+
+    /** @brief 工作线程取消告警探测，不做同步等待。
      * @param[in] closing true为最终释放，进程退出后终止所属事件循环；false保留线程供重启。
      */
     void cancel(bool closing=false) {
         closing_|=closing;pending_=active_=0;timeout_->stop();
+        liveProbe_->cancel(LiveStreamProbe::Purpose::NetworkWarning);
+        if (closing_) liveProbe_->cancel(LiveStreamProbe::Purpose::PlaybackRetry);
         if(process_->state()!=QProcess::NotRunning) process_->kill();else if(closing_) thread()->quit();
     }
 private:
@@ -94,13 +157,20 @@ private:
     /** @brief 将值结果安全投递UI；短锁只覆盖QObject地址校验与排队，不执行探测。
      * @param[in] generation 结果所属轮次。
      * @param[in] action UI收到后应用结果，不能携带后台可变对象引用。
+     * @param[in] playback true 使用播放代次，否则使用告警检查代次。
      */
-    void publish(quint64 generation,std::function<void(NetworkStatusMonitor*)> action) {
-        const auto guard=guard_;std::lock_guard<std::mutex> lock(guard->mutex);
-        QObject *target=guard->target;if(!target || guard->generation.load()!=generation) return;
-        QMetaObject::invokeMethod(target,[guard,generation,target,action=std::move(action)] {
-            if(guard->generation.load()==generation) action(static_cast<NetworkStatusMonitor*>(target));
-        },Qt::QueuedConnection);
+    void publish(quint64 generation, std::function<void(NetworkStatusMonitor*)> action,
+                 bool playback=false)
+    {
+        const auto guard=guard_;
+        std::lock_guard<std::mutex> lock(guard->mutex);
+        QObject *target=guard->target;
+        auto &counter = playback ? guard->playbackGeneration : guard->generation;
+        if (!target || counter.load() != generation) return;
+        QMetaObject::invokeMethod(target, [guard,generation,target,playback,action=std::move(action)] {
+            const auto &counter = playback ? guard->playbackGeneration : guard->generation;
+            if (counter.load() == generation) action(static_cast<NetworkStatusMonitor*>(target));
+        }, Qt::QueuedConnection);
     }
     /** @brief 后台读取在线开关，保持offline优先规则，不触及UI QSettings。 */
     bool onlineEnabled() const {
@@ -112,16 +182,14 @@ private:
     void startPending() {
         if(closing_ || !pending_) return;
         active_=pending_;pending_=0;if(!current()) { active_=0;return; }
-        const auto generation=active_;QElapsedTimer elapsed;elapsed.start();
+        const auto generation=active_;
         const bool enabled=onlineEnabled();bool carrierValid=false;
         const bool linkUp=enabled ? NetworkStatusMonitor::isWiredLinkUp(&carrierValid) : true;
         if(!current()) return;
         const bool route=enabled && (!carrierValid || linkUp) ? NetworkStatusMonitor::hasDefaultRoute() : false;
         if(!current()) return;
-        const auto spent=elapsed.elapsed();const auto workerId=quintptr(QThread::currentThreadId());
-        publish(generation,[enabled,carrierValid,linkUp,route,spent,workerId](NetworkStatusMonitor *ui) {
+        publish(generation,[enabled,carrierValid,linkUp,route](NetworkStatusMonitor *ui) {
             ui->checkState_=NetworkStatusMonitor::CheckState::Idle;
-            qInfo().noquote()<<QStringLiteral("[network-check] worker=%1 elapsedMs=%2 defaultRoute=%3").arg(workerId,0,16).arg(spent).arg(route);
             if(!enabled) { IcEventBridge::instance()->updateNetworkAvailability(true);ui->clearWarning();return; }
             if(carrierValid && !linkUp) { IcEventBridge::instance()->updateNetworkAvailability(false);ui->setWarning(NetworkStatusMonitor::WarningKind::LinkDown);return; }
             ui->lastDefaultRouteOk_=route;ui->checkState_=NetworkStatusMonitor::CheckState::Pinging;
@@ -153,6 +221,7 @@ private:
     }
     std::shared_ptr<NetworkCheckGuard> guard_;QString path_;int timeoutMs_; /**< 借用取消门、自有配置路径与目标超时毫秒。 */
     QProcess *process_;QTimer *timeout_;QStringList targets_;int index_=0; /**< 工作线程独占，QObject持有子对象；原目标顺序不变。 */
+    LiveStreamProbe *liveProbe_; /**< 网络线程内拥有两路直播探测及共享管理器的 QObject 子对象。 */
     quint64 active_=0,pending_=0;bool closing_=false; /**< 活动/最新待处理代次，0无任务；最终关闭后拒绝新请求。 */
 };
 
@@ -163,8 +232,7 @@ private:
 NetworkStatusMonitor::NetworkStatusMonitor(QWidget *mainWindow,
                                            const QString &configPath)
     : QWidget(mainWindow),
-      main_(mainWindow),
-      configPath_(configPath.isEmpty() ? Rk3566Platform::netConfigPath() : configPath)
+      main_(mainWindow)
 {
     setAttribute(Qt::WA_TransparentForMouseEvents, true);
     setAttribute(Qt::WA_NoSystemBackground, true);
@@ -179,10 +247,7 @@ NetworkStatusMonitor::NetworkStatusMonitor(QWidget *mainWindow,
         setGeometry(main_->rect());
     }
 
-    checkTimer_.setObjectName(QStringLiteral("network.status.check"));
     checkTimer_.setInterval(checkIntervalMs_);
-    blinkTimer_.setObjectName(QStringLiteral("network.blink"));
-    autoHideTimer_.setObjectName(QStringLiteral("network.hide"));
     connect(&checkTimer_, &QTimer::timeout,
             this, &NetworkStatusMonitor::checkNetworkStatus);
 
@@ -197,7 +262,8 @@ NetworkStatusMonitor::NetworkStatusMonitor(QWidget *mainWindow,
 
     networkThread_=new QThread;
     networkThread_->setObjectName(QStringLiteral("network.probe"));
-    networkWorker_=new NetworkProbeWorker(networkGuard_,configPath_,pingTimeoutMs_);
+    const auto path = configPath.isEmpty() ? Rk3566Platform::netConfigPath() : configPath;
+    networkWorker_=new NetworkProbeWorker(networkGuard_,path,pingTimeoutMs_);
     networkWorker_->moveToThread(networkThread_);
     connect(networkThread_,&QThread::finished,networkWorker_,&QObject::deleteLater);
     connect(networkThread_,&QThread::finished,networkThread_,&QObject::deleteLater);
@@ -206,10 +272,11 @@ NetworkStatusMonitor::NetworkStatusMonitor(QWidget *mainWindow,
     hide();
 }
 
-/** @brief 销毁前关闭UI投递门，异步取消后台进程并回收线程；不在UI等待进程或join。 */
+/** @brief 关闭 UI 投递门，异步取消两路直播探测和 ping 后回收网络线程。 */
 NetworkStatusMonitor::~NetworkStatusMonitor()
 {
     stop();
+    networkGuard_->playbackGeneration.fetch_add(1);
     { std::lock_guard<std::mutex> lock(networkGuard_->mutex);networkGuard_->target=nullptr; }
     auto *worker=networkWorker_;
     QMetaObject::invokeMethod(worker,[worker] { worker->cancel(true); },Qt::QueuedConnection);
@@ -222,18 +289,15 @@ void NetworkStatusMonitor::start()
     checkTimer_.start();
 }
 
-/** @brief 停止定时器、进程和所有进行中的流探测。 */
+/** @brief 停止告警定时器并异步取消告警探测；播放重试独立取消。 */
 void NetworkStatusMonitor::stop()
 {
     networkGuard_->generation.fetch_add(1);
-    checkState_=CheckState::Idle;
     checkTimer_.stop();
     blinkTimer_.stop();
     autoHideTimer_.stop();
     auto *worker=networkWorker_;
     QMetaObject::invokeMethod(worker,[worker] { worker->cancel(); },Qt::QueuedConnection);
-
-    cancelStreamProbe();
 
     checkState_ = CheckState::Idle;
     warningKind_ = WarningKind::None;
@@ -246,18 +310,6 @@ void NetworkStatusMonitor::stop()
 bool NetworkStatusMonitor::isWarningActive() const
 {
     return warningActive_;
-}
-
-/** @return 配置允许联网业务时返回 true。 */
-bool NetworkStatusMonitor::isOnlineFeatureEnabled() const
-{
-    QSettings ini(configPath_, QSettings::IniFormat);
-    const bool onlineV1  = ini.value(QStringLiteral("feature/online_v1"), false).toBool();
-    const bool onlineV2  = ini.value(QStringLiteral("feature/online_v2"), false).toBool();
-    const bool offlineV1 = ini.value(QStringLiteral("feature/offline_v1"), false).toBool();
-
-    // offline_v1 或未启用在线模式时，不显示网络异常提示。
-    return !offlineV1 && (onlineV1 || onlineV2);
 }
 
 /** @brief 读取有线网卡 carrier；valid 表示系统节点是否可读。 */
@@ -412,7 +464,7 @@ void NetworkStatusMonitor::checkNetworkStatus()
     QMetaObject::invokeMethod(worker,[worker,generation] { worker->request(generation); },Qt::QueuedConnection);
 }
 
-/** @brief 结束外网探测并继续直播源检查或设置告警。 */
+/** @brief 在 UI 应用外网结果；外网可用时排队提交直播源告警检查。 */
 void NetworkStatusMonitor::finishInternetProbe(bool internetOk,bool onlineEnabled)
 {
     checkState_ = CheckState::Idle;
@@ -437,875 +489,43 @@ void NetworkStatusMonitor::finishInternetProbe(bool internetOk,bool onlineEnable
 
     // 网络和外网都正常后，再判断业务目标 LIVE 是否真的有数据流。
     // 这样可以把“网络问题”和“服务器/推流方无流”分开提示。
-    beginLiveStreamProbeIfNeeded();
-}
-
-
-/** @brief 从共享配置读取“期望直播/实际模式/URL/类型”。 */
-NetworkStatusMonitor::LiveProbeTarget NetworkStatusMonitor::readLiveProbeTargetFromConfig() const
-{
-    LiveProbeTarget target;
-
-    QSettings ini(configPath_, QSettings::IniFormat);
-    ini.setIniCodec("UTF-8");
-
-    ini.beginGroup(QStringLiteral("playback"));
-    const bool commandReceived = ini.value(QStringLiteral("command_received"), false).toBool();
-    const QString targetMode = ini.value(QStringLiteral("target_mode")).toString().trimmed().toUpper();
-    const QString currentMode = ini.value(QStringLiteral("current_mode")).toString().trimmed().toUpper();
-    const bool fallbackFromLive = ini.value(QStringLiteral("fallback_from_live"), false).toBool();
-    QString liveUrl = ini.value(QStringLiteral("live_url")).toString().trimmed();
-    QString liveKind = ini.value(QStringLiteral("live_kind")).toString().trimmed().toLower();
-    ini.endGroup();
-
-    if (!commandReceived || targetMode != QStringLiteral("LIVE")) {
-        return target;
-    }
-
-    // 正式已经在LIVE播放时不由提示层重复判断；LIVE内部watchdog负责无帧回退。
-    if (currentMode == QStringLiteral("LIVE") && !fallbackFromLive) {
-        return target;
-    }
-
-    target.needed = true;
-
-    if (liveUrl.isEmpty()) {
-        liveUrl = ini.value(QStringLiteral("stream/url")).toString().trimmed();
-    }
-    if (liveKind.isEmpty()) {
-        liveKind = detectLiveKindFromUrl(liveUrl);
-    }
-
-    target.url = liveUrl;
-    target.kind = liveKind;
-    target.ok = !target.url.isEmpty();
-    if (!target.ok) {
-        target.detail = QStringLiteral("未配置直播地址");
-    }
-    return target;
-}
-
-/** @brief 按 URL scheme 和扩展名推断直播协议类型。 */
-QString NetworkStatusMonitor::detectLiveKindFromUrl(const QString &url) const
-{
-    const QString lower = url.trimmed().toLower();
-    if (lower.startsWith(QStringLiteral("rtsp://"))) {
-        return QStringLiteral("rtsp");
-    }
-    if (lower.startsWith(QStringLiteral("rtmp://")) || lower.startsWith(QStringLiteral("rtmps://"))) {
-        return QStringLiteral("rtmp");
-    }
-    if (lower.startsWith(QStringLiteral("srt://"))) {
-        return QStringLiteral("srt");
-    }
-    if (lower.startsWith(QStringLiteral("udp://"))) {
-        return QStringLiteral("udp");
-    }
-    if (lower.startsWith(QStringLiteral("http://")) || lower.startsWith(QStringLiteral("https://"))) {
-        if (lower.contains(QStringLiteral(".m3u8"))) {
-            return QStringLiteral("hls");
-        }
-        if (lower.contains(QStringLiteral(".ts"))) {
-            return QStringLiteral("http-ts");
-        }
-        return QStringLiteral("live");
-    }
-    return QStringLiteral("live");
-}
-
-/** @return 业务类型应按裸 UDP 数据流探测时返回 true。 */
-bool NetworkStatusMonitor::isRawUdpLiveKind(const QString &scheme, const QString &kind) const
-{
-    const QString s = scheme.trimmed().toLower();
-    const QString k = kind.trimmed().toLower();
-    return s == QStringLiteral("udp") ||
-           k == QStringLiteral("udp") ||
-           k == QStringLiteral("multicast") ||
-           k.contains(QStringLiteral("multicast"));
-}
-
-/** @return 文本是 IPv4 组播地址时返回 true。 */
-bool NetworkStatusMonitor::isMulticastIpv4(const QString &ipText) const
-{
-    QString ip = ipText.trimmed();
-    const int slash = ip.indexOf('/');
-    if (slash >= 0) {
-        ip = ip.left(slash);
-    }
-
-    const QStringList parts = ip.split('.');
-    if (parts.size() != 4) {
-        return false;
-    }
-
-    bool ok = false;
-    const int first = parts.at(0).toInt(&ok);
-    return ok && first >= 224 && first <= 239;
-}
-
-/** @brief 解析 UDP URL 中的主机和端口。 */
-NetworkStatusMonitor::UdpProbeTarget NetworkStatusMonitor::parseUdpProbeTarget(const QString &url) const
-{
-    UdpProbeTarget target;
-
-    const QString text = url.trimmed();
-    const QUrl u(text);
-
-    QString host = u.host().trimmed();
-    int port = u.port();
-
-    // 兼容 udp://239.1.1.1:5000、udp://@239.1.1.1:5000、udp://0.0.0.0:5000。
-    if (host.isEmpty() || port <= 0) {
-        QRegExp rx(QStringLiteral("udp://@?([^/:\\?]+):(\\d+)"));
-        if (rx.indexIn(text) >= 0) {
-            if (host.isEmpty()) {
-                host = rx.cap(1).trimmed();
-            }
-            if (port <= 0) {
-                bool ok = false;
-                const int parsedPort = rx.cap(2).toInt(&ok);
-                if (ok) {
-                    port = parsedPort;
-                }
-            }
-        }
-    }
-
-    if (port <= 0 || port > 65535) {
-        return target;
-    }
-
-    if (host.isEmpty()) {
-        host = QStringLiteral("0.0.0.0");
-    }
-
-    target.ok = true;
-    target.host = host;
-    target.port = static_cast<quint16>(port);
-    target.multicast = isMulticastIpv4(host);
-    return target;
-}
-
-/** @brief 仅在当前业务需要时启动直播源探测。 */
-void NetworkStatusMonitor::beginLiveStreamProbeIfNeeded()
-{
-    const LiveProbeTarget target = readLiveProbeTargetFromConfig();
-    if (!target.needed) {
-        clearWarning();
-        return;
-    }
-
-    if (!target.ok) {
-        setWarning(WarningKind::StreamNoData, target.detail);
-        return;
-    }
-
-    startLiveStreamProbe(target);
-}
-
-/** @brief 根据目标协议选择具体异步探测实现。 */
-void NetworkStatusMonitor::startLiveStreamProbe(const LiveProbeTarget &target)
-{
-    cancelStreamProbe();
-
-    QUrl u(target.url);
-    QString scheme = u.scheme().trimmed().toLower();
-    QString kind = target.kind.trimmed().toLower();
-    if (kind.isEmpty() || kind == QStringLiteral("live")) {
-        kind = detectLiveKindFromUrl(target.url);
-    }
-    if (scheme.isEmpty()) {
-        scheme = kind;
-    }
-
     checkState_ = CheckState::StreamProbing;
-    streamProbeUrl_ = target.url;
-
-    if (isRawUdpLiveKind(scheme, kind)) {
-        startUdpStreamProbe(parseUdpProbeTarget(target.url), target.url);
-        return;
-    }
-
-    if (scheme == QStringLiteral("http") || scheme == QStringLiteral("https") ||
-        kind == QStringLiteral("hls") || kind == QStringLiteral("http-ts")) {
-        if (!u.isValid() || u.host().isEmpty()) {
-            finishStreamProbe(false, QStringLiteral("直播地址无效"));
-            return;
-        }
-        startHttpStreamProbe(u, target.url);
-        return;
-    }
-
-    if (scheme == QStringLiteral("rtsp")) {
-        if (!u.isValid() || u.host().isEmpty()) {
-            finishStreamProbe(false, QStringLiteral("RTSP 地址无效"));
-            return;
-        }
-        startRtspStreamProbe(u, target.url);
-        return;
-    }
-
-    if (scheme == QStringLiteral("rtmp")) {
-        if (!u.isValid() || u.host().isEmpty()) {
-            finishStreamProbe(false, QStringLiteral("RTMP 地址无效"));
-            return;
-        }
-        startRtmpStreamProbe(u, target.url);
-        return;
-    }
-
-    // SRT/未知协议不做 carrier-only 误判：既然当前目标是 LIVE 但还没切进去，直接提示直播源不可确认。
-    finishStreamProbe(false, QStringLiteral("当前协议暂不支持后台确认"));
+    const auto generation = networkGuard_->generation.load();
+    auto *worker = networkWorker_;
+    QMetaObject::invokeMethod(worker, [worker, generation] { worker->requestWarningProbe(generation); },
+                              Qt::QueuedConnection);
 }
 
-/** @brief 监听 UDP 数据，组播目标会加入对应组。 */
-void NetworkStatusMonitor::startUdpStreamProbe(const UdpProbeTarget &target, const QString &sourceUrl, const QString &detailPrefix)
-{
-    if (!target.ok || target.port == 0) {
-        finishStreamProbe(false, QStringLiteral("UDP 直播地址缺少端口"));
-        return;
-    }
-
-    if (streamUdpSocket_) {
-        streamUdpSocket_->deleteLater();
-        streamUdpSocket_ = nullptr;
-    }
-
-    QUdpSocket *udp = new QUdpSocket(this);
-    streamUdpSocket_ = udp;
-
-    const bool bindOk = udp->bind(QHostAddress::AnyIPv4,
-                                  target.port,
-                                  QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint);
-    if (!bindOk) {
-        const QString detail = detailPrefix.isEmpty()
-                ? QStringLiteral("UDP 端口绑定失败:%1").arg(target.port)
-                : detailPrefix + QStringLiteral("，UDP 端口绑定失败:%1").arg(target.port);
-        udp->deleteLater();
-        streamUdpSocket_ = nullptr;
-        finishStreamProbe(false, detail);
-        return;
-    }
-
-    if (target.multicast) {
-        if (!udp->joinMulticastGroup(QHostAddress(target.host))) {
-            const QString detail = detailPrefix.isEmpty()
-                    ? QStringLiteral("加入组播失败:%1:%2").arg(target.host).arg(target.port)
-                    : detailPrefix + QStringLiteral("，加入组播失败:%1:%2").arg(target.host).arg(target.port);
-            udp->close();
-            udp->deleteLater();
-            streamUdpSocket_ = nullptr;
-            finishStreamProbe(false, detail);
-            return;
-        }
-    }
-
-    connect(udp, &QUdpSocket::readyRead, this, [this, udp]() {
-        if (udp != streamUdpSocket_) {
-            return;
-        }
-        while (udp->hasPendingDatagrams()) {
-            QByteArray datagram;
-            const qint64 pendingSize = udp->pendingDatagramSize();
-            datagram.resize(static_cast<int>(qMin<qint64>(pendingSize, 2048)));
-            udp->readDatagram(datagram.data(), datagram.size());
-        }
-        finishStreamProbe(true, QStringLiteral("UDP media packet received"));
-    });
-
-    QTimer::singleShot(streamProbeTimeoutMs_, udp, [this, udp, target, sourceUrl, detailPrefix]() {
-        Q_UNUSED(sourceUrl);
-        if (udp != streamUdpSocket_) {
-            return;
-        }
-        const QString base = target.multicast
-                ? QStringLiteral("未收到组播数据包:%1:%2").arg(target.host).arg(target.port)
-                : QStringLiteral("未收到 UDP 数据包:%1").arg(target.port);
-        finishStreamProbe(false, detailPrefix.isEmpty() ? base : detailPrefix + QStringLiteral("，") + base);
-    });
-
-    qDebug() << "[网络提示] 开始探测 UDP 直播流数据:" << sourceUrl
-             << "host=" << target.host << "port=" << target.port
-             << "multicast=" << target.multicast;
-}
-
-/** @brief 通过 HTTP 响应头和少量正文判断直播内容。 */
-void NetworkStatusMonitor::startHttpStreamProbe(const QUrl &url, const QString &sourceUrl)
-{
-    streamHttpManager_ = new QNetworkAccessManager(this);
-    streamHttpReply_ = nullptr;
-
-    QNetworkRequest req(url);
-    req.setRawHeader("User-Agent", "qt_ycest-network-status-stream-probe");
-    req.setRawHeader("Accept", "*/*");
-    req.setRawHeader("Connection", "close");
-    req.setRawHeader("Range", "bytes=0-4095");
-#if QT_VERSION >= QT_VERSION_CHECK(5, 6, 0)
-    req.setAttribute(QNetworkRequest::FollowRedirectsAttribute, true);
-#endif
-
-    streamHttpReply_ = streamHttpManager_->get(req);
-
-    connect(streamHttpReply_, &QNetworkReply::finished, this, [this, sourceUrl]() {
-        if (!streamHttpReply_) {
-            return;
-        }
-
-        const int statusCode = streamHttpReply_->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-        const QString contentType = QString::fromLatin1(streamHttpReply_->rawHeader("Content-Type"));
-        const QByteArray body = streamHttpReply_->readAll();
-
-        if (isHttpRedirectStatus(statusCode)) {
-            finishStreamProbe(false, QStringLiteral("HTTP 重定向未解析:%1").arg(statusCode));
-            return;
-        }
-
-        if (!isHttpSuccessStatus(statusCode)) {
-            finishStreamProbe(false, QStringLiteral("HTTP 状态:%1").arg(statusCode));
-            return;
-        }
-
-        QString detail;
-        if (!isLikelyLiveHttpBody(sourceUrl, contentType, body, &detail)) {
-            finishStreamProbe(false, detail);
-            return;
-        }
-
-        finishStreamProbe(true, detail);
-    });
-
-    connect(streamHttpReply_,
-            static_cast<void (QNetworkReply::*)(QNetworkReply::NetworkError)>(&QNetworkReply::error),
-            this, [this](QNetworkReply::NetworkError) {
-        finishStreamProbe(false, QStringLiteral("HTTP 连接错误"));
-    });
-
-    QTimer::singleShot(streamProbeTimeoutMs_ + 1000, streamHttpReply_, [this]() {
-        if (!streamHttpReply_) {
-            return;
-        }
-        finishStreamProbe(false, QStringLiteral("HTTP 探测超时"));
-    });
-
-    qDebug() << "[网络提示] 开始探测 HTTP 直播流数据:" << sourceUrl;
-}
-
-/** @brief 执行 RTSP DESCRIBE/SETUP，并在需要时继续探测 SDP 组播。 */
-void NetworkStatusMonitor::startRtspStreamProbe(const QUrl &url, const QString &sourceUrl)
-{
-    int port = url.port();
-    if (port <= 0) {
-        port = 554;
-    }
-
-    QTcpSocket *sock = new QTcpSocket(this);
-    streamTcpSocket_ = sock;
-    sock->setProperty("yc_probe_done", false);
-    sock->setProperty("yc_probe_buffer", QByteArray());
-    sock->setProperty("yc_probe_stage", QStringLiteral("rtsp_describe"));
-
-    connect(sock, &QTcpSocket::connected, this, [this, sock, sourceUrl]() {
-        if (sock != streamTcpSocket_) {
-            return;
-        }
-        sendRtspDescribe(sock, sourceUrl);
-    });
-
-    connect(sock, &QTcpSocket::readyRead, this, [this, sock, sourceUrl]() {
-        if (sock != streamTcpSocket_) {
-            return;
-        }
-
-        QByteArray buf = sock->property("yc_probe_buffer").toByteArray();
-        buf += sock->readAll();
-        sock->setProperty("yc_probe_buffer", buf);
-
-        const RtspResponse resp = parseRtspResponse(buf);
-        if (!resp.complete) {
-            return;
-        }
-
-        sock->setProperty("yc_probe_buffer", buf.mid(resp.consumedBytes));
-        const QString stage = sock->property("yc_probe_stage").toString();
-
-        if (stage == QStringLiteral("rtsp_describe")) {
-            if (resp.statusCode != 200) {
-                finishStreamProbe(false, QStringLiteral("RTSP DESCRIBE 失败:%1").arg(resp.statusCode));
-                return;
-            }
-
-            const QString videoControl = findRtspVideoControl(resp.body);
-            if (videoControl.isEmpty()) {
-                finishStreamProbe(false, QStringLiteral("RTSP 未发现视频轨道"));
-                return;
-            }
-
-            // RTSP 组播场景下，DESCRIBE 成功不代表推流方正在发 RTP。
-            // 如果 SDP 能解析出组播地址和 video 端口，继续加入组播等待真实 RTP 包。
-            const RtspMulticastInfo mcast = findRtspMulticastInfo(resp.body);
-            if (mcast.ok) {
-                UdpProbeTarget udpTarget;
-                udpTarget.ok = true;
-                udpTarget.multicast = true;
-                udpTarget.host = mcast.group;
-                udpTarget.port = mcast.port;
-
-                sock->abort();
-                sock->deleteLater();
-                if (sock == streamTcpSocket_) {
-                    streamTcpSocket_ = nullptr;
-                }
-                startUdpStreamProbe(udpTarget, sourceUrl, QStringLiteral("RTSP 组播 SDP 正常"));
-                return;
-            }
-
-            const QString setupUrl = buildRtspControlUrl(QUrl(sourceUrl), videoControl);
-            if (setupUrl.trimmed().isEmpty()) {
-                finishStreamProbe(false, QStringLiteral("RTSP video control 为空"));
-                return;
-            }
-
-            sock->setProperty("yc_probe_stage", QStringLiteral("rtsp_setup"));
-            sendRtspSetup(sock, setupUrl);
-            return;
-        }
-
-        if (stage == QStringLiteral("rtsp_setup")) {
-            if (resp.statusCode == 200) {
-                finishStreamProbe(true, QStringLiteral("RTSP DESCRIBE+SETUP ok"));
-                return;
-            }
-            finishStreamProbe(false, QStringLiteral("RTSP SETUP 失败:%1").arg(resp.statusCode));
-            return;
-        }
-
-        finishStreamProbe(false, QStringLiteral("RTSP 探测状态异常"));
-    });
-
-    connect(sock,
-            static_cast<void (QAbstractSocket::*)(QAbstractSocket::SocketError)>(&QAbstractSocket::error),
-            this, [this](QAbstractSocket::SocketError) {
-        finishStreamProbe(false, QStringLiteral("RTSP 连接错误"));
-    });
-
-    QTimer::singleShot(streamProbeTimeoutMs_ + 1000, sock, [this, sock]() {
-        if (sock != streamTcpSocket_) {
-            return;
-        }
-        finishStreamProbe(false, QStringLiteral("RTSP 探测超时"));
-    });
-
-    qDebug() << "[网络提示] 开始探测 RTSP 直播流数据:" << sourceUrl;
-    sock->connectToHost(url.host(), static_cast<quint16>(port));
-}
-
-/** @brief 通过 TCP 握手可达性探测 RTMP 地址。 */
-void NetworkStatusMonitor::startRtmpStreamProbe(const QUrl &url, const QString &sourceUrl)
-{
-    int port = url.port();
-    if (port <= 0) {
-        port = 1935;
-    }
-
-    QTcpSocket *sock = new QTcpSocket(this);
-    streamTcpSocket_ = sock;
-    sock->setProperty("yc_probe_buffer", QByteArray());
-
-    connect(sock, &QTcpSocket::connected, this, [sock]() {
-        QByteArray req;
-        req.resize(1537);
-        req.fill('\0');
-        req[0] = 0x03;
-        sock->write(req);
-        sock->flush();
-    });
-
-    connect(sock, &QTcpSocket::readyRead, this, [this, sock]() {
-        if (sock != streamTcpSocket_) {
-            return;
-        }
-        QByteArray buf = sock->property("yc_probe_buffer").toByteArray();
-        buf += sock->readAll();
-        sock->setProperty("yc_probe_buffer", buf);
-        if (buf.size() >= 1537 && static_cast<unsigned char>(buf.at(0)) == 0x03) {
-            finishStreamProbe(true, QStringLiteral("RTMP handshake ok"));
-        }
-    });
-
-    connect(sock,
-            static_cast<void (QAbstractSocket::*)(QAbstractSocket::SocketError)>(&QAbstractSocket::error),
-            this, [this](QAbstractSocket::SocketError) {
-        finishStreamProbe(false, QStringLiteral("RTMP 连接错误"));
-    });
-
-    QTimer::singleShot(streamProbeTimeoutMs_ + 1000, sock, [this, sock]() {
-        if (sock != streamTcpSocket_) {
-            return;
-        }
-        finishStreamProbe(false, QStringLiteral("RTMP 探测超时"));
-    });
-
-    qDebug() << "[网络提示] 开始探测 RTMP 直播流数据:" << sourceUrl;
-    sock->connectToHost(url.host(), static_cast<quint16>(port));
-}
-
-/** @brief 收束流探测资源并更新告警状态。 */
+/** @brief 接收网络线程返回的告警结果并更新覆盖层。
+ * @param[in] streamOk true 清除直播源告警。
+ * @param[in] detail 失败时的直播源告警说明。
+ */
 void NetworkStatusMonitor::finishStreamProbe(bool streamOk, const QString &detail)
 {
-    if (checkState_ != CheckState::StreamProbing) {
-        return;
-    }
-
-    cancelStreamProbe();
+    if (checkState_ != CheckState::StreamProbing) return;
     checkState_ = CheckState::Idle;
-
-    if (!isOnlineFeatureEnabled()) {
-        clearWarning();
-        return;
-    }
-
-    if (streamOk) {
-        clearWarning();
-    } else {
-        setWarning(WarningKind::StreamNoData, detail);
-    }
+    if (streamOk) clearWarning();
+    else setWarning(WarningKind::StreamNoData, detail);
 }
 
-/** @brief 中止并释放当前 HTTP/TCP/UDP 探测对象。 */
-void NetworkStatusMonitor::cancelStreamProbe()
+void NetworkStatusMonitor::requestPlaybackProbe(const QString &url, const QString &kind,
+                                               LiveStreamProbe::Completion completion)
 {
-    if (streamHttpReply_) {
-        streamHttpReply_->abort();
-        streamHttpReply_->deleteLater();
-        streamHttpReply_ = nullptr;
-    }
-    if (streamHttpManager_) {
-        streamHttpManager_->deleteLater();
-        streamHttpManager_ = nullptr;
-    }
-    if (streamTcpSocket_) {
-        streamTcpSocket_->abort();
-        streamTcpSocket_->deleteLater();
-        streamTcpSocket_ = nullptr;
-    }
-    if (streamUdpSocket_) {
-        streamUdpSocket_->close();
-        streamUdpSocket_->deleteLater();
-        streamUdpSocket_ = nullptr;
-    }
-    streamProbeUrl_.clear();
+    const auto generation = networkGuard_->playbackGeneration.fetch_add(1) + 1;
+    auto *worker = networkWorker_;
+    QMetaObject::invokeMethod(worker, [worker, generation, url, kind, completion=std::move(completion)] {
+        worker->requestPlaybackProbe(generation, url, kind, completion);
+    }, Qt::QueuedConnection);
 }
 
-/** @brief 从 RTSP 状态行解析三位状态码。 */
-int NetworkStatusMonitor::parseRtspStatusCode(const QByteArray &statusLine) const
+void NetworkStatusMonitor::cancelPlaybackProbe()
 {
-    const QList<QByteArray> parts = statusLine.trimmed().split(' ');
-    if (parts.size() < 2) {
-        return 0;
-    }
-
-    bool ok = false;
-    const int code = parts.at(1).toInt(&ok);
-    return ok ? code : 0;
+    const auto generation = networkGuard_->playbackGeneration.fetch_add(1) + 1;
+    auto *worker = networkWorker_;
+    QMetaObject::invokeMethod(worker, [worker, generation] { worker->cancelPlaybackProbe(generation); },
+                              Qt::QueuedConnection);
 }
 
-/** @brief 从 RTSP 头解析 Content-Length。 */
-int NetworkStatusMonitor::parseRtspContentLength(const QByteArray &header) const
-{
-    const QList<QByteArray> lines = header.split('\n');
-    for (QByteArray line : lines) {
-        line = line.trimmed();
-        const int colon = line.indexOf(':');
-        if (colon <= 0) {
-            continue;
-        }
-
-        const QByteArray key = line.left(colon).trimmed().toLower();
-        if (key != "content-length") {
-            continue;
-        }
-
-        bool ok = false;
-        const int len = line.mid(colon + 1).trimmed().toInt(&ok);
-        return ok && len >= 0 ? len : 0;
-    }
-
-    return 0;
-}
-
-/** @brief 从累计缓冲区解析完整 RTSP 响应及消费字节数。 */
-NetworkStatusMonitor::RtspResponse NetworkStatusMonitor::parseRtspResponse(const QByteArray &buffer) const
-{
-    RtspResponse resp;
-
-    int headerEnd = buffer.indexOf("\r\n\r\n");
-    int sepLen = 4;
-    if (headerEnd < 0) {
-        headerEnd = buffer.indexOf("\n\n");
-        sepLen = 2;
-    }
-    if (headerEnd < 0) {
-        return resp;
-    }
-
-    const QByteArray header = buffer.left(headerEnd);
-    const int firstLineEnd = header.indexOf('\n');
-    const QByteArray statusLine = (firstLineEnd >= 0 ? header.left(firstLineEnd) : header).trimmed();
-    const int contentLength = parseRtspContentLength(header);
-
-    const int totalLen = headerEnd + sepLen + contentLength;
-    if (buffer.size() < totalLen) {
-        return resp;
-    }
-
-    resp.complete = true;
-    resp.statusCode = parseRtspStatusCode(statusLine);
-    resp.statusLine = QString::fromLatin1(statusLine);
-    resp.body = buffer.mid(headerEnd + sepLen, contentLength);
-    resp.consumedBytes = totalLen;
-    return resp;
-}
-
-/** @brief 从 SDP 找到优先的视频 track control。 */
-QString NetworkStatusMonitor::findRtspVideoControl(const QByteArray &sdpBody) const
-{
-    const QString sdp = QString::fromUtf8(sdpBody);
-    const QStringList lines = sdp.split('\n', QString::SkipEmptyParts);
-
-    bool inVideoBlock = false;
-    for (QString line : lines) {
-        line = line.trimmed();
-        if (line.isEmpty()) {
-            continue;
-        }
-
-        if (line.startsWith(QStringLiteral("m="))) {
-            inVideoBlock = line.startsWith(QStringLiteral("m=video"));
-            continue;
-        }
-
-        if (!inVideoBlock || !line.startsWith(QStringLiteral("a=control:"))) {
-            continue;
-        }
-
-        const QString control = line.mid(QStringLiteral("a=control:").size()).trimmed();
-        if (!control.isEmpty()) {
-            return control;
-        }
-    }
-
-    return QString();
-}
-
-/** @brief 将 SDP control 值解析为可请求的绝对 RTSP URL。 */
-QString NetworkStatusMonitor::buildRtspControlUrl(const QUrl &baseUrl, const QString &control) const
-{
-    const QString c = control.trimmed();
-    if (c.isEmpty() || c == QStringLiteral("*")) {
-        return baseUrl.toString(QUrl::RemoveQuery | QUrl::RemoveFragment);
-    }
-
-    const QString lower = c.toLower();
-    if (lower.startsWith(QStringLiteral("rtsp://")) ||
-        lower.startsWith(QStringLiteral("rtsps://"))) {
-        return c;
-    }
-
-    if (c.startsWith('/')) {
-        QUrl u = baseUrl;
-        u.setPath(c);
-        u.setQuery(QString());
-        u.setFragment(QString());
-        return u.toString();
-    }
-
-    QString base = baseUrl.toString(QUrl::RemoveQuery | QUrl::RemoveFragment);
-    if (!base.endsWith('/')) {
-        base += '/';
-    }
-    return base + c;
-}
-
-/** @brief 从 SDP 媒体段提取视频组播端点。 */
-NetworkStatusMonitor::RtspMulticastInfo NetworkStatusMonitor::findRtspMulticastInfo(const QByteArray &sdpBody) const
-{
-    RtspMulticastInfo info;
-
-    const QString sdp = QString::fromUtf8(sdpBody);
-    const QStringList lines = sdp.split('\n', QString::SkipEmptyParts);
-
-    QString sessionGroup;
-    QString videoGroup;
-    quint16 videoPort = 0;
-    bool inVideoBlock = false;
-
-    for (QString line : lines) {
-        line = line.trimmed();
-        if (line.isEmpty()) {
-            continue;
-        }
-
-        if (line.startsWith(QStringLiteral("m="))) {
-            inVideoBlock = line.startsWith(QStringLiteral("m=video"));
-            if (inVideoBlock) {
-                const QStringList fields = line.split(QRegExp("\\s+"), QString::SkipEmptyParts);
-                if (fields.size() >= 2) {
-                    bool ok = false;
-                    const int port = fields.at(1).toInt(&ok);
-                    if (ok && port > 0 && port <= 65535) {
-                        videoPort = static_cast<quint16>(port);
-                    }
-                }
-            }
-            continue;
-        }
-
-        if (line.startsWith(QStringLiteral("c=IN IP4"))) {
-            const QStringList fields = line.split(QRegExp("\\s+"), QString::SkipEmptyParts);
-            if (fields.size() >= 3) {
-                QString ip = fields.at(2).trimmed();
-                const int slash = ip.indexOf('/');
-                if (slash >= 0) {
-                    ip = ip.left(slash);
-                }
-                if (isMulticastIpv4(ip)) {
-                    if (inVideoBlock) {
-                        videoGroup = ip;
-                    } else if (sessionGroup.isEmpty()) {
-                        sessionGroup = ip;
-                    }
-                }
-            }
-        }
-    }
-
-    const QString group = !videoGroup.isEmpty() ? videoGroup : sessionGroup;
-    if (!group.isEmpty() && videoPort > 0) {
-        info.ok = true;
-        info.group = group;
-        info.port = videoPort;
-    }
-    return info;
-}
-
-/** @brief 向套接字发送 RTSP DESCRIBE 请求。 */
-void NetworkStatusMonitor::sendRtspDescribe(QTcpSocket *sock, const QString &url)
-{
-    if (!sock) {
-        return;
-    }
-
-    QByteArray req;
-    req += "DESCRIBE ";
-    req += QUrl(url).toEncoded(QUrl::FullyEncoded);
-    req += " RTSP/1.0\r\n";
-    req += "CSeq: 1\r\n";
-    req += "Accept: application/sdp\r\n";
-    req += "User-Agent: qt_ycest-network-status-stream-probe\r\n";
-    req += "\r\n";
-    sock->write(req);
-    sock->flush();
-}
-
-/** @brief 向套接字发送 RTSP SETUP 请求。 */
-void NetworkStatusMonitor::sendRtspSetup(QTcpSocket *sock, const QString &trackUrl)
-{
-    if (!sock) {
-        return;
-    }
-
-    QByteArray req;
-    req += "SETUP ";
-    req += QUrl(trackUrl).toEncoded(QUrl::FullyEncoded);
-    req += " RTSP/1.0\r\n";
-    req += "CSeq: 2\r\n";
-    req += "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n";
-    req += "User-Agent: qt_ycest-network-status-stream-probe\r\n";
-    req += "\r\n";
-    sock->write(req);
-    sock->flush();
-}
-
-/** @return HTTP 状态码表示成功时返回 true。 */
-bool NetworkStatusMonitor::isHttpSuccessStatus(int statusCode) const
-{
-    return statusCode == 200 || statusCode == 204 || statusCode == 206;
-}
-
-/** @return HTTP 状态码表示重定向时返回 true。 */
-bool NetworkStatusMonitor::isHttpRedirectStatus(int statusCode) const
-{
-    return statusCode == 301 || statusCode == 302 || statusCode == 303 ||
-           statusCode == 307 || statusCode == 308;
-}
-
-/** @return 响应正文看起来是 HTML 错误页时返回 true。 */
-bool NetworkStatusMonitor::isProbablyHtmlBody(const QByteArray &body) const
-{
-    const QByteArray trimmed = body.left(512).trimmed().toLower();
-    return trimmed.startsWith("<!doctype html") ||
-           trimmed.startsWith("<html") ||
-           trimmed.contains("<head") ||
-           trimmed.contains("<body");
-}
-
-/** @brief 结合 URL、Content-Type 和正文特征判断是否为直播内容。 */
-bool NetworkStatusMonitor::isLikelyLiveHttpBody(const QString &url,
-                                                const QString &contentType,
-                                                const QByteArray &body,
-                                                QString *detail) const
-{
-    const QString lowerUrl = url.toLower();
-    const QString ct = contentType.toLower();
-
-    if (body.isEmpty()) {
-        if (detail) {
-            *detail = QStringLiteral("HTTP 无媒体数据");
-        }
-        return false;
-    }
-
-    if (isProbablyHtmlBody(body)) {
-        if (detail) {
-            *detail = QStringLiteral("HTTP 返回网页而不是媒体流");
-        }
-        return false;
-    }
-
-    if (ct.contains(QStringLiteral("mpegurl")) || ct.contains(QStringLiteral("mpegurl")) ||
-        ct.contains(QStringLiteral("mp2t")) || ct.contains(QStringLiteral("video")) ||
-        ct.contains(QStringLiteral("octet-stream"))) {
-        if (detail) {
-            *detail = QStringLiteral("HTTP media response ok");
-        }
-        return true;
-    }
-
-    if (lowerUrl.contains(QStringLiteral(".m3u8"))) {
-        if (body.contains("#EXTM3U")) {
-            if (detail) {
-                *detail = QStringLiteral("HLS playlist ok");
-            }
-            return true;
-        }
-        if (detail) {
-            *detail = QStringLiteral("HLS 播放列表无效");
-        }
-        return false;
-    }
-
-    if (lowerUrl.contains(QStringLiteral(".ts")) || lowerUrl.contains(QStringLiteral("live"))) {
-        if (detail) {
-            *detail = QStringLiteral("HTTP body ok");
-        }
-        return true;
-    }
-
-    if (detail) {
-        *detail = QStringLiteral("HTTP 响应不像直播媒体");
-    }
-    return false;
-}
 
 /** @brief 设置告警类型、文案及闪现定时器。 */
 void NetworkStatusMonitor::setWarning(WarningKind kind, const QString &detail)

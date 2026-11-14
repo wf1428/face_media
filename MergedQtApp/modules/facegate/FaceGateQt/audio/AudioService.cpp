@@ -2,11 +2,13 @@
  * @file AudioService.cpp
  * @brief 使用进程内 GStreamer 播放门禁语音提示的实现。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-11-10；修改人：Du lin；刷脸播报使用即时声音开关；关闭时停止当前刷脸播报，密码提示不受影响。
  */
 
 #include "AudioService.h"
+#include "common/device_feature_switches.h"
 
 #include "components/multimedia/gst_player_widget.h"
 #include "components/multimedia/vol_ctrl.h"
@@ -31,6 +33,8 @@ AudioService::AudioService(QObject *parent)
     // RK809 输出路径及硬件音量初始化，这里只同步界面配置值。
     config_.audioVolume = volumeController_->currentPromptVolume();
     player_ = new GstPlayerWidget;
+    player_->enablePriorityAudio();
+    player_->setPromptAudioMode(true);
     player_->setVideoOutput(nullptr);
     player_->setVolume(1.0f);
     connect(player_, &GstPlayerWidget::videoFinished, this, [this]() {
@@ -48,6 +52,13 @@ AudioService::AudioService(QObject *parent)
             playbackStartTimer_.start();
         }
     });
+    connect(&AudioPromptFocusManager::instance(), &AudioPromptFocusManager::focusSuspended,
+            this, [this](QObject *owner) {
+        if (owner != this) return;
+        playbackStartTimer_.stop();
+        voiceFocusRestoreTimer_.stop();
+        if (player_) player_->pause();
+    });
 
     playbackStartTimer_.setSingleShot(true);
     // 硬件音量切到独立播报音量后短暂稳定；提示音链路已通过 preroll 静音准备。
@@ -63,6 +74,9 @@ AudioService::AudioService(QObject *parent)
                          .arg(pendingFileName_));
     });
 
+    connect(&DeviceFeatureSwitches::soundChanges(), &DeviceSoundChanges::changed, this, [this] {
+        if (facePlayback_ && !DeviceFeatureSwitches::current().faceAudio) stopCurrentPlayback();
+    });
     voiceFocusRestoreTimer_.setSingleShot(true);
     connect(&voiceFocusRestoreTimer_, &QTimer::timeout,
             this, &AudioService::endVoiceFocus);
@@ -110,8 +124,18 @@ int AudioService::volume() const
             : qBound(0, config_.audioVolume, 100);
 }
 
+void AudioService::playFacePrompt(Prompt prompt)
+{
+    if (DeviceFeatureSwitches::current().faceAudio) playPrompt(prompt,true);
+}
+
+void AudioService::playFaceAccessFailure(int resultCode)
+{
+    if (DeviceFeatureSwitches::current().faceAudio) playAccessFailure(resultCode,true);
+}
+
 /** @brief 在提示类型启用且冷却允许时播放对应音频。 */
-void AudioService::playPrompt(Prompt prompt)
+void AudioService::playPrompt(Prompt prompt, bool fromFace)
 {
     if (!AmpVolumeController::isPromptPlaybackEnabled()) {
         return;
@@ -119,11 +143,11 @@ void AudioService::playPrompt(Prompt prompt)
     if (!promptEnabled(prompt)) {
         return;
     }
-    startGstreamer(absoluteAudioPath(promptFile(prompt)), false, prompt);
+    startGstreamer(absoluteAudioPath(promptFile(prompt)), false, prompt,fromFace);
 }
 
 /** @brief 按统一通行结果码播放专用失败音，未配置的结果使用通用失败音。 */
-void AudioService::playAccessFailure(int resultCode)
+void AudioService::playAccessFailure(int resultCode, bool fromFace)
 {
     if (!AmpVolumeController::isPromptPlaybackEnabled() ||
             !config_.promptVerifyFailedEnabled) {
@@ -153,13 +177,13 @@ void AudioService::playAccessFailure(int resultCode)
     default:
         break;
     }
-    startGstreamer(absoluteAudioPath(fileName), false, Prompt::VerifyFailed);
+    startGstreamer(absoluteAudioPath(fileName), false, Prompt::VerifyFailed,fromFace);
 }
 
 /** @brief 按配置键测试播放指定提示，忽略业务冷却。 */
 void AudioService::testPlay(const QString &promptKey)
 {
-    if (!AmpVolumeController::isPromptPlaybackEnabled()) {
+    if (!DeviceFeatureSwitches::current().faceAudio || !AmpVolumeController::isPromptPlaybackEnabled()) {
         emit audioStatus(QStringLiteral("语音播报已关闭"));
         return;
     }
@@ -185,7 +209,7 @@ void AudioService::testPlay(const QString &promptKey)
         emit audioError(QStringLiteral("未知音频事件：%1").arg(promptKey));
         return;
     }
-    startGstreamer(absoluteAudioPath(promptFile(prompt)), true, prompt);
+    startGstreamer(absoluteAudioPath(promptFile(prompt)), true, prompt,true);
 }
 
 /** @brief 停止当前 GStreamer 提示音。 */
@@ -316,7 +340,7 @@ bool AudioService::cooldownAllowed(Prompt prompt) const
 }
 
 /** @brief 校验文件并通过 GStreamer 启动播放。 */
-bool AudioService::startGstreamer(const QString &path, bool ignoreCooldown, Prompt prompt)
+bool AudioService::startGstreamer(const QString &path, bool ignoreCooldown, Prompt prompt, bool fromFace)
 {
     if (path.trimmed().isEmpty()) {
         emit audioError(QStringLiteral("音频文件路径为空"));
@@ -345,6 +369,7 @@ bool AudioService::startGstreamer(const QString &path, bool ignoreCooldown, Prom
     player_->setVolume(1.0f);
     player_->setMedia(info.absoluteFilePath());
     if (!player_->isAvailable()) return false;
+    facePlayback_ = fromFace;
     pendingFileName_ = info.fileName();
     beginVoiceFocus();
     return true;
@@ -360,12 +385,13 @@ void AudioService::beginVoiceFocus()
     }
     voiceFocusActive_ = true;
     voiceFocusRestoreTimer_.start(15000);
-    AudioPromptFocusManager::instance().acquire(this);
+    AudioPromptFocusManager::instance().acquire(this, player_);
 }
 
 /** @brief 恢复播报前的视频音量与 RK809 原始音量。 */
 void AudioService::endVoiceFocus()
 {
+    facePlayback_ = false;
     volumeBoostTimer_.stop();
     playbackStartTimer_.stop();
     voiceFocusRestoreTimer_.stop();

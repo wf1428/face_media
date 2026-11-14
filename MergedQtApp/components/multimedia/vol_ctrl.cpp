@@ -4,11 +4,12 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-04；修改人：Du lin；正常系统/播报音量持久化改为共享配置线程串行读改写，保留volume.dat字段和硬件标尺；系统完成通知按代次过滤旧保存结果，不在UI读写文件，启动迁移保留同步。
+ * @note 最近修改：2026-11-12；修改人：Du lin；移除播报增益请求、完成和焦点交接的逐步诊断输出，保留焦点变更及失败告警；增益串行写入、播报期间音量丢弃与恢复流程不变。
  */
 
 #include "vol_ctrl.h"
 #include "common/configuration_work.h"
+#include "common/serial_work_queue.h"
 #include "src/call/AudioOutputFocus.h"
 
 #include "gst_player_widget.h"
@@ -37,11 +38,12 @@ constexpr int kDefaultPromptVolumePercent = 60; // 对应旧版固定原始值 2
 constexpr int kMaximumHardwarePlaybackRaw = 255;
 const char kVolumeStatePath[] = "/home/cat/face_media/volume.dat";
 
-/** @brief UI 线程串行访问的通话硬件保护，不持锁等待进程或改变配置文件结构。 */
+/** @brief UI 线程串行访问的通话和广播文件音频硬件写入保护。 */
 struct CallOutputState {
     QPointer<AmpVolumeController> owner; /**< 通话焦点的控制器，借用；恢复完成后清空。 */
+    QPointer<AmpVolumeController> promptOwner; /**< 广播文件音频的控制器，借用；用户增益恢复完成后清空。 */
     QSet<QProcess *> writers; /**< 已启动的异步 amixer；以指针作键，退出/析构移除。 */
-    quint64 generation=0; /**< 无符号硬件代次，通话接管/放开时递增并自然回绕。 */
+    quint64 generation=0; /**< 无符号硬件代次，焦点接管/放开时递增并自然回绕。 */
     int latestSystemPercent=-1; /**< 保护期间最后一次 setVolume；-1 表示从持久化文件恢复。 */
 };
 /** @return 仅供 UI 线程访问的共享硬件保护状态，不创建控制器或执行硬件操作。 */
@@ -287,7 +289,10 @@ bool AmpVolumeController::amplifierOpen()
         return false;
     }
     const char value = 1;
-    return file.write(&value, 1) == 1;
+    const bool written = file.write(&value, 1) == 1;
+    qInfo() << "[audio] amplifier request" << "controller=" << this
+            << "enabled=" << true << "success=" << written;
+    return written;
 }
 
 /** @brief 关闭功放控制设备。 */
@@ -304,7 +309,10 @@ bool AmpVolumeController::amplifierClose()
         return false;
     }
     const char value = 0;
-    return file.write(&value, 1) == 1;
+    const bool written = file.write(&value, 1) == 1;
+    qInfo() << "[audio] amplifier request" << "controller=" << this
+            << "enabled=" << false << "success=" << written;
+    return written;
 }
 
 /** @brief 首次初始化功放/路由；通话中延迟创建的其他控制器只保留逻辑配置。 */
@@ -379,10 +387,21 @@ bool AmpVolumeController::loadAmpFlagFromFile()
     return m_ampFlag;
 }
 
-/** @brief 将用户音量限制到 0~100，并防抖应用和保存。 */
+/** @brief 丢弃播报期间的新请求和重复值，其余用户音量防抖保存。 */
 void AmpVolumeController::setVolume(int value)
 {
-    m_pendingVolume = qBound(0, value, 100);
+    value = qBound(0, value, 100);
+    if (userVolumeBlocked()) {
+        qInfo() << "[audio] user volume ignored during prompt" << "controller=" << this
+                << "requested=" << value << "current=" << m_volume;
+        return;
+    }
+    if (value == m_volume) {
+        qInfo() << "[audio] unchanged user volume skipped" << "controller=" << this
+                << "volume=" << value;
+        return;
+    }
+    m_pendingVolume = value;
     // 对外立即反映用户刚设置的值。硬件写入仍保留 80 ms 防抖，避免拖动
     // 音量条时频繁启动 amixer；提示音若在防抖期间到来，也能保存并恢复
     // 到这个最新值，而不是恢复到上一次已经落盘的旧值。
@@ -390,6 +409,13 @@ void AmpVolumeController::setVolume(int value)
     if (callOutputState().owner) callOutputState().latestSystemPercent=m_volume;
     m_ampFlag = m_volume > 0;
     m_debounce.start();
+}
+
+/** @return 广播文件音频写入权由另一控制器持有时返回 true。 */
+bool AmpVolumeController::userVolumeBlocked() const
+{
+    const auto &state=callOutputState();
+    return state.promptOwner && state.promptOwner.data()!=this;
 }
 
 /** @brief 保存语音播报百分比，正常媒体音量保持不变。 */
@@ -467,8 +493,8 @@ void AmpVolumeController::startPendingRawVolumeRequest()
     if (rawVolumeRequestActive_ || pendingRawVolume_ < 0 || !rawVolumeProcess_) return;
     auto &state=callOutputState();
     if (callBlocksHardware() || pendingRawGeneration_!=state.generation) { pendingRawVolume_=-1;return; }
-    if (state.owner.data()==this) {
-        // 旧外部 amixer 必须实际退出，不能仅靠再次设置音量来补救一次迟到的静音。
+    if (state.owner.data()==this || state.promptOwner.data()==this) {
+        // 旧外部 amixer 必须实际退出，避免迟到的写入覆盖当前播报或通话增益。
         for (auto *writer:state.writers) if (writer!=rawVolumeProcess_) return;
     }
 
@@ -541,14 +567,39 @@ void AmpVolumeController::releaseCallOutput()
     if (state.owner.data()!=this) return;
     state.owner.clear();state.latestSystemPercent=-1;++state.generation;
 }
+/** @brief 广播文件音频保护新音量请求；非通话场景废弃旧硬件代次并等待旧写者。 */
+void AmpVolumeController::claimPromptOutput()
+{
+    auto &state=callOutputState();
+    if (state.promptOwner.data()==this) return;
+    state.promptOwner=this;
+    // 与通话重叠时沿用通话持有者的代次，避免废弃尚在进行的通话增益。
+    if (!state.owner) ++state.generation;
+    qInfo() << "[audio-focus] prompt output claimed" << "controller=" << this
+            << "writers=" << state.writers.size() << "generation=" << state.generation;
+}
+/** @brief 播报恢复音量后解除写入保护，不执行任何旧音量请求。 */
+void AmpVolumeController::releasePromptOutput()
+{
+    auto &state=callOutputState();
+    if (state.promptOwner.data()!=this) return;
+    state.promptOwner.clear();
+    ++state.generation;
+    qInfo() << "[audio-focus] prompt output released" << "controller=" << this
+            << "generation=" << state.generation;
+}
 bool AmpVolumeController::callBlocksHardware() const
 {
-    const auto &state=callOutputState();return state.owner && state.owner.data()!=this;
+    const auto &state=callOutputState();
+    if (state.owner) return state.owner.data()!=this;
+    return state.promptOwner && state.promptOwner.data()!=this;
 }
 void AmpVolumeController::completeHardwareWrite(QProcess *process)
 {
     auto &state=callOutputState();state.writers.remove(process);
     if (state.owner) QTimer::singleShot(0,state.owner.data(),&AmpVolumeController::startPendingRawVolumeRequest);
+    if (state.promptOwner && state.promptOwner.data()!=state.owner.data())
+        QTimer::singleShot(0,state.promptOwner.data(),&AmpVolumeController::startPendingRawVolumeRequest);
 }
 
 /** @return 进程内唯一播报音频焦点管理器。 */
@@ -558,12 +609,14 @@ AudioPromptFocusManager &AudioPromptFocusManager::instance()
     return manager;
 }
 
-/** @brief 初始化视频排空延时和统一的异步硬件音量回调。 */
+/** @brief 初始化声卡交接、普通播报增益和既有通话音量回调。 */
 AudioPromptFocusManager::AudioPromptFocusManager(QObject *parent)
     : QObject(parent)
 {
     // 在界面初始化阶段完成一次控制器/音频路径准备，避免首次播报时同步
     // 查找 amixer 和初始化 RK809 造成可见停顿。
+    // 混音器先于焦点管理器构造，退出时交接线程先关闭。
+    GstPlayerWidget::holdVideoAudio(false);
     volumeController_ = new AmpVolumeController(this);
     connect(volumeController_, &AmpVolumeController::rawVolumeTemporaryApplied,
             this, [this](int rawValue, bool success) {
@@ -572,17 +625,18 @@ AudioPromptFocusManager::AudioPromptFocusManager(QObject *parent)
             if (!success) {
                 qWarning() << "[audio-focus] prompt volume boost failed; continuing";
             }
-            const QSet<QObject *> readyOwners = pendingReadyOwners_;
-            pendingReadyOwners_.clear();
-            for (QObject *owner : readyOwners) {
-                if (owners_.contains(owner)) emit focusReady(owner);
-            }
+            if (activeOwner_) emit focusReady(activeOwner_);
             return;
         }
         if (owners_.isEmpty() && savedAmpRawVolume_ >= 0 &&
                 rawValue == savedAmpRawVolume_) {
             if (!success) {
                 qWarning() << "[audio-focus] user volume restore failed";
+                if (requirePromptRestore_ && !restoreRetried_) {
+                    restoreRetried_ = true;
+                    volumeController_->setRawVolumeTemporaryAsync(savedAmpRawVolume_);
+                    return;
+                }
             }
             if (callOutputHeld_) {
                 const int latest=volumeController_->callRestoreRawVolume();
@@ -593,8 +647,18 @@ AudioPromptFocusManager::AudioPromptFocusManager(QObject *parent)
                 }
                 volumeController_->releaseCallOutput();callOutputHeld_=false;
             }
+            if (!success && requirePromptRestore_) {
+                qWarning() << "[audio-focus] video audio remains held after volume restore failure"
+                           << "savedRaw=" << savedAmpRawVolume_ << "callOutputHeld=" << callOutputHeld_;
+                return; // 增益仍未确认，保持视频静音。
+            }
+            requirePromptRestore_ = false;
             savedAmpRawVolume_ = -1;
+            volumeController_->releasePromptOutput();
             restoreVideoPlayers();
+        } else if (owners_.isEmpty() && savedAmpRawVolume_ >= 0) {
+            qWarning() << "[audio-focus] volume result did not match pending restore"
+                       << "completedRaw=" << rawValue << "savedRaw=" << savedAmpRawVolume_;
         }
     });
 
@@ -607,7 +671,7 @@ AudioPromptFocusManager::AudioPromptFocusManager(QObject *parent)
 AudioPromptFocusManager::~AudioPromptFocusManager()
 {
     boostDelayTimer_.stop();
-    restoreVideoPlayers();
+    promptHandoff_.reset();
     if (volumeController_ && callOutputHeld_) {
         savedAmpRawVolume_=volumeController_->callRestoreRawVolume();
         volumeController_->releaseCallOutput();callOutputHeld_=false;
@@ -615,6 +679,8 @@ AudioPromptFocusManager::~AudioPromptFocusManager()
     if (volumeController_ && savedAmpRawVolume_ >= 0) {
         volumeController_->setRawVolumeTemporary(savedAmpRawVolume_);
     }
+    if (volumeController_) volumeController_->releasePromptOutput();
+    restoreVideoPlayers();
     delete volumeController_;
     volumeController_ = nullptr;
 }
@@ -648,9 +714,54 @@ void AudioPromptFocusManager::restoreVideoPlayers()
         if (player) player->clearAudioDucking(this);
     }
     duckedPlayers_.clear();
+    GstPlayerWidget::holdVideoAudio(false);
+    qInfo() << "[audio-focus] video audio gate released";
 }
 
-/** @brief 视频旧采样排空后异步提升 RK809 音量。 */
+void AudioPromptFocusManager::beginPromptHandoff()
+{
+    boostDelayTimer_.stop();
+    if (promptHandoffPending_ || requestedBoostRaw_ >= 0) return;
+    if (!promptHandoff_) promptHandoff_.reset(new SerialWorkQueue(QStringLiteral("audio.prompt-handoff")));
+    promptHandoffPending_ = true;
+    const auto generation = ++promptHandoffGeneration_;
+    const auto clearConfirmed = std::make_shared<std::atomic_bool>(false);
+    promptHandoff_->enqueue([this,generation,clearConfirmed] {
+        if (generation != promptHandoffGeneration_.load()) return SerialWorkQueue::Task{};
+        return SerialWorkQueue::Task{[this,generation,clearConfirmed] {
+            if (generation != promptHandoffGeneration_.load()) return QString();
+            bool cleared = false;
+            const bool resumed = GstPlayerWidget::discardQueuedAudioForPrompt(&cleared);
+            clearConfirmed->store(cleared);
+            return resumed ? QString() :
+                QStringLiteral("shared audio clear was not confirmed");
+        },[this,generation,clearConfirmed](const QString &error) {
+            if (generation != promptHandoffGeneration_.load()) return;
+            promptHandoffPending_ = false;
+            if (!activeOwner_ || callOwnsFocus()) return;
+            const auto priority = requests_.value(activeOwner_).priority;
+            if (error.isEmpty() || (clearConfirmed->load() && priority <= Priority::Schedule)) {
+                // 旧 PCM 已清除时增益不应依赖共享 sink 是否重开成功；避免该轮沿用用户音量。
+                if (!error.isEmpty())
+                    qWarning() << "[audio-focus] shared output resume failed after PCM clear; applying prompt gain";
+                requirePromptRestore_ = true;
+                requestBoost();
+                return;
+            }
+            qWarning() << "[audio-focus]" << error << "; using current output volume";
+            boostReady_ = true;
+            emit focusReady(activeOwner_);
+        }};
+    });
+}
+
+void AudioPromptFocusManager::cancelPromptHandoff()
+{
+    ++promptHandoffGeneration_;
+    promptHandoffPending_ = false;
+}
+
+/** @brief 普通播报清除旧采样后提高增益；通话与直播保留既有入口。 */
 void AudioPromptFocusManager::requestBoost()
 {
     if (owners_.isEmpty()) return;
@@ -665,58 +776,116 @@ void AudioPromptFocusManager::requestBoost()
     volumeController_->setRawVolumeTemporaryAsync(requestedBoostRaw_);
 }
 
-/** @brief 获取可重叠的播报焦点。 */
-void AudioPromptFocusManager::acquire(QObject *owner)
+void AudioPromptFocusManager::acquire(QObject *owner, GstPlayerWidget *player, Priority priority)
 {
-    if (!owner) return;
-    const bool firstOwner = owners_.isEmpty();
-    const bool newOwner = !owners_.contains(owner);
+    if (!owner || requests_.contains(owner)) return;
+    if ((priority == Priority::Tagged || priority == Priority::Schedule) && volumeController_)
+        volumeController_->claimPromptOutput();
+    const bool hadCall = callOwnsFocus();
+    const auto destroyed = connect(owner, &QObject::destroyed, this, [this](QObject *key) { release(key); });
+    requests_.insert(owner, Request{player, priority, destroyed});
+    order_.append(owner);
     owners_.insert(owner);
-    pendingReadyOwners_.insert(owner);
-    if (newOwner) {
-        connect(owner, &QObject::destroyed, this,
-                [this](QObject *destroyedOwner) { release(destroyedOwner); });
-    }
+    qInfo() << "[audio-focus] acquire" << "owner=" << owner
+            << "player=" << player << "priority=" << int(priority)
+            << "owners=" << owners_.size();
+    GstPlayerWidget::holdVideoAudio(true);
     duckNewActiveVideoPlayers();
+    selectOwner();
+    if (!hadCall && callOwnsFocus()) emit callFocusChanged(true);
+}
 
-    if (boostReady_) {
-        pendingReadyOwners_.remove(owner);
-        const QPointer<QObject> safeOwner(owner);
-        QTimer::singleShot(0, this, [this, safeOwner]() {
-            if (safeOwner && owners_.contains(safeOwner.data())) {
-                emit focusReady(safeOwner.data());
-            }
-        });
-        return;
+bool AudioPromptFocusManager::callOwnsFocus() const
+{
+    const auto it = requests_.constFind(activeOwner_);
+    return it != requests_.constEnd() && it->priority == Priority::Call;
+}
+
+bool AudioPromptFocusManager::blocks(Priority priority) const
+{
+    const auto it = requests_.constFind(activeOwner_);
+    return it != requests_.constEnd() && it->priority > priority;
+}
+
+void AudioPromptFocusManager::selectOwner()
+{
+    QObject *next = nullptr;
+    for (QObject *owner : order_) {
+        if (!next || requests_[owner].priority > requests_[next].priority) next = owner;
     }
-    if (firstOwner) boostDelayTimer_.start();
+    if (next == activeOwner_) return;
+    QObject *old = activeOwner_;
+    activeOwner_ = next;
+    qInfo() << "[audio-focus] owner selected" << "old=" << old << "next=" << next
+            << "priority=" << (next ? int(requests_.value(next).priority) : -1)
+            << "boostReady=" << boostReady_ << "handoffPending=" << promptHandoffPending_;
+    if (next) {
+        const Request &request = requests_[next];
+        GstPlayerWidget::setPriorityAudioOwner(request.player, request.priority == Priority::Call);
+    } else {
+        GstPlayerWidget::setPriorityAudioOwner(nullptr, false);
+    }
+    if (old && requests_.contains(old)) emit focusSuspended(old);
+    if (next && activeOwner_ == next) {
+        if (!boostReady_) {
+            const auto priority = requests_.value(next).priority;
+            if (priority == Priority::Call) {
+                cancelPromptHandoff();
+                boostDelayTimer_.start();
+            } else if (priority != Priority::Live || promptHandoffPending_) {
+                beginPromptHandoff();
+            } else if (requestedBoostRaw_ < 0) {
+                boostDelayTimer_.start();
+            }
+        } else {
+            const QPointer<QObject> guard(next);
+            QTimer::singleShot(0, this, [this, guard] {
+                if (guard && guard.data() == activeOwner_ && boostReady_) emit focusReady(guard);
+            });
+        }
+    }
 }
 
 void AudioPromptFocusManager::acquireCall(QObject *owner)
 {
-    if (!owner || !volumeController_) return;
-    volumeController_->claimCallOutput();callOutputHeld_=true;
-    // 不能沿用另一提示/旧恢复请求的 ready；本次必须等待当前代次的增益完成。
-    boostReady_=false;requestedBoostRaw_=-1;
-    acquire(owner);boostDelayTimer_.start();
+    if (!owner || !volumeController_ || requests_.contains(owner)) return;
+    volumeController_->claimCallOutput();
+    callOutputHeld_ = true;
+    boostReady_ = false;
+    requestedBoostRaw_ = -1;
+    acquire(owner, nullptr, Priority::Call);
 }
 
-/** @brief 全部焦点结束后，通话保护保持到最新系统音量异步恢复完成。 */
 void AudioPromptFocusManager::release(QObject *owner)
 {
-    if (!owner) return;
-    pendingReadyOwners_.remove(owner);
-    if (owners_.remove(owner) <= 0) return;
+    const auto request = requests_.find(owner);
+    if (request == requests_.end()) return;
+    const bool hadCall = callOwnsFocus();
+    qInfo() << "[audio-focus] release" << "owner=" << owner
+            << "priority=" << int(request->priority) << "wasActive=" << (owner == activeOwner_)
+            << "ownersBefore=" << owners_.size();
+    // 直播控制线程等 ALSA 和共享输出交接完成后才撤销申请。
+    if (request->priority == Priority::Live) requirePromptRestore_ = true;
+    disconnect(request->destroyed);
+    requests_.erase(request);
+    order_.removeAll(owner);
+    owners_.remove(owner);
+    selectOwner();
+    if (hadCall && !callOwnsFocus()) emit callFocusChanged(false);
     if (!owners_.isEmpty()) return;
 
     boostDelayTimer_.stop();
+    cancelPromptHandoff();
     boostReady_ = false;
     requestedBoostRaw_ = -1;
-    if (volumeController_ && callOutputHeld_) savedAmpRawVolume_=volumeController_->callRestoreRawVolume();
+    restoreRetried_ = false;
+    if (volumeController_ && callOutputHeld_) savedAmpRawVolume_ = volumeController_->callRestoreRawVolume();
     if (volumeController_ && savedAmpRawVolume_ >= 0) {
         volumeController_->setRawVolumeTemporaryAsync(savedAmpRawVolume_);
     } else {
+        requirePromptRestore_ = false;
         savedAmpRawVolume_ = -1;
+        if (volumeController_) volumeController_->releasePromptOutput();
         restoreVideoPlayers();
     }
 }

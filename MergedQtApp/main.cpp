@@ -3,8 +3,8 @@
  * @brief 应用程序入口及启动环境初始化。
  *
  * @author Du lin
+ * @note 最近修改：2026-11-10；修改人：Du lin；运行配置准备成功后固定摄像头和声音开关的开机快照，并记录启用状态。
  * @date 2026-07-25
- * @note 最近修改：2026-11-03；修改人：Du lin；以保持原事件分发的诊断应用观察通话期间UI长事件；分别计时原Qt日志编码和write输出，不改变输出、过滤及错误处理。
  */
 
 #include <unistd.h>
@@ -47,9 +47,9 @@
 #include "components/multimedia/multimediademo.h"
 #include "components/splash/splashscreen.h"
 #include "common/sql/dbstore.h"
-#include "common/debug/ui_performance.h"
 #include "ic_board/ic_board.h"
 #include "platform/rk3566_platform.h"
+#include "common/device_feature_switches.h"
 
 
 /** Qt 默认消息处理器的保留句柄；当前实现不继续转发，避免重复输出。 */
@@ -175,7 +175,7 @@ static bool shouldDropPngWarning(QtMsgType type, const QString &msg)
  * 诊断仅对未过滤消息采样格式化和原write耗时，不重试短写、不新增日志锁。
  * @param[in] type 原Qt日志级别。
  * @param[in] ctx 原Qt日志上下文，本实现不输出。
- * @param[in] msg 原Qt消息正文，诊断不保存其内容。
+ * @param[in] msg 原 Qt 消息正文，以 UTF-8 写入原日志输出。
  */
 static void myUtf8MessageHandler(QtMsgType type,
                                  const QMessageLogContext &ctx,
@@ -187,7 +187,6 @@ static void myUtf8MessageHandler(QtMsgType type,
     if (shouldDropPngWarning(type, msg)) {
         return;
     }
-    UiPerformance::LogMeasurement measurement;
 
     // 直接以 UTF-8 写入 stderr，绕开设备系统 locale 不一致造成的中文乱码。
     const char* t = "";
@@ -203,9 +202,7 @@ static void myUtf8MessageHandler(QtMsgType type,
     out.append('['); out.append(t); out.append("] ");
     out.append(msg.toUtf8());
     out.append('\n');
-    measurement.beforeWrite();
-    const auto written=::write(2, out.constData(), out.size());
-    measurement.finish(out.size(),written);
+    ::write(2, out.constData(), out.size());
 
     // 如需同时进入 Qt 默认日志链，可恢复以下转发；当前关闭以避免同一消息输出两次。
     // if (g_oldHandler) g_oldHandler(type, ctx, msg);
@@ -246,7 +243,6 @@ static void setupQtHeartbeat(QCoreApplication *app)
     updateHeartbeat();
 
     QTimer *heartbeatTimer = new QTimer(app);
-    heartbeatTimer->setObjectName(QStringLiteral("app.heartbeat"));
     QObject::connect(heartbeatTimer, &QTimer::timeout, app, updateHeartbeat);
     heartbeatTimer->start(10000);   // 每 10 秒更新一次
 }
@@ -254,7 +250,7 @@ static void setupQtHeartbeat(QCoreApplication *app)
 /**
  * @brief 融合应用入口。
  * 
- * 在保持原分发语义的诊断QApplication创建前完成Wayland/OpenGL ES、虚拟键盘和日志环境配置，
+ * 在 QApplication 创建前完成Wayland/OpenGL ES、虚拟键盘和日志环境配置，
  * 随后初始化外壳、启动页、数据库退出清理及 IC 板 I/O。
  * @param argc 命令行参数个数。
  * @param argv 命令行参数数组。
@@ -325,7 +321,7 @@ int main(int argc, char *argv[])
     g_oldHandler = qInstallMessageHandler(myUtf8MessageHandler);
     QTextCodec::setCodecForLocale(QTextCodec::codecForName("UTF-8"));
 
-    UiDiagnosticApplication a(argc, argv);
+    QApplication a(argc, argv);
     UsbPersonImportSource::clearImportRequestOnStartup();
     UsbPersonExportTarget::clearExportRequestOnStartup();
     QApplication::setQuitOnLastWindowClosed(false);
@@ -341,6 +337,12 @@ int main(int argc, char *argv[])
             << "net=" << Rk3566Platform::netConfigPath()
             << "ui=" << Rk3566Platform::uiConfigPath()
             << "facegate=" << Rk3566Platform::faceGateConfigPath();
+    const auto &features = DeviceFeatureSwitches::boot();
+    qInfo() << "[CONFIG] device switches"
+            << "cameraScreenshot=" << features.cameraScreenshot
+            << "broadcastAudio=" << features.broadcastAudio
+            << "icCardAudio=" << features.icCardAudio
+            << "faceAudio=" << features.faceAudio;
     VirtualKeyboardFocusFilter keyboardFilter(&a);
     a.installEventFilter(&keyboardFilter);
     InputCursorController inputCursorController(&a);

@@ -3,7 +3,7 @@
  * @brief 独立IPC事件循环、有界增量组帧、后台业务编解码与线程安全代理。
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-04；修改人：Du lin；普通/高清图片共用2项额外准入预算，后台完整写入/取消时归还，拒绝不占预算；音频紧急优先、原有普通字节节流/配置屏障/协议不变。
+ * @note 最近修改：2026-11-05；修改人：Du lin；在现有小型IPC帧快速路径分流广播PCM，保留通话媒体队列和信用。
  */
 #include "mqttipcclient.h"
 #include "mqttpacketparser.h"
@@ -57,6 +57,7 @@ bool reserveUrgent(std::atomic_int &count) {
 struct Request {
     QJsonObject json;QByteArray raw,encoded; /**< 自有值；encoded仅后台写，原请求正文不可变。 */
     bool isRaw=false,urgent=false; /**< 原始模式及媒体/信令优先级。 */
+    std::shared_ptr<std::atomic_bool> cancelled; /**< 摄像头会话取消令牌，空为原普通请求；仅未开写可丢弃。 */
     bool snapshot=false; /**< true占用2项图片预算，完整写入或取消后归还；不改变线上信封。 */
     bool configBarrier=false; /**< set_config未发送前，后续普通apply等不能越过它；媒体仍走优先队列。 */
     qint64 queuedAtMs=0; /**< IPC线程接收请求的单调毫秒，供队列年龄诊断。 */
@@ -71,6 +72,8 @@ struct MqttIpcShared {
     FixedMailbox<Request,MaxNormal+MaxUrgent> requests; /**< 普通/小信令固定交接槽，动态正文只隐式共享，IPC消费时释放。 */
     FixedMailbox<RealtimeLine,MaxUrgent> realtimeLines; /**< 固定实时行，后台消费；普通JSON不占用这些存储。 */
     QObject *target=nullptr;std::atomic_bool closing{false};std::atomic<quint64> serial{0}; /**< target仅在mutex下检查/投递；closing后拒绝新提交。 */
+    std::atomic_bool cameraReady{false}; /**< IPC线程发布的本地空闲/大帧预算快照，供摄像头跳帧准入。 */
+    std::atomic_int cameras{0}; /**< 已提交摄像头帧数；非零时5ms轮询取消，不影响原普通请求轮询。 */
     std::atomic_int snapshots{0}; /**< 图片已受理数，包含待编码/待发/写入中，最多2项。 */
     std::atomic_int state{int(QLocalSocket::UnconnectedState)},normal{0},urgent{0},deferred{0}; /**< 连接状态及已接受请求槽数。 */
     std::atomic<qint64> wireBytes{0},urgentBytes{0},rawBytes{0}; /**< 正在写的帧/Qt待写、紧急估计及普通原始排队字节。 */
@@ -119,7 +122,7 @@ public:
         auto *realtimeTimer=new QTimer(this);realtimeTimer->setTimerType(Qt::PreciseTimer);realtimeTimer->setInterval(5);
         connect(realtimeTimer,&QTimer::timeout,this,[this] {
             const bool priority=shared_->reservation.load()!=0;
-            if(!shared_->realtimeLines.empty() || !shared_->requests.empty() || priority!=polledRealtime_) { polledRealtime_=priority;pump(); }
+            if(!shared_->realtimeLines.empty() || !shared_->requests.empty() || shared_->cameras.load()>0 || priority!=polledRealtime_) { polledRealtime_=priority;pump(); }
         });realtimeTimer->start();
         emit log(QStringLiteral("[mqtt-io] ready thread=%1 chunkBytes=32768 mediaBypass=1 parser=worker-task").arg(quintptr(QThread::currentThreadId()),0,16));
     }
@@ -153,9 +156,13 @@ public:
         pumpPending_=false;
         Request submitted;
         for(int n=0;n<MaxNormal+MaxUrgent && shared_->requests.pop(submitted);++n) {
-            if(submitted.connection!=shared_->connection.load()) { release(submitted);continue; }
+            if(submitted.connection!=shared_->connection.load() || (submitted.cancelled && submitted.cancelled->load())) { release(submitted);continue; }
             submitted.queuedAtMs=clock_.elapsed();
             (submitted.urgent ? urgent_ : normal_).push_back(std::move(submitted));
+        }
+        for(auto item=normal_.begin();item!=normal_.end();) {
+            if(item->cancelled && (item->cancelled->load() || clock_.elapsed()-item->queuedAtMs>1000)) { release(*item);item=normal_.erase(item); }
+            else ++item;
         }
         RealtimeLine line;
         for(int n=0;n<MaxUrgent && shared_->realtimeLines.pop(line);++n) {
@@ -192,6 +199,9 @@ public:
                 if(next==normal_.end() || next->encoded.isEmpty()) { updatePending();return; }
                 current_=std::move(*next);normal_.erase(next);
             }
+            if(current_.cancelled && current_.cancelled->load()) {
+                release(current_);current_={};schedulePump();updatePending();return;
+            }
             wire_=current_.encoded;wireOffset_=0;wireStartMs_=clock_.elapsed();
             if(!current_.urgent) {
                 normalFrameMaxBytes_=qMax<qint64>(normalFrameMaxBytes_,wire_.size());
@@ -227,6 +237,8 @@ signals:
      * @param[in] object 校验为媒体类型的小型JSON。
      */
     void media(const QJsonObject &object);
+    /** @brief 将广播帧直接交给独立媒体接收者。 */
+    void broadcast(const QJsonObject &object);
     /** @brief 完成后台解析的单个业务值；代理消费完成后才放行下一业务值。
      * @param[in] object 标准化信封。
      * @param[in] display 原RX摘要。
@@ -240,6 +252,7 @@ private:
      * @param[in] request 已提交或已取消的请求。
      */
     void release(const Request &request) {
+        if(request.cancelled) shared_->cameras.fetch_sub(1);
         if(request.snapshot) shared_->snapshots.fetch_sub(1);
         if(request.urgent) { shared_->urgent.fetch_sub(1);shared_->urgentBytes.fetch_sub(request.cost); }
         else { shared_->normal.fetch_sub(1);if(request.isRaw) shared_->rawBytes.fetch_sub(request.raw.size()); }
@@ -260,7 +273,13 @@ private:
         current_={};wire_.clear();wireOffset_=0;shared_->deferred=0;updatePending();
     }
     /** @brief 发布即时音频背压快照，延后的普通帧不挤占媒体信用。 */
-    void updatePending() { shared_->wireBytes.store((socket_ ? socket_->bytesToWrite() : 0)+qMax<qint64>(0,wire_.size()-wireOffset_)); }
+    void updatePending() {
+        const auto bytes=(socket_ ? socket_->bytesToWrite() : 0)+qMax<qint64>(0,wire_.size()-wireOffset_);
+        shared_->wireBytes.store(bytes);
+        shared_->cameraReady.store(socket_ && socket_->state()==QLocalSocket::ConnectedState && bytes==0 &&
+            shared_->normal.load()==0 && shared_->urgent.load()==0 && shared_->snapshots.load()==0 && !busy_ &&
+            (shared_->reservation.load()==0 || clock_.elapsed()>=nextNormalMs_));
+    }
     /** @brief 合并发送唤醒，避免逐帧积累无界Qt事件。 */
     void schedulePump() { if(!pumpPending_) { pumpPending_=true;QTimer::singleShot(0,this,&MqttIpcWorker::pump); } }
     /** @brief 合并接收唤醒，每次最多读取并扫描32KiB。 */
@@ -298,6 +317,12 @@ private:
         if(partBytes_<=4096) {
             QByteArray small;small.reserve(int(partBytes_));for(const auto &p:parts_) small.append(p);
             const auto document=QJsonDocument::fromJson(small);const auto object=document.object();const auto type=object.value("type").toString();
+            if (type=="broadcast_audio") {
+                emit broadcast(object);
+                parts_.clear();
+                partBytes_=0;
+                return true;
+            }
             if(type=="audio" || type=="call_ready" || type=="call_sent") { emit media(object);parts_.clear();partBytes_=0;return true; }
         }
         if(partBytes_>MaxBytes || rxPending_+partBytes_>MaxBytes || rx_.size()>=256) {
@@ -332,7 +357,7 @@ private:
                     if(epoch!=self->shared_->connection.load()) return;
                     self->busy_=false;
                     const auto item=std::find_if(self->normal_.begin(),self->normal_.end(),[id](const Request &r) { return r.id==id; });
-                    if(item==self->normal_.end()) return;
+                    if(item==self->normal_.end()) { self->schedulePump();self->startTask();return; }
                     qint64 prepared=0;for(const auto &r:self->normal_) prepared+=r.encoded.size();
                     if(encoded.size()>MaxBytes || prepared+encoded.size()>MaxBytes) {
                         self->release(*item);self->normal_.erase(item);emit self->error(QStringLiteral("IPC业务编码达到64MiB预算，已拒绝该请求"));
@@ -362,6 +387,7 @@ MqttIpcClient::MqttIpcClient(QObject *parent):QObject(parent),shared_(std::make_
     connect(worker_,&MqttIpcWorker::connected,this,&MqttIpcClient::connected,Qt::DirectConnection);
     connect(worker_,&MqttIpcWorker::disconnected,this,&MqttIpcClient::disconnected,Qt::DirectConnection);
     connect(worker_,&MqttIpcWorker::media,this,&MqttIpcClient::mediaFrameReceived,Qt::DirectConnection);
+    connect(worker_,&MqttIpcWorker::broadcast,this,&MqttIpcClient::broadcastFrameReceived,Qt::DirectConnection);
     connect(worker_,&MqttIpcWorker::error,this,&MqttIpcClient::errorOccurred);
     connect(worker_,&MqttIpcWorker::log,this,&MqttIpcClient::logMessage);
     connect(worker_,&MqttIpcWorker::business,this,[this](const QJsonObject &object,const QString &display,const QString &error,const QByteArray &raw,quint64 epoch) {
@@ -398,6 +424,14 @@ bool MqttIpcClient::sendRawLine(const QByteArray &line) { return submit({},line,
 bool MqttIpcClient::sendSnapshotJsonLine(const QJsonObject &object) {return submit(object,{},false,true);}
 bool MqttIpcClient::sendSnapshotRawLine(const QByteArray &line) {return submit({},line,true,true);}
 int MqttIpcClient::pendingSnapshotPublishes() const {return shared_->snapshots.load();}
+bool MqttIpcClient::cameraSnapshotReady() const {
+    return isConnected() && shared_->cameraReady.load() && shared_->normal.load()==0 &&
+        shared_->urgent.load()==0 && shared_->snapshots.load()==0;
+}
+bool MqttIpcClient::sendCameraSnapshotRawLine(const QByteArray &line,const std::shared_ptr<std::atomic_bool> &cancelled) {
+    if(!cancelled || cancelled->load() || line.size()>1000000 || (line.size()>4096 && !cameraSnapshotReady()))return false;
+    return submit({},line,true,true,cancelled);
+}
 bool MqttIpcClient::sendRealtimeLine(const char *line,int length) {
     if(!line || length<1 || length>2048 || line[length-1]!='\n' || shared_->closing.load() || !isConnected()) return false;
     const auto connection=shared_->connection.load();
@@ -407,7 +441,7 @@ bool MqttIpcClient::sendRealtimeLine(const char *line,int length) {
     if(shared_->realtimeLines.push(std::move(value))) return true;
     shared_->urgent.fetch_sub(1);shared_->urgentBytes.fetch_sub(1536);return false;
 }
-bool MqttIpcClient::submit(const QJsonObject &object,const QByteArray &line,bool raw,bool snapshot)
+bool MqttIpcClient::submit(const QJsonObject &object,const QByteArray &line,bool raw,bool snapshot,const std::shared_ptr<std::atomic_bool> &cancelled)
 {
     if(!isConnected() || (raw && line.size()>MaxBytes)) return false;
     const auto command=object.value("cmd").toString();
@@ -438,8 +472,11 @@ bool MqttIpcClient::submit(const QJsonObject &object,const QByteArray &line,bool
             if(!accepted) { shared_->normal.fetch_sub(1);releaseImage();return false; }
         }
     }
+    request.cancelled=cancelled;
+    if(cancelled)shared_->cameras.fetch_add(1);
     request.id=shared_->serial.fetch_add(1)+1;
     if(shared_->requests.push(std::move(request))) return true;
+    if(cancelled)shared_->cameras.fetch_sub(1);
     releaseImage();
     if(urgent) { shared_->urgent.fetch_sub(1);shared_->urgentBytes.fetch_sub(1536); }
     else { shared_->normal.fetch_sub(1);if(raw) shared_->rawBytes.fetch_sub(line.size()); }

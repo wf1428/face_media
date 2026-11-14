@@ -4,7 +4,7 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-04；修改人：Du lin；普通/高清截图恢复一次根render，隐藏视频不读帧且不作特殊处理；可见视频仅截图期间禁用更新并恢复，保留后台编码、尺寸/缓存及有界异步上传。
+ * @note 最近修改：2026-11-13；修改人：Du lin；声明网络线程直播重试入口及取消约束，移除闲置的预检播放器。
  */
 
 #ifndef MULTIMEDIADEMO_H
@@ -13,6 +13,7 @@
 #include <QDialog>
 #include <QDebug>
 #include <QLabel>
+#include <QPointer>
 #include <QTimer>
 #include <QHash>
 #include <QImage>
@@ -135,9 +136,9 @@ public:
     void setStreamUrl(const QString& url, const QString& kind);
 
     /**
-     * @brief 使用独立播放器预探测直播首帧，成功后再切换主播放器。
-     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
-     * @param url 待探测的直播地址。
+     * @brief 异步探测直播源；网络线程返回可用结果后按原条件切回主播放器。
+     * @note 视频区域关闭时不探测；请求、超时和资源清理由网络线程执行。
+     * @param[in] url 待探测的直播地址。
      */
     void probeLiveStream(const QString& url);
     /**
@@ -168,6 +169,10 @@ public:
      * @note GUI只记录命令与帧值，栅格化/合成/编码共用后台线程；源变化不得复用旧结果。
      */
     void captureCompositeSnapshot();
+    /** @brief 为普通 MQTT getPlayInfo 获取画面；可见下载卡片优先新抓图，无卡片时使用常规截图。
+     * @note GUI 线程调用。合并在途卡片抓图，过期结果重新采集，采集或编码失败时回传空图。
+     */
+    void captureMqttPlayImage();
     /**
      * @brief 为高清协议直接绘制原DPR尺寸UI像素或取得原生图像后备，通过既有信号提交共享后台。
      * @param token 独立高清请求令牌；必须在GUI调用，只绘制UI像素/交接值，视频转换/JPEG/Base64/JSON编码在后台。
@@ -378,14 +383,14 @@ private slots:
      */
     void forceStopCurrentLivePlayerForFallback(const QString& reason);
     /**
-     * @brief 上游仍有压缩数据但无解码输出时，原地完整重建直播管线。
-     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
-     * @param reason 触发解码管线重建的诊断原因。
+     * @brief 响应 MPP 时间轴或解码拥塞告警，原地重建当前直播管线。
+     * @param[in] reason 触发解码管线重建的诊断原因。
+     * @note 保留当前无帧期限；视频区域关闭时不启动视频资源。
      */
     void restartLivePipelineAfterDecoderStall(const QString& reason);
 
     /**
-     * @brief 启动直播首帧/持续无帧 watchdog。
+     * @brief 启动直播看门狗，以单调毫秒记录首帧等待起点；已运行时保留计时状态。
      */
     void startLiveWatchdog();
     /**
@@ -393,7 +398,7 @@ private slots:
      */
     void stopLiveWatchdog();
     /**
-     * @brief 判定首帧或持续无帧超时并触发回退。
+     * @brief GUI 定时检查，连续 10 秒无真实视频帧时切回本地；已验证直播保留后台探测。
      */
     void onLiveWatchdogTimeout();
 
@@ -435,6 +440,12 @@ signals:
      * @brief 当前播放画面 Base64 快照已更新。
      */
     void currentPlayImageChanged(const QString &base64Image);
+    /** @brief 普通 MQTT 截图就绪，供等待中的 getPlayInfo 请求回执。
+     * @param[in] base64Image JPEG 数据 URI；空串表示本次卡片抓图或编码失败。
+     */
+    void mqttPlayImageReady(const QString &base64Image);
+    /** @brief 下载卡片画面已变化，普通 MQTT 等待中的回执须重新采集。 */
+    void mqttPlayImageInvalidated();
 
     /**
      * @brief 当前用户音量发生变化。
@@ -528,12 +539,11 @@ private:
     bool m_isLiveMode = false;
     bool m_modulePlaybackSuspended = false; /**< 人体感应切换模块期间暂存播放状态。 */
 
-    QTimer* m_liveWatchdogTimer = nullptr;
-    qint64 m_lastLiveFrameMs = 0;       // 最近一次真实解码视频帧时间
-    qint64 m_liveWatchdogStartMs = 0;   // watchdog 启动时间，用于首次出帧保护
-    int m_liveTimeoutMs = 10000;         /**< 连续 10 秒无新帧判定直播中断。 */
-    int m_liveStartupGraceMs = 10000;   /**< 启动后 10 秒仍无首帧则回退本地轮播。 */
-    int m_liveDecoderInputActiveWindowMs = 3000; /**< 此窗口内仍有解码输入则判为解码器停滞。 */
+    QTimer* m_liveWatchdogTimer = nullptr; /**< 本页持有，每秒在 GUI 线程检查直播到帧。 */
+    qint64 m_lastLiveFrameMs = 0; /**< 最近真实视频帧的单调毫秒；启动或停止检查时清零。 */
+    qint64 m_liveWatchdogStartMs = 0; /**< 首帧等待起点的单调毫秒；0 表示未启动检查。 */
+    int m_liveTimeoutMs = 10000; /**< 从开始等首帧或最近一帧起算，单位毫秒。 */
+    int m_liveDecoderInputActiveWindowMs = 3000; /**< 解码输入活跃的日志诊断窗口，单位毫秒。 */
     quint64 m_playbackPersistRevision=0; /**< UI独占的配置快照代次；旧落盘完成不得回写新界面字段。 */
     bool m_liveSourceValidated = false;  // 当前LIVE地址是否曾经输出过真实解码视频帧
     bool m_liveRecovering = false;
@@ -541,8 +551,16 @@ private:
     MqttManager *mqttManager_ = nullptr;
     /** @return 当前媒体/图片/下载状态和几何的纯内存键；仅UI读取，不访问文件或管线。 */
     QByteArray snapshotCacheKey() const;
-    /** @brief 下轮UI事件只执行一次必要抓图，抓取期间禁止重入；缓存命中不抓图，编码在原工作线程。 */
-    void captureCompositeSnapshotNow();
+    /** @brief 执行一次普通抓图；GUI 绘制期间禁止重入，缩放和编码在截图后台。
+     * @param[in] mqttDownload true 表示普通 MQTT 请求且卡片已确认可见，跳过常规缓存并复用下载态分支；false 沿用常规策略。
+     */
+    void captureCompositeSnapshotNow(bool mqttDownload = false);
+    /** @brief 下载卡片内容或可见性变化时，使普通 MQTT 在途图像和待发回执失效。 */
+    void invalidateMqttDownloadSnapshot();
+    /** @brief 在 GUI 线程核对卡片图像版本，过期则重抓，否则向普通 MQTT 回执交付结果。
+     * @param[in] base64Image 自有编码结果；抓图或编码失败时为空。
+     */
+    void finishMqttDownloadSnapshot(const QString &base64Image);
     /** @brief UI一次根render绘制560x360以内小图；隐藏视频不取帧，可见视频更新状态在截图后恢复；后台合成编码及原生后备保持。
      * @param[in] host UI根控件，可空，空/尺寸无效返回false。
      * @param[in] videoImage 可空的原生视频后备帧。
@@ -559,6 +577,10 @@ private:
     // GUI截图门面，共用后台队列执行视频合成和编码
 
     SnapshotProcessor *m_snapshotProcessor = nullptr;
+    SnapshotProcessor *m_mqttDownloadSnapshotProcessor = nullptr; /**< 本页持有，复用截图后台队列，仅返回普通 MQTT 卡片图。 */
+    bool m_mqttDownloadSnapshotBusy = false; /**< GUI 独占；true 表示卡片抓图正在等待绘制或编码，后续请求合并。 */
+    quint64 m_mqttDownloadRevision = 0; /**< GUI 独占；卡片内容或可见性变化时递增。 */
+    quint64 m_mqttDownloadWorkRevision = 0; /**< 本次交给后台的卡片版本，用于拒绝迟到结果。 */
 
     QTimer *m_snapshotTimeoutTimer = nullptr;
 
@@ -577,7 +599,7 @@ private:
     int m_liveRetryIntervalMs = 10000;
     QElapsedTimer m_liveProbeFailureLogElapsed; /**< 持续探测失败时限制状态日志的打印频率。 */
     QString m_liveProbeFailureLogUrl;    /**< 当前受失败日志限流的直播地址。 */
-    qint64 m_localPlayerBusyUntilMs = 0; // 本地视频切文件保护窗口，避免 LIVE 后台探测抢占 GStreamer
+    qint64 m_localPlayerBusyUntilMs = 0; /**< 本地切文件时的单调毫秒截止时间；0 表示尚无避让窗口。 */
 
     // 音量设置
     AmpVolumeController *m_ampCtrl = nullptr;
@@ -819,8 +841,7 @@ private:
     GstPlayerWidget  *nextVideoPlayer; /**< 预加载下一视频的备用播放器。 */
 
     // 直播探测播放器
-    GstPlayerWidget *m_liveProbePlayer = nullptr;
-    bool m_liveProbeRunning = false;
+    bool m_liveProbeRunning = false; /**< GUI 持有；当前 LIVE 目标有已提交但尚未返回的探测。 */
     bool m_liveSwitching = false;
 
     VideoHoleWidget  *videoWidget;
@@ -934,6 +955,11 @@ private:
     bool m_downloadResumeLocalAfterFinish = false;
     QString m_downloadActiveFileName;
     quint64 m_localPlaybackStartSerial = 0;
+    qint64 m_liveFallbackStartedMs = 0; /**< 本次直播回退起点，单调毫秒；0 为无回退。 */
+    qint64 m_liveFallbackAttemptMs = 0; /**< 当前本地视频首帧等待起点，单调毫秒；0 为无在途尝试。 */
+    bool m_liveFallbackReplacedPlayer = false; /**< 一次回退至多换绑一次旧直播播放器，之后试播其他文件。 */
+    int m_liveFallbackFailedItems = 0; /**< 本轮未出帧的本地视频项数，整表失败后延迟重扫。 */
+    QPointer<GstPlayerWidget> m_liveFallbackRetiringPlayer; /**< 最多保留一个后台清理的旧实例，销毁后自动清空。 */
 
 
 private:
@@ -1111,11 +1137,19 @@ private:
      */
     void playVideoRectMediaAt(int index);
     /**
-     * @brief 让主播放器播放 videoRect 视频项。
-     * @param filePath 待读取的文件路径。
-     * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
+     * @brief 异步预卷 videoRect 本地视频，确认就绪后播放。
+     * @param[in] filePath 待读取的文件路径。
+     * @note 直播回退期间等待本地首帧并处理失败；视频区域关闭时不启动播放。
      */
     void playVideoRectVideo(const QString &filePath);
+    /** @brief 将当前主播放器的错误、截图和到帧通知接入页面。 */
+    void connectMainMediaPlayer();
+    /** @brief 对尚未出本地首帧的直播回退排队换绑或试播下一项。
+     * @param[in] reason 当前本地启动失败的诊断信息。
+     */
+    void recoverLiveFallbackPlayback(const QString &reason);
+    /** @brief 结束本次直播回退的首帧跟踪和重试。 */
+    void clearLiveFallbackPlayback();
     /**
      * @brief 隐藏视频画布并显示 videoRect 图片项。
      * @param filePath 待读取的文件路径。
@@ -1168,6 +1202,13 @@ private:
      * @brief 停止直播重试并清除重入标记。
      */
     void stopLiveRetry();
+    /** @brief 提交直播探测并在 GUI 应用仍有效的结果。
+     * @param[in] url 待探测地址。
+     * @param[in] restoring true 时保留启动恢复的链路断开状态上报。
+     */
+    void requestLiveStreamProbe(const QString &url, bool restoring);
+    /** @brief 使在途直播重试结果失效并异步取消网络请求。 */
+    void cancelLiveStreamProbe();
     /**
      * @brief 重试定时到达时重新探测期望直播源。
      * @note 视频区域关闭时不启动/恢复视频资源；独立 PIC 和识别流程保持原规则。
@@ -1321,7 +1362,7 @@ private:
      */
     quint64 issueLocalPlaybackStartSerial();
     /**
-     * @brief 递增序号，使所有在途本地播放启动回调失效。
+     * @brief 递增序号并清除直播回退状态，使在途本地播放启动和恢复回调失效。
      */
     void invalidatePendingLocalPlaybackStarts();
 };

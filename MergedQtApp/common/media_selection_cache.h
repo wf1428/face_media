@@ -2,6 +2,7 @@
  * @file media_selection_cache.h
  * @brief 后台刷新媒体选择配置，界面只读取无锁内存值。
  * @author Du lin
+ * @note 最近修改：2026-11-05；修改人：Du lin；移除已取消的串行队列耗时开关引用，原任务和回调行为不变。
  * @date 2026-11-04
  */
 #pragma once
@@ -46,7 +47,7 @@ public:
         };
         const auto values=std::make_shared<Values>();const auto path=path_;const QPointer<MediaSelectionCache> alive(this);
         ConfigurationWork::queue().enqueue([alive,path,values] {
-            SerialWorkQueue::Task task;task.reportSlow=false;
+            SerialWorkQueue::Task task;
             task.run=[path,values] {
                 QSettings settings(path,QSettings::IniFormat);settings.setIniCodec("UTF-8");
                 values->type=MediaContentPolicy::normalizeContentType(settings.value("playback/contentType","VIDEO_IMAGE").toString());

@@ -2,7 +2,7 @@
 
 Author: Du lin
 Date: 2026-10-30
-Note: 最近修改：2026-10-30；修改人：Du lin；更新视频0%静音及1~100%映射100~230的预期，覆盖端点、限幅和功放恢复；保留旧隔离基线复现。
+Note: 最近修改：2026-11-11；修改人：Du lin；模拟旧 PCM 已清除但共享输出恢复失败，验证普通播报仍写入播报增益并在结束时恢复用户音量；保留未清除时的原策略。
 The entire production vol_ctrl.cpp is compiled; only its fixed data path and GStreamer
 widget include are redirected. Qt QProcess, timers, persistence, and arbitration stay real.
 --baseline uses the saved pre-fix source and runs the reported media-volume regression.
@@ -77,9 +77,22 @@ int main(int argc,char **argv) {
     (output / 'fake_player.h').write_text(r"""
 #pragma once
 #include <QWidget>
+#include <QThread>
+#include <atomic>
 class GstPlayerWidget:public QWidget {
     Q_OBJECT
 public:
+    static void setPriorityAudioOwner(GstPlayerWidget *,bool) {}
+    inline static bool videoHeld=false;
+    inline static std::atomic_int clearCalls{0},clearDelayMs{0};
+    inline static std::atomic_bool clearOk{true},clearConfirmed{true};
+    static void holdVideoAudio(bool held) { videoHeld=held; }
+    static bool discardQueuedAudioForPrompt(bool *nullConfirmed=nullptr) {
+        ++clearCalls;
+        QThread::msleep(unsigned(clearDelayMs.load()));
+        if (nullConfirmed) *nullConfirmed=clearConfirmed.load();
+        return clearOk.load();
+    }
     bool active=true;float duck=1;
     bool hasVideoOutput() const { return true; }
     bool hasActiveMedia() const { return active; }
@@ -164,10 +177,62 @@ private slots:
         media.setVolume(20);pump(150);QCOMPARE(gain(),230);
         qputenv("VOICE_DELAY_MS","0");VoiceCall::releaseOutputVolume(&call);QTRY_COMPARE(gain(),125);pump(50);
     }
+    /** @brief 验证直播和计划依次挂起、释放后按优先级恢复。 */
+    void broadcastPreemptionRestoresPreviousOwners() {
+        QObject ordinary, tagged, scheduled, live, call;
+        GstPlayerWidget player;
+        auto &focus=AudioPromptFocusManager::instance();
+        using Priority=AudioPromptFocusManager::Priority;
+        QSignalSpy ready(&focus,&AudioPromptFocusManager::focusReady);
+        QSignalSpy paused(&focus,&AudioPromptFocusManager::focusSuspended);
+        focus.acquire(&ordinary,&player);
+        QTRY_COMPARE(ready.size(),1);
+        focus.acquire(&tagged,&player,Priority::Tagged);
+        QTRY_COMPARE(ready.size(),2);
+        focus.acquire(&scheduled,&player,Priority::Schedule);
+        QTRY_COMPARE(ready.size(),3);
+        focus.acquire(&live,&player,Priority::Live);
+        QTRY_COMPARE(ready.size(),4);
+        focus.acquireCall(&call);
+        QTRY_COMPARE(ready.size(),5);
+        QCOMPARE(paused.size(),4);
+        QVERIFY(focus.callOwnsFocus());
+        focus.release(&call);
+        QTRY_COMPARE(ready.size(),6);
+        QCOMPARE(qvariant_cast<QObject *>(ready.last()[0]),&live);
+        focus.release(&live);
+        QTRY_COMPARE(ready.size(),7);
+        QCOMPARE(qvariant_cast<QObject *>(ready.last()[0]),&scheduled);
+        focus.release(&tagged);
+        focus.release(&scheduled);
+        QTRY_COMPARE(ready.size(),8);
+        QCOMPARE(qvariant_cast<QObject *>(ready.last()[0]),&ordinary);
+        focus.release(&ordinary);
+    }
+    /** @brief 直播结束后，硬件仍在写入原增益期间视频继续静音。 */
+    void liveRestoreWaitsForAmplifier() {
+        AmpVolumeController media;
+        media.setVolume(50);QTRY_COMPARE(gain(),164);
+        QObject live;GstPlayerWidget video;
+        auto &focus=AudioPromptFocusManager::instance();
+        QSignalSpy ready(&focus,&AudioPromptFocusManager::focusReady);
+        focus.acquire(&live,&video,AudioPromptFocusManager::Priority::Live);
+        QTRY_VERIFY(!ready.isEmpty());
+        QCOMPARE(gain(),230);
+        qputenv("VOICE_DELAY_RAW","164");qputenv("VOICE_DELAY_MS","350");
+        focus.release(&live);
+        QTRY_VERIFY(read("writes.log").endsWith("begin 164\n"));
+        const bool held=GstPlayerWidget::videoHeld && video.duck==0.0f;
+        qputenv("VOICE_DELAY_MS","0");
+        QVERIFY(held);
+        QTRY_VERIFY(!GstPlayerWidget::videoHeld);
+        QCOMPARE(gain(),164);
+        QCOMPARE(video.duck,1.0f);
+    }
     void overlapAndCancel() {
-        AmpVolumeController media;QObject prompt,call;
+        AmpVolumeController media;QObject prompt,call;GstPlayerWidget video;
         auto &focus=AudioPromptFocusManager::instance();QSignalSpy ready(&focus,&AudioPromptFocusManager::focusReady);
-        focus.acquire(&prompt);QTRY_VERIFY(!ready.isEmpty());
+        focus.acquire(&prompt, &video);QTRY_VERIFY(!ready.isEmpty());
         int callReady=0;VoiceCall::acquireOutputVolume(&call,[&]() { ++callReady; });QTRY_COMPARE(callReady,1);
         VoiceCall::releaseOutputVolume(&call);media.setVolume(65);pump(150);
         QCOMPARE(gain(),230); // Another prompt still owns the shared focus.
@@ -190,6 +255,92 @@ private slots:
         VoiceCall::releaseOutputVolume(&call);media.setVolume(64);
         QTRY_COMPARE(gain(),183);pump(120);QCOMPARE(ready,0);
         qputenv("VOICE_DELAY_MS","0");media.setVolume(50);QTRY_COMPARE(gain(),164);pump(50);
+    }
+    void promptClearAndRestoreOrdering() {
+        QObject first,second;
+        GstPlayerWidget video;
+        auto &focus=AudioPromptFocusManager::instance();
+        QSignalSpy ready(&focus,&AudioPromptFocusManager::focusReady);
+        GstPlayerWidget::clearCalls=0;
+        GstPlayerWidget::clearDelayMs=180;
+        focus.acquire(&first,&video);
+        focus.acquire(&second,&video);
+        QVERIFY(GstPlayerWidget::videoHeld);
+        pump(80);
+        QCOMPARE(ready.size(),0);
+        QCOMPARE(gain(),164);
+        QTRY_COMPARE(ready.size(),1);
+        QCOMPARE(gain(),230);
+        focus.release(&first);
+        QTRY_COMPARE(ready.size(),2);
+        QCOMPARE(GstPlayerWidget::clearCalls.load(),1);
+
+        qputenv("VOICE_DELAY_RAW","164");qputenv("VOICE_DELAY_MS","180");
+        focus.release(&second);
+        pump(60);
+        QVERIFY(GstPlayerWidget::videoHeld);
+        QCOMPARE(gain(),230);
+        QTRY_VERIFY(!GstPlayerWidget::videoHeld);
+        QCOMPARE(gain(),164);
+        QCOMPARE(video.duck,1.0f);
+        qputenv("VOICE_DELAY_MS","0");
+        GstPlayerWidget::clearDelayMs=0;
+    }
+    void promptTimeoutUsesOriginalGain() {
+        QObject prompt;
+        GstPlayerWidget video;
+        auto &focus=AudioPromptFocusManager::instance();
+        QSignalSpy ready(&focus,&AudioPromptFocusManager::focusReady);
+        GstPlayerWidget::clearOk=false;
+        GstPlayerWidget::clearConfirmed=false;
+        const auto before=read("writes.log");
+        focus.acquire(&prompt,&video);
+        QTRY_COMPARE(ready.size(),1);
+        QCOMPARE(gain(),164);
+        QCOMPARE(read("writes.log"),before);
+        QVERIFY(GstPlayerWidget::videoHeld);
+        focus.release(&prompt);
+        QVERIFY(!GstPlayerWidget::videoHeld);
+        QCOMPARE(gain(),164);
+        GstPlayerWidget::clearOk=true;
+        GstPlayerWidget::clearConfirmed=true;
+    }
+    /** @brief 旧 PCM 已确认清除时，声卡重开失败不再使文件播报沿用较小的用户音量。 */
+    void promptResumeFailureUsesPromptGain() {
+        QObject prompt;
+        GstPlayerWidget video;
+        auto &focus=AudioPromptFocusManager::instance();
+        QSignalSpy ready(&focus,&AudioPromptFocusManager::focusReady);
+        GstPlayerWidget::clearOk=false;
+        GstPlayerWidget::clearConfirmed=true;
+        focus.acquire(&prompt,&video);
+        QTRY_COMPARE(ready.size(),1);
+        QCOMPARE(gain(),230);
+        QVERIFY(GstPlayerWidget::videoHeld);
+        focus.release(&prompt);
+        QTRY_COMPARE(gain(),164);
+        QTRY_VERIFY(!GstPlayerWidget::videoHeld);
+        GstPlayerWidget::clearOk=true;
+    }
+    void callPreemptsPendingPromptClear() {
+        QObject prompt,call;
+        GstPlayerWidget video;
+        auto &focus=AudioPromptFocusManager::instance();
+        QSignalSpy ready(&focus,&AudioPromptFocusManager::focusReady);
+        GstPlayerWidget::clearCalls=0;
+        GstPlayerWidget::clearDelayMs=300;
+        focus.acquire(&prompt,&video);
+        QTRY_COMPARE(GstPlayerWidget::clearCalls.load(),1);
+        focus.acquireCall(&call);
+        QTRY_COMPARE(ready.size(),1);
+        QCOMPARE(qvariant_cast<QObject *>(ready.last()[0]),&call);
+        pump(350);
+        QCOMPARE(ready.size(),1);
+        focus.release(&prompt);
+        focus.release(&call);
+        QTRY_VERIFY(!GstPlayerWidget::videoHeld);
+        QCOMPARE(gain(),164);
+        GstPlayerWidget::clearDelayMs=0;
     }
     void nextCallDuringRestore() {
         AmpVolumeController media;QObject call;int ready=0;

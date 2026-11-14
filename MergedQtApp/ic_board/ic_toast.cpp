@@ -2,7 +2,8 @@
  * @file ic_toast.cpp
  * @brief 实现 IC 结果覆盖提示、边缘呼吸动画和提示音焦点管理。
  *
- * @author Dulin
+ * @author Du lin
+ * @note 最近修改：2026-11-10；修改人：Du lin；即时开关只限制并停止 IC 播报，保留二维码提示和界面。
  * @date 2026-07-25
  */
 
@@ -25,6 +26,7 @@
 #include <QEasingCurve>
 #include <QPaintEvent>
 #include "platform/rk3566_platform.h"
+#include "common/device_feature_switches.h"
 
 IcToast* IcToast::self_ = nullptr;
 
@@ -82,6 +84,8 @@ IcToast::IcToast(QWidget* mainWindow)
             this, &IcToast::endVoiceFocus);
 
     voicePlayer_ = new GstPlayerWidget(this);
+    voicePlayer_->enablePriorityAudio();
+    voicePlayer_->setPromptAudioMode(true);
     voicePlayer_->setVideoOutput(nullptr);
     voicePlayer_->setVolume(1.0f);
     connect(voicePlayer_, &GstPlayerWidget::videoFinished,
@@ -96,6 +100,19 @@ IcToast::IcToast(QWidget* mainWindow)
         if (owner == this && voiceFocusActive_ && !pendingVoiceFile_.isEmpty()) {
             voiceStartTimer_.start();
         }
+    });
+    connect(&AudioPromptFocusManager::instance(), &AudioPromptFocusManager::focusSuspended,
+            this, [this](QObject *owner) {
+        if (owner != this) return;
+        voiceStartTimer_.stop();
+        voiceFocusRestoreTimer_.stop();
+        if (voicePlayer_) voicePlayer_->pause();
+    });
+
+    connect(&DeviceFeatureSwitches::soundChanges(), &DeviceSoundChanges::changed, this, [this] {
+        if (!cardPlayback_ || DeviceFeatureSwitches::current().icCardAudio) return;
+        voicePlayer_->stop();
+        endVoiceFocus();
     });
 
     // 所有提示音统一从 common/audio 资源目录读取；GStreamer 播放临时文件。
@@ -149,7 +166,7 @@ bool IcToast::allowTriggerNow(bool isFail)
     return true;
 }
 
-/** @return MusicPlayEn 为 1 或缺少配置时返回 true。 */
+/** @return 原统一播报总开关，供仍需播报的通行来源共享。 */
 bool IcToast::isVoicePromptEnabled() const
 {
     return AmpVolumeController::isPromptPlaybackEnabled();
@@ -159,8 +176,9 @@ bool IcToast::isVoicePromptEnabled() const
 /**
  * @brief 显示绿色全屏边缘呼吸效果，并尝试播放通过提示音。
  * @param ms 调用方期望的显示时长；边缘动画周期由内部固定参数控制。
+ * @param fromCard true 使用 IC 声音开关；false 保留普通提示。
  */
-void IcToast::showPass(int ms)
+void IcToast::showPass(int ms, bool fromCard)
 {
 
     if (!allowTriggerNow(false)) {
@@ -181,7 +199,7 @@ void IcToast::showPass(int ms)
         setGeometry(main_->rect());
     }
 
-    playPassVoice();
+    if (!fromCard || DeviceFeatureSwitches::current().icCardAudio) playVoiceFile(passVoiceFile_,fromCard);
 
     hideTimer_.stop();
     raise();
@@ -195,8 +213,10 @@ void IcToast::showPass(int ms)
  * @brief 显示本地化失败文本和红色边缘动画，并尝试播放失败提示音。
  * @param reason 协议失败原因码或已本地化文本。
  * @param ms 文字提示自动隐藏时间，单位 ms。
+ * @param resultCode 可选的专用音频结果码。
+ * @param fromCard true 使用 IC 声音开关；false 保留普通提示。
  */
-void IcToast::showFail(const QString& reason, int ms, int resultCode)
+void IcToast::showFail(const QString& reason, int ms, int resultCode, bool fromCard)
 {
     qWarning().noquote()
             << QString("[IC-TOAST] showFail enter reason=%1 ms=%2")
@@ -217,7 +237,7 @@ void IcToast::showFail(const QString& reason, int ms, int resultCode)
     showText(QStringLiteral("%1").arg(r), ms);
 
     // 再播失败语音
-    playFailVoice(resultCode);
+    if (!fromCard || DeviceFeatureSwitches::current().icCardAudio) playFailVoice(resultCode,fromCard);
 
     // 红框走和绿框一样的脉冲逻辑
     startPassEdgeFlash();
@@ -648,7 +668,7 @@ void IcToast::ensureAmpReady()
 }
 
 /** @brief 检查路径、配置和播放器后播放提示音，并建立异常恢复兜底。 */
-void IcToast::playVoiceFile(const QString& localFilePath)
+void IcToast::playVoiceFile(const QString& localFilePath, bool fromCard)
 {
     if (localFilePath.trimmed().isEmpty()) {
         qWarning() << "[IC-TOAST] local voice file path empty";
@@ -668,6 +688,7 @@ void IcToast::playVoiceFile(const QString& localFilePath)
     voiceStartTimer_.stop();
     voicePlayer_->stop();
     endVoiceFocus();
+    cardPlayback_ = fromCard;
     pendingVoiceFile_ = localFilePath;
 
     voicePlayer_->setVideoOutput(nullptr);
@@ -676,14 +697,8 @@ void IcToast::playVoiceFile(const QString& localFilePath)
     beginVoiceFocus();
 }
 
-/** @brief 播放已物化的通过提示音。 */
-void IcToast::playPassVoice()
-{
-    playVoiceFile(passVoiceFile_);
-}
-
 /** @brief 按 MQTT 结果码播放专用失败音，其他错误沿用通用失败音。 */
-void IcToast::playFailVoice(int resultCode)
+void IcToast::playFailVoice(int resultCode, bool fromCard)
 {
     switch (resultCode) {
     case 4000:
@@ -706,7 +721,7 @@ void IcToast::playFailVoice(int resultCode)
                 .arg(resultCode);
         const QString codeVoice = materializeResourceToTemp(resourcePath);
         if (!codeVoice.isEmpty()) {
-            playVoiceFile(codeVoice);
+            playVoiceFile(codeVoice,fromCard);
             return;
         }
         break;
@@ -714,7 +729,7 @@ void IcToast::playFailVoice(int resultCode)
     default:
         break;
     }
-    playVoiceFile(failVoiceFile_);
+    playVoiceFile(failVoiceFile_,fromCard);
 }
 
 /** @return volume.dat 中语音播报百分比映射出的 RK809 原始音量。 */
@@ -739,12 +754,13 @@ void IcToast::beginVoiceFocus()
 
     voiceFocusActive_ = true;
     voiceFocusRestoreTimer_.start(15000);
-    AudioPromptFocusManager::instance().acquire(this);
+    AudioPromptFocusManager::instance().acquire(this, voicePlayer_);
 }
 
 /** @brief 恢复语音焦点前保存的播放器音量和 RK809 播放音量。 */
 void IcToast::endVoiceFocus()
 {
+    cardPlayback_ = false;
     voiceBoostTimer_.stop();
     voiceStartTimer_.stop();
     voiceFocusRestoreTimer_.stop();

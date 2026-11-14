@@ -2,7 +2,8 @@
  * @file ic_toast.h
  * @brief IC 验证结果覆盖提示、边缘动画和语音焦点控制。
  *
- * @author Dulin
+ * @author Du lin
+ * @note 最近修改：2026-11-10；修改人：Du lin；声明提示来源和当前 IC 播放状态，关闭开关时仅终止 IC 音频。
  * @date 2026-07-25
  */
 
@@ -37,11 +38,19 @@ public:
      */
     static IcToast* instance(QWidget* mainWindow);
 
-    /** @brief 显示成功主题的全屏绿色呼吸边框并播放通过提示音。 */
-    void showPass(int ms = 1200);
+    /** @brief 显示成功主题的全屏绿色呼吸边框，可选播放通过提示音。
+     * @param[in] ms 显示时长，边缘动画使用内部周期，单位毫秒。
+     * @param[in] fromCard true 时额外检查 IC 声音开关。
+     */
+    void showPass(int ms = 1200, bool fromCard = false);
 
-    /** @brief 本地化失败原因，显示红色提示并播放失败提示音。 */
-    void showFail(const QString& reason, int ms = 5000, int resultCode = 0);
+    /** @brief 本地化失败原因并显示红色提示，可选播放失败提示音。
+     * @param[in] reason 失败原因码或显示文本。
+     * @param[in] ms 隐藏延时，单位毫秒。
+     * @param[in] resultCode 可选的专用提示音结果码。
+     * @param[in] fromCard true 时额外检查 IC 声音开关。
+     */
+    void showFail(const QString& reason, int ms = 5000, int resultCode = 0, bool fromCard = false);
 
     /** @brief 显示普通居中文本提示，并在指定毫秒数后隐藏。 */
     void showText(const QString& text, int ms = 5000);
@@ -88,13 +97,13 @@ private:
     void ensureAmpReady();
 
     /** @brief 在配置允许时播放本地提示音，并建立临时语音焦点。 */
-    void playVoiceFile(const QString& localFilePath);
+    /** @param[in] fromCard true 标记为 IC 音频，以便即时停止。 */
+    void playVoiceFile(const QString& localFilePath, bool fromCard);
 
-    /** @brief 播放通过提示音。 */
-    void playPassVoice();
 
     /** @brief 按 MQTT 结果码播放对应失败提示音，未配置时使用通用失败音。 */
-    void playFailVoice(int resultCode);
+    /** @param[in] fromCard true 标记为 IC 音频。 */
+    void playFailVoice(int resultCode, bool fromCard);
 
     /** @return volume.dat 中语音播报百分比映射出的 RK809 原始音量。 */
     int boostedToastRawVolume() const;
@@ -104,6 +113,7 @@ private:
 
     /** @brief 恢复所有被压低的播放器和 RK809 播放音量。 */
     void endVoiceFocus();
+    bool cardPlayback_ = false; /**< 当前待播或在播音频来自 IC 卡。 */
 
     /** @brief 在硬件音量恢复完成后平滑恢复视频软件音量。 */
     void startVideoVolumeRestore(qreal startFactor);

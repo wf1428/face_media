@@ -1,9 +1,10 @@
 /**
  * @file MainWindow.h
- * @brief 管理融合应用页面、功能模块生命周期和跨模块信号路由。
+ * @brief 管理人脸门禁前台、识别服务及共享摄像头后台截图需求。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-11-05；修改人：Du lin；合并识别与后台截图采集需求；截图不激活模块、不投递PIC，普通停用不等待采集线程。
  */
 
 #ifndef MAIN_WINDOW_H
@@ -54,7 +55,7 @@ public:
     /** @brief 启动或恢复摄像头、推理和门禁业务。 */
     bool activateModule();
 
-    /** @brief 暂停摄像头和验证，但保留后台服务以便恢复。 */
+    /** @brief 暂停前台验证与预览；独立截图仍需要时保留采集，其他后台服务保留。 */
     void deactivateModule();
 
     /** @brief 停止所有线程、服务和播放器；重复调用保持幂等。 */
@@ -254,7 +255,7 @@ private:
     /** @brief 隐藏并清理成功通行缩略图。 */
     void hideSuccessfulAccess();
 
-    /** @brief 根据模块活动态和当前页面需求启停摄像头。 */
+    /** @brief 根据前台识别/录入与截图并集异步启停摄像头；截图不改变UI状态。 */
     void updateCameraPowerState();
 
     /** @brief 清除主预览和录入预览中的旧帧。 */
@@ -320,6 +321,7 @@ private:
     QThread *personExportThread_ = nullptr;
     QPointer<PersonExportWorker> personExportWorker_;
 
+    bool screenshotCameraNeeded_=false; /**< 截图源的后台需求；与原UI需求取并集，不决定识别活动态。 */
     CameraService camera_;
     LivenessWorker liveness_;
     AudioService audio_;

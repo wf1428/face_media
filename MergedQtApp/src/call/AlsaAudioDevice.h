@@ -3,12 +3,11 @@
  * @brief 封装RK809的Channel 0单声道copy采集、双声道播放及非阻塞通话路由。
  * @author Du lin
  * @date 2026-10-29
- * @note 最近修改：2026-11-04；修改人：Du lin；通话采集打开前将硬件Capture Volume逐通道限制到240，保留更低值及原环境变量覆盖；关闭/打开失败按占用值校验恢复原增益，不改DSP和Channel 0。
+ * @note 最近修改：2026-11-05；修改人：Du lin；删除 ALSA 诊断快照接口与存储，保留设备、传输和播放参考接口。
  */
 #pragma once
 #include "CallProtocol.h"
 #include "PlaybackReference.h"
-#include "AudioDiagnostics.h"
 #include <QString>
 #include <atomic>
 struct _snd_pcm;
@@ -39,7 +38,7 @@ public:
      * @param[in] stop 跨线程原子停止标志。
      * @return true 一帧传输完成；false 为取消、超时或不可恢复错误。
      * @note 只允许设备所属线程调用；每次等待最多10ms，整帧最长100ms。wait错误按I/O错误处理；停止不输出超时日志。
-     *       XRUN恢复只在固定快照中累计阶段耗时，不做文本输出；由调用者读取transferTrace异步诊断。
+     *       XRUN 恢复不在实时路径输出文本；累计次数由 xruns() 返回。
      *       时间查询首次仅因跨度超过2000us失效时最多立即重查一次；第二次失败仍保持valid=false。
      *       关闭AEC时不为诊断新增逐帧avail_delay查询。
      */
@@ -61,14 +60,10 @@ public:
     }
     /** @return 声卡排队采样估计延时，单位毫秒；获取失败返回 0。 */
     int delayMs() const;
-    /** @brief 后台关闭句柄、恢复本次采集增益并清除几何/单帧诊断；幂等，不清零XRUN计数。 */
+    /** @brief 后台关闭句柄、恢复本次采集增益并清除参考时间；幂等，不清零XRUN计数。 */
     void close();
     /** @return 本实例进入XRUN/挂起恢复分支的次数，包含prepare失败，非网络丢帧数。 */
     uint64_t xruns() const { return xruns_; }
-    /** @return 本次open的应用PCM缓冲/阈值快照；未知字段为-1，仅所属线程读取。 */
-    const VoiceCall::AlsaGeometry &geometry() const { return geometry_; }
-    /** @return 最近一次transfer快照，包括失败/取消；仅所属线程读取，不做ALSA调用。 */
-    const VoiceCall::AlsaTransferTrace &transferTrace() const { return transferTrace_; }
     /** @brief 在后台设置SPK_HP、Main Mic，并校验原采集增益覆盖参数。
      * @param[out] error 路由或录音增益设置失败原因。
      * @note QT_YCEST_CALL_CAPTURE_VOLUME仍接受0..255；实际增益由采集实例open保存/设置/恢复。
@@ -95,7 +90,4 @@ private:
     bool timingEnabled_=false; /**< 默认false保留V1；仅AEC有效时开启元数据查询。 */
     VoiceCall::AudioTiming lastTiming_; /**< 本次完整读写后的时间，失败/关闭时失效。 */
     VoiceCall::Pcm lastPlaybackPcm_{}; /**< 由实际交错输出缓冲解码的左声道，只在计时启用时更新。 */
-    VoiceCall::AlsaGeometry geometry_; /**< 打开时只读查询，不把查询失败当录放失败。 */
-    VoiceCall::AlsaTransferTrace transferTrace_; /**< 固定单帧诊断，不跨线程共享。 */
-    uint64_t transferSequence_=0;int64_t lastIoSuccessUs_=0; /**< 本次open调用序号及最近成功I/O单调微秒；仅所属线程访问。 */
 };

@@ -3,7 +3,7 @@
  * @brief 管理后台全双工录放、限长音频队列和实际播放参考。
  * @author Du lin
  * @date 2026-10-29
- * @note 最近修改：2026-11-04；修改人：Du lin；采集帧改为固定5槽所有权交接，发送取帧不再等待统计锁；采集统计仅try_lock发布，完整累计在退出后补齐，100ms过期和原协议不变。
+ * @note 最近修改：2026-11-05；修改人：Du lin；移除调度、丢弃细分及逐帧诊断状态，保留无锁音频电平和原有统计接口。
  */
 #pragma once
 #include "CallProtocol.h"
@@ -16,7 +16,7 @@
 #include <mutex>
 #include <memory>
 
-/** @brief 每通话启动一次的播放后台；采集和数值诊断各自在线程运行。
+/** @brief 每通话启动一次的播放后台；采集和原有周期汇总各自在线程运行。
  * @details 控制器只调用非阻塞 start/stop/队列接口；ALSA、amixer 和共享混音器
  *          状态切换均在后台。正常挂断通过 finished 异步收尾，UI 不 join。
  */
@@ -44,7 +44,7 @@ public:
      * @param[in] packet MQTT 原始 650 字节帧。
      */
     void receive(const QByteArray &packet);
-    /** @brief 取最旧且不超过 100ms 的待发送帧，丢弃过期帧并单独累计过期计数。
+    /** @brief 取最旧且不超过 100ms 的待发送帧，丢弃过期帧并计入上行总丢弃。
      * @param[out] frame 成功时写入采集 PCM。
      * @return true 有新帧；false 禁用或暂无可取得有效槽；不等待采集或统计线程。
      */
@@ -63,24 +63,24 @@ signals:
      * @param[in] error 不含原始 PCM 的诊断文本。
      */
     void failed(const QString &error);
-    /** @brief 周期、异常限频及结束时报告队列、PCM连续性、DSP模式与XRUN统计。
+    /** @brief 报告原有周期、结束汇总、XRUN计数及音频设备/DSP状态。
      * @param[in] text 统计字段及数值，或恢复失败信息。
      */
     void statistics(const QString &text);
 protected:
-    /** @brief 后台完成路由/声卡初始化、播放循环、采集及诊断线程退出与混音器恢复。 */
+    /** @brief 后台完成路由/声卡初始化、播放循环、采集及汇总线程退出与混音器恢复。 */
     void run() override;
 private:
     /** @brief 复制小型计数后在锁外格式化周期/结束诊断，txDrop为满队列与过期丢帧之和。
      * @param[in] phase tick 或 final，用于区分运行与结束快照。
-     * @note tick仅诊断线程调用，final在采集/诊断join后调用；tx域短锁复制、下行电平原子读取，不嵌套持锁。
+     * @note tick仅诊断线程调用，final在采集/汇总线程退出后调用；tx域短锁复制、下行电平原子读取，不嵌套持锁。
      */
     void reportStatistics(const QString &phase);
-    VoiceCall::LevelStats micLevel_,rxLevel_,playLevel_; /**< 原始采集由txMutex_保护，rxLevel_仅接收线程写；播放电平仅诊断线程/退出后读取。 */
+    VoiceCall::LevelStats micLevel_,rxLevel_,playLevel_; /**< 原始采集由txMutex_保护，rxLevel_仅接收线程写；播放电平由汇总线程发布，退出后由播放线程写入最终值。 */
     uint64_t playedFrames_=0; /**< ALSA 完成写入帧数，含静音。 */
     std::atomic<int64_t> statsStartMs_{0}; /**< TALKING起点，单调毫秒；0为未开始。 */
-    int64_t lastCaptureMs_=0,captureGapMaxMs_=0; /**< 本地单调时钟时间及最大采集间隔，单位毫秒。 */
-    std::atomic_bool stop_{true}; /**< true使采集/播放线程在ALSA有限等待后退出；诊断队列在后台收尾。 */
+    int64_t captureGapMaxMs_=0; /**< 最大采集间隔，单位毫秒，由 txMutex_ 保护。 */
+    std::atomic_bool stop_{true}; /**< true使采集/播放线程在ALSA有限等待后退出。 */
     std::atomic_bool talking_{false}; /**< 仅 TALKING 才允许媒体进出队列。 */
     mutable std::mutex txMutex_; /**< 只保护低频统计快照；采集循环仅try_lock，发送/播放不获取，退出后可等待补齐最终值。 */
     /** @brief 单接收者发布累计电平；原子数值快照不要求各字段来自同一帧，统计不影响PCM。 */
@@ -99,7 +99,6 @@ private:
     std::array<std::atomic<uint64_t>,10> receivedLevels_{}; /**< 固定原子电平点：高32位接收单调毫秒低位，低32位为peak16|rms16；UI无锁读取。 */
     size_t receivedLevelCursor_=0; /**< 单接收者下一写入槽，首次接收新epoch时初始化。 */
     std::atomic<int64_t> lastReceivedMs_{0}; /**< 当前通话最后有效帧接收时刻；0 表示尚无帧。 */
-    std::atomic<int64_t> uiNativeTid_{0}; /**< begin在UI记录本线程内核TID，后台只读用于/proc采样；不支持为0。 */
     VoiceCall::ConcurrentJitterBuffer incoming_; /**< 10 帧/200ms 抖动缓冲。 */
     FixedMailbox<VoiceCall::Frame,5> outgoing_; /**< 固定5槽，采集发布/发送消费；满时替换最旧Ready，绝不覆盖Reading。 */
     VoiceCall::PlaybackReference reference_; /**< 仅采集线程访问的固定64槽历史；播放通过SPSC送入实际写入结果，停止后begin可重置。 */
@@ -108,6 +107,5 @@ private:
     VoiceCall::ProcessingStats dspStats_; /**< 采集线程复制的DSP计数，txMutex_保护，UI只读低频日志。 */
     std::atomic<uint64_t> txDrops_{0},txFrames_{0}; /**< 独立原子上行累计；丢弃为容量/有界竞争及100ms过期之和，不保护PCM。 */
     std::atomic<uint64_t> rxFrames_{0}; /**< 接收线程发布，播放只读；rxStatsEpoch_标明所属通话。 */
-    std::atomic<uint64_t> txDropFull_{0},txDropExpired_{0}; /**< 固定槽满/有界竞争拒绝与年龄严格大于100ms的直接丢弃帧数，begin在停止状态清零。 */
     std::atomic<size_t> txHighWater_{0}; /**< 单采集者发布Ready槽近似峰值，最多5帧。 */
 };

@@ -3,13 +3,12 @@
  * @brief 将后台任务与界面完成回调串行衔接，支持待执行任务合并及过期过滤。
  * @author Du lin
  * @date 2026-11-04
- * @note 最近修改：2026-11-04；修改人：Du lin；后台任务可关闭原慢任务输出，进度轮询不新增日志，串行与退出语义保持。
+ * @note 最近修改：2026-11-05；修改人：Du lin；移除慢任务计时输出，保留串行执行、过期过滤、完成回调和关机错误日志。
  */
 #pragma once
 #include <QObject>
 #include <QThread>
 #include <QPointer>
-#include <QElapsedTimer>
 #include <QDebug>
 #include <deque>
 #include <functional>
@@ -31,7 +30,6 @@ public:
     struct Task {
         std::function<QString()> run; /**< 后台操作；空串成功，非空错误；可为空表示仅执行完成回调。 */
         std::function<void(const QString &)> done; /**< 所有者线程完成回调；shutdown 后不再执行。 */
-        bool reportSlow=true; /**< false仅关闭该任务原有慢段输出；不改变执行及错误回调。 */
     };
     /** @brief 创建后台线程。
      * @param[in] name 线程诊断名称。
@@ -101,13 +99,10 @@ private:
             const QPointer<SerialWorkQueue> alive(this);
             auto task=pending.prepare();if(!alive) return;
             if(!task.run) { if(task.done) task.done({});if(!alive) return;continue; }
-            busy_=true;const auto operation=pending.key.isEmpty() ? QStringLiteral("barrier") : pending.key;
-            post([this,task=std::move(task),operation]() mutable {
-                QElapsedTimer timer;timer.start();QString error;
+            busy_=true;
+            post([this,task=std::move(task)]() mutable {
+                QString error;
                 try { error=task.run(); } catch(...) { error=QStringLiteral("后台串行任务异常"); }
-                if(task.reportSlow && timer.elapsed()>=20) qInfo()<<"[media-work] queue="<<static_cast<const void*>(this)
-                    <<"thread="<<QThread::currentThread()->objectName()<<"operation="<<operation
-                    <<"beginMonoMs="<<timer.msecsSinceReference()<<"elapsedMs="<<timer.elapsed();
                 QMetaObject::invokeMethod(this,[this,task=std::move(task),error]() mutable {
                     if(closing_) return;
                     // done 可提交后继任务；完成回调结束前保持 busy，避免提前修改句柄。

@@ -4,13 +4,14 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-04；修改人：Du lin；新增高清截图场景值异步接线，普通/高清图像后台处理共享队列，保留原高清图像信号兼容路径和协议。
+ * @note 最近修改：2026-11-12；修改人：Du lin；普通 MQTT 请求改接下载卡片优先抓图入口，并转发待发图像失效通知。
  */
 
 #include "mainwindow.h"
 #include "src/call/CallPanel.h"
 #include "src/call/CallManager.h"
 #include "src/call/CallGpioButton.h"
+#include "src/call/CallRingtone.h"
 #include "ui_mainwindow.h"
 #include <QKeyEvent>
 #include <QDebug>
@@ -110,6 +111,7 @@ static QString normalizeProtocolModeValue(const QString &raw)
 /**
  * @brief 创建全部页面、运行模块并建立跨页面信号连接。
  * @param parent Qt 父对象；对象销毁由父子关系管理，空指针表示无父对象。
+ * @note 普通 MQTT 截图请求及下载卡片失效通知在 GUI 线程转交。
  * @note 高清截图的令牌和原图使用排队连接；本窗口不合成、编码或序列化高清图像。
  *       通话面板为主窗口子控件，操作只投递非阻塞业务请求，不暂停当前视频或改变页面。
  */
@@ -242,6 +244,9 @@ MainWindow::MainWindow(QWidget *parent)
         auto *calls=manager->callManager();
         KeyboardDialog::loadPropertyCallButtonVisibility(Rk3566Platform::netConfigPath());
         new CallPanel(calls,this);
+        auto *ringtone = new CallRingtone(calls);
+        connect(calls, &CallManager::outgoingRingtoneChanged,
+                ringtone, &CallRingtone::setPhase);
 #ifdef Q_OS_LINUX
         auto *callKey=new CallGpioButton(QStringLiteral("/sys/class/gpio"),calls);
         callKey->setCallAvailable(calls->canUseCallButton());
@@ -251,7 +256,6 @@ MainWindow::MainWindow(QWidget *parent)
         connect(callKey,&CallGpioButton::logMessage,calls,&CallManager::logMessage);
         connect(callKey,&CallGpioButton::callRequested,calls,[this,calls]() {
             if (!calls->canUseCallButton()) return;
-            if (calls->state()!=CallManager::Idle) { calls->pressCallButton(); return; }
             // 物理键若在密码键盘显示时按下，复用该键盘的退出结果及原排队连接。
             for (auto *keyboard:findChildren<KeyboardDialog *>())
                 if (keyboard->requestPropertyCall()) return;
@@ -288,11 +292,13 @@ MainWindow::MainWindow(QWidget *parent)
         connect(cast, &MultimediaDemo::currentRecordedFileChanged,
                 settingsDialog, &SettingsDialog::onCurrentRecordedFileChanged);
 
-        connect(cast, &MultimediaDemo::currentPlayImageChanged,
+        connect(cast, &MultimediaDemo::mqttPlayImageReady,
                 settingsDialog, &SettingsDialog::onCurrentPlayImageChanged);
+        connect(cast, &MultimediaDemo::mqttPlayImageInvalidated,
+                settingsDialog, &SettingsDialog::invalidatePlayImage);
 
         connect(settingsDialog, &SettingsDialog::requestCapturePlayImage,
-                cast, &MultimediaDemo::captureCompositeSnapshot);
+                cast, &MultimediaDemo::captureMqttPlayImage);
 
         connect(cast, &MultimediaDemo::currentPlayVolumeChanged,
                 settingsDialog, &SettingsDialog::onCurrentPlayVolumeChanged);

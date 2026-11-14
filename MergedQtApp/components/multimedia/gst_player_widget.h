@@ -3,8 +3,10 @@
  * @brief 实现 GStreamer 播放管线、三槽帧邮箱和 Qt OpenGL 视频画布。
  *
  * @author Du lin
+ * @note 最近修改：2026-11-13；修改人：Du lin；明确视频 sink 和压缩帧探针的单调毫秒基准及清零语义，供直播看门狗判断和记录。 补充本地自动播放的预卷门控和脱离前台后的管线清理接口契约。
  * @date 2026-07-25
- * @note 最近修改：2026-11-04；修改人：Du lin；新增按需tryLock复用NV12邮箱值和UI画布查询，截图不触发GL读回、不延长播放租约、不修改管线/录放。
+ * @par 修改记录
+ * 2026-11-05，Du lin：增加共享输出优先门及独立直播 PCM 分支。
  */
 
 #ifndef GST_PLAYER_WIDGET_H
@@ -130,24 +132,67 @@ public:
 
     /** @brief 在音频后台线程切换通话独占模式，释放/恢复共享 ALSA 输出。
      * @param[in] exclusive true 丢弃媒体和提示 PCM 并关闭共享 sink；false 恢复现有分支。
-     * @return true 已释放声卡或成功提交恢复；false 为共享管线状态切换失败。
-     * @note 不触碰视频 playbin；不得从 UI 线程调用；释放时最多等待 1 秒状态确认，切换本身耗时由 GStreamer 决定。
+     * @return true 已释放声卡或成功提交恢复；false 为直播交接超时或共享管线状态切换失败。
+     * @note 仅后台调用，不操作视频 playbin。申请时最多等待 1 秒归还直播设备，再执行原 GStreamer 状态确认。
      */
     static bool setCallAudioExclusive(bool exclusive);
+    /** @brief 后台接管共享声卡，用于直播独立 ALSA 播放。
+     * @param[in,out] stop 直播停止标志，通话抢占时置位，需活到归还。
+     * @return true 共享输出已释放且直播取得独占权。
+     */
+    static bool acquireBroadcastAudioOutput(std::atomic_bool &stop);
+    /** @brief 探测已校验本地文件的音频时长，仅在后台调用，不打开扬声器。
+     * @param[in] path 本地文件路径。
+     * @return 媒体时长毫秒；无音频、缺插件、探测超时或非设备构建时为0。
+     */
+    static qint64 probeAudioDurationMs(const QString &path);
+    /** @brief 后台归还直播独占；调用前必须关闭直播 ALSA 句柄。
+     * @return true 表示共享输出已就绪、等下一帧创建或已让给通话，false 表示恢复失败。
+     */
+    static bool releaseBroadcastAudioOutput();
+
+    /** @brief 设置共享输出唯一媒体输入。仅主线程调用，采样线程读取原子门。
+     * @param[in] player 当前获准的播放器身份，可空。
+     * @param[in] call true 只允许通话铃声，false 允许 player；空 player 恢复普通输出。
+     */
+    static void setPriorityAudioOwner(GstPlayerWidget *player, bool call);
+    /** @brief 后台通过共享音频输出的 NULL 状态清除旧 PCM，随后恢复输出。
+     * @param[out] nullConfirmed 可空；返回后为 true 表示旧共享输出已到达 NULL，即使随后恢复失败。
+     * @return true 已清除且提交恢复；遇到声卡独占、确认超时或失败返回 false。
+     * @note 不改变视频 playbin；不得在 UI 线程调用。
+     */
+    static bool discardQueuedAudioForPrompt(bool *nullConfirmed = nullptr);
+    /** @brief 控制独立于焦点选择的视频静音门，仅主线程写入。
+     * @param[in] held true 保持普通视频音频静音，false 交回原音频策略。
+     */
+    static void holdVideoAudio(bool held);
+    /** @brief 标记为焦点管理输入，未获选时也不播放退出前积压的采样。
+     * @note 主线程在首次创建音频分支前设置，后续保持。
+     */
+    void enablePriorityAudio() { priorityManaged_.store(true); }
+    /** @return 是否需要统一焦点授予才允许出声，可在线程间读取。 */
+    bool priorityManaged() const { return priorityManaged_.load(); }
 
     /** @brief 指定承载视频画布或硬件 overlay 的目标控件。 */
     void setVideoOutput(QWidget *widget);
-    /** @brief 设置本地路径或网络URL并使旧源失效；耗时停止、切源和预卷在后台串行执行。
-     * @param[in] path 原媒体路径或URL，沿用既有校验及状态转换。
-     * @note UI立即使旧源失效；后台串行NULL/URI/PAUSED，过期结果不重启定时器或报错。
+    /** @brief 异步加载媒体，只有当前媒体切源成功后才允许播放。
+     * @param[in] path 待加载的本地路径或 URL。
+     * @param[in] playWhenPrepared true 表示完成 PAUSED 预卷后自动播放，默认沿用显式播放。
+     * @note GUI 使旧媒体失效，工作线程串行执行 NULL、URI 和 PAUSED；过期结果不报错或启动播放。
      */
-    void setMedia(const QString &path);
-    /** @brief 异步请求播放；与切源/停止串行，预加载或提示音准备未完成时沿原prepared路径继续。 */
+    void setMedia(const QString &path, bool playWhenPrepared = false);
+    /** @brief 异步请求播放；切源失败时丢弃请求，提示音继续遵守原预卷条件。 */
     void play();
     /** @brief UI立即撤销播放意图，后台串行暂停并移除普通媒体混音分支。 */
     void pause();
     /** @brief 立即清除画布和播放意图，异步停止；不等待GStreamer。 */
     void stop();
+    /**
+     * @brief 在后台停止并退役已从前台解绑的播放器。
+     * @note GUI 线程调用；停止失败后等待 2000 ms 重试，确认 NULL 后 deleteLater。
+     *       调用后不得再给此实例提交播放请求，父对象继续持有它直到销毁。
+     */
+    void retire();
     /** @brief 排队完整释放并重建 playbin；后续 setMedia/play 按序执行。
      * @return true 表示重建请求已受理；异步创建失败通过 errorOccured 报告。
      */
@@ -179,8 +224,16 @@ public:
     void setAudioDucking(const QObject *owner, float factor01);
     /** @brief 释放一个播报所有者的临时压低，不影响其他仍在播报的所有者。 */
     void clearAudioDucking(const QObject *owner);
-    /** @brief 启用短提示音静音预卷，使共享音频链路在首个语音采样前就绪。 */
+    /** @brief 在真实 PCM 前预热共享输出；受管文件播报获得焦点后才送入静音。
+     * @param[in] on true 启用提示音时间线和静音预热，false 使用普通媒体路径。
+     * @note 主线程在首次创建播放管线前设置。
+     */
     void setPromptAudioMode(bool on);
+    /** @brief 为专用外呼铃声播放器申请或归还共享混音优先权。
+     * @param[in] active true 分配新代次，只允许对应铃声的音频；false 立即屏蔽该铃声的已排队采样。
+     * @note 仅 UI 线程调用；独立的 AudioEngine 声卡独占优先于铃声。
+     */
+    void setCallRingtonePriority(bool active);
 
     /** @brief 改变预加载角色并提交不可合并的旧图销毁屏障。
      * @param[in] on true只准备，false为正常输出；角色不变时不重建。
@@ -190,11 +243,11 @@ public:
     /** @return 管线已完成异步准备时返回 true。 */
     bool isPrepared() const { return prepared_; }
 
-    /** @return 最近视频帧到达的单调时钟毫秒值。 */
+    /** @return 最近视频帧到达 sink 的 MonotonicClock 毫秒值；当前源无采样时为 0。 */
     qint64 lastVideoFrameMSecs() const { return lastVideoFrameMs_.loadAcquire(); }
     /** @return 最近音频帧到达的单调时钟毫秒值。 */
     qint64 lastAudioFrameMSecs() const { return lastAudioFrameMs_.loadAcquire(); }
-    /** @return 最近一个压缩视频 buffer 进入解码器的单调时钟毫秒值。 */
+    /** @return 最近一个压缩视频 buffer 进入解码器的 MonotonicClock 毫秒值；未采样时为 0。 */
     qint64 lastDecoderInputMSecs() const { return decoderInputLastBufferMs_.loadAcquire(); }
 
     /** @brief 设置配置文件指定的播放区域；rect 使用目标控件父窗口坐标。 */
@@ -224,8 +277,12 @@ signals:
     void prepared();
     /** @brief 播放位置或总时长更新，单位毫秒。 */
     void positionChanged(int positionMs, int durationMs);
-    /** @brief 视频探针观测到有效帧，参数为单调时钟毫秒值。 */
+    /** @brief 视频 sink 探针以排队方式通知 GUI 当前源到帧，每 200 ms 最多通知一次。
+     * @param[in] msecs 本帧到达时的 MonotonicClock 毫秒值。
+     */
     void videoFrameArrived(qint64 msecs);
+    /** @brief 当前媒体首次向画布提交帧；独立 overlay 路径以视频 sink 收到首帧为准。 */
+    void firstVideoFrameSubmitted();
     /** @brief MPP输出持续失速或时间轴异常，需要上层原地重建当前直播管线。 */
     void liveTimelineFaultDetected(const QString &reason);
     /** @brief 音频探针观测到有效帧，参数为单调时钟毫秒值。 */
@@ -283,6 +340,13 @@ private:
     void releasePipeline();
     /** @brief 仅最终析构在后台退出后清理尚未移交的引用；普通释放已在后台销毁旧图。 */
     void releasePipelineResources();
+    /** @brief 关闭旧源并在后台串行停止，退役时由 GUI 调度重试和销毁。
+     * @param[in] retireAfterStop true 时等待 NULL 确认后删除播放器。
+     */
+    void stopPipeline(bool retireAfterStop);
+    bool mediaLoadAccepted_ = true; /**< GUI 持有；切源开始时清除，成功提交 PAUSED 后恢复。 */
+    bool localAutoPlay_ = false; /**< 当前切源请求是否要求预卷完成后自动播放；仅 GUI 读写。 */
+    uint64_t firstOutputFrameRevision_ = 0; /**< 最近已通知首帧的媒体代次；仅 GUI 读写。 */
     std::unique_ptr<SerialWorkQueue> pipelineQueue_; /**< 每播放器专用串行队列；析构先等待，再释放回调目标。 */
     std::atomic<uint64_t> pipelineFrameRevision_{0}; /**< 后台已配置源对应代次，必须与意图代次相同才放行，避免旧任务重新打开新代次入口。 */
     std::atomic_bool pipelineFramesEnabled_{false}; /**< 停止/切源关闭旧帧入口；新源NULL及URI完成后才放行解码样本。 */
@@ -341,6 +405,11 @@ private:
     void resetPlaybackDiagnostics();
     /** @brief 清除提示音 preroll 引用和本次静音前导状态。 */
     void resetPromptPrerollState();
+    /** @brief 后台按已解码首帧的格式为获焦播报建立静音前导。
+     * @param[in] revision 当前播放代次。
+     * @return 实际送入静音为 OK，等待为 FLUSHING，故障为 ERROR。
+     */
+    GstFlowReturn primeManagedPrompt(quint64 revision);
     /** @brief 在UI计算音量快照，后台串行写入playbin，合并尚未执行的旧音量任务。 */
     void applyEffectiveVolume();
     /** @return UI线程计算的归一化有效音量，包含全部临时压低，供后台状态任务捕获。 */
@@ -348,7 +417,7 @@ private:
 
     /** @brief 在同步总线回调中绑定硬件视频窗口句柄。 */
     static GstBusSyncReply busSyncHandler(GstBus *bus, GstMessage *message, gpointer userData);
-    /** @brief 记录当前有效源的帧信息；延迟GUI信号按源代次过滤。
+    /** @brief 记录当前有效源到达视频 sink 的单调毫秒；延迟 GUI 信号按源代次过滤。
      * @param[in] pad GStreamer借用的探针pad；音频探针不使用此参数。
      * @param[in] info GStreamer借用的探针信息，仅buffer参与统计。
      * @param[in] userData 受管线停止/析构屏障保护的播放器指针。
@@ -442,19 +511,22 @@ private:
     QAtomicInt mediaGeneration_ {1};
     QAtomicInt h264AuAlignmentEnabled_ {0};
     QAtomicInt liveRtspMode_ {0};
-    QAtomicInt promptAudioMode_ {0};
-    QAtomicInt promptAudioPrimed_ {0};
-    QAtomicInt promptLeadInQueued_ {0};
+    std::atomic_bool priorityManaged_{false}; /**< true 必须通过统一输出门。 */
+    QAtomicInt promptAudioMode_ {0}; /**< 非0使用提示音时间线；创建解码管线前设置。 */
+    std::atomic<uint64_t> ringtoneToken_{0}; /**< 0 为普通媒体，1 为已停铃声，其他值区分铃声轮次。 */
+    QAtomicInt promptAudioPrimed_ {0}; /**< 本次提示音预热完成；换源、停止或受管暂停时清除。 */
+    QAtomicInt promptLeadInQueued_ {0}; /**< 本次静音已入队，受管提示音据此放行首帧。 */
     QAtomicInt liveDecoderAuAligned_ {-1};
     QAtomicInt liveDecoderCapsLogged_ {0};
     QAtomicInt liveWaitingForKeyframe_ {0};
     QAtomicInt liveCreditRecoveryPending_ {0};
     QAtomicInt liveCreditOverLimitConsecutiveAus_ {0};
     GstSample *promptPrerollSample_ = nullptr; /**< 提示音 PAUSED 阶段保留的首个 PCM 样本。 */
-    QAtomicInteger<qint64> lastVideoFrameMs_ {0};
+    QAtomicInteger<qint64> lastVideoFrameMs_ {0}; /**< 视频线程发布，GUI 读取的最近到帧单调毫秒；停播或切源清零。 */
     QAtomicInteger<qint64> lastAudioFrameMs_ {0};
-    QAtomicInteger<qint64> lastVideoSignalMs_ {0};
+    QAtomicInteger<qint64> lastVideoSignalMs_ {0}; /**< 最近排队到帧信号的单调毫秒；0 表示未排队。 */
     QAtomicInteger<qint64> lastAudioSignalMs_ {0};
+
 
     QAtomicInteger<quint64> appSinkSamples_ {0};
     QAtomicInteger<quint64> appSinkRgaFrames_ {0};
@@ -486,7 +558,7 @@ private:
     QAtomicInteger<quint64> decoderInputCorruptedFrames_ {0};
     QAtomicInteger<quint64> decoderOutputFrames_ {0};
     QAtomicInteger<quint64> decoderOutputCorruptedFrames_ {0};
-    QAtomicInteger<qint64> decoderInputLastBufferMs_ {0};
+    QAtomicInteger<qint64> decoderInputLastBufferMs_ {0}; /**< 解码探针发布的最近输入单调毫秒；诊断重置时清零。 */
     QAtomicInteger<qint64> decoderInputMaxGapMs_ {0};
     QAtomicInteger<qint64> decoderInputPtsOffsetNs_ {0};
     QAtomicInteger<qint64> decoderInputMaxAbsPtsOffsetNs_ {0};

@@ -2,7 +2,7 @@
  * @file SpeexDsp.h
  * @brief 通过原IAec/IPreprocessor接口封装可选SpeexDSP运行库与RAII状态。
  * @author Du lin
- * @note 最近修改：2026-11-04；修改人：Du lin；新增预处理当前AGC增益、感知响度及讲话概率只读GET观测；不支持只标未知，不调整参数或降级处理。
+ * @note 最近修改：2026-11-05；修改人：Du lin；删除只读诊断接口，保留原处理和配置接口。
  * @date 2026-10-31
  */
 #pragma once
@@ -66,8 +66,6 @@ public:
     void process(int16_t *inOut,int samples) override;
     /** @return 状态创建和全部控制参数是否成功。 */
     bool valid() const { return state_!=nullptr; }
-    /** @return 同线程读取原生GET_AGC_GAIN/LOUDNESS/PROB；仅已启用AGC才查增益，不支持保持未知。 */
-    VoiceCall::PreprocessorObservation observation() const;
 private:
     /** @brief 仅静态工厂使用的空状态构造。 */
     SpeexPreprocessor()=default;

@@ -2,8 +2,9 @@
  * @file volumepopup.cpp
  * @brief 从右侧滑入的触摸音量调节面板的实现。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-11-12；修改人：Du lin；触摸滑块在广播文件音频期间恢复原显示值并停止上报本地音量指令，避免无效调整影响播放状态。
  */
 
 #include "volumepopup.h"
@@ -52,12 +53,20 @@ VolumePanel::VolumePanel(AmpVolumeController *ctrl, QWidget *parent)
     lay->addWidget(m_label, 0, Qt::AlignHCenter);
     lay->addWidget(m_slider, 1, Qt::AlignHCenter);
 
+    // 拖动回调与平台写入共用焦点保护；广播期间滑块立即回到实际音量。
     connect(m_slider, &QSlider::valueChanged, this, [this](int v){
+        if (m_ctrl && m_ctrl->userVolumeBlocked()) {
+            qInfo() << "[audio] local slider volume ignored during prompt"
+                    << "requested=" << v << "current=" << m_ctrl->currentVolume();
+            setCurrentVolume(m_ctrl->currentVolume());
+            return;
+        }
         m_label->setText(QString("音量 %1").arg(v));
         if (m_ctrl) m_ctrl->setVolume(v); // 0关PA，>0开PA并设置
     });
 
     connect(m_slider, &QSlider::sliderReleased, this, [this](){
+        if (m_ctrl && m_ctrl->userVolumeBlocked()) return;
         emit manualVolumeChanged(m_slider->value(),QStringLiteral("Local manual volume adjustment：%1").arg(m_slider->value())); // 松开时发送最终值
     });
 

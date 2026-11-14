@@ -4,7 +4,7 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-10-24；修改人：Du lin；声明资源包版本进度信号，区分整包结束与重启调度结果。
+ * @note 最近修改：2026-11-12；修改人：Du lin；增加普通 MQTT 截图失效转发槽，通知待发回执重新获取画面。
  */
 
 #ifndef SETTINGSDIALOG_H
@@ -16,6 +16,7 @@
 #include <QHBoxLayout>
 #include <QStackedWidget>
 #include <QLabel>
+#include <QList>
 #include <QWidget>
 
 #include "components/multimedia/gst_player_widget.h"
@@ -93,6 +94,8 @@ private slots:
 
     /** @brief 切换到显示旋转页面。 */
     void onDisplayButtonClicked();
+    /** @brief 打开多媒体声音开关页。 */
+    void onSoundButtonClicked();
 
 private:
     /** @brief 创建导航栏和内容页面栈。 */
@@ -101,11 +104,13 @@ private:
     /** @brief 建立各子页面与多媒体主窗口之间的转发连接。 */
     void setupConnections();
 
-    /** @brief 按当前宽高重排设置导航。 */
+    /** @brief 按配置及实际宿主宽高选择导航，窄屏入口固定在顶部。 */
     void applyResponsiveLayout();
 
     /** @brief 创建带滚动兜底的普通设置页容器。 */
     QWidget *wrapScrollablePage(QWidget *page);
+    /** @return 由页面栈拥有、切换时同步保存的声音设置页。 */
+    QWidget *createSoundPage();
 
     /** @brief 将窗口限制到当前宿主的实际区域。 */
     void fitToHost();
@@ -116,13 +121,17 @@ private:
     QPushButton *systemInfoButton = nullptr;    /**< 系统信息按钮。 */
     QPushButton *standbyLockButton = nullptr;   /**< 待机和锁屏按钮。 */
     QPushButton *ftpButton = nullptr;           /**< FTP 设置按钮。 */
+    QPushButton *soundButton_ = nullptr;        /**< 声音设置导航。 */
+    QWidget *soundContainer_ = nullptr;          /**< 声音设置滚动容器。 */
     QPushButton *displayButton = nullptr;       /**< 显示方向设置按钮。 */
 
     QBoxLayout *mainLayout_ = nullptr;          /**< 可切换方向的设置窗口根布局。 */
-    QGridLayout *navigationLayout_ = nullptr;   /**< 横屏单列/窄屏网格导航。 */
-    QWidget *sidebarWidget_ = nullptr;          /**< 导航容器。 */
-    QuickNavigationWidget *quickNavigation_ = nullptr; /**< 共用 Quick 动画导航。 */
-    bool topNavigation_ = false;                /**< 当前是否使用顶部导航。 */
+    QGridLayout *navigationLayout_ = nullptr;   /**< 原生导航布局，窄屏网格或横屏单列回退。 */
+    QWidget *sidebarWidget_ = nullptr;          /**< 原生导航容器，按钮由其拥有。 */
+    QList<QPushButton *> navigationButtons_;   /**< 同时作为原生按钮顺序和 Quick 导航索引。 */
+    QPushButton *navigationBack_ = nullptr;     /**< 顶部原生导航的返回入口。 */
+    int navigationColumns_ = 1;                /**< 原生布局当前列数，尺寸变化时按需重排。 */
+    QuickNavigationWidget *quickNavigation_ = nullptr; /**< 横屏 Quick 动画导航。 */
     QString previousModuleId_;                  /**< 打开设置前的统一界面路由。 */
 
     QStackedWidget *contentStack; /**< 设置子页面内容栈。 */
@@ -155,6 +164,8 @@ public slots:
     void onCurrentRecordedFileChanged(const QString &fullPath);
     /** @brief 把当前播放截图转交 MQTT 页面。 */
     void onCurrentPlayImageChanged(const QString &base64Image);
+    /** @brief 将普通 MQTT 截图失效通知转交 MQTT 页面。 */
+    void invalidatePlayImage();
     /** @brief 把当前播放器音量转交 MQTT 页面。 */
     void onCurrentPlayVolumeChanged(int volume);
     /** @brief 上报本地手动音量变化。 */

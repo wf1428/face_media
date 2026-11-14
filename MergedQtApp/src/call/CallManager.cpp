@@ -3,11 +3,10 @@
  * @brief 实现双向通话的幂等信令、单会话约束、掉线兜底及异步音频收尾。
  * @author Du lin
  * @date 2026-10-29
- * @note 最近修改：2026-11-03；修改人：Du lin；保留原状态机及UI诊断；退出时先停止音频调度代理再释放借用的引擎，普通呼叫/挂断仍异步。
+ * @note 最近修改：2026-11-05；修改人：Du lin；移除物理键挂断分支，外呼等待时驱动铃声并提前申请音量焦点，接听或结束时停止铃声。
  */
 #include "CallManager.h"
 #include "AudioOutputFocus.h"
-#include "common/debug/ui_performance.h"
 #include <QJsonValue>
 #include <QDebug>
 
@@ -29,6 +28,7 @@ CallManager::CallManager(MqttIpcClient *ipc,QObject *parent):QObject(parent)
         if (state_!=Starting || !available()) return;
         if (!outgoing_ && !report(QStringLiteral("call.answer"))) { finish("disconnect",false); return; }
         timeout_.stop(); change(Talking); engine_->setTalking(true);
+        if (outgoing_) emit outgoingRingtoneChanged(RingtonePhase::Off);
     });
     connect(engine_,&AudioEngine::failed,this,[this](const QString &error) {
         emit logMessage(QStringLiteral("[call] %1 error=%2").arg(callId_,error));
@@ -41,12 +41,21 @@ CallManager::CallManager(MqttIpcClient *ipc,QObject *parent):QObject(parent)
         // ready/failed/finished 均排队到同一 UI 线程，不在音频线程析构 QThread。
         enginePending_=false;
         if (state_!=Ending && state_!=Idle) finish(QStringLiteral("audio_error"),true);
-        VoiceCall::releaseOutputVolume(this);
+        releaseOutput();
         if (state_==Ending) { retire(); callId_.clear(); change(Idle); }
     });
     connect(this,&CallManager::logMessage,this,[](const QString &text) { qInfo().noquote()<<text; });
 }
-CallManager::~CallManager() { adapter_->media(false); delete adapter_; adapter_=nullptr; engine_->stopAsync(); delete engine_; VoiceCall::releaseOutputVolume(this); }
+CallManager::~CallManager()
+{
+    emit outgoingRingtoneChanged(RingtonePhase::Off);
+    adapter_->media(false);
+    delete adapter_;
+    adapter_=nullptr;
+    engine_->stopAsync();
+    delete engine_;
+    releaseOutput();
+}
 void CallManager::configure(const QString &deviceId) {
     if (adapter_->deviceId()!=deviceId) { finish("route_changed",true); adapter_->configure(deviceId); }
     change(state_);
@@ -58,12 +67,8 @@ void CallManager::setOnline(bool online) {
     change(state_);
 }
 bool CallManager::handleIpc(const QJsonObject &obj) { return adapter_->handleIpc(obj); }
-/** @brief 保持原状态通知顺序，并仅向诊断模块传递通话标签。
- * @param[in] state 原目标状态；Idle请求诊断异步最终汇总，其他状态不延迟业务处理。
- */
 void CallManager::change(State state) {
     state_=state;
-    UiPerformance::setCallContext(state_==Idle ? QString() : callId_.isEmpty() ? QStringLiteral("pending") : callId_);
     const QStringList names={"空闲","正在呼叫物业","等待物业接听（排队中）","等待接听","正在连接语音","通话中","正在结束通话"};
     emit logMessage(QStringLiteral("[call] callId=%1 state=%2").arg(callId_).arg(int(state_)));
     emit changed(state_==Idle && cancelledRequest_ ? QStringLiteral("等待上一呼叫结束") :
@@ -83,24 +88,54 @@ void CallManager::requestCall() {
     if (!canRequestCall()) return;
     outgoing_=true;
     if (!adapter_->event(QStringLiteral("call.request"),{})) return;
-    change(Requesting); timeout_.start(30000);
+    timeout_.start(30000);
+    change(Requesting);
+    if (state_!=Requesting) return;
+    emit outgoingRingtoneChanged(RingtonePhase::Preparing);
+    prepareOutput();
 }
 void CallManager::answer() { if (state_==Ringing && !outgoing_) startAudio(); }
-void CallManager::pressCallButton() {
-    if (state_==Idle) requestCall();
-    else if (state_!=Ending) hangup();
+void CallManager::pressCallButton()
+{
+    requestCall();
 }
 void CallManager::hangup() { finish(QStringLiteral("hangup"),true); }
 void CallManager::startAudio() {
     if (state_!=Ringing && state_!=Queued) return;
+    if (outgoing_) emit outgoingRingtoneChanged(RingtonePhase::HandingOff);
     change(Starting);
-    VoiceCall::acquireOutputVolume(this,[this]() {
-        if (state_!=Starting || enginePending_) return;
-        enginePending_=true;engine_->begin();
+    prepareOutput();
+    beginAudioIfReady();
+}
+void CallManager::prepareOutput()
+{
+    if (outputRequested_) return;
+    outputRequested_=true;
+    VoiceCall::acquireOutputVolume(this, [this]() {
+        outputReady_=true;
+        if (state_==Starting) {
+            beginAudioIfReady();
+        } else if (outgoing_ && (state_==Requesting || state_==Queued || state_==Ringing)) {
+            emit outgoingRingtoneChanged(RingtonePhase::Playing);
+        }
     });
+}
+void CallManager::beginAudioIfReady()
+{
+    if (state_!=Starting || !outputReady_ || enginePending_) return;
+    enginePending_=true;
+    engine_->begin();
+}
+void CallManager::releaseOutput()
+{
+    if (!outputRequested_) return;
+    outputRequested_=false;
+    outputReady_=false;
+    VoiceCall::releaseOutputVolume(this);
 }
 void CallManager::finish(const QString &reason,bool notify) {
     if (state_==Idle || state_==Ending) return;
+    if (outgoing_) emit outgoingRingtoneChanged(RingtonePhase::Off);
     engine_->setTalking(false); adapter_->media(false); timeout_.stop();
     if (state_==Requesting && callId_.isEmpty() && reason!=QStringLiteral("busy")) {
         cancelledRequest_=true;
@@ -113,7 +148,7 @@ void CallManager::finish(const QString &reason,bool notify) {
     }
     if (notify && online_) report(QStringLiteral("call.hangup"),reason);
     change(Ending); engine_->stopAsync();
-    if (!enginePending_) { VoiceCall::releaseOutputVolume(this); retire(); callId_.clear(); change(Idle); }
+    if (!enginePending_) { releaseOutput(); retire(); callId_.clear(); change(Idle); }
 }
 bool CallManager::handleSignal(const QString &topic,const QJsonObject &payload)
 {

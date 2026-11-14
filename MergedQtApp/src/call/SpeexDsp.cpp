@@ -2,7 +2,7 @@
  * @file SpeexDsp.cpp
  * @brief 动态加载开源SpeexDSP并封装单线程AEC与温和预处理，缺库可安全旁路。
  * @author Du lin
- * @note 最近修改：2026-11-04；修改人：Du lin；预处理新增只读AGC增益/响度/讲话概率诊断，不改变SET参数、处理次序、异常和PCM输出。
+ * @note 最近修改：2026-11-05；修改人：Du lin；移除仅用于日志的 Speex 查询，保留 AEC、AGC、降噪和处理调用。
  * @date 2026-10-31
  */
 #include "SpeexDsp.h"
@@ -135,17 +135,4 @@ void SpeexPreprocessor::process(int16_t *inOut,int samples)
 {
     if (state_ && inOut && samples==VoiceCall::Samples)
         (void)api_->preProcess(static_cast<SpeexPreprocessState *>(state_),inOut);
-}
-
-/** @brief 获取当前状态的只读原生诊断；控制不支持不改变DSP有效性或增益。 */
-VoiceCall::PreprocessorObservation SpeexPreprocessor::observation() const
-{
-    VoiceCall::PreprocessorObservation result;if(!state_) return result;
-    auto *state=static_cast<SpeexPreprocessState *>(state_);spx_int32_t value=0;
-    if(config_.agcEnabled) {
-        if(api_->preCtl(state,SPEEX_PREPROCESS_GET_AGC_GAIN,&value)==0) { result.gainValid=true;result.gainDb=int(value); }
-        if(api_->preCtl(state,SPEEX_PREPROCESS_GET_AGC_LOUDNESS,&value)==0) result.loudness=int(value);
-    }
-    if(api_->preCtl(state,SPEEX_PREPROCESS_GET_PROB,&value)==0) result.speechProbability=int(value);
-    return result;
 }

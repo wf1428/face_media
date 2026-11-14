@@ -3,7 +3,7 @@
  * @brief 处理 MQTT 媒体命令、维护播放状态并构建协议响应包。
  *
  * @author Du lin
- * @note 最近修改：2026-11-04；修改人：Du lin；拆分后台配置准备与UI业务，后台使用已初始化路径快照避免重复补种媒体；过滤过期播放源并保留原音量/下载处理及协议。
+ * @note 最近修改：2026-11-12；修改人：Du lin；视频控制音量先记录请求再交给设备执行，避免同步回调报告实际音量后被请求值覆盖；广播期间被忽略的音量请求按实际值回执失败。
  * @date 2026-07-25
  */
 
@@ -737,6 +737,8 @@ bool MqttService::handleVideoControlMessage(const QString& topic, const QJsonObj
                             .arg(videoVolume));
         }
 
+        // 同线程回调可能立即报告广播期间保留的旧音量，不能在回调返回后再覆写请求值。
+        playInfo_.videoVolume = videoVolume;
         emit mqttVolumeReceived(videoVolume);
     } else {
         pendingVolumeAck_ = false;
@@ -745,8 +747,7 @@ bool MqttService::handleVideoControlMessage(const QString& topic, const QJsonObj
     }
 
     if(preparation.playbackObsolete) {
-        // 旧源已被后续指令替代；音量仍按原请求处理和回执，不回滚当前播放字段。
-        if(hasVideoVolume) playInfo_.videoVolume=videoVolume;
+        // 旧源已被后续指令替代；音量已在通知设备前记录，保留实际回报值。
         playInfo_.status=previousStatus;
         emit logMessage(QStringLiteral("videoControl播放操作已被后续指令替代，跳过旧源"));
         return true;
@@ -754,9 +755,6 @@ bool MqttService::handleVideoControlMessage(const QString& topic, const QJsonObj
 
     // 记录当前播放状态
     playInfo_.videoType = videoType.isEmpty() ? "NONE" : videoType;
-    if (hasVideoVolume) {
-        playInfo_.videoVolume = videoVolume;
-    }
 
     if (playInfo_.videoType != "LIVE") {
         playInfo_.videoUrl.clear();
@@ -1298,7 +1296,10 @@ bool MqttService::hasPendingVolumeAck() const
     return pendingVolumeAck_;
 }
 
-/** @brief 完成挂起的音量请求并发出统一结果信号。 */
+/** @brief 核对实际音量后完成挂起请求；未执行的广播期间请求不能回执成功。
+ * @param[in] ok 原音量处理链路是否完成。
+ * @param[in] reason 失败原因；实际音量不符时改用明确的忽略原因。
+ */
 void MqttService::notifyVolumeSetFinished(bool ok, const QString &reason)
 {
     if (!pendingVolumeAck_) {
@@ -1306,12 +1307,20 @@ void MqttService::notifyVolumeSetFinished(bool ok, const QString &reason)
         return;
     }
 
+    const bool ignored = ok && playInfo_.videoVolume != pendingVolumeValue_;
+    if (ignored) {
+        ok = false;
+        emit logMessage(QStringLiteral("广播音频播放期间忽略音量请求：requested=%1 actual=%2")
+                        .arg(pendingVolumeValue_).arg(playInfo_.videoVolume));
+    }
     // 更新当前播放信息里的音量状态日志
     if (ok) {
         playInfo_.deviceLog = QStringLiteral("Volume setting successful：%1").arg(pendingVolumeValue_);
         playInfo_.status = "ok";
     } else {
-        playInfo_.deviceLog = reason.trimmed().isEmpty()
+        playInfo_.deviceLog = ignored
+                ? QStringLiteral("Broadcast audio active; volume request ignored")
+                : reason.trimmed().isEmpty()
                 ? QStringLiteral("Volume setting failed")
                 : reason.trimmed();
         playInfo_.status = "error";

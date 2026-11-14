@@ -4,14 +4,14 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-04；修改人：Du lin；普通/高清均恢复一次根控件render，隐藏或非当前宿主视频不取帧、不走视频排除；可见视频在截图栈内禁用更新并恢复，保留尺寸、后台编码、缓存和有界上传。
+ * @note 最近修改：2026-11-13；修改人：Du lin；本地视频预卷后开播并在直播回退失败时换独立播放器；直播重试把链路检测和协议请求交给网络线程，GUI 仅使用有效结果切回。
  */
 
 #include "multimediademo.h"
 #include "common/configuration_work.h"
-#include "common/debug/ui_performance.h"
 #include <memory>
 #include "common/media_content_policy.h"
+#include "common/monotonic_clock.h"
 #include "common/ui_image_resources.h"
 #include "ui_multimediademo.h"
 #include <QGraphicsDropShadowEffect>
@@ -35,16 +35,10 @@
 #include <QFile>
 #include <QThread>
 #include <QUrl>
-#include <QTcpSocket>
-#include <QAbstractSocket>
-#include <QNetworkAccessManager>
-#include <QNetworkRequest>
-#include <QNetworkReply>
 #include <QVariant>
 #include <QProcess>
+#include <QPointer>
 #include <QRegExp>
-#include <QUdpSocket>
-#include <QHostAddress>
 #include <QStringList>
 #include <QVector>
 #include <QMap>
@@ -162,228 +156,6 @@ static QString normalizePlaybackModeForCfg(const QString &raw)
 }
 
 
-/**
- * @brief 读取网卡 carrier；valid 区分“链路断开”和“节点不可读”。
- */
-static bool readNetworkCarrierForLiveRetry(const QString &ifaceName, bool *valid)
-{
-    if (valid) {
-        *valid = false;
-    }
-
-    const QString carrierPath = QStringLiteral("/sys/class/net/%1/carrier").arg(ifaceName);
-    QFile f(carrierPath);
-    if (!f.exists() || !f.open(QIODevice::ReadOnly)) {
-        return false;
-    }
-
-    const QString v = QString::fromLatin1(f.readAll()).trimmed();
-    if (v.isEmpty()) {
-        return false;
-    }
-
-    if (valid) {
-        *valid = true;
-    }
-    return v == QStringLiteral("1");
-}
-
-/**
- * @return 直播重试前确认默认有线网卡链路可用时返回 true。
- */
-static bool isWiredLinkUpForLiveRetry()
-{
-    // T113/Tina 常见是 eth0，部分系统可能叫 end0。
-    // 优先检查明确的有线网口；如果这些 carrier 文件不存在，再退回扫描所有非 lo 网口。
-    const QStringList preferredIfaces = { QStringLiteral("eth0"), QStringLiteral("end0") };
-    for (const QString &iface : preferredIfaces) {
-        bool valid = false;
-        const bool up = readNetworkCarrierForLiveRetry(iface, &valid);
-        if (valid) {
-            return up;
-        }
-    }
-
-    QDir netDir(QStringLiteral("/sys/class/net"));
-    const QStringList ifaces = netDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
-
-    bool sawCarrier = false;
-    for (const QString &iface : ifaces) {
-        if (iface == QStringLiteral("lo")) {
-            continue;
-        }
-
-        bool valid = false;
-        const bool up = readNetworkCarrierForLiveRetry(iface, &valid);
-        if (!valid) {
-            continue;
-        }
-
-        sawCarrier = true;
-        if (up) {
-            return true;
-        }
-    }
-
-    // 没有 carrier 能力时不改变旧逻辑，避免误杀非标准网络环境。
-    return !sawCarrier;
-}
-
-/**
- * @return 当前直播重试应按裸 UDP 或 SRT 数据到达方式探测时返回 true。
- */
-static bool isRawUdpOrSrtLiveKindForLiveRetry(const QString &scheme, const QString &kind)
-{
-    const QString s = scheme.trimmed().toLower();
-    const QString k = kind.trimmed().toLower();
-    return s == QStringLiteral("udp") || s == QStringLiteral("srt") ||
-           k == QStringLiteral("udp") || k == QStringLiteral("srt") ||
-           k == QStringLiteral("multicast") || k.contains(QStringLiteral("multicast"));
-}
-
-/**
- * @return 当前直播重试应按裸 UDP 数据流探测时返回 true。
- */
-static bool isRawUdpLiveKindForLiveRetry(const QString &scheme, const QString &kind)
-{
-    const QString s = scheme.trimmed().toLower();
-    const QString k = kind.trimmed().toLower();
-    return s == QStringLiteral("udp") ||
-           k == QStringLiteral("udp") ||
-           k == QStringLiteral("multicast") ||
-           k.contains(QStringLiteral("multicast"));
-}
-
-/** @return 文本地址属于 IPv4 组播范围时返回 true。 */
-static bool isMulticastIpv4ForLiveRetry(const QString &ipText);
-
-/** @brief 直播重试流程解析出的 UDP 单播或组播目标。 */
-struct UdpLiveProbeTargetForLiveRetry
-{
-    QString host;          /**< 目标 IPv4 地址或主机名。 */
-    quint16 port = 0;      /**< UDP 端口；0 表示未解析。 */
-    bool ok = false;       /**< 地址与端口均有效时为 true。 */
-    bool multicast = false; /**< 目标属于 IPv4 组播范围时为 true。 */
-};
-
-/**
- * @brief 从直播 URL 解析 UDP 地址、端口及组播属性。
- */
-static UdpLiveProbeTargetForLiveRetry parseUdpLiveProbeTargetForLiveRetry(const QString &url)
-{
-    UdpLiveProbeTargetForLiveRetry target;
-
-    const QString text = url.trimmed();
-    const QUrl u(text);
-
-    QString host = u.host().trimmed();
-    int port = u.port();
-
-    // 兼容常见写法：udp://239.1.1.1:5000、udp://@239.1.1.1:5000、
-    // udp://0.0.0.0:5000。部分 Qt 版本对 udp://@host:port 的解析不稳定，
-    // 所以这里再做一次文本兜底解析。
-    if (host.isEmpty() || port <= 0) {
-        QRegExp rx(QStringLiteral("udp://@?([^/:\\?]+):(\\d+)"));
-        if (rx.indexIn(text) >= 0) {
-            if (host.isEmpty()) {
-                host = rx.cap(1).trimmed();
-            }
-            if (port <= 0) {
-                bool ok = false;
-                const int parsedPort = rx.cap(2).toInt(&ok);
-                if (ok) {
-                    port = parsedPort;
-                }
-            }
-        }
-    }
-
-    if (port <= 0 || port > 65535) {
-        return target;
-    }
-
-    if (host.isEmpty()) {
-        host = QStringLiteral("0.0.0.0");
-    }
-
-    target.host = host;
-    target.port = static_cast<quint16>(port);
-    target.ok = true;
-    target.multicast = isMulticastIpv4ForLiveRetry(host);
-    return target;
-}
-
-/**
- * @return 文本地址属于 224.0.0.0/4 时返回 true。
- */
-static bool isMulticastIpv4ForLiveRetry(const QString &ipText)
-{
-    QString ip = ipText.trimmed();
-    const int slash = ip.indexOf('/');
-    if (slash >= 0) {
-        ip = ip.left(slash);
-    }
-
-    const QStringList parts = ip.split('.');
-    if (parts.size() != 4) {
-        return false;
-    }
-
-    bool ok = false;
-    const int first = parts.at(0).toInt(&ok);
-    return ok && first >= 224 && first <= 239;
-}
-
-/**
- * @return SDP 连接字段声明组播地址时返回 true。
- */
-static bool sdpLooksLikeMulticastForLiveRetry(const QString &sdp)
-{
-    const QStringList lines = sdp.split('\n', QString::SkipEmptyParts);
-    for (QString line : lines) {
-        line = line.trimmed();
-        if (!line.startsWith(QStringLiteral("c=IN IP4"))) {
-            continue;
-        }
-
-        const QStringList fields = line.split(QRegExp("\\s+"), QString::SkipEmptyParts);
-        if (fields.size() >= 3 && isMulticastIpv4ForLiveRetry(fields.at(2))) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/**
- * @brief 按 URL scheme 和扩展名推断写入配置的直播类型。
- */
-static QString detectLiveKindFromUrlForCfg(const QString &url)
-{
-    const QString lower = url.trimmed().toLower();
-    if (lower.startsWith(QStringLiteral("rtsp://"))) {
-        return QStringLiteral("rtsp");
-    }
-    if (lower.startsWith(QStringLiteral("rtmp://")) || lower.startsWith(QStringLiteral("rtmps://"))) {
-        return QStringLiteral("rtmp");
-    }
-    if (lower.startsWith(QStringLiteral("srt://"))) {
-        return QStringLiteral("srt");
-    }
-    if (lower.startsWith(QStringLiteral("udp://"))) {
-        return QStringLiteral("udp");
-    }
-    if (lower.startsWith(QStringLiteral("http://")) || lower.startsWith(QStringLiteral("https://"))) {
-        if (lower.contains(QStringLiteral(".m3u8"))) {
-            return QStringLiteral("hls");
-        }
-        if (lower.contains(QStringLiteral(".ts"))) {
-            return QStringLiteral("http-ts");
-        }
-        return QStringLiteral("live");
-    }
-    return QStringLiteral("live");
-}
-
 /** @brief 由功能开关选出的当前 MQTT 路由摘要。 */
 struct ActiveMqttRouteInfo
 {
@@ -446,355 +218,7 @@ static ActiveMqttRouteInfo resolveActiveMqttRoute(QSettings &settings)
     return info;
 }
 
-/**
- * @brief 从 RTSP 状态行解析三位状态码。
- */
-static int parseRtspStatusCodeForLiveRetry(const QByteArray &statusLine)
-{
-    const QList<QByteArray> parts = statusLine.trimmed().split(' ');
-    if (parts.size() < 2) {
-        return 0;
-    }
 
-    bool ok = false;
-    const int code = parts.at(1).toInt(&ok);
-    return ok ? code : 0;
-}
-
-/**
- * @brief 从 RTSP 头部解析 Content-Length。
- */
-static int parseRtspContentLengthForLiveRetry(const QByteArray &header)
-{
-    const QList<QByteArray> lines = header.split('\n');
-    for (QByteArray line : lines) {
-        line = line.trimmed();
-        const int colon = line.indexOf(':');
-        if (colon <= 0) {
-            continue;
-        }
-
-        const QByteArray key = line.left(colon).trimmed().toLower();
-        if (key != "content-length") {
-            continue;
-        }
-
-        bool ok = false;
-        const int len = line.mid(colon + 1).trimmed().toInt(&ok);
-        return ok && len >= 0 ? len : 0;
-    }
-
-    return 0;
-}
-
-/** @brief 直播重试流程从 TCP 缓冲区解析出的 RTSP 响应。 */
-struct RtspProbeResponse
-{
-    bool complete = false;  /**< 头部和 Content-Length 正文均已收齐。 */
-    int statusCode = 0;     /**< RTSP 三位状态码；0 表示未解析。 */
-    QString statusLine;     /**< 原始 RTSP 状态行。 */
-    QByteArray body;        /**< SDP 或其他响应正文。 */
-    int consumedBytes = 0;  /**< 当前响应在累计缓冲区中占用的字节数。 */
-};
-
-/**
- * @brief 从累计 TCP 缓冲区提取一个完整 RTSP 响应。
- */
-static RtspProbeResponse parseRtspResponseForLiveRetry(const QByteArray &buffer)
-{
-    RtspProbeResponse resp;
-
-    int headerEnd = buffer.indexOf("\r\n\r\n");
-    int sepLen = 4;
-    if (headerEnd < 0) {
-        headerEnd = buffer.indexOf("\n\n");
-        sepLen = 2;
-    }
-    if (headerEnd < 0) {
-        return resp;
-    }
-
-    const QByteArray header = buffer.left(headerEnd);
-    const int firstLineEnd = header.indexOf('\n');
-    const QByteArray statusLine = (firstLineEnd >= 0 ? header.left(firstLineEnd) : header).trimmed();
-    const int contentLength = parseRtspContentLengthForLiveRetry(header);
-
-    const int totalLen = headerEnd + sepLen + contentLength;
-    if (buffer.size() < totalLen) {
-        return resp;
-    }
-
-    resp.complete = true;
-    resp.statusCode = parseRtspStatusCodeForLiveRetry(statusLine);
-    resp.statusLine = QString::fromLatin1(statusLine);
-    resp.body = buffer.mid(headerEnd + sepLen, contentLength);
-    resp.consumedBytes = totalLen;
-    return resp;
-}
-
-/**
- * @brief 从 SDP 中选择视频媒体段的 control 值。
- * @param sdpBody RTSP DESCRIBE 响应中的 SDP 正文字节。
- * @return 首个视频媒体段内的非空 control；未找到时返回空字符串。
- * @note 不使用会话级或音频轨的 control 来证明视频轨存在。
- */
-static QString findRtspVideoControlForLiveRetry(const QByteArray &sdpBody)
-{
-    const QString sdp = QString::fromUtf8(sdpBody);
-    const QStringList lines = sdp.split('\n', QString::SkipEmptyParts);
-
-    bool inVideoBlock = false;
-
-    for (QString line : lines) {
-        line = line.trimmed();
-        if (line.isEmpty()) {
-            continue;
-        }
-
-        if (line.startsWith(QStringLiteral("m="))) {
-            inVideoBlock = line.startsWith(QStringLiteral("m=video"));
-            continue;
-        }
-
-        if (!line.startsWith(QStringLiteral("a=control:"))) {
-            continue;
-        }
-
-        const QString control = line.mid(QStringLiteral("a=control:").size()).trimmed();
-        if (control.isEmpty()) {
-            continue;
-        }
-
-        if (inVideoBlock) {
-            return control;
-        }
-    }
-
-    return QString();
-}
-
-/**
- * @brief 将 SDP control 字段解析为绝对 RTSP 地址。
- */
-static QString buildRtspControlUrlForLiveRetry(const QUrl &baseUrl, const QString &control)
-{
-    const QString c = control.trimmed();
-    if (c.isEmpty() || c == QStringLiteral("*")) {
-        return baseUrl.toString(QUrl::RemoveQuery | QUrl::RemoveFragment);
-    }
-
-    const QString lower = c.toLower();
-    if (lower.startsWith(QStringLiteral("rtsp://")) ||
-        lower.startsWith(QStringLiteral("rtsps://"))) {
-        return c;
-    }
-
-    if (c.startsWith('/')) {
-        QUrl u = baseUrl;
-        u.setPath(c);
-        u.setQuery(QString());
-        u.setFragment(QString());
-        return u.toString();
-    }
-
-    QString base = baseUrl.toString(QUrl::RemoveQuery | QUrl::RemoveFragment);
-    if (!base.endsWith('/')) {
-        base += '/';
-    }
-    return base + c;
-}
-
-/**
- * @brief 发送用于直播源预检的 RTSP DESCRIBE 请求。
- */
-static void sendRtspDescribeForLiveRetry(QTcpSocket *sock, const QString &url)
-{
-    QByteArray req;
-    req += "DESCRIBE ";
-    req += QUrl(url).toEncoded(QUrl::FullyEncoded);
-    req += " RTSP/1.0\r\n";
-    req += "CSeq: 1\r\n";
-    req += "Accept: application/sdp\r\n";
-    req += "User-Agent: qt_ycest-live-probe\r\n";
-    req += "\r\n";
-    sock->write(req);
-    sock->flush();
-}
-
-/**
- * @brief 发送用于确认媒体轨可用性的 RTSP SETUP 请求。
- */
-static void sendRtspSetupForLiveRetry(QTcpSocket *sock, const QString &trackUrl)
-{
-    QByteArray req;
-    req += "SETUP ";
-    req += QUrl(trackUrl).toEncoded(QUrl::FullyEncoded);
-    req += " RTSP/1.0\r\n";
-    req += "CSeq: 2\r\n";
-    req += "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n";
-    req += "User-Agent: qt_ycest-live-probe\r\n";
-    req += "\r\n";
-    sock->write(req);
-    sock->flush();
-}
-
-
-/**
- * @return HTTP 状态码表示成功时返回 true。
- */
-static bool isHttpSuccessStatusForLiveRetry(int statusCode)
-{
-    return statusCode == 200 || statusCode == 204 || statusCode == 206;
-}
-
-/**
- * @return HTTP 状态码表示重定向时返回 true。
- */
-static bool isHttpRedirectStatusForLiveRetry(int statusCode)
-{
-    return statusCode == 301 || statusCode == 302 || statusCode == 303 ||
-           statusCode == 307 || statusCode == 308;
-}
-
-/**
- * @return 响应正文更像 HTML 错误页而非媒体数据时返回 true。
- */
-static bool isProbablyHtmlBodyForLiveRetry(const QByteArray &body)
-{
-    const QByteArray trimmed = body.left(256).trimmed().toLower();
-    return trimmed.startsWith("<!doctype html") ||
-           trimmed.startsWith("<html") ||
-           trimmed.contains("<html");
-}
-
-/**
- * @return 正文包含 HLS 播放列表标记时返回 true。
- */
-static bool isLikelyHlsPlaylistForLiveRetry(const QByteArray &body)
-{
-    const QByteArray b = body.left(8192).trimmed();
-    if (!b.startsWith("#EXTM3U")) {
-        return false;
-    }
-
-    return b.contains("#EXT-X-STREAM-INF") ||
-           b.contains("#EXT-X-TARGETDURATION") ||
-           b.contains("#EXTINF") ||
-           b.contains(".ts") ||
-           b.contains(".m4s");
-}
-
-/**
- * @return 数据具有 MPEG-TS 同步字节特征时返回 true。
- */
-static bool isLikelyTsBodyForLiveRetry(const QByteArray &body)
-{
-    if (body.size() < 188) {
-        return false;
-    }
-
-    // MPEG-TS 包长 188，正常情况下同步字节是 0x47。
-    // Range/HTTP 分片不一定从包边界开始，因此只在前几个偏移内找连续同步字节。
-    for (int offset = 0; offset < 188 && offset < body.size(); ++offset) {
-        if (static_cast<unsigned char>(body.at(offset)) != 0x47) {
-            continue;
-        }
-        const int next = offset + 188;
-        if (next < body.size() && static_cast<unsigned char>(body.at(next)) == 0x47) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/**
- * @return 数据具有 FLV 文件头时返回 true。
- */
-static bool isLikelyFlvBodyForLiveRetry(const QByteArray &body)
-{
-    return body.size() >= 3 && body.left(3) == "FLV";
-}
-
-/**
- * @return 数据具有 MP4 box 文件头时返回 true。
- */
-static bool isLikelyMp4BodyForLiveRetry(const QByteArray &body)
-{
-    return body.size() >= 12 && body.mid(4, 4) == "ftyp";
-}
-
-/**
- * @brief 综合 URL、Content-Type 和正文魔数判断 HTTP 直播内容。
- */
-static bool isLikelyLiveHttpBodyForLiveRetry(const QString &url,
-                                             const QString &contentType,
-                                             const QByteArray &body,
-                                             QString *detail)
-{
-    const QString lowerUrl = url.toLower();
-    const QString ct = contentType.toLower();
-
-    if (lowerUrl.contains(QStringLiteral(".m3u8")) ||
-        ct.contains(QStringLiteral("application/vnd.apple.mpegurl")) ||
-        ct.contains(QStringLiteral("application/x-mpegurl")) ||
-        ct.contains(QStringLiteral("mpegurl"))) {
-        if (isLikelyHlsPlaylistForLiveRetry(body)) {
-            if (detail) *detail = QStringLiteral("HLS playlist ok");
-            return true;
-        }
-        if (detail) *detail = QStringLiteral("HLS playlist invalid or empty");
-        return false;
-    }
-
-    if (lowerUrl.contains(QStringLiteral(".ts")) || ct.contains(QStringLiteral("mp2t"))) {
-        if (isLikelyTsBodyForLiveRetry(body) || ct.contains(QStringLiteral("mp2t"))) {
-            if (detail) *detail = QStringLiteral("HTTP-TS ok");
-            return true;
-        }
-        if (detail) *detail = QStringLiteral("HTTP-TS body invalid");
-        return false;
-    }
-
-    if (lowerUrl.contains(QStringLiteral(".flv")) || ct.contains(QStringLiteral("flv"))) {
-        if (isLikelyFlvBodyForLiveRetry(body) || ct.contains(QStringLiteral("flv"))) {
-            if (detail) *detail = QStringLiteral("HTTP-FLV ok");
-            return true;
-        }
-        if (detail) *detail = QStringLiteral("HTTP-FLV body invalid");
-        return false;
-    }
-
-    if (lowerUrl.contains(QStringLiteral(".mp4")) || ct.contains(QStringLiteral("mp4"))) {
-        if (isLikelyMp4BodyForLiveRetry(body) || ct.contains(QStringLiteral("mp4"))) {
-            if (detail) *detail = QStringLiteral("HTTP-MP4 ok");
-            return true;
-        }
-        if (detail) *detail = QStringLiteral("HTTP-MP4 body invalid");
-        return false;
-    }
-
-    // 未带典型扩展名的 HTTP 直播，例如 /live、/stream。
-    // 不能只看 200，否则普通网页也会误切 LIVE；至少要求不是 HTML，且 content-type 或 body 看起来像媒体。
-    if (isProbablyHtmlBodyForLiveRetry(body)) {
-        if (detail) *detail = QStringLiteral("HTTP body is html, not media stream");
-        return false;
-    }
-
-    if (ct.startsWith(QStringLiteral("video/")) ||
-        ct.startsWith(QStringLiteral("audio/")) ||
-        ct.contains(QStringLiteral("octet-stream")) ||
-        ct.contains(QStringLiteral("mpegurl")) ||
-        isLikelyTsBodyForLiveRetry(body) ||
-        isLikelyFlvBodyForLiveRetry(body) ||
-        isLikelyMp4BodyForLiveRetry(body)) {
-        if (detail) *detail = QStringLiteral("generic HTTP media ok");
-        return true;
-    }
-
-    if (detail) *detail = QStringLiteral("HTTP response is not recognized as media stream") +
-                          QStringLiteral(" content-type=") + contentType;
-    return false;
-}
 
 } // namespace
 
@@ -945,7 +369,6 @@ MultimediaDemo::MultimediaDemo(QWidget *parent) :
     // 保持 GStreamer 软件音量为 1.0，避免百分比在软硬件两端重复衰减。
     if (mediaPlayer) mediaPlayer->setVolume(1.0f);
     if (nextVideoPlayer) nextVideoPlayer->setVolume(1.0f);
-    if (m_liveProbePlayer) m_liveProbePlayer->setVolume(0.0f);
     m_ampCtrl->setVolume(v);
 
     // 建面板
@@ -1133,6 +556,7 @@ void MultimediaDemo::suspendPlaybackForModuleSwitch()
     if (m_modulePlaybackSuspended) return;
 
     m_modulePlaybackSuspended = true;
+    invalidatePendingLocalPlaybackStarts();
     // m_liveDesired/m_desiredLiveUrl 是唯一 LIVE 业务目标。离开多媒体主页时
     // 只停止解码和探测资源，不清除目标；返回后先播放本地，再重新验证
     // LIVE 确实有媒体数据，避免把旧的连接状态误当成当前可用。
@@ -1143,10 +567,7 @@ void MultimediaDemo::suspendPlaybackForModuleSwitch()
     stopLiveWatchdog();
     stopLiveRetry();
 
-    if (m_liveProbePlayer) {
-        m_liveProbePlayer->stop();
-    }
-    m_liveProbeRunning = false;
+    cancelLiveStreamProbe();
 
     disconnect(mediaPlayer, &GstPlayerWidget::videoFinished,
                this, &MultimediaDemo::playNextVideo);
@@ -1188,7 +609,7 @@ bool MultimediaDemo::applyVideoDisplayPolicy()
     stopEmptyVideoListWatch();
     stopLiveWatchdog();
     stopLiveRetry();
-    m_liveProbeRunning = false;
+    cancelLiveStreamProbe();
     m_isLiveMode = false;
     m_liveSwitching = false;
     m_liveRecovering = false;
@@ -1198,8 +619,6 @@ bool MultimediaDemo::applyVideoDisplayPolicy()
         mediaPlayer->stop();
     if (nextVideoPlayer && nextVideoPlayer->hasActiveMedia())
         nextVideoPlayer->stop();
-    if (m_liveProbePlayer && m_liveProbePlayer->hasActiveMedia())
-        m_liveProbePlayer->stop();
     stopVideoRectPictureDisplay(true);
     if (videoWidget)
         videoWidget->hide();
@@ -1919,7 +1338,8 @@ void MultimediaDemo::playVideoRectMediaAt(int index)
 /**
  * @brief 让主播放器播放 videoRect 视频项。
  * @param filePath 待读取的文件路径。
- * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
+ * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；
+ *       等待 GStreamer 预卷完成后播放；直播回退期间为每个文件设置首帧期限并记录耗时。
  */
 void MultimediaDemo::playVideoRectVideo(const QString &filePath)
 {
@@ -1945,8 +1365,13 @@ void MultimediaDemo::playVideoRectVideo(const QString &filePath)
         return;
     }
 
+    qInfo() << "[audio-path] mode switch" << "target=local"
+            << "player=" << mediaPlayer << "wasLive=" << m_isLiveMode
+            << "localName=" << QFileInfo(filePath).fileName()
+            << "playlistIndex=" << currentVideoRectMediaIndex;
+
     // 本地视频切文件时会 stop/setMedia/play，同一时刻不要让后台 LIVE 探测播放器抢占 GStreamer 解码资源。
-    m_localPlayerBusyUntilMs = QDateTime::currentMSecsSinceEpoch() + 2000;
+    m_localPlayerBusyUntilMs = MonotonicClock::nowMs() + 2000;
 
     stopVideoRectPictureDisplay(true);
 
@@ -1991,12 +1416,102 @@ void MultimediaDemo::playVideoRectVideo(const QString &filePath)
                 this, &MultimediaDemo::playNextVideo,
                 Qt::QueuedConnection);
 
-        mediaPlayer->setMedia(filePath);
+        if (m_liveFallbackStartedMs > 0) {
+            const quint64 serial = issueLocalPlaybackStartSerial();
+            const QPointer<GstPlayerWidget> player = mediaPlayer;
+            m_liveFallbackAttemptMs = MonotonicClock::nowMs();
+            const int timeoutMs = m_liveFallbackReplacedPlayer ? 5000 : 2000;
+            QTimer::singleShot(timeoutMs, Qt::PreciseTimer, this, [this, player, serial]() {
+                if (!player || player != mediaPlayer || serial != m_localPlaybackStartSerial ||
+                    !m_liveFallbackAttemptMs) return;
+                recoverLiveFallbackPlayback(QStringLiteral("本地视频首帧超时"));
+            });
+        }
+
+        mediaPlayer->setMedia(filePath, true);
         mediaPlayer->requestDisplayRectUpdate();
-        mediaPlayer->play();
     }
 
-    LOG_VIDEO("videoRect 混播：开始播放视频:" << filePath);
+    LOG_VIDEO("videoRect 混播：已提交本地媒体加载:" << filePath);
+}
+
+/**
+ * @brief 恢复直播中断后的本地首帧，首次失败时脱离旧播放器并重试当前文件。
+ * @param[in] reason 切源、解码或首帧超时的诊断原因。
+ * @note GUI 线程调用；新播放器拥有独立队列，旧播放器在后台确认 NULL 后自销毁。
+ *       同时至多保留一条待清理旧管线；换管线仍失败时尝试下一项，整表失败后延迟重扫。
+ */
+void MultimediaDemo::recoverLiveFallbackPlayback(const QString &reason)
+{
+    if (!m_liveFallbackAttemptMs || !m_liveFallbackStartedMs || !mediaPlayer ||
+        m_isLiveMode || m_currentVideoRectIsImage || m_downloadPauseActive ||
+        m_modulePlaybackSuspended || !m_localPlaybackEnabled || !isVisible() || !applyVideoDisplayPolicy()) {
+        return;
+    }
+
+    qWarning() << "[视频播放] 本地回退尚未出帧" << "player=" << mediaPlayer
+               << "file=" << QFileInfo(m_currentVideoRectMediaPath).fileName()
+               << "attemptMs=" << MonotonicClock::nowMs() - m_liveFallbackAttemptMs
+               << "elapsedMs=" << MonotonicClock::nowMs() - m_liveFallbackStartedMs
+               << "reason=" << reason;
+    m_liveFallbackAttemptMs = 0;
+    const quint64 serial = issueLocalPlaybackStartSerial();
+
+    // 错误信号可能来自旧播放器的总线遍历；在该调用栈退出后再换绑。
+    const QPointer<GstPlayerWidget> failedPlayer = mediaPlayer;
+    QTimer::singleShot(0, this, [this, failedPlayer, serial]() {
+        if (!failedPlayer || failedPlayer != mediaPlayer || serial != m_localPlaybackStartSerial ||
+            !m_liveFallbackStartedMs || m_isLiveMode || m_currentVideoRectIsImage ||
+            m_downloadPauseActive || m_modulePlaybackSuspended || !m_localPlaybackEnabled ||
+            !isVisible() || !applyVideoDisplayPolicy()) return;
+
+        if (!m_liveFallbackReplacedPlayer && !m_liveFallbackRetiringPlayer) {
+            m_liveFallbackReplacedPlayer = true;
+            m_liveFallbackRetiringPlayer = failedPlayer;
+            const QString filePath = m_currentVideoRectMediaPath;
+            disconnect(failedPlayer.data(), nullptr, this, nullptr);
+            failedPlayer->setVideoOutput(nullptr);
+            failedPlayer->retire();
+            mediaPlayer = new GstPlayerWidget(this);
+            mediaPlayer->setVolume(failedPlayer->volume());
+            mediaPlayer->setDisplayRect(QRect(VideoDisplay_x, VideoDisplay_y,
+                                              VideoDisplay_x_Size, VideoDisplay_y_Size));
+            connectMainMediaPlayer();
+            qInfo() << "[视频播放] 本地回退换用独立播放器"
+                    << "old=" << failedPlayer.data() << "new=" << mediaPlayer;
+            playVideoRectVideo(filePath);
+            return;
+        }
+
+        if (!m_liveFallbackReplacedPlayer && m_liveFallbackRetiringPlayer) {
+            qWarning() << "[视频播放] 上一条旧直播管线仍在清理" << m_liveFallbackRetiringPlayer.data();
+        }
+
+        if (++m_liveFallbackFailedItems < videoRectMediaList.size()) {
+            playNextVideo();
+            return;
+        }
+
+        mediaPlayer->stop();
+        if (videoWidget) videoWidget->hide();
+        qWarning() << "[视频播放] 本地回退本轮无可用媒体，延迟重扫";
+        QTimer::singleShot(2000, this, [this, serial]() {
+            if (serial != m_localPlaybackStartSerial || !m_liveFallbackStartedMs || m_isLiveMode ||
+                m_downloadPauseActive || m_modulePlaybackSuspended || !m_localPlaybackEnabled ||
+                !isVisible() || !applyVideoDisplayPolicy()) return;
+            m_liveFallbackFailedItems = 0;
+            resumeLocalPlaylistFromStart();
+        });
+    });
+}
+
+/** @brief 清除本次直播回退的首帧等待和本地候选计数。 */
+void MultimediaDemo::clearLiveFallbackPlayback()
+{
+    m_liveFallbackStartedMs = 0;
+    m_liveFallbackAttemptMs = 0;
+    m_liveFallbackReplacedPlayer = false;
+    m_liveFallbackFailedItems = 0;
 }
 
 /**
@@ -2087,6 +1602,11 @@ void MultimediaDemo::playVideoRectImage(const QString &filePath)
 
     videoRectPictureTimer->start(qMax(1, VideoPic_disp_Time) * 1000);
 
+    if (m_liveFallbackStartedMs > 0) {
+        qInfo() << "[视频播放] 本地回退首项图片已显示"
+                << "elapsedMs=" << MonotonicClock::nowMs() - m_liveFallbackStartedMs;
+        clearLiveFallbackPlayback();
+    }
     LOG_IMAGE("videoRect 混播：显示图片:" << filePath);
 }
 
@@ -2325,11 +1845,12 @@ quint64 MultimediaDemo::issueLocalPlaybackStartSerial()
 
 
 /**
- * @brief 递增序号，使所有在途本地播放启动回调失效。
+ * @brief 递增序号并清除直播回退状态，使所有在途本地开播及恢复回调失效。
  */
 void MultimediaDemo::invalidatePendingLocalPlaybackStarts()
 {
     ++m_localPlaybackStartSerial;
+    clearLiveFallbackPlayback();
 }
 
 
@@ -2444,7 +1965,10 @@ void MultimediaDemo::resumeLocalPlaybackAfterDownload()
 }
 
 /**
- * @brief 更新非模态下载进度提示。
+ * @brief 更新非模态下载卡片，使普通 MQTT 截图重新采集卡片画面。
+ * @param[in] title 卡片标题，区分正在下载和下载完成等状态。
+ * @param[in] percent 下载百分比；控件将数值钳制在 0 到 100。
+ * @param[in] detail 进度卡片详情，可为空。
  */
 void MultimediaDemo::showDownloadProgressToast(const QString &title, int percent, const QString &detail)
 {
@@ -2453,15 +1977,17 @@ void MultimediaDemo::showDownloadProgressToast(const QString &title, int percent
     }
 
     m_downloadToast->showProgress(title, percent, detail);
+    invalidateMqttDownloadSnapshot();
 }
 
 /**
- * @brief 隐藏并重置下载进度提示。
+ * @brief 隐藏下载进度卡片，并作废可能仍含卡片的普通 MQTT 截图。
  */
 void MultimediaDemo::hideDownloadProgressToast()
 {
-    if (m_downloadToast) {
+    if (m_downloadToast && !m_downloadToast->isHidden()) {
         m_downloadToast->hideToast();
+        invalidateMqttDownloadSnapshot();
     }
 }
 
@@ -2668,7 +2194,7 @@ MultimediaDemo::~MultimediaDemo()
     delete m_elevatorDemoTimer;
     delete pictureTimer;
     delete mediaPlayer;
-    delete m_liveProbePlayer;
+    delete m_networkStatusMonitor;
     delete videoWidget;
     delete m_netInfoPanel;
     // 释放空调相关资源
@@ -2680,7 +2206,10 @@ MultimediaDemo::~MultimediaDemo()
     delete label_airCondiTemp;
 }
 
-//初始化UI组件
+/** @brief 初始化多媒体控件、定时器及截图回调。
+ * @note 视频帧探针提供单调毫秒，GUI 只接受当前直播检查启动后的到帧通知。
+ * @note 普通 MQTT 下载卡片与常规截图分别接收编码结果，两个处理器共用后台串行队列。
+ */
 void MultimediaDemo::initializeComponents()
 {
     LOG_INIT("开始初始化UI组件");
@@ -2776,11 +2305,6 @@ void MultimediaDemo::initializeComponents()
     mediaPlayer = new GstPlayerWidget(this);
     nextVideoPlayer = new GstPlayerWidget(this);
 
-    m_liveProbePlayer = new GstPlayerWidget(this);
-    m_liveProbePlayer->setPreloadMode(true);
-    m_liveProbePlayer->setVolume(0.0f);
-    m_liveProbePlayer->setVideoOutput(nullptr);
-
     // 绑定输出窗口
     mediaPlayer->setVideoOutput(videoWidget);
     nextVideoPlayer->setVideoOutput(nullptr);
@@ -2801,78 +2325,10 @@ void MultimediaDemo::initializeComponents()
             this, &MultimediaDemo::playNextVideo, Qt::QueuedConnection);
 
 
-    connect(mediaPlayer, &GstPlayerWidget::snapshotReady,
-            this, &MultimediaDemo::onVideoSnapshotReady);
-
-    connect(mediaPlayer, &GstPlayerWidget::snapshotFailed,
-            this, &MultimediaDemo::onVideoSnapshotFailed);
-
-//    qDebug() << "videoFinished emitted from thread:" << QThread::currentThread();
-//    qDebug() << "MultimediaDemo thread:" << this->thread();
-
-
-    // 监听错误，定位预加载是否失败
-    connect(mediaPlayer, &GstPlayerWidget::errorOccured, this, [this](const QString& msg){
-        qWarning() << "[GStreamer] mediaPlayer error:" << msg;
-        if (!m_isLiveMode) {
-            return;
-        }
-
-        if (!m_liveSourceValidated) {
-            if (!m_liveRecovering) {
-                // 新地址在产生任何真实视频帧前就由GStreamer报告致命错误，
-                // 延迟到当前setMedia/play调用栈结束后立即回本地，且不启动后台重试。
-                m_liveRecovering = true;
-                QTimer::singleShot(0, this, [this, msg]() {
-                    if (!m_isLiveMode || m_liveSourceValidated) {
-                        m_liveRecovering = false;
-                        return;
-                    }
-                    onLiveStreamInterrupted(QStringLiteral("live startup error: ") + msg, false);
-                });
-            }
-            return;
-        }
-
-        LOG_VIDEO("已验证LIVE播放器报告错误，等待10秒无帧watchdog确认网络中断:" << msg);
-    });
+    connectMainMediaPlayer();
     connect(nextVideoPlayer, &GstPlayerWidget::errorOccured, this, [](const QString& msg){
         qWarning() << "[GStreamer] nextVideoPlayer error:" << msg;
     });
-
-    // 后台 LIVE 探测已经改为 QTcpSocket 轻量探测。
-    // 不再使用 GstPlayerWidget 做探测，避免探测播放器误触发 prepared 后把前台从本地轮播切到 LIVE。
-
-    connect(mediaPlayer, &GstPlayerWidget::positionChanged, this, [this](qint64){
-        // 不再把 positionChanged 当作“收到新视频帧”。
-        // 组播/UDP 断流时底层管线可能仍然不报错，甚至 position timer 还能周期触发，
-        // 如果这里刷新 m_lastLiveFrameMs，会掩盖真实无帧状态，导致画面停在最后一帧不回本地。
-    });
-
-    connect(mediaPlayer, &GstPlayerWidget::videoFrameArrived,
-            this,
-            [this](qint64 msecs) {
-        if (m_isLiveMode &&
-            m_liveWatchdogStartMs > 0 &&
-            msecs >= m_liveWatchdogStartMs) {
-            m_lastLiveFrameMs = msecs;
-            if (!m_liveSourceValidated) {
-                m_liveSourceValidated = true;
-                persistPlaybackStateToNetCfg(QStringLiteral("LIVE"), QStringLiteral("LIVE"),
-                                             QStringLiteral("live_frame_validated"));
-                LOG_VIDEO("直播源已收到真实解码帧，后续断流允许后台重试");
-            }
-        }
-    }, Qt::QueuedConnection);
-
-    connect(mediaPlayer, &GstPlayerWidget::liveTimelineFaultDetected,
-            this,
-            [this](const QString &reason) {
-        if (!m_isLiveMode || !m_liveDesired || m_liveRecovering) return;
-        m_liveRecovering = true;
-        LOG_VIDEO("直播MPP输出持续失速或时间轴异常，原地完整重建LIVE管线:" << reason);
-        restartLivePipelineAfterDecoderStall(reason);
-    }, Qt::QueuedConnection);
 
     QTimer *qualityMonitorTimer = new QTimer(this);
     connect(qualityMonitorTimer, &QTimer::timeout, this, [this]() {
@@ -2907,6 +2363,19 @@ void MultimediaDemo::initializeComponents()
     // 截图后台处理线程
     // =========================
     m_snapshotProcessor = new SnapshotProcessor(this);
+    m_mqttDownloadSnapshotProcessor = new SnapshotProcessor(this);
+    connect(m_mqttDownloadSnapshotProcessor, &SnapshotProcessor::finished,
+            this, &MultimediaDemo::finishMqttDownloadSnapshot);
+    connect(m_mqttDownloadSnapshotProcessor, &SnapshotProcessor::failed, this, [this](const QString &reason) {
+        qWarning() << "[截图] MQTT 下载卡片编码失败:" << reason;
+        finishMqttDownloadSnapshot(QString());
+    });
+    connect(this, &MultimediaDemo::currentPlayImageChanged, this, [this](const QString &base64Image) {
+        // 本地网页也能触发常规截图。下载卡片请求只接受独立采集的当前图像。
+        if (!m_mqttDownloadSnapshotBusy && !(m_downloadToast && m_downloadToast->isVisible())) {
+            emit mqttPlayImageReady(base64Image);
+        }
+    });
 
     m_snapshotTimeoutTimer = new QTimer(this);
     m_snapshotTimeoutTimer->setSingleShot(true);
@@ -2998,6 +2467,84 @@ void MultimediaDemo::initializeComponents()
     LOG_INIT("UI组件初始化完成，初始标签状态设置完毕");
     LOG_INIT("初始显示状态: 楼层数字和状态标签已显示，方向/日期/星期标签根据配置显示");
 }
+
+/** @brief 把主播放器的错误、截图和到帧信号绑定到当前页面；换管线后可重复绑定新实例。 */
+void MultimediaDemo::connectMainMediaPlayer()
+{
+    connect(mediaPlayer, &GstPlayerWidget::snapshotReady,
+            this, &MultimediaDemo::onVideoSnapshotReady);
+
+    connect(mediaPlayer, &GstPlayerWidget::snapshotFailed,
+            this, &MultimediaDemo::onVideoSnapshotFailed);
+
+    connect(mediaPlayer, &GstPlayerWidget::errorOccured, this, [this](const QString& msg){
+        qWarning() << "[GStreamer] mediaPlayer error:" << msg;
+        if (!m_isLiveMode) {
+            recoverLiveFallbackPlayback(msg);
+            return;
+        }
+
+        if (!m_liveSourceValidated) {
+            if (!m_liveRecovering) {
+                // 新地址在产生任何真实视频帧前就由GStreamer报告致命错误，
+                // 延迟到当前setMedia/play调用栈结束后立即回本地，且不启动后台重试。
+                m_liveRecovering = true;
+                QTimer::singleShot(0, this, [this, msg]() {
+                    if (!m_isLiveMode || m_liveSourceValidated) {
+                        m_liveRecovering = false;
+                        return;
+                    }
+                    onLiveStreamInterrupted(QStringLiteral("live startup error: ") + msg, false);
+                });
+            }
+            return;
+        }
+
+        LOG_VIDEO("已验证LIVE播放器报告错误，等待10秒无帧watchdog确认网络中断:" << msg);
+    });
+    connect(mediaPlayer, &GstPlayerWidget::positionChanged, this, [this](qint64){
+        // 不再把 positionChanged 当作“收到新视频帧”。
+        // 组播/UDP 断流时底层管线可能仍然不报错，甚至 position timer 还能周期触发，
+        // 如果这里刷新 m_lastLiveFrameMs，会掩盖真实无帧状态，导致画面停在最后一帧不回本地。
+    });
+
+    const QPointer<GstPlayerWidget> player = mediaPlayer;
+    connect(mediaPlayer, &GstPlayerWidget::firstVideoFrameSubmitted, this, [this, player]() {
+        if (player != mediaPlayer || m_isLiveMode || !m_liveFallbackAttemptMs || m_downloadPauseActive ||
+            m_modulePlaybackSuspended || !m_localPlaybackEnabled || m_currentVideoRectIsImage) return;
+        qInfo() << "[视频播放] 本地回退已提交首帧"
+                << "player=" << mediaPlayer
+                << "file=" << QFileInfo(m_currentVideoRectMediaPath).fileName()
+                << "attemptMs=" << MonotonicClock::nowMs() - m_liveFallbackAttemptMs
+                << "elapsedMs=" << MonotonicClock::nowMs() - m_liveFallbackStartedMs;
+        clearLiveFallbackPlayback();
+    });
+    connect(mediaPlayer, &GstPlayerWidget::videoFrameArrived,
+            this,
+            [this, player](qint64 msecs) {
+        if (player == mediaPlayer && m_isLiveMode &&
+            m_liveWatchdogStartMs > 0 &&
+            msecs >= m_liveWatchdogStartMs) {
+            m_lastLiveFrameMs = qMax(m_lastLiveFrameMs, msecs);
+            if (!m_liveSourceValidated) {
+                m_liveSourceValidated = true;
+                persistPlaybackStateToNetCfg(QStringLiteral("LIVE"), QStringLiteral("LIVE"),
+                                             QStringLiteral("live_frame_validated"));
+                LOG_VIDEO("直播源已收到真实解码帧，后续断流允许后台重试");
+            }
+        }
+    }, Qt::QueuedConnection);
+
+    connect(mediaPlayer, &GstPlayerWidget::liveTimelineFaultDetected,
+            this,
+            [this, player](const QString &reason) {
+        if (player != mediaPlayer || !m_isLiveMode || !m_liveDesired || m_liveRecovering) return;
+        m_liveRecovering = true;
+        LOG_VIDEO("直播MPP输出持续失速或时间轴异常，原地完整重建LIVE管线:" << reason);
+        restartLivePipelineAfterDecoderStall(reason);
+    }, Qt::QueuedConnection);
+}
+
 
 /**
  * @brief 从设备配置文件加载显示、媒体和功能参数。
@@ -5149,6 +4696,10 @@ void MultimediaDemo::playNextPicture()
 void MultimediaDemo::showEvent(QShowEvent *e)
 {
     QWidget::showEvent(e);
+    // 页面重新显示时，原有卡片也会进入可采集范围。
+    if (m_downloadToast && !m_downloadToast->isHidden()) {
+        invalidateMqttDownloadSnapshot();
+    }
     if (m_pictureRefreshPending && PicDisplay_en) initPicturePlayer();
     if (m_directionMovie) {
         m_directionMovie->setPaused(false);
@@ -5183,14 +4734,20 @@ void MultimediaDemo::showEvent(QShowEvent *e)
 
 /**
  * @brief 页面隐藏时暂停不应在后台运行的交互状态。
+ * @param[in] e Qt 分派的隐藏事件，借用且仅在本次调用期间有效。
+ * @note 下载卡片随页面隐藏，作废可能仍含卡片的普通 MQTT 待发图像。
  */
 void MultimediaDemo::hideEvent(QHideEvent *e)
 {
+    if (m_downloadToast && !m_downloadToast->isHidden()) {
+        invalidateMqttDownloadSnapshot();
+    }
     if (m_directionMovie) {
         m_directionMovie->setPaused(true);
     }
     cancelAdminLongPress();
     m_localPlaybackEnabled = false;
+    invalidatePendingLocalPlaybackStarts();
     stopEmptyVideoListWatch();
 
     // 离开本页时，彻底停止8秒隐藏逻辑
@@ -5839,7 +5396,7 @@ void MultimediaDemo::persistPlaybackStateToNetCfg(const QString &targetMode,
     const QString target=normalizePlaybackModeForCfg(targetMode),current=normalizePlaybackModeForCfg(currentMode);
     if(target.isEmpty() || current.isEmpty()) { LOG_CONFIG("播放状态持久化失败：非法模式");return; }
     const QString liveUrl=!m_desiredLiveUrl.trimmed().isEmpty() ? m_desiredLiveUrl.trimmed() : m_streamUrl.trimmed();
-    const QString liveKind=!m_desiredLiveKind.trimmed().isEmpty() ? m_desiredLiveKind.trimmed().toLower() : detectLiveKindFromUrlForCfg(liveUrl);
+    const QString liveKind=!m_desiredLiveKind.trimmed().isEmpty() ? m_desiredLiveKind.trimmed().toLower() : LiveStreamProbe::kindFromUrl(liveUrl);
     const bool validated=m_liveSourceValidated;const auto path=netCfgPath();
     const auto updated=QDateTime::currentDateTime().toString(Qt::ISODate);
     const auto revision=++m_playbackPersistRevision;const QPointer<MultimediaDemo> alive(this);
@@ -5919,7 +5476,7 @@ void MultimediaDemo::restorePlaybackStateFromNetCfg()
             return;
         }
         if (liveKind.isEmpty()) {
-            liveKind = detectLiveKindFromUrlForCfg(liveUrl);
+            liveKind = LiveStreamProbe::kindFromUrl(liveUrl);
         }
 
         m_liveDesired = true;
@@ -5939,14 +5496,7 @@ void MultimediaDemo::restorePlaybackStateFromNetCfg()
             // 重启恢复时不要无条件直接打开 LIVE。
             // 如果网线/交换机/上游组播还没恢复，直接进入 GStreamer LIVE 容易再次卡死。
             // 保持默认本地轮播，后台定时探测；网络恢复后 probeLiveStream() 会切回 LIVE。
-            if (!isWiredLinkUpForLiveRetry()) {
-                persistPlaybackStateToNetCfg(QStringLiteral("LIVE"), QStringLiteral("RECORDED"),
-                                             QStringLiteral("restore_live_wait_link_down"));
-                LOG_VIDEO("恢复 LIVE 目标但网口未连通，保持本地轮播并后台监测:" << m_desiredLiveUrl);
-                return;
-            }
-
-            probeLiveStream(m_desiredLiveUrl);
+            requestLiveStreamProbe(m_desiredLiveUrl, true);
         });
 
         LOG_CONFIG("已根据 net_cfg.ini 恢复 LIVE 目标，等待后台探测: " << liveUrl << " kind=" << liveKind);
@@ -6014,6 +5564,7 @@ void MultimediaDemo::setStreamUrl(const QString& url, const QString& kind)
     m_desiredLiveUrl = u;
     m_desiredLiveKind = k;
     if (sourceChanged) {
+        cancelLiveStreamProbe();
         m_liveSourceValidated = false;
         m_liveProbeFailureLogElapsed.invalidate();
         m_liveProbeFailureLogUrl.clear();
@@ -6043,409 +5594,65 @@ void MultimediaDemo::setStreamUrl(const QString& url, const QString& kind)
     startLiveRetry();
 }
 
-/**
- * @brief 使用独立播放器预探测直播首帧，成功后再切换主播放器。
-  * @param url 待探测的直播地址。
- * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
+/** @brief 提交网络线程的直播源探测；只对仍有效的 LIVE 目标应用结果。
+ * @param[in] url 待探测直播地址。
  */
 void MultimediaDemo::probeLiveStream(const QString& url)
 {
-    if (!applyVideoDisplayPolicy())
-        return;
-    const QString probeUrl = url.trimmed();
-    if (probeUrl.isEmpty()) return;
-    if (!m_startupPlaybackReleased || m_modulePlaybackSuspended) {
-        LOG_VIDEO("多媒体播放尚未放行或模块已暂停，跳过直播探测:" << probeUrl);
-        return;
-    }
-    if (m_liveProbeRunning) return;
-
-    const bool logProbeAttempt = !m_liveProbeFailureLogElapsed.isValid() ||
-            m_liveProbeFailureLogUrl != probeUrl ||
-            m_liveProbeFailureLogElapsed.elapsed() >= kLiveProbeFailureLogIntervalMs;
-
-    if (!isWiredLinkUpForLiveRetry()) {
-        LOG_VIDEO("后台探测直播流跳过：网口 carrier=0，继续本地轮播等待网线恢复");
-        return;
-    }
-
-    const QUrl u(probeUrl);
-    QString scheme = u.scheme().toLower();
-    QString desiredKind = m_desiredLiveKind.trimmed().toLower();
-    if (desiredKind.isEmpty() || desiredKind == QStringLiteral("live")) {
-        desiredKind = detectLiveKindFromUrlForCfg(probeUrl);
-    }
-    if (scheme.isEmpty()) {
-        scheme = desiredKind;
-    }
-
-    auto switchIfStillWanted = [this, probeUrl, desiredKind, scheme](const QString &detail) {
-        // 一旦探测成功，结束本轮失败日志限流；以后再次失败时立即打印首条提示。
-        m_liveProbeFailureLogElapsed.invalidate();
-        m_liveProbeFailureLogUrl.clear();
-
-        if (!m_liveDesired || m_desiredLiveUrl.trimmed() != probeUrl || m_isLiveMode) {
-            LOG_VIDEO("后台探测直播流成功，但LIVE目标已变化，忽略切换:" << probeUrl);
-            return;
-        }
-
-        // 轻量探测是异步的；其回调可能晚于人体感应的模块切换。
-        // 人脸模块活动期间不能在后台重建解码链；LIVE 目标继续由
-        // m_liveDesired/m_desiredLiveUrl 保存，返回后重新验证。
-        if (m_modulePlaybackSuspended) {
-            LOG_VIDEO("后台探测直播流成功，但多媒体模块已暂停，等待返回后重新探测:"
-                      << probeUrl << detail);
-            return;
-        }
-
-        const QString kind = desiredKind.isEmpty()
-                ? (scheme.isEmpty() ? detectLiveKindFromUrlForCfg(probeUrl) : scheme)
-                : desiredKind;
-
-        LOG_VIDEO("后台探测直播流确认可用，准备切回正式LIVE:" << probeUrl << detail);
-        switchToLiveStream(probeUrl, kind);
-    };
-
-    auto startUdpTrafficProbeIfPossible = [this, probeUrl, switchIfStillWanted](const UdpLiveProbeTargetForLiveRetry &target) {
-        if (!target.ok || target.port == 0) {
-            LOG_VIDEO("后台 UDP 直播探测失败：URL 中没有有效端口，继续本地轮播:" << probeUrl);
-            return;
-        }
-
-        m_liveProbeRunning = true;
-
-        QUdpSocket *udp = new QUdpSocket(this);
-        udp->setProperty("yc_udp_probe_done", false);
-
-        auto finishUdpProbe = [this, udp, probeUrl, switchIfStillWanted](bool ok, const QString &detail) {
-            if (!udp || udp->property("yc_udp_probe_done").toBool()) {
-                return;
-            }
-
-            udp->setProperty("yc_udp_probe_done", true);
-            m_liveProbeRunning = false;
-
-            udp->close();
-            udp->deleteLater();
-
-            if (!ok) {
-                // 网线 carrier=1 但没有有效 UDP 媒体包时，保持本地轮播。
-                // 不在后台反复重启；只有已经切到 LIVE 后 watchdog 发现无真实帧，才记录状态并重启。
-                LOG_VIDEO("后台 UDP 直播探测失败:" << detail << " url=" << probeUrl);
-                return;
-            }
-
-            switchIfStillWanted(detail);
-        };
-
-        const bool bindOk = udp->bind(QHostAddress::AnyIPv4, target.port,
-                                      QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint);
-        if (!bindOk) {
-            finishUdpProbe(false, QStringLiteral("udp bind failed port=") + QString::number(target.port) +
-                           QStringLiteral(" error=") + udp->errorString());
-            return;
-        }
-
-        if (target.multicast) {
-            const bool joinOk = udp->joinMulticastGroup(QHostAddress(target.host));
-            if (!joinOk) {
-                finishUdpProbe(false, QStringLiteral("join multicast group failed group=") + target.host +
-                               QStringLiteral(" port=") + QString::number(target.port) +
-                               QStringLiteral(" error=") + udp->errorString());
-                return;
-            }
-        }
-
-        connect(udp, &QUdpSocket::readyRead, this, [udp, finishUdpProbe]() {
-            while (udp->hasPendingDatagrams()) {
-                QByteArray datagram;
-                const qint64 pendingSize = udp->pendingDatagramSize();
-                datagram.resize(static_cast<int>(qMin<qint64>(pendingSize, 2048)));
-                udp->readDatagram(datagram.data(), datagram.size());
-            }
-            finishUdpProbe(true, QStringLiteral("UDP media packet received"));
-        });
-
-        QTimer::singleShot(3500, udp, [finishUdpProbe]() {
-            finishUdpProbe(false, QStringLiteral("no UDP media packet within timeout"));
-        });
-
-        LOG_VIDEO("后台 UDP 直播探测等待媒体包:" << probeUrl
-                  << " group/host=" << target.host
-                  << " port=" << target.port
-                  << " multicast=" << target.multicast);
-    };
-
-    // 原始 UDP 组播不能只看 carrier。网线插着但上游没流量时，carrier-only 会误切 LIVE，
-    // 随后 GStreamer 无帧卡住再重启，形成循环。这里先加入组播/绑定端口等待真实 UDP 包。
-    if (isRawUdpLiveKindForLiveRetry(scheme, desiredKind)) {
-        startUdpTrafficProbeIfPossible(parseUdpLiveProbeTargetForLiveRetry(probeUrl));
-        return;
-    }
-
-    // SRT 没有引入 libsrt 的情况下做不了可靠轻量握手，仍只作为恢复触发；
-    // 如果实际切 LIVE 后没有真实视频帧，LIVE watchdog 会记录状态并重启。
-    if (isRawUdpOrSrtLiveKindForLiveRetry(scheme, desiredKind)) {
-        LOG_VIDEO("后台 SRT/特殊组播探测采用 carrier-only 策略:" << probeUrl);
-        QTimer::singleShot(0, this, [switchIfStillWanted]() {
-            switchIfStillWanted(QStringLiteral("SRT/special carrier up"));
-        });
-        return;
-    }
-
-    // HTTP/HTTPS/HLS/HTTP-TS/HTTP-FLV：使用 QNetworkAccessManager 做真正 HTTP 探测。
-    // 不能用裸 QTcpSocket 发 HEAD：HTTPS 不支持，很多流媒体服务也不支持 HEAD。
-    if (scheme == QStringLiteral("http") || scheme == QStringLiteral("https") ||
-        desiredKind == QStringLiteral("hls") || desiredKind == QStringLiteral("http-ts")) {
-        if (!u.isValid() || u.host().isEmpty()) {
-            LOG_VIDEO("后台 HTTP 探测直播流失败：URL 无效或 host 为空:" << probeUrl);
-            return;
-        }
-
-        m_liveProbeRunning = true;
-
-        QNetworkAccessManager *manager = new QNetworkAccessManager(this);
-        manager->setProperty("yc_probe_done", false);
-
-        QNetworkRequest req(u);
-        req.setRawHeader("User-Agent", "qt_ycest-live-probe");
-        req.setRawHeader("Accept", "*/*");
-        req.setRawHeader("Connection", "close");
-        req.setRawHeader("Range", "bytes=0-4095");
-#if QT_VERSION >= QT_VERSION_CHECK(5, 6, 0)
-        req.setAttribute(QNetworkRequest::FollowRedirectsAttribute, true);
-#endif
-
-        QNetworkReply *reply = manager->get(req);
-
-        auto finishHttpProbe = [this, manager, reply, probeUrl, switchIfStillWanted](bool ok, const QString &detail) {
-            if (!manager || manager->property("yc_probe_done").toBool()) {
-                return;
-            }
-
-            manager->setProperty("yc_probe_done", true);
-            m_liveProbeRunning = false;
-
-            if (reply) {
-                reply->abort();
-                reply->deleteLater();
-            }
-            manager->deleteLater();
-
-            if (!ok) {
-                LOG_VIDEO("后台 HTTP 探测直播流失败:" << detail << " url=" << probeUrl);
-                return;
-            }
-
-            switchIfStillWanted(detail);
-        };
-
-        connect(reply, &QNetworkReply::finished, this, [reply, finishHttpProbe, probeUrl]() {
-            const int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-            const QString contentType = QString::fromLatin1(reply->rawHeader("Content-Type"));
-            const QByteArray body = reply->readAll();
-
-            if (isHttpRedirectStatusForLiveRetry(statusCode)) {
-                // FollowRedirectsAttribute 正常会自动跟随；如果仍拿到重定向，说明没有最终媒体响应，不直接切 LIVE。
-                finishHttpProbe(false, QStringLiteral("HTTP redirect not resolved status=") + QString::number(statusCode));
-                return;
-            }
-
-            if (!isHttpSuccessStatusForLiveRetry(statusCode)) {
-                finishHttpProbe(false, QStringLiteral("HTTP status=") + QString::number(statusCode));
-                return;
-            }
-
-            QString detail;
-            if (!isLikelyLiveHttpBodyForLiveRetry(probeUrl, contentType, body, &detail)) {
-                finishHttpProbe(false, detail);
-                return;
-            }
-
-            finishHttpProbe(true, detail);
-        });
-
-        connect(reply, QOverload<QNetworkReply::NetworkError>::of(&QNetworkReply::error),
-                this, [finishHttpProbe](QNetworkReply::NetworkError) {
-            finishHttpProbe(false, QStringLiteral("network reply error"));
-        });
-
-        QTimer::singleShot(4000, reply, [finishHttpProbe]() {
-            finishHttpProbe(false, QStringLiteral("timeout"));
-        });
-
-        LOG_VIDEO("后台 HTTP 探测直播流:" << probeUrl);
-        return;
-    }
-
-    const QString host = u.host();
-    if (host.isEmpty()) {
-        LOG_VIDEO("后台探测直播流失败：URL host 为空:" << probeUrl);
-        return;
-    }
-
-    int port = u.port();
-    if (port <= 0) {
-        if (scheme == QStringLiteral("rtsp")) {
-            port = 554;
-        } else if (scheme == QStringLiteral("rtmp")) {
-            port = 1935;
-        } else if (scheme == QStringLiteral("rtmps")) {
-            port = 443;
-        } else {
-            // udp/srt 没有可靠的轻量探测能力。后台重试阶段不直接切 LIVE，
-            // 否则会造成“本地轮播 -> LIVE失败 -> 本地轮播”的循环。
-            LOG_VIDEO("后台探测直播流失败：当前协议不支持安全后台探测 scheme=" << scheme << " url=" << probeUrl);
-            return;
-        }
-    }
-
-    m_liveProbeRunning = true;
-
-    QTcpSocket *sock = new QTcpSocket(this);
-    sock->setProperty("yc_probe_done", false);
-    sock->setProperty("yc_probe_buffer", QByteArray());
-    sock->setProperty("yc_probe_stage", scheme == QStringLiteral("rtsp")
-                      ? QStringLiteral("rtsp_describe")
-                      : QStringLiteral("tcp_connect"));
-
-    auto finishProbe = [this, sock, probeUrl, switchIfStillWanted, logProbeAttempt](bool ok, const QString &detail) {
-        if (!sock) return;
-        if (sock->property("yc_probe_done").toBool()) return;
-
-        sock->setProperty("yc_probe_done", true);
-        m_liveProbeRunning = false;
-
-        sock->abort();
-        sock->deleteLater();
-
-        if (!ok) {
-            if (logProbeAttempt) {
-                LOG_VIDEO("后台探测直播流失败:" << detail << " url=" << probeUrl);
-                m_liveProbeFailureLogUrl = probeUrl;
-                m_liveProbeFailureLogElapsed.start();
-            }
-            return;
-        }
-
-        switchIfStillWanted(detail);
-    };
-
-    connect(sock, &QTcpSocket::connected, this, [sock, probeUrl, scheme, finishProbe]() {
-        if (scheme == QStringLiteral("rtsp")) {
-            // RTSP 不能只看 TCP 连通或 DESCRIBE 200。
-            // 这里先 DESCRIBE 拿 SDP，再对 video track 执行 SETUP。
-            // 只有 SETUP 200 才认为直播流真正可用，避免无流时反复切前台 LIVE。
-            sendRtspDescribeForLiveRetry(sock, probeUrl);
-            return;
-        }
-
-        if (scheme == QStringLiteral("rtmp")) {
-            // RTMP 做最小握手探测，比单纯 TCP connect 更可靠；
-            // 但它仍不能百分百确认具体 playpath 有流，只能确认 RTMP 服务可握手。
-            QByteArray req;
-            req.resize(1537);
-            req.fill('\0');
-            req[0] = 0x03; // C0 version
-            sock->write(req);
-            sock->flush();
-            return;
-        }
-
-        // rtmps 需要 TLS + RTMP 握手，当前不用正式播放器做后台探测，避免误切。
-        finishProbe(false, QStringLiteral("unsupported tcp live scheme without safe probe: ") + scheme);
-    });
-
-    connect(sock, &QTcpSocket::readyRead, this, [sock, probeUrl, scheme, finishProbe]() {
-        QByteArray buf = sock->property("yc_probe_buffer").toByteArray();
-        buf += sock->readAll();
-        sock->setProperty("yc_probe_buffer", buf);
-
-        if (scheme == QStringLiteral("rtsp")) {
-            const RtspProbeResponse resp = parseRtspResponseForLiveRetry(buf);
-            if (!resp.complete) {
-                return;
-            }
-
-            sock->setProperty("yc_probe_buffer", buf.mid(resp.consumedBytes));
-
-            const QString stage = sock->property("yc_probe_stage").toString();
-            if (stage == QStringLiteral("rtsp_describe")) {
-                if (resp.statusCode != 200) {
-                    finishProbe(false, QStringLiteral("RTSP DESCRIBE failed: ") + resp.statusLine);
-                    return;
-                }
-
-                const QString videoControl = findRtspVideoControlForLiveRetry(resp.body);
-                if (videoControl.isEmpty()) {
-                    finishProbe(false, QStringLiteral("RTSP DESCRIBE ok but no video track in SDP"));
-                    return;
-                }
-
-                // RTSP 组播 SDP 通常会在 c=IN IP4 里给出 224.0.0.0/4 地址。
-                // 这类流用 TCP unicast SETUP 探测经常失败，导致重启后一直停留本地。
-                // 这里 DESCRIBE 已确认有 video track 且 SDP 指向组播地址，就允许切回 LIVE，
-                // 后续由真实视频帧 watchdog 判断是否真正恢复。
-                if (sdpLooksLikeMulticastForLiveRetry(resp.body)) {
-                    finishProbe(true, QStringLiteral("RTSP multicast DESCRIBE ok"));
-                    return;
-                }
-
-                const QString setupUrl = buildRtspControlUrlForLiveRetry(QUrl(probeUrl), videoControl);
-                if (setupUrl.trimmed().isEmpty()) {
-                    finishProbe(false, QStringLiteral("RTSP video control url empty"));
-                    return;
-                }
-
-                sock->setProperty("yc_probe_stage", QStringLiteral("rtsp_setup"));
-                sendRtspSetupForLiveRetry(sock, setupUrl);
-                return;
-            }
-
-            if (stage == QStringLiteral("rtsp_setup")) {
-                if (resp.statusCode == 200) {
-                    finishProbe(true, QStringLiteral("RTSP DESCRIBE+SETUP ok"));
-                    return;
-                }
-
-                finishProbe(false, QStringLiteral("RTSP SETUP failed: ") + resp.statusLine);
-                return;
-            }
-
-            finishProbe(false, QStringLiteral("RTSP invalid probe stage"));
-            return;
-        }
-
-        if (scheme == QStringLiteral("rtmp")) {
-            if (buf.size() >= 1537 && static_cast<unsigned char>(buf.at(0)) == 0x03) {
-                finishProbe(true, QStringLiteral("RTMP handshake ok"));
-            }
-            return;
-        }
-    });
-
-    connect(sock, QOverload<QAbstractSocket::SocketError>::of(&QAbstractSocket::error),
-            this, [finishProbe](QAbstractSocket::SocketError) {
-        finishProbe(false, QStringLiteral("socket error"));
-    });
-
-    QTimer::singleShot(3500, sock, [finishProbe]() {
-        finishProbe(false, QStringLiteral("timeout"));
-    });
-
-    if (logProbeAttempt) {
-        LOG_VIDEO("后台探测直播流:" << probeUrl);
-    }
-    sock->connectToHost(host, static_cast<quint16>(port));
+    requestLiveStreamProbe(url, false);
 }
 
+/** @brief 排队检测 carrier 和直播协议，回到 GUI 后应用仍有效的结果。
+ * @param[in] url 待探测地址。
+ * @param[in] restoring true 时在链路未连通的启动恢复场景保留原 RECORDED 持久化状态。
+ */
+void MultimediaDemo::requestLiveStreamProbe(const QString &url, bool restoring)
+{
+    if (!applyVideoDisplayPolicy()) return;
+    const QString probeUrl = url.trimmed();
+    if (probeUrl.isEmpty() || !m_startupPlaybackReleased || m_modulePlaybackSuspended ||
+        m_liveProbeRunning || !m_networkStatusMonitor) return;
+
+    QString kind = m_desiredLiveKind.trimmed().toLower();
+    if (kind.isEmpty() || kind == QStringLiteral("live")) {
+        kind = LiveStreamProbe::kindFromUrl(probeUrl);
+    }
+    m_liveProbeRunning = true;
+    m_networkStatusMonitor->requestPlaybackProbe(probeUrl, kind,
+            [this, probeUrl, kind, restoring](LiveStreamProbe::Result result) {
+        m_liveProbeRunning = false;
+        if (!m_liveDesired || m_desiredLiveUrl.trimmed() != probeUrl || m_isLiveMode ||
+            m_modulePlaybackSuspended || !applyVideoDisplayPolicy()) return;
+
+        if (!result.available) {
+            if (result.linkDown && restoring) {
+                persistPlaybackStateToNetCfg(QStringLiteral("LIVE"), QStringLiteral("RECORDED"),
+                                             QStringLiteral("restore_live_wait_link_down"));
+            }
+            return;
+        }
+        m_liveProbeFailureLogElapsed.invalidate();
+        m_liveProbeFailureLogUrl.clear();
+        LOG_VIDEO("后台探测直播流确认可用，准备切回正式LIVE:" << probeUrl << result.detail);
+        switchToLiveStream(probeUrl, kind);
+    });
+}
+
+/** @brief 使本地在途直播探测失效，在网络线程异步关闭请求。 */
+void MultimediaDemo::cancelLiveStreamProbe()
+{
+    if (!m_liveProbeRunning) return;
+    m_liveProbeRunning = false;
+    if (m_networkStatusMonitor) m_networkStatusMonitor->cancelPlaybackProbe();
+}
 
 // 切换到直播流
 /**
  * @brief 按视频区域开关约束原有 switchToLiveStream 流程。
  * @param url 目标直播地址。
  * @param kind 直播协议类型。
- * @note VideoDisplay_en=false 时停止并隐藏 videoRect，不影响独立 PIC 或识别流程。
+ * @note VideoDisplay_en=false 时停止并隐藏 videoRect，不影响独立 PIC 或识别流程；
+ *       有效直播切入前记录播放器身份、上一个模式及协议类型，不记录直播地址。
  */
 void MultimediaDemo::switchToLiveStream(const QString& url, const QString& kind)
 {
@@ -6457,6 +5664,10 @@ void MultimediaDemo::switchToLiveStream(const QString& url, const QString& kind)
         return;
     }
 
+    qInfo() << "[audio-path] mode switch" << "target=network"
+            << "player=" << mediaPlayer << "wasLive=" << m_isLiveMode
+            << "kind=" << kind;
+
     m_localPlaybackEnabled = false;
     invalidatePendingLocalPlaybackStarts();
     stopEmptyVideoListWatch();
@@ -6465,9 +5676,6 @@ void MultimediaDemo::switchToLiveStream(const QString& url, const QString& kind)
     stopVideoRectPictureDisplay(true);
 
     stopLiveWatchdog();
-    m_liveWatchdogStartMs = 0;
-    m_lastLiveFrameMs = 0;
-
     m_liveSwitching = true;
     m_isLiveMode = true;
     m_liveRecovering = false;
@@ -6609,8 +5817,8 @@ void MultimediaDemo::forceStopCurrentLivePlayerForFallback(const QString& reason
  * 该路径不启动本地 4K 轮播，也不再用仅能证明 RTP 可达的轻量探测作为
  * 恢复条件；完整销毁 playbin 后直接重新建立当前 LIVE 会话，以释放异常的
  * MPP 解码上下文和 DMA-BUF 池。
-  * @param reason 触发重建的诊断原因。
- * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
+ * @param[in] reason 触发重建的诊断原因。
+ * @note 同一 LIVE 会话的重建保留原无帧期限，实际收到新帧后才更新；视频资源服从 VideoDisplay_en。
  */
 void MultimediaDemo::restartLivePipelineAfterDecoderStall(const QString& reason)
 {
@@ -6623,7 +5831,6 @@ void MultimediaDemo::restartLivePipelineAfterDecoderStall(const QString& reason)
         return;
     }
 
-    stopLiveWatchdog();
     m_liveRecovering = true;
     m_liveSwitching = true;
     m_isLiveMode = true;
@@ -6644,12 +5851,10 @@ void MultimediaDemo::restartLivePipelineAfterDecoderStall(const QString& reason)
         nextVideoPlayer->setVideoOutput(nullptr);
         nextVideoPlayer->setPreloadMode(true);
     }
-    if (m_liveProbePlayer) {
-        m_liveProbePlayer->stop();
-    }
-    m_liveProbeRunning = false;
+    cancelLiveStreamProbe();
 
     if (!mediaPlayer->recreatePipeline()) {
+        stopLiveWatchdog();
         m_isLiveMode = false;
         m_liveSwitching = false;
         m_liveRecovering = false;
@@ -6688,11 +5893,15 @@ void MultimediaDemo::restartLivePipelineAfterDecoderStall(const QString& reason)
  * @brief 沿用直播中断后的业务回退规则，视频开播许可同时服从 videoRect 总开关。
  * @param reason 触发中断的诊断原因。
  * @param keepLiveRetry true 保留 LIVE 目标并允许原重试流程；false 沿用原无效源处理。
- * @note VideoDisplay_en=false 时回退不启动视频资源，原业务目标和状态上报规则保持不变。
+ * @note VideoDisplay_en=false 时回退不启动视频资源，原业务目标和状态上报规则保持不变；
+ *       在状态切换前记录回退原因，随后跟踪本地首帧，失败时由本地恢复流程接手。
  */
 void MultimediaDemo::onLiveStreamInterrupted(const QString& reason, bool keepLiveRetry)
 {
     stopLiveWatchdog();
+    qInfo() << "[audio-path] mode fallback" << "target=local"
+            << "player=" << mediaPlayer << "keepLiveRetry=" << keepLiveRetry
+            << "reason=" << reason;
     LOG_VIDEO("直播中断，切回本地轮播:"
               << reason << " keepLiveRetry=" << keepLiveRetry);
 
@@ -6709,13 +5918,14 @@ void MultimediaDemo::onLiveStreamInterrupted(const QString& reason, bool keepLiv
         m_desiredLiveKind.clear();
         m_liveSourceValidated = false;
         stopLiveRetry();
-        if (m_liveProbePlayer) {
-            m_liveProbePlayer->stop();
-        }
-        m_liveProbeRunning = false;
+        cancelLiveStreamProbe();
     }
 
     forceStopCurrentLivePlayerForFallback(reason);
+    clearLiveFallbackPlayback();
+    if (VideoDisplay_en && !m_downloadPauseActive && !m_modulePlaybackSuspended && isVisible()) {
+        m_liveFallbackStartedMs = MonotonicClock::nowMs();
+    }
 
     if (keepLiveRetry) {
         // 已经正常出过帧后断流：保留LIVE目标，网络恢复后自动切回。
@@ -6739,7 +5949,8 @@ void MultimediaDemo::onLiveStreamInterrupted(const QString& reason, bool keepLiv
 
 /**
  * @brief 从列表首项恢复本地轮播。
- * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
+ * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；
+ *       进入列表重扫前记录播放器身份和此前直播状态，供后续音频快照关联。
  */
 void MultimediaDemo::resumeLocalPlaylistFromStart()
 {
@@ -6750,6 +5961,9 @@ void MultimediaDemo::resumeLocalPlaylistFromStart()
         return;
     }
     stopLiveWatchdog();
+
+    qInfo() << "[audio-path] local playlist resume" << "player=" << mediaPlayer
+            << "wasLive=" << m_isLiveMode;
 
     LOG_VIDEO("开始恢复本地轮播");
 
@@ -7041,12 +6255,12 @@ void MultimediaDemo::startFirstLocalVideoFromList()
 }
 
 /**
- * @brief 启动直播首帧/持续无帧 watchdog。
+ * @brief 启动直播看门狗，以单调毫秒开始首帧等待；正在检查时保留当前起点。
  */
 void MultimediaDemo::startLiveWatchdog()
 {
     if (m_liveWatchdogTimer && !m_liveWatchdogTimer->isActive()) {
-        m_liveWatchdogStartMs = QDateTime::currentMSecsSinceEpoch();
+        m_liveWatchdogStartMs = MonotonicClock::nowMs();
         m_lastLiveFrameMs = 0;
         m_liveWatchdogTimer->start();
         LOG_VIDEO("直播watchdog已启动，等待真实视频帧");
@@ -7062,24 +6276,18 @@ void MultimediaDemo::stopLiveWatchdog()
         m_liveWatchdogTimer->stop();
         LOG_VIDEO("直播watchdog已停止");
     }
+    m_liveWatchdogStartMs = 0;
+    m_lastLiveFrameMs = 0;
 }
 
 
 /**
- * @brief 判定首帧或持续无帧超时并触发回退。
+ * @brief 每秒用单调时间检查首帧或最后一帧，满 10 秒无帧则回到本地轮播。
+ * @note 已验证的直播保留后台探测目标。解码输入的活跃度只记录到超时日志。
  */
 void MultimediaDemo::onLiveWatchdogTimeout()
 {
-    if (!m_isLiveMode) return;
-    if (m_liveRecovering) return;
-
-    const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    const qint64 decoderInputMs = mediaPlayer
-            ? mediaPlayer->lastDecoderInputMSecs() : 0;
-    const qint64 decoderInputIdleMs = decoderInputMs > 0
-            ? now - decoderInputMs : -1;
-    const bool decoderInputActive = decoderInputIdleMs >= 0 &&
-            decoderInputIdleMs <= m_liveDecoderInputActiveWindowMs;
+    if (!m_isLiveMode || m_liveRecovering || m_liveWatchdogStartMs == 0) return;
 
     // 关键：优先读取 GStreamer pad probe 记录的真实解码视频帧时间。
     // 对组播/UDP 来说，RTSP/TCP 控制连接状态不能代表媒体数据是否还在到达。
@@ -7088,48 +6296,26 @@ void MultimediaDemo::onLiveWatchdogTimeout()
         m_lastLiveFrameMs = playerVideoMs;
     }
 
-    const bool hasRealFrame = (m_lastLiveFrameMs > 0 &&
-                               m_liveWatchdogStartMs > 0 &&
-                               m_lastLiveFrameMs >= m_liveWatchdogStartMs);
-
-    if (!hasRealFrame) {
-        const qint64 waitFirstFrameMs = now - m_liveWatchdogStartMs;
-        if (waitFirstFrameMs < m_liveStartupGraceMs) {
-            LOG_VIDEO("直播watchdog等待首个真实视频帧(ms): " << waitFirstFrameMs);
-            return;
-        }
-
-        m_liveRecovering = true;
-        if (decoderInputActive) {
-            LOG_VIDEO("直播首帧超时，但解码器输入仍活跃，按解码器停滞重建: waitMs="
-                      << waitFirstFrameMs << " decoderInputIdleMs=" << decoderInputIdleMs);
-            restartLivePipelineAfterDecoderStall(
-                        QStringLiteral("live decoder first-frame stall"));
-            return;
-        }
-        LOG_VIDEO("直播首帧超时，未收到真实解码视频帧(ms): " << waitFirstFrameMs);
-        onLiveStreamInterrupted(QStringLiteral("live watchdog first video frame timeout"),
-                                m_liveSourceValidated);
+    const bool hasRealFrame = m_lastLiveFrameMs >= m_liveWatchdogStartMs;
+    const qint64 sinceMs = hasRealFrame ? m_lastLiveFrameMs : m_liveWatchdogStartMs;
+    const qint64 idleMs = MonotonicClock::nowMs() - sinceMs;
+    if (idleMs < m_liveTimeoutMs) {
+        if (!hasRealFrame) LOG_VIDEO("直播watchdog等待首个真实视频帧(ms): " << idleMs);
         return;
     }
 
-    const qint64 idleMs = now - m_lastLiveFrameMs;
+    const qint64 decoderInputMs = mediaPlayer ? mediaPlayer->lastDecoderInputMSecs() : 0;
+    const qint64 decoderInputIdleMs = decoderInputMs > 0 ? MonotonicClock::nowMs() - decoderInputMs : -1;
+    const bool decoderInputActive = decoderInputIdleMs >= 0 &&
+            decoderInputIdleMs <= m_liveDecoderInputActiveWindowMs;
+    LOG_VIDEO("直播超时，无真实解码视频帧时长(ms): " << idleMs
+              << " firstFramePending=" << !hasRealFrame
+              << " decoderInputIdleMs=" << decoderInputIdleMs
+              << " decoderInputActive=" << decoderInputActive);
 
-    if (idleMs >= m_liveTimeoutMs) {
-        m_liveRecovering = true;
-        if (decoderInputActive) {
-            LOG_VIDEO("直播无解码输出但输入仍活跃，按解码器停滞重建: outputIdleMs="
-                      << idleMs << " decoderInputIdleMs=" << decoderInputIdleMs);
-            restartLivePipelineAfterDecoderStall(
-                        QStringLiteral("live decoder output stall"));
-            return;
-        }
-        LOG_VIDEO("直播超时，无真实解码视频帧时长(ms): " << idleMs
-                  << " lastVideoFrameMs=" << m_lastLiveFrameMs
-                  << " decoderInputIdleMs=" << decoderInputIdleMs);
-
-        onLiveStreamInterrupted(QStringLiteral("live watchdog decoded video frame timeout"), true);
-    }
+    onLiveStreamInterrupted(hasRealFrame ? QStringLiteral("live watchdog decoded video frame timeout")
+                                         : QStringLiteral("live watchdog first video frame timeout"),
+                            hasRealFrame || m_liveSourceValidated);
 }
 
 /**
@@ -7159,6 +6345,7 @@ void MultimediaDemo::stopLiveRetry()
 
 /**
  * @brief 重试定时到达时重新探测期望直播源。
+ * @note 本地切文件的探测避让以单调毫秒计时。
  * @note 视频区域的启动、显示和恢复受 VideoDisplay_en 约束，关闭时不启动视频资源；原非视频流程保留。
  */
 void MultimediaDemo::onLiveRetryTimeout()
@@ -7175,12 +6362,7 @@ void MultimediaDemo::onLiveRetryTimeout()
     // 已经有探测任务在跑，不重复发起
     if (m_liveProbeRunning) return;
 
-    if (!isWiredLinkUpForLiveRetry()) {
-        LOG_VIDEO("直播重试跳过：网口 carrier=0，继续本地轮播等待网线恢复");
-        return;
-    }
-
-    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    const qint64 now = MonotonicClock::nowMs();
     if (m_localPlayerBusyUntilMs > 0 && now < m_localPlayerBusyUntilMs) {
         LOG_VIDEO("直播重试延后：本地视频正在切文件，避免后台探测抢占 GStreamer 资源");
         return;
@@ -7190,7 +6372,9 @@ void MultimediaDemo::onLiveRetryTimeout()
             m_liveProbeFailureLogUrl != m_desiredLiveUrl.trimmed() ||
             m_liveProbeFailureLogElapsed.elapsed() >= kLiveProbeFailureLogIntervalMs;
     if (logProbeAttempt) {
-        LOG_VIDEO("直播重试触发，开始轻量探测: " << m_desiredLiveUrl);
+        LOG_VIDEO("直播重试触发，提交网络线程探测: " << m_desiredLiveUrl);
+        m_liveProbeFailureLogUrl = m_desiredLiveUrl.trimmed();
+        m_liveProbeFailureLogElapsed.start();
     }
 
     probeLiveStream(m_desiredLiveUrl);
@@ -7210,11 +6394,7 @@ void MultimediaDemo::stopDesiredLive()
     m_liveProbeFailureLogUrl.clear();
     //m_isLiveMode = false;
 
-    if (m_liveProbePlayer) {
-        m_liveProbePlayer->stop();
-    }
-    m_liveProbeRunning = false;
-
+    cancelLiveStreamProbe();
 
     stopLiveRetry();
     stopLiveWatchdog();
@@ -7302,10 +6482,7 @@ void MultimediaDemo::switchToRecordedMode()
     stopLiveRetry();
     stopLiveWatchdog();
 
-    if (m_liveProbePlayer) {
-        m_liveProbePlayer->stop();
-    }
-    m_liveProbeRunning = false;
+    cancelLiveStreamProbe();
 
     if (alreadyInLocalPlaylist && !selectionChanged) {
         LOG_VIDEO("当前已处于本地轮播，仅更新RECORDED状态，跳过播放器重启");
@@ -7321,10 +6498,11 @@ void MultimediaDemo::switchToRecordedMode()
 
 
 /**
- * @brief 停止直播、本地轮播及预加载播放器。
+ * @brief 停止直播、本地轮播及预加载播放器，撤销待执行的本地回退。
  */
 void MultimediaDemo::stopAllPlayback()
 {
+    invalidatePendingLocalPlaybackStarts();
     const bool localImageRunning = m_currentVideoRectIsImage &&
                                    videoRectPictureTimer &&
                                    videoRectPictureTimer->isActive();
@@ -7360,10 +6538,7 @@ void MultimediaDemo::stopAllPlayback()
     stopLiveWatchdog();
     stopEmptyVideoListWatch();
 
-    if (m_liveProbePlayer) {
-        m_liveProbePlayer->stop();
-    }
-    m_liveProbeRunning = false;
+    cancelLiveStreamProbe();
 
     // 2) 重置状态
     m_isLiveMode = false;
@@ -7419,7 +6594,6 @@ void MultimediaDemo::stopAllPlayback()
  */
 QJsonObject MultimediaDemo::localWebPlaybackState() const
 {
-    UiPerformance::OperationScope performance(UiPerformance::Operation::WebMediaRead,this,"player-state");
     const bool active = mediaPlayer && mediaPlayer->hasActiveMedia();
     const bool image = m_currentVideoRectIsImage && !m_currentVideoRectMediaPath.isEmpty();
     const QString type =
@@ -7456,17 +6630,23 @@ QJsonObject MultimediaDemo::localWebPlaybackState() const
 
 /**
  * @brief 通过既有播放器入口执行本地 Web 设置，不经过 MQTT 消息处理。
- * @param request 当前 HTTP 请求，身份由会话校验取得。
+ * @param[in] request 当前 HTTP 请求，身份由会话校验取得。
+ * @note 广播文件音频占有增益时，仅忽略本次视频音量字段，播放模式仍照常切换。
  */
 void MultimediaDemo::applyLocalWebPlayback(const QJsonObject &request)
 {
     if (request.contains("videoVolume")) {
         const int volume = qBound(0, request.value("videoVolume").toInt(), 100);
-        if (m_ampCtrl)
+        const bool blocked = m_ampCtrl && m_ampCtrl->userVolumeBlocked();
+        const int reportedVolume = blocked ? m_ampCtrl->currentVolume() : volume;
+        if (blocked)
+            qInfo() << "[audio] local web volume ignored during prompt"
+                    << "requested=" << volume << "current=" << reportedVolume;
+        else if (m_ampCtrl)
             m_ampCtrl->setVolume(volume);
         if (m_volPanel)
-            m_volPanel->setCurrentVolume(volume);
-        emit currentPlayVolumeChanged(volume);
+            m_volPanel->setCurrentVolume(reportedVolume);
+        emit currentPlayVolumeChanged(reportedVolume);
     }
     const QString type = request.value("videoType").toString();
     if (type == "NONE")
@@ -7497,12 +6677,22 @@ void MultimediaDemo::applyLocalWebPlayback(const QJsonObject &request)
 }
 
 /**
- * @brief 应用 MQTT 下发音量并回报执行结果。
+ * @brief 应用 MQTT 下发音量；播报期间保留原音量并报告实际值。
+ * @param[in] volume 平台请求的系统音量百分比，限制到 0~100。
  */
 void MultimediaDemo::onMqttVolumeChanged(int volume)
 {
     if (volume < 0) volume = 0;
     if (volume > 100) volume = 100;
+
+    if (m_ampCtrl && m_ampCtrl->userVolumeBlocked()) {
+        const int current = m_ampCtrl->currentVolume();
+        qInfo() << "[audio] MQTT volume ignored during prompt"
+                << "requested=" << volume << "current=" << current;
+        if (m_volPanel) m_volPanel->setCurrentVolume(current);
+        emit currentPlayVolumeChanged(current);
+        return;
+    }
 
     if (m_ampCtrl) {
         m_ampCtrl->setVolume(volume);
@@ -7553,7 +6743,6 @@ void MultimediaDemo::deliverCompanySnapshot(const QString &token, const QImage &
     QScopedValueRollback<bool> captureGuard(m_snapshotCaptureInProgress,true);
     QWidget *host = ResponsiveUi::overlayHost(this);
     if(videoImage.isNull()) {
-        UiPerformance::OperationScope grab(UiPerformance::Operation::UiGrab,host,"company-root");
         auto *video=mediaPlayer?mediaPlayer->snapshotVideoWidget():nullptr;
         if(video && (!host || !video->isVisible() || !host->isAncestorOf(video))) video=nullptr;
         const auto frame=video?mediaPlayer->snapshotVideoFrame():SnapshotVideoFrame();
@@ -7561,7 +6750,7 @@ void MultimediaDemo::deliverCompanySnapshot(const QString &token, const QImage &
         emit companySceneReady(token,scene);return;
     }
     const QPixmap shot=[&] {
-        UiPerformance::OperationScope grab(UiPerformance::Operation::UiGrab,host,"company-root");return host ? host->grab() : QPixmap();
+        return host ? host->grab() : QPixmap();
     }();
     if (shot.isNull()) {
         emit companySnapshotReady(token, QImage(), QImage(), QRect(),
@@ -7603,6 +6792,44 @@ void MultimediaDemo::captureCompositeSnapshot()
     m_snapshotRefreshQueued=true;
     QTimer::singleShot(0,this,[this] { m_snapshotRefreshQueued=false;captureCompositeSnapshotNow(); });
 }
+
+void MultimediaDemo::invalidateMqttDownloadSnapshot()
+{
+    ++m_mqttDownloadRevision;
+    emit mqttPlayImageInvalidated();
+}
+
+void MultimediaDemo::captureMqttPlayImage()
+{
+    if (m_mqttDownloadSnapshotBusy) return;
+    if (!m_downloadToast || !m_downloadToast->isVisible()) {
+        captureCompositeSnapshot();
+        return;
+    }
+
+    m_mqttDownloadSnapshotBusy = true;
+    if (m_snapshotCaptureInProgress || !m_companySnapshotToken.isEmpty()) {
+        // 同步 Qt 绘制可能重入事件循环，等当前绘制退出再采集。
+        QTimer::singleShot(20, this, [this] {
+            m_mqttDownloadSnapshotBusy = false;
+            captureMqttPlayImage();
+        });
+        return;
+    }
+
+    captureCompositeSnapshotNow(true);
+}
+
+void MultimediaDemo::finishMqttDownloadSnapshot(const QString &base64Image)
+{
+    m_mqttDownloadSnapshotBusy = false;
+    if (m_mqttDownloadWorkRevision != m_mqttDownloadRevision || !m_downloadToast->isVisible()) {
+        captureMqttPlayImage();
+        return;
+    }
+    emit mqttPlayImageReady(base64Image);
+}
+
 /** @brief GUI直接绘制普通截图小图并复用现成NV12，后台合成/编码；原生视频后备保持原图像路径。
  * @param[in] host GUI抓取根控件；空或尺寸无效返回false。
  * @param[in] videoImage 可空的原生视频后备帧，自有QImage值。
@@ -7614,7 +6841,6 @@ bool MultimediaDemo::submitScaledSnapshot(QWidget *host,const QImage &videoImage
 {
     if(!host || host->size().isEmpty()) return false;
     if(videoImage.isNull()) {
-        UiPerformance::OperationScope grab(UiPerformance::Operation::UiGrab,host,"app-root");
         auto *video=mediaPlayer?mediaPlayer->snapshotVideoWidget():nullptr;
         if(video && (!host || !video->isVisible() || !host->isAncestorOf(video))) video=nullptr;
         const auto frame=video?mediaPlayer->snapshotVideoFrame():SnapshotVideoFrame();
@@ -7630,7 +6856,6 @@ bool MultimediaDemo::submitScaledSnapshot(QWidget *host,const QImage &videoImage
     if(image.isNull()) return false;
     image.fill(Qt::transparent);
     {
-        UiPerformance::OperationScope grab(UiPerformance::Operation::UiGrab,host,"app-root");
         QPainter painter(&image);if(!painter.isActive()) return false;
         painter.scale(qreal(target.width())/host->width(),qreal(target.height())/host->height());
         host->render(&painter,QPoint(),QRegion(),QWidget::DrawWindowBackground|QWidget::DrawChildren);
@@ -7646,8 +6871,7 @@ bool MultimediaDemo::submitScaledSnapshot(QWidget *host,const QImage &videoImage
     return true;
 }
 
-/** @brief 在UI刷新轮次绘制必要小图；Qt可能嵌套分发事件，重入门覆盖视频抓帧和界面绘制全过程。 */
-void MultimediaDemo::captureCompositeSnapshotNow()
+void MultimediaDemo::captureCompositeSnapshotNow(bool mqttDownload)
 {
     if(m_snapshotCaptureInProgress || !m_companySnapshotToken.isEmpty()) {
         // 高清/Qt嵌套抓取尚未退出时保留一次普通刷新；定时回调有间隔，避免0ms重试占满事件循环。
@@ -7655,20 +6879,31 @@ void MultimediaDemo::captureCompositeSnapshotNow()
         QTimer::singleShot(20,this,[this] { m_snapshotRefreshQueued=false;captureCompositeSnapshotNow(); });
         return;
     }
-    if(m_snapshotWorkerBusy || m_snapshotPending) return;
+    if(!mqttDownload && (m_snapshotWorkerBusy || m_snapshotPending)) return;
     QScopedValueRollback<bool> captureGuard(m_snapshotCaptureInProgress,true);
-    const auto key=snapshotCacheKey();
-    if(key!=m_snapshotCacheKey) { m_snapshotCacheKey=key;m_lastSnapshotMs=0;m_lastSnapshotBase64.clear(); }
-    m_snapshotWorkKey=key;
-
-    UiPerformance::OperationScope performance(UiPerformance::Operation::SnapshotRequest,this,"composite");
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
 
-    // 全部分支共用原2秒缓存；下载态也不再绕过缓存重复抓图。
-    if(now-m_lastSnapshotMs>=0 && now-m_lastSnapshotMs<2000 && !m_lastSnapshotBase64.isEmpty()) { emit currentPlayImageChanged(m_lastSnapshotBase64);return; }
-    m_snapshotRequestMs=now; // 延续原缓存年龄：从抓取起点计时，不从后台完成时重新开始。
-    // 下载态：播放器保持暂停，直接抓 Qt 当前界面
-    if (m_downloadPauseActive) {
+    if (!mqttDownload) {
+        const auto key=snapshotCacheKey();
+        if(key!=m_snapshotCacheKey) { m_snapshotCacheKey=key;m_lastSnapshotMs=0;m_lastSnapshotBase64.clear(); }
+        m_snapshotWorkKey=key;
+        if(now-m_lastSnapshotMs>=0 && now-m_lastSnapshotMs<2000 && !m_lastSnapshotBase64.isEmpty()) { emit currentPlayImageChanged(m_lastSnapshotBase64);return; }
+        m_snapshotRequestMs=now; // 缓存年龄从抓取起点计时。
+    }
+
+    // 下载态直接抓多媒体页。普通 MQTT 请求使用原尺寸抓图以保留卡片及其阴影，后台再缩小。
+    if (m_downloadPauseActive || mqttDownload) {
+        if (mqttDownload) {
+            m_mqttDownloadWorkRevision = m_mqttDownloadRevision;
+            const QImage image = grab().toImage();
+            if (image.isNull()) {
+                qWarning() << "[截图] MQTT 下载卡片抓图为空";
+                finishMqttDownloadSnapshot(QString());
+            } else {
+                m_mqttDownloadSnapshotProcessor->processUiOnlySnapshot(image);
+            }
+            return;
+        }
         if (m_snapshotTimeoutTimer) {
             m_snapshotTimeoutTimer->stop();
         }
@@ -7764,7 +6999,6 @@ void MultimediaDemo::captureCompositeSnapshotNow()
  */
 void MultimediaDemo::onVideoSnapshotReady(const QImage& videoImage)
 {
-    UiPerformance::OperationScope performance(UiPerformance::Operation::SnapshotReady,this,"composite-callback");
     if (!m_companySnapshotToken.isEmpty()) {
         const QString token = m_companySnapshotToken;
         m_companySnapshotToken.clear();

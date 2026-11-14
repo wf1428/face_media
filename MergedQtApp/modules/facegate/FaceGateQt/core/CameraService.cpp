@@ -2,8 +2,9 @@
  * @file CameraService.cpp
  * @brief 摄像头采集线程服务的实现。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-11-05；修改人：Du lin；按独立消费者需求复用RGB帧，截图不消费识别邮箱；正常启停异步协调，原后端采集/识别处理保持。
  */
 
 /*
@@ -18,16 +19,27 @@
 #include "RgaImageProcessor.h"
 
 #include <QDebug>
+#include <QDateTime>
+#include <QTimer>
 
 #include <memory>
 #include <utility>
 
 namespace {
 
-/** @brief 把采集缓冲区通过 RGA 转换为人脸算法需要的连续 RGB 帧。 */
+/** @brief 按消费者需求生成自有RGB，以及可选识别YUV/录入预览；不保留驱动借用内存。
+ * @param[in] sourceImage 当前出队帧，调用期间有效，完成后可重新入队。
+ * @param[in] outputFormat 后端标准化NV12/NV21格式。
+ * @param[in] frameIndex 当前采集序号。
+ * @param[in] recognition true沿用原三路转换，false仅生成截图RGB。
+ * @param[out] frame 成功时替换完整帧；失败保持原值。
+ * @param[out] error 可为空；失败时写入参数、分配或RGA错误。
+ * @return true转换成功；false输入无效、分配失败或RGA失败。
+ */
 bool buildRgaFrame(const RgaImageProcessor::Buffer &sourceImage,
                    RgaImageProcessor::PixelFormat outputFormat,
                    int frameIndex,
+                   bool recognition,
                    CameraFrame *frame,
                    QString *error)
 {
@@ -58,13 +70,15 @@ bool buildRgaFrame(const RgaImageProcessor::Buffer &sourceImage,
     const int width = sourceImage.width;
     const int height = sourceImage.height;
     CameraFrame result;
-    result.yuv420sp.resize(width * height * 3 / 2);
-    const Buffer yuvImage = Buffer::fromVirtualAddress(
-        result.yuv420sp.data(), width, height, width, height, outputFormat);
+    if (recognition) {
+        result.yuv420sp.resize(width * height * 3 / 2);
+        const Buffer yuvImage = Buffer::fromVirtualAddress(
+            result.yuv420sp.data(), width, height, width, height, outputFormat);
 
-    // This normalized YUV copy remains valid after the V4L2 buffer is returned.
-    if (!RgaImageProcessor::process(sourceImage, yuvImage, error)) {
-        return false;
+        // This normalized YUV copy remains valid after the V4L2 buffer is returned.
+        if (!RgaImageProcessor::process(sourceImage, yuvImage, error)) {
+            return false;
+        }
     }
 
     result.image = QImage(width, height, QImage::Format_RGB888);
@@ -81,26 +95,28 @@ bool buildRgaFrame(const RgaImageProcessor::Buffer &sourceImage,
         return false;
     }
 
-    constexpr int kEnrollPreviewWidth = 512;
-    constexpr int kEnrollPreviewHeight = 384;
-    result.enrollmentPreview =
-        QImage(kEnrollPreviewWidth, kEnrollPreviewHeight, QImage::Format_RGB888);
-    if (result.enrollmentPreview.isNull()) {
-        if (error) {
-            *error = QStringLiteral("Unable to allocate the enrollment preview buffer");
+    if (recognition) {
+        constexpr int kEnrollPreviewWidth = 512;
+        constexpr int kEnrollPreviewHeight = 384;
+        result.enrollmentPreview =
+            QImage(kEnrollPreviewWidth, kEnrollPreviewHeight, QImage::Format_RGB888);
+        if (result.enrollmentPreview.isNull()) {
+            if (error) {
+                *error = QStringLiteral("Unable to allocate the enrollment preview buffer");
+            }
+            return false;
         }
-        return false;
-    }
 
-    const Buffer enrollmentPreview = Buffer::fromVirtualAddress(
-        result.enrollmentPreview.bits(),
-        kEnrollPreviewWidth,
-        kEnrollPreviewHeight,
-        kEnrollPreviewWidth,
-        kEnrollPreviewHeight,
-        PixelFormat::Rgb888);
-    if (!RgaImageProcessor::process(rgbImage, enrollmentPreview, error)) {
-        return false;
+        const Buffer enrollmentPreview = Buffer::fromVirtualAddress(
+            result.enrollmentPreview.bits(),
+            kEnrollPreviewWidth,
+            kEnrollPreviewHeight,
+            kEnrollPreviewWidth,
+            kEnrollPreviewHeight,
+            PixelFormat::Rgb888);
+        if (!RgaImageProcessor::process(rgbImage, enrollmentPreview, error)) {
+            return false;
+        }
     }
 
     const bool nv21 = outputFormat == PixelFormat::Nv21;
@@ -142,7 +158,7 @@ bool CameraService::start(const QString &devicePath,
     return start(profile);
 }
 
-/** @brief 使用兼容参数构造 MIPI 配置并启动采集。 */
+/** @brief 按完整配置启动线程；硬件打开错误由采集线程异步报告。 */
 bool CameraService::start(const CameraProfile &profile)
 {
     if (running_) {
@@ -156,6 +172,7 @@ bool CameraService::start(const CameraProfile &profile)
         captureThread_.join();
     }
 
+    desiredRunning_ = true;
     profile_ = profile;
     profile_.pixelFormat = profile_.pixelFormat.trimmed().toLower();
     {
@@ -164,6 +181,7 @@ bool CameraService::start(const CameraProfile &profile)
         frameDeliveryPending_ = false;
     }
     running_ = true;
+    captureExited_ = false;
     captureThread_ = std::thread(&CameraService::captureLoop, this);
     return true;
 }
@@ -171,6 +189,8 @@ bool CameraService::start(const CameraProfile &profile)
 /** @brief 请求采集线程停止并等待退出。 */
 void CameraService::stop()
 {
+    desiredRunning_ = false;
+    setScreenshotEnabled(false);
     running_ = false;
     if (captureThread_.joinable()) {
         captureThread_.join();
@@ -179,6 +199,48 @@ void CameraService::stop()
     std::lock_guard<std::mutex> lock(frameMutex_);
     latestFrame_ = CameraFrame();
     frameDeliveryPending_ = false;
+}
+
+/** @brief 仅设置需求，已退出线程才在对象线程回收，不等待 V4L2/MPP 释放。 */
+void CameraService::requestRunning(const CameraProfile &profile,bool wanted,bool recognition)
+{
+    desiredProfile_=profile; desiredRunning_=wanted; recognitionEnabled_=recognition;
+    reconcileCapture();
+}
+
+/** @brief 以唯一异步检查串行化停止与再次启动，避免快速交叠时 join 正在退出的线程。 */
+void CameraService::reconcileCapture()
+{
+    if(!desiredRunning_) { running_=false; return; }
+    if(running_)return;
+    if(captureThread_.joinable() && !captureExited_) {
+        if(!reconcilePending_) {
+            reconcilePending_=true;
+            QTimer::singleShot(10,this,[this]{reconcilePending_=false;reconcileCapture();});
+        }
+        return;
+    }
+    start(desiredProfile_);
+}
+
+/** @brief 仅切换截图消费者，清空旧截图/失败结果不改变原识别邮箱。 */
+void CameraService::setScreenshotEnabled(bool enabled)
+{
+    if(screenshotEnabled_.exchange(enabled)==enabled)return;
+    screenshotRequested_=false;
+    std::lock_guard<std::mutex> lock(screenshotMutex_);
+    screenshotImage_=QImage(); screenshotTs_=0;
+}
+
+/** @brief try_lock 领取自有截图；无帧时请求采集线程在后续有效帧准备一次。 */
+bool CameraService::takeScreenshot(QImage *image,qint64 *ts)
+{
+    if(!image || !ts || !screenshotEnabled_)return false;
+    std::unique_lock<std::mutex> lock(screenshotMutex_,std::try_to_lock);
+    if(!lock.owns_lock())return false;
+    if(screenshotImage_.isNull() && screenshotTs_==0) { screenshotRequested_=true; return false; }
+    *image=std::move(screenshotImage_); screenshotImage_=QImage();
+    *ts=screenshotTs_; screenshotTs_=0; return true;
 }
 
 /** @return 采集线程运行标志。 */
@@ -211,6 +273,12 @@ bool CameraService::takeLatestFrame(CameraFrame *frame)
 /** @brief 采集线程主循环，确保每个出队缓冲区最终重新入队。 */
 void CameraService::captureLoop()
 {
+    /** @brief 在后端和局部资源释放后发布退出完成；所有错误/非Linux返回路径均覆盖。 */
+    struct ExitGuard {
+        std::atomic_bool &exited; /**< 借用服务成员，服务析构在 join 后才释放。 */
+        /** @brief 后端已释放后标记退出完成，不访问UI或执行设备操作。 */
+        ~ExitGuard() { exited=true; }
+    } exitGuard{captureExited_};
 #ifndef Q_OS_LINUX
     emit cameraError(QStringLiteral("CameraService requires embedded Linux V4L2"));
     running_ = false;
@@ -261,28 +329,37 @@ void CameraService::captureLoop()
             continue;
         }
 
+        const bool wantScreenshot=screenshotEnabled_ && screenshotRequested_.exchange(false);
+        const qint64 capturedTs=wantScreenshot?QDateTime::currentMSecsSinceEpoch():0;
         bool shouldConvert = false;
         {
             std::lock_guard<std::mutex> lock(frameMutex_);
-            if (!frameDeliveryPending_) {
+            if (recognitionEnabled_ && !frameDeliveryPending_) {
                 frameDeliveryPending_ = true;
                 shouldConvert = true;
             }
         }
 
-        if (shouldConvert) {
+        if (shouldConvert || wantScreenshot) {
             CameraFrame frame;
             QString rgaError;
             if (buildRgaFrame(captured.source,
                               backend->normalizedOutputFormat(),
                               frameIndex,
+                              shouldConvert,
                               &frame,
                               &rgaError)) {
-                {
+                if(wantScreenshot && screenshotEnabled_) {
+                    std::unique_lock<std::mutex> lock(screenshotMutex_,std::try_to_lock);
+                    if(lock.owns_lock() && screenshotEnabled_) {
+                        screenshotImage_=frame.image; screenshotTs_=capturedTs;
+                    } else if(screenshotEnabled_) screenshotRequested_=true;
+                }
+                if(shouldConvert) {
                     std::lock_guard<std::mutex> lock(frameMutex_);
                     latestFrame_ = std::move(frame);
                 }
-                emit frameAvailable();
+                if(shouldConvert) emit frameAvailable();
                 if (firstRgaFrame) {
                     firstRgaFrame = false;
                     qInfo() << "[CAMERA-RGA] first frame ready"
@@ -297,15 +374,21 @@ void CameraService::captureLoop()
                                     : "NV12")
                             << "CPU fallback=disabled";
                 }
-            } else {
+            } else if(shouldConvert) {
+                // 原识别转换失败仍走原故障路径；截图自身的失败不能停掉共享识别相机。
                 {
                     std::lock_guard<std::mutex> lock(frameMutex_);
                     frameDeliveryPending_ = false;
                 }
                 emit cameraError(rgaError);
                 running_ = false;
+            } else if(wantScreenshot && screenshotEnabled_) {
+                std::unique_lock<std::mutex> lock(screenshotMutex_,std::try_to_lock);
+                if(lock.owns_lock() && screenshotEnabled_) {
+                    screenshotImage_=QImage();screenshotTs_=capturedTs;
+                }
             }
-        } else {
+        } else if(recognitionEnabled_) {
             ++busyDropCount;
             if ((busyDropCount % 120) == 0) {
                 qInfo() << "[CAMERA-MAILBOX] dropped busy frames=" << busyDropCount;

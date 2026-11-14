@@ -1,16 +1,16 @@
 /**
  * @file snapshot_work.h
- * @brief 普通和高清截图共用的单一后台串行队列。
+ * @brief 普通、高清和空闲准入摄像头截图共用的单一后台串行队列。
  * @author Du lin
  * @date 2026-11-04
- * @note 最近修改：2026-11-04；修改人：Du lin；更新后台职责为视频合成/编码，已绘制UI像素不再回放文字命令，串行队列和退出屏障逻辑保持。
+ * @note 最近修改：2026-11-05；修改人：Du lin；移除已取消的串行队列耗时开关引用，原任务和回调行为不变。
  */
 #pragma once
 #include "serial_work_queue.h"
 #include <QCoreApplication>
 namespace SnapshotWork {
 /** @return UI所有的截图队列门面；所有run共用一个后台线程，不并发JPEG/NV12处理；UI已绘成像素，不再回放绘图命令。
- * @note 仅UI调用enqueue；prepare/done在UI，run只访问自有图像值。任务须reportSlow=false，不新增日志。
+ * @note 仅UI调用enqueue；prepare/done在UI，run只访问自有图像值。
  * 最终应用退出由队列屏障结束在途任务并丢弃待执行项，普通截图/页面销毁不在UI等待。
  */
 inline SerialWorkQueue &queue() {

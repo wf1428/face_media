@@ -3,7 +3,7 @@
  * @brief 以真实SpeexDSP验证回声下降、双讲人声保留及V1旁路；参考/配置独立回归。
  * @author Du lin
  * @date 2026-10-31
- * @note 最近修改：2026-11-04；修改人：Du lin；验证参考失败细分、同帧平滑/后备预处理、失参后恢复及双讲能量；保留全部禁用V1逐样本一致与既有AEC收敛基线。
+ * @note 最近修改：2026-11-05；修改人：Du lin；移除本轮新增的测试；保留原失参恢复用例并按现有后备预处理验证输出。
  */
 #include <QtTest>
 #include <QSettings>
@@ -12,7 +12,6 @@
 #include "src/call/AudioProcessing.h"
 #include "src/call/PlaybackReference.h"
 #include <vector>
-#include "src/call/CaptureContinuity.h"
 
 /** @brief 可重现的宽带远端/近端信号试验结果，不是现场AEC效果保证。 */
 struct ScenarioResult {
@@ -179,50 +178,12 @@ private slots:
         QVERIFY(info.contains("initialization failed"));VoiceCall::Pcm pcm{};pcm.fill(-1000);const auto original=pcm;
         processing.process(pcm,nullptr,0);QVERIFY(pcm==original);QCOMPARE(processing.stats().failures,uint64_t(1));
     }
-    /** @brief 每个参考覆盖失败返回不同原因和明确边界，不使用部分插值输出。 */
-    void referenceFailureReasons() {
-        VoiceCall::PlaybackReference history;VoiceCall::ReferenceReadTrace trace;VoiceCall::Pcm pcm{},out{};
-        QVERIFY(!history.read(1000000,0,out,&trace));QCOMPARE(int(trace.reason),int(VoiceCall::ReferenceReason::Empty));
-        history.push(pcm,1000000,5000,32);
-        QVERIFY(!history.read(999999,0,out,&trace));QCOMPARE(int(trace.reason),int(VoiceCall::ReferenceReason::BeforeHistory));
-        QVERIFY(!history.read(1020000,0,out,&trace));QCOMPARE(int(trace.reason),int(VoiceCall::ReferenceReason::AfterHistory));
-        QVERIFY(!history.read(1000031,0,out,&trace));QCOMPARE(int(trace.reason),int(VoiceCall::ReferenceReason::NextSample));QCOMPARE(trace.failedSample,319);
-        QVERIFY(history.read(1000000,0,out,&trace));QCOMPARE(int(trace.reason),int(VoiceCall::ReferenceReason::Valid));
-        QCOMPARE(trace.oldestUs,int64_t(1000000));QCOMPARE(trace.newestEndUs,int64_t(1020000));
-    }
-    /** @brief 缺参边界连续、恢复只混合同一帧，直流逐渐消除且不重放旧语音。 */
-    void pcmTransition() {
-        VoiceCall::CaptureContinuity continuity;VoiceCall::Pcm normal{},raw{},fallback{};normal.fill(3);raw.fill(630);
-        continuity.prepare(raw,fallback);QVERIFY(!continuity.finish(normal,true,&fallback));
-        for(int n=0;n<40;++n) continuity.prepare(raw,fallback);
-        auto missing=fallback;QVERIFY(continuity.finish(missing,false,nullptr));QCOMPARE(missing.front(),int16_t(3));
-        VoiceCall::LevelStats level;level.add(missing);QVERIFY(std::abs(level.dc())<10);
-        normal.fill(20);fallback.fill(10);const auto previous=missing.back();
-        QVERIFY(continuity.finish(normal,true,&fallback));QCOMPARE(normal.front(),previous);QCOMPARE(normal.back(),int16_t(20));
-        normal.fill(700);const auto unmodified=normal;QVERIFY(!continuity.finish(normal,true,&fallback));QVERIFY(normal==unmodified);
-    }
-    /** @brief 连续近端人声叠加DC时短缺参考不静音，丢失/恢复边界连续，使用真实Speex库。 */
-    void nearSpeechDuringReferenceLoss() {
-        VoiceCall::ProcessingConfig cfg;cfg.libraryPath=library();cfg.preprocessEnabled=true;cfg.agcEnabled=false;cfg.denoiseEnabled=false;
-        QString info;VoiceCall::AudioProcessing processing(cfg,info);QVERIFY2(processing.active(),qPrintable(info));
-        VoiceCall::Pcm reference{};int tail=0;bool previousLoss=false;
-        for(int frame=0;frame<260;++frame) {
-            VoiceCall::Pcm mic{};for(int i=0;i<320;++i) mic[size_t(i)]=int16_t(631+3000*std::sin(2*3.141592653589793*701*(frame*320+i)/16000.0));
-            const bool lost=frame==200 || frame==201 || frame==230;
-            processing.process(mic,lost ? nullptr : &reference,1);
-            if(lost!=previousLoss && frame>0) QCOMPARE(int(mic.front()),tail);
-            if(frame>=190) { VoiceCall::LevelStats level;level.add(mic);QVERIFY2(level.rms()>100,"Near speech must not be muted during missing-reference fallback"); }
-            tail=mic.back();previousLoss=lost;
-        }
-        QCOMPARE(processing.stats().fallbackFrames,uint64_t(3));QCOMPARE(processing.stats().transitionFrames,uint64_t(4));
-        QCOMPARE(processing.stats().failures,uint64_t(0));
-    }
-    /** @brief 参考丢失时后备预处理并仅重置一次AEC，换代后可恢复；预处理可独立运行。 */
+    /** @brief 参考丢失时保留同帧后备预处理并仅重置一次，换代后可恢复；预处理可独立运行。 */
     void lossResetAndIndependentPreprocess() {
         VoiceCall::ProcessingConfig cfg;cfg.libraryPath=library();cfg.preprocessEnabled=true;QString info;
         VoiceCall::AudioProcessing processing(cfg,info);QVERIFY2(processing.active(),qPrintable(info));
         VoiceCall::Pcm pcm{},reference{};pcm.fill(1200);processing.process(pcm,&reference,1);
-        pcm.fill(2345);const auto original=pcm;processing.process(pcm,nullptr,1);QVERIFY(pcm!=original);QCOMPARE(processing.stats().fallbackFrames,uint64_t(1));
+        pcm.fill(2345);const auto original=pcm;processing.process(pcm,nullptr,1);QVERIFY(pcm!=original);
         const auto resets=processing.stats().resets;processing.process(pcm,nullptr,1);QCOMPARE(processing.stats().resets,resets);
         processing.process(pcm,&reference,2);QVERIFY(processing.stats().aecFrames>=2);
         cfg.aecEnabled=false;VoiceCall::AudioProcessing independent(cfg,info);QVERIFY(independent.active());QVERIFY(!independent.needsReference());

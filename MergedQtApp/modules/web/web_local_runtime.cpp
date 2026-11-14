@@ -2,12 +2,11 @@
  * @file web_local_runtime.cpp
  * @brief Qt 主线程的真实状态采集、设备控制和异步截图桥。
  * @author Du lin
- * @note 最近修改：2026-11-04；修改人：Du lin；命名Web媒体刷新定时器并分段记录主线程状态读取与互斥发布耗时，不改变1秒刷新、快照或Web控制流程。
+ * @note 最近修改：2026-11-05；修改人：Du lin；移除 Web 媒体状态读写计时，保留原状态刷新和发布逻辑。
  * @date 2026-10-16
  */
 
 #include "web_local_runtime.h"
-#include "common/debug/ui_performance.h"
 #include "common/media_content_policy.h"
 #include "platform/rk3566_platform.h"
 #include <QCoreApplication>
@@ -87,7 +86,6 @@ WebLocalRuntime::WebLocalRuntime(QObject *parent) : QObject(parent)
                     qWarning() << "[WEB] uploaded video playback failed:" << message;
             });
     auto *timer = new QTimer(this);
-    timer->setObjectName(QStringLiteral("web.media.refresh"));
     connect(timer, &QTimer::timeout, this, [this]() {
         refreshMedia();
         // 仅在既有播放器允许启动且上一轮切换结束后播放新发布文件。
@@ -153,13 +151,11 @@ void WebLocalRuntime::refreshMedia()
 {
     QJsonObject value;
     if (mediaOwner_ && read_) {
-        UiPerformance::OperationScope performance(UiPerformance::Operation::WebMediaRead,this,"read-state");
         value = read_();
     }
     value.insert("available", !value.isEmpty());
     value.insert("observedAt", QDateTime::currentDateTime().toString(Qt::ISODate));
     {
-        UiPerformance::OperationScope performance(UiPerformance::Operation::WebMediaPublish,this,"publish-state");
         QMutexLocker lock(&mutex_);
         media_ = value;
     }

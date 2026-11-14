@@ -4,7 +4,7 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-04；修改人：Du lin；普通截图回执按图片2项预算延迟提交，只保留原32项请求元数据；等待时不重复抓图/编码，不改ID/主题/音频逻辑。
+ * @note 最近修改：2026-11-12；修改人：Du lin；下载卡片变化时清除普通截图并重置待发请求的就绪状态，防止上传旧画面。
  */
 
 #include "mqttpage.h"
@@ -1273,6 +1273,17 @@ void MqttPage::onCurrentPlayImageChanged(const QString &base64Image)
     for(auto &request:pendingPlayInfo_) request.imageReady=true;
     drainPlayInfoReplies();
 }
+
+void MqttPage::invalidatePlayImage()
+{
+    if (!manager_) return;
+    manager_->updateCurrentPlayImage(QString());
+    for (auto &request : pendingPlayInfo_) {
+        request.imageReady = false;
+    }
+    drainPlayInfoReplies();
+}
+
 /** @brief 有界保存原请求字段，允许一张截图满足多个ID；溢出只提前回最旧项，不丢请求。 */
 void MqttPage::onGetPlayInfoRequested(const QString &topic,const QString &reqId,const QString &deviceId)
 {

@@ -3,7 +3,7 @@
  * @brief 仅供本机测试的 ALSA API 声明，不提供真实设备或 ABI 兼容保证。
  * @author Du lin
  * @date 2026-10-29
- * @note 最近修改：2026-11-03；修改人：Du lin；补充只读PCM几何/软件阈值查询声明，验证诊断失败不影响传输和软件参数资源配对；不改变生产ALSA头。
+ * @note 最近修改：2026-11-05；修改人：Du lin；移除本轮排查与整改新增的测试代码，保留原有测试基线。
  */
 #pragma once
 #ifndef ESTRPIPE
@@ -13,7 +13,6 @@ extern "C" {
 typedef struct _snd_pcm snd_pcm_t;
 typedef struct _snd_config snd_config_t;
 typedef struct _snd_input snd_input_t;
-typedef struct _snd_pcm_sw_params snd_pcm_sw_params_t;
 typedef long snd_pcm_sframes_t;
 typedef unsigned long snd_pcm_uframes_t;
 enum { SND_PCM_STREAM_PLAYBACK=0,SND_PCM_STREAM_CAPTURE=1,SND_PCM_NONBLOCK=1,
@@ -97,40 +96,6 @@ int snd_pcm_start(snd_pcm_t *pcm);
  * @return 0 成功，负值为格式/注入错误。
  */
 int snd_pcm_set_params(snd_pcm_t *pcm,int format,int access,unsigned channels,unsigned rate,int resample,unsigned latency);
-/** @brief 返回测试PCM几何，不改参数。
- * @param[in] pcm 有效模拟句柄。
- * @param[out] buffer 成功返回960音频帧。
- * @param[out] period 成功返回320音频帧。
- * @return 0成功，负值为诊断查询故障注入。
- */
-int snd_pcm_get_params(snd_pcm_t *pcm,snd_pcm_uframes_t *buffer,snd_pcm_uframes_t *period);
-/** @brief 分配测试软件参数快照。
- * @param[out] params 返回须配对free的对象。
- * @return 0成功，负值为注入失败。
- */
-int snd_pcm_sw_params_malloc(snd_pcm_sw_params_t **params);
-/** @brief 释放测试快照。
- * @param[in] params malloc返回的有效对象。
- */
-void snd_pcm_sw_params_free(snd_pcm_sw_params_t *params);
-/** @brief 只读加载测试软件参数。
- * @param[in] pcm 有效模拟句柄。
- * @param[out] params 已分配的快照。
- * @return 0成功，负值为注入失败。
- */
-int snd_pcm_sw_params_current(snd_pcm_t *pcm,snd_pcm_sw_params_t *params);
-/** @brief 获取测试启动阈值。
- * @param[in] params 有效模拟快照。
- * @param[out] value 成功返回960音频帧。
- * @return 0成功，负值为注入失败。
- */
-int snd_pcm_sw_params_get_start_threshold(const snd_pcm_sw_params_t *params,snd_pcm_uframes_t *value);
-/** @brief 获取测试唤醒阈值。
- * @param[in] params 有效模拟快照。
- * @param[out] value 成功返回320音频帧。
- * @return 0成功，负值为注入失败。
- */
-int snd_pcm_sw_params_get_avail_min(const snd_pcm_sw_params_t *params,snd_pcm_uframes_t *value);
 /** @brief 测试采集每次最多返回 80 帧，或返回注入的错误。
  * @param[in,out] pcm 测试采集句柄及读取游标。
  * @param[out] buffer 单声道小端 PCM 缓冲。

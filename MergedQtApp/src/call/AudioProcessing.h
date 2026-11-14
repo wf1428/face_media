@@ -3,7 +3,7 @@
  * @brief 定义兼容V1的采集处理接口、配置快照及串行SpeexDSP处理上下文。
  * @author Du lin
  * @date 2026-10-29
- * @note 最近修改：2026-11-04；修改人：Du lin；增加只读分阶段波形/AGC观测及按需PCM快照，保留原process接口、DSP参数、后备/平滑和逐样本行为。
+ * @note 最近修改：2026-11-05；修改人：Du lin；删除 PCM 观察与录音副本接口，保留处理配置和原有统计接口。
  */
 #pragma once
 #include <cstdint>
@@ -12,7 +12,6 @@
 #include <memory>
 #include <QString>
 #include "CallProtocol.h"
-#include "PcmDiagnostics.h"
 
 /** @brief 仅由采集线程使用的可选回声消除器；关闭DSP时不创建实例。 */
 class IAec {
@@ -81,7 +80,6 @@ struct ProcessingConfig {
 struct ProcessingStats {
     uint64_t aecFrames=0,preprocessFrames=0; /**< 实际AEC帧数及当前选用路径的预处理帧数；未选用的后备热处理不计preprocessFrames，耗时仍计入maxProcessingUs。 */
     uint64_t bypassFrames=0,referenceMisses=0; /**< AEC/整处理旁路帧数及缺参考帧数；有后备预处理时不再意味着原PCM直通。 */
-    uint64_t fallbackFrames=0,transitionFrames=0; /**< 实际选择后备输出和路径切换平滑的帧数；不改变帧数量。 */
     uint64_t resets=0,failures=0; /**< 历史重置次数及导致降级的故障次数。 */
     int64_t maxProcessingUs=0; /**< 单帧处理/重同步最大耗时，单调微秒。 */
 };
@@ -114,14 +112,6 @@ public:
     void reset(const QString &reason);
     /** @return 当前计数与耗时，仅所属采集线程调用。 */
     ProcessingStats stats() const;
-    /** @return 最近一帧的纯数值阶段观测，所属采集线程调用，不修改Speex状态。 */
-    ProcessingObservation observation() const;
-    /** @brief 仅开启固定PCM副本，供按需本地短录音，不改变采样或协议。
-     * @param[in] enabled true才复制AEC/预处理中间PCM；在采集线程设置。
-     */
-    void enablePcmObservation(bool enabled);
-    /** @return 最近一帧已启用的中间PCM副本及有效位；关闭时valid=0，所属线程调用。 */
-    ProcessingPcm pcmObservation() const;
     /** @return 一次性重置/失败说明；正常逐帧路径返回空，不输出原始录音。 */
     QString takeNotice();
 private:

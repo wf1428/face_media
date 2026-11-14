@@ -1,10 +1,10 @@
 /**
  * @file CallGpioButton.h
- * @brief 用户态读取GPIO40高有效通话键，将消抖后的拨号/取消/挂断动作安全交给UI。
+ * @brief 用户态读取GPIO40高有效通话键，将消抖后的拨号动作安全交给UI。
  * @details 文件访问仅在后台线程；可用性代次阻止旧按键在通话结束或重连后补发。
  * @author Du lin
  * @date 2026-10-30
- * @note 最近修改：2026-11-03；修改人：Du lin；明确会话中可再次按下取消/挂断，每次状态刷新均使旧代次失效；消抖与线程资源规则不变。
+ * @note 最近修改：2026-11-05；修改人：Du lin；更新物理键可用性和通知契约，只允许拨号，保留消抖与线程规则。
  */
 #pragma once
 #include <QThread>
@@ -23,9 +23,9 @@ public:
     /** @brief 采样电平，并在一次有效按下时返回原可用性代次。
      * @param[in] high true 为高电平按下，false 为低电平释放。
      * @param[in] nowMs 单调递增的本地毫秒值，不能使用可回拨墙上时钟。
-     * @param[in] eligibility bit0为允许本次通话按键动作；高位为UI业务状态代次。
+     * @param[in] eligibility bit0为允许发起新呼叫；高位为UI业务状态代次。
      * @return 非零奇数表示按下；0 表示抖动、长按、未武装或按下期间可用性已变化。
-     * @note 即使当前不可操作也消费高电平；状态改变后持续按住不会补发或自动挂断。
+     * @note 即使当前不可操作也消费高电平；状态改变后持续按住不会补发拨号。
      */
     quint64 sample(bool high,qint64 nowMs,quint64 eligibility);
 private:
@@ -57,15 +57,15 @@ public:
     ~CallGpioButton() override;
 public slots:
     /** @brief UI线程刷新按键动作可用性；每次调用均推进代次，不访问GPIO。
-     * @param[in] available true允许拨号或会话取消/挂断；false用于离线、结束中或等待迟到ACK。
-     * @note 即使前后均true也须在业务状态变化时调用，避免旧拨号动作成为新会话的挂断。
+     * @param[in] available true 允许空闲拨号；false 用于离线、已有会话或等待迟到 ACK。
+     * @note 即使前后均true也须在业务状态变化时调用，避免旧按下跨状态发起新呼叫。
      */
     void setCallAvailable(bool available);
     /** @brief 立即取消可用性并请求后台退出；不等待，GPIO 关闭发生在后台。 */
     void stopAsync();
 signals:
-    /** @brief UI线程核对代次后发出单次按下；接收端按当前状态选择拨号或取消/挂断。
-     * @note 自动/直接连接到UI线程的状态感知入口；不直接连接无条件hangup，不模拟KEY3/KEY4。
+    /** @brief UI线程核对代次后发出单次按下；接收端再次核对是否允许新拨号。
+     * @note 连接到 UI 线程的拨号入口；保留独立于 KEY3/KEY4 的事件路径。
      */
     void callRequested();
     /** @brief 后台配置、读取失败及恢复日志，最多在错误变化/恢复时输出。

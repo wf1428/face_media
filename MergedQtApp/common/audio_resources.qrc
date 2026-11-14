@@ -1,3 +1,5 @@
+<!-- @author Du lin
+     @note 最近修改：2026-11-05；修改人：Du lin；登记外呼循环铃声 MP3，随应用资源部署。 -->
 <RCC>
     <qresource prefix="/common/audio">
         <file alias="code_200.mp3">audio/code_200.mp3</file>
@@ -19,6 +21,7 @@
         <file alias="code_4501.mp3">audio/code_4501.mp3</file>
         <file alias="face_access_timeout.mp3">audio/face_access_timeout.mp3</file>
         <file alias="face_liveness_unavailable.mp3">audio/face_liveness_unavailable.mp3</file>
+        <file alias="phone_ringing.mp3">audio/phone_ringing.mp3</file>
         <file alias="fail.wav">audio/fail.wav</file>
         <file alias="verify_passed.wav">audio/verify_passed.wav</file>
         <file alias="verify_failed.wav">audio/verify_failed.wav</file>

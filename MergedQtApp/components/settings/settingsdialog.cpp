@@ -4,7 +4,7 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-10-24；修改人：Du lin；转发资源包版本进度到主窗口，不将资源文件误送入原视频下载完成链路。
+ * @note 最近修改：2026-11-12；修改人：Du lin；转发下载卡片画面变化通知，使 MQTT 页面作废待发的普通截图。
  */
 
 #include "settingsdialog.h"
@@ -16,10 +16,15 @@
 #include "ftppage.h"
 #include "displayrotationpage.h"
 #include "common/responsive_ui.h"
+#include "common/device_feature_switches.h"
+#include "common/toggle_switch.h"
 #include "components/quick/QuickNavigationWidget.h"
 #include "shell/QuickUiRuntime.h"
 
 #include <QDebug>
+#include <QLabel>
+#include <QMessageBox>
+#include <QSignalBlocker>
 #include <QBoxLayout>
 #include <QStyle>
 #include <QGroupBox>
@@ -103,21 +108,29 @@ void SettingsDialog::setupUI()
     standbyLockButton = new QPushButton("待机和锁屏", sidebarWidget_);
     systemInfoButton = new QPushButton("系统信息", sidebarWidget_);
     displayButton = new QPushButton("显示设置", sidebarWidget_);
+    soundButton_ = new QPushButton(QStringLiteral("声音"), sidebarWidget_);
 
 
     // 设置按钮样式（模拟 element-ui 风格）
-    QList<QPushButton*> buttons = {networkButton, bluetoothButton, mqttButton, ftpButton,
-                                   standbyLockButton, systemInfoButton, displayButton};
-    for (auto button : buttons) {
+    navigationButtons_ = {networkButton, bluetoothButton, mqttButton, ftpButton,
+                          standbyLockButton, systemInfoButton, displayButton, soundButton_};
+    for (auto *button : navigationButtons_) {
+        button->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
         button->setMinimumHeight(40);
         button->setStyleSheet("QPushButton { text-align: left; padding: 10px 20px; border: 1px solid #dcdfe6; border-radius: 6px; background-color: white; color: #606266; font-size: 14px; } "
                              "QPushButton:hover { border-color: #409eff; background-color: #ecf5ff; color: #409eff; } "
                              "QPushButton:pressed { border-color: #337ecc; background-color: #d9ecff; color: #337ecc; } ");
     }
-    for (int index = 0; index < buttons.size(); ++index) {
-        navigationLayout_->addWidget(buttons.at(index), index, 0);
+    for (int index = 0; index < navigationButtons_.size(); ++index) {
+        navigationLayout_->addWidget(navigationButtons_.at(index), index, 0);
     }
-    navigationLayout_->setRowStretch(buttons.size(), 1);
+    navigationLayout_->setRowStretch(navigationButtons_.size(), 1);
+    navigationBack_ = new QPushButton(QStringLiteral("‹"), sidebarWidget_);
+    navigationBack_->setAccessibleName(QStringLiteral("返回"));
+    navigationBack_->setFixedWidth(46);
+    navigationBack_->hide();
+    connect(navigationBack_, &QPushButton::clicked, this, &QDialog::reject);
+    soundButton_->setProperty("normalSoundButtonStyle",soundButton_->styleSheet());
 
     // 创建内容区域
     contentStack = new QStackedWidget(this);
@@ -149,16 +162,14 @@ void SettingsDialog::setupUI()
     contentStack->addWidget(standbyLockContainer_);
     contentStack->addWidget(systemInfoContainer_);
     contentStack->addWidget(displayContainer_);
+    soundContainer_ = wrapScrollablePage(createSoundPage());
+    contentStack->addWidget(soundContainer_);
 
     // Quick 只接管导航框架；各设置页仍复用原 QWidget 和原保存/连接逻辑。
     quickNavigation_ = new QuickNavigationWidget(this);
-    quickNavigation_->setItems({QStringLiteral("网络连接"),
-                                QStringLiteral("蓝牙连接"),
-                                QStringLiteral("MQTT连接"),
-                                QStringLiteral("视频下载"),
-                                QStringLiteral("待机和锁屏"),
-                                QStringLiteral("系统信息"),
-                                QStringLiteral("显示设置")});
+    QStringList navigationLabels;
+    for (const auto *button : navigationButtons_) navigationLabels.append(button->text());
+    quickNavigation_->setItems(navigationLabels);
     quickNavigation_->setHeader(QStringLiteral("系统设置"), QString());
     quickNavigation_->setBackVisible(true);
     quickNavigation_->setCurrentIndex(0);
@@ -166,13 +177,8 @@ void SettingsDialog::setupUI()
             this, &QDialog::reject);
     connect(quickNavigation_, &QuickNavigationWidget::itemActivated,
             this, [this](int index) {
-        const QList<QPushButton *> buttons = {
-            networkButton, bluetoothButton, mqttButton, ftpButton,
-            standbyLockButton, systemInfoButton, displayButton
-        };
-        if (index >= 0 && index < buttons.size() && buttons.at(index)) {
-            buttons.at(index)->click();
-        }
+        if (index >= 0 && index < navigationButtons_.size())
+            navigationButtons_.at(index)->click();
     });
     sidebarWidget_->hide();
 
@@ -211,34 +217,38 @@ void SettingsDialog::applyResponsiveLayout()
         return;
     }
 
-    const bool top = ResponsiveUi::usesTopNavigation(
-                ResponsiveUi::layoutReferenceSize(this));
-    topNavigation_ = top;
-    const bool quickReady = quickNavigation_->status() == QQuickWidget::Ready;
-    quickNavigation_->setVisible(quickReady);
-    sidebarWidget_->setVisible(!quickReady);
-    if (!quickReady) {
-        mainLayout_->setDirection(QBoxLayout::LeftToRight);
-        sidebarWidget_->setMinimumWidth(198);
-        sidebarWidget_->setMaximumWidth(210);
-        mainLayout_->invalidate();
-        return;
-    }
-    mainLayout_->setDirection(top ? QBoxLayout::TopToBottom
-                                  : QBoxLayout::LeftToRight);
+    const QSize hostSize = ResponsiveUi::hostRect(parentWidget()).size();
+    // 实际屏幕旋转后，配置里的背景尺寸可能仍是横屏。
+    const bool top = ResponsiveUi::usesTopNavigation(hostSize) ||
+                     ResponsiveUi::usesTopNavigation(ResponsiveUi::layoutReferenceSize(this));
+    const bool quick = !top && quickNavigation_->status() == QQuickWidget::Ready;
+    quickNavigation_->setVisible(quick);
+    sidebarWidget_->setVisible(!quick);
+    mainLayout_->setDirection(top ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
 
-    quickNavigation_->setHorizontal(top);
-    if (top) {
-        quickNavigation_->setMinimumWidth(0);
-        quickNavigation_->setMaximumWidth(QWIDGETSIZE_MAX);
-        quickNavigation_->setMinimumHeight(92);
-        quickNavigation_->setMaximumHeight(112);
-    } else {
-        quickNavigation_->setMinimumHeight(0);
-        quickNavigation_->setMaximumHeight(QWIDGETSIZE_MAX);
-        quickNavigation_->setMinimumWidth(198);
-        quickNavigation_->setMaximumWidth(198);
+    const int columns = top ? (hostSize.width() >= 560 ? 4 : 3) : 1;
+    if (columns != navigationColumns_) {
+        navigationColumns_ = columns;
+        navigationLayout_->removeWidget(navigationBack_);
+        for (int row = 0; row < navigationLayout_->rowCount(); ++row)
+            navigationLayout_->setRowStretch(row, 0);
+        for (int index = 0; index < navigationButtons_.size(); ++index) {
+            auto *button = navigationButtons_.at(index);
+            navigationLayout_->removeWidget(button);
+            navigationLayout_->addWidget(button, index / columns, index % columns);
+        }
+        const int rows = (navigationButtons_.size() + columns - 1) / columns;
+        if (top) navigationLayout_->addWidget(navigationBack_, 0, columns, rows, 1);
+        else navigationLayout_->setRowStretch(rows, 1);
     }
+    navigationBack_->setVisible(top);
+    sidebarWidget_->setMinimumWidth(top ? 0 : 198);
+    sidebarWidget_->setMaximumWidth(top ? QWIDGETSIZE_MAX : 210);
+    sidebarWidget_->setSizePolicy(QSizePolicy::Preferred, top ? QSizePolicy::Maximum : QSizePolicy::Preferred);
+
+    // 宽屏继续用原来的 Quick 侧栏。
+    quickNavigation_->setMinimumWidth(198);
+    quickNavigation_->setMaximumWidth(198);
     mainLayout_->invalidate();
 }
 
@@ -288,6 +298,7 @@ void SettingsDialog::setupConnections()
     connect(systemInfoButton, &QPushButton::clicked, this, &SettingsDialog::onSystemInfoButtonClicked);
     connect(standbyLockButton, &QPushButton::clicked, this, &SettingsDialog::onStandbyLockButtonClicked);
     connect(displayButton, &QPushButton::clicked, this, &SettingsDialog::onDisplayButtonClicked);
+    connect(soundButton_, &QPushButton::clicked, this, &SettingsDialog::onSoundButtonClicked);
 
     // 现有导航页仍保留各自的选中样式逻辑；离开显示页时只恢复新增按钮，
     // 避免同时出现两个选中项。
@@ -301,6 +312,12 @@ void SettingsDialog::setupConnections()
                 "QPushButton { text-align: left; padding: 10px 20px; border: 1px solid #dcdfe6; border-radius: 6px; background-color: white; color: #606266; font-size: 14px; } "
                 "QPushButton:hover { border-color: #409eff; background-color: #ecf5ff; color: #409eff; } "
                 "QPushButton:pressed { border-color: #337ecc; background-color: #d9ecff; color: #337ecc; } ");
+        });
+    }
+    for (auto *button : QList<QPushButton *>{networkButton,bluetoothButton,mqttButton,ftpButton,
+                                            standbyLockButton,systemInfoButton,displayButton}) {
+        connect(button,&QPushButton::clicked,this,[this] {
+            soundButton_->setStyleSheet(soundButton_->property("normalSoundButtonStyle").toString());
         });
     }
     connect(networkPage, &NetworkPage::cancelRequested, this, &QDialog::reject);
@@ -476,6 +493,13 @@ void SettingsDialog::onCurrentPlayImageChanged(const QString &base64Image)
 {
     if (mqttPage) {
         mqttPage->onCurrentPlayImageChanged(base64Image);
+    }
+}
+
+void SettingsDialog::invalidatePlayImage()
+{
+    if (mqttPage) {
+        mqttPage->invalidatePlayImage();
     }
 }
 
@@ -663,4 +687,54 @@ void SettingsDialog::onDisplayButtonClicked()
     }
     displayButton->setStyleSheet(
         "QPushButton { text-align: left; padding: 10px 20px; border: 1px solid #409eff; border-radius: 6px; background-color: #ecf5ff; color: #409eff; font-size: 14px; } ");
+}
+
+QWidget *SettingsDialog::createSoundPage()
+{
+    auto *page = new QWidget(contentStack);
+    auto *layout = new QVBoxLayout(page);
+    auto *group = new QGroupBox(QStringLiteral("声音"),page);
+    auto *rows = new QGridLayout(group);
+    const auto saved = DeviceFeatureSwitches::read();
+    auto addSwitch = [this,group,rows,saved](int row,const QString &title,bool DeviceFeatureSwitches::*member) {
+        rows->addWidget(new QLabel(title,group),row,0);
+        auto *toggle = new ToggleSwitch(group);
+        toggle->setChecked(saved.*member);
+        rows->addWidget(toggle,row,1,Qt::AlignRight);
+        connect(&DeviceFeatureSwitches::soundChanges(),&DeviceSoundChanges::changed,toggle,[toggle,member] {
+            const QSignalBlocker blocker(toggle);
+            toggle->setChecked(DeviceFeatureSwitches::current().*member);
+        });
+        connect(toggle,&QCheckBox::toggled,this,[this,toggle,member](bool checked) {
+            auto settings = DeviceFeatureSwitches::read();
+            const bool before = DeviceFeatureSwitches::current().*member;
+            settings.*member = checked;
+            if (settings.saveSound()) {
+                settings.applySound();
+            } else {
+                const QSignalBlocker blocker(toggle);
+                toggle->setChecked(before);
+                QMessageBox::warning(this,QStringLiteral("声音"),QStringLiteral("声音设置保存失败"));
+            }
+        });
+    };
+    addSwitch(0,QStringLiteral("广播音频"),&DeviceFeatureSwitches::broadcastAudio);
+    addSwitch(1,QStringLiteral("IC 卡播报"),&DeviceFeatureSwitches::icCardAudio);
+    addSwitch(2,QStringLiteral("人脸播报"),&DeviceFeatureSwitches::faceAudio);
+    layout->addWidget(group);
+    layout->addStretch();
+    return page;
+}
+
+void SettingsDialog::onSoundButtonClicked()
+{
+    if (quickNavigation_) quickNavigation_->setCurrentIndex(contentStack->indexOf(soundContainer_));
+    contentStack->setCurrentWidget(soundContainer_);
+    const auto normal = soundButton_->property("normalSoundButtonStyle").toString();
+    for (auto *button : QList<QPushButton *>{networkButton,bluetoothButton,mqttButton,ftpButton,
+                                            standbyLockButton,systemInfoButton,displayButton})
+        button->setStyleSheet(normal);
+    soundButton_->setStyleSheet(QStringLiteral(
+        "QPushButton { text-align:left; padding:10px 20px; border:1px solid #409eff;"
+        "border-radius:6px; background-color:#ecf5ff; color:#409eff; font-size:14px; }"));
 }

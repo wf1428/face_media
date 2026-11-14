@@ -2,6 +2,7 @@
  * @file ConcurrentJitterBuffer.h
  * @brief 固定10槽下行抖动缓存；单接收者/单播放者通过槽所有权交接，不持互斥、不分配。
  * @author Du lin
+ * @note 最近修改：2026-11-05；修改人：Du lin；移除 CAS 争用细分诊断计数，保留原扫描上限、总丢帧和欠载行为。
  * @date 2026-11-04
  */
 #pragma once
@@ -28,12 +29,12 @@ public:
     /** @brief 消费者停止后推进通话epoch及清计数；不改写仍可能在途的旧生产者槽。 */
     void reset() {
         epoch_.fetch_add(1,std::memory_order_acq_rel);
-        played_.store(0);dropped=0;underruns=0;highWater=0;contentionDrops=0;pushRetries=0;takeRetries=0;takeExhausted=0;primed_=false;consecutive_=0;
+        played_.store(0);dropped=0;underruns=0;highWater=0;primed_=false;consecutive_=0;
     }
     /** @brief 插入一帧；固定槽中去重并在满时淘汰最旧，不等播放线程。
      * @param[in] frame 已校验PCM，localMs为本地接收毫秒。
      * @param[in] expectedEpoch 接收入口取得的通话代次，0表示当前代次；旧值直接拒绝。
-     * @return false重复/已播放旧帧/过时代次；true已接受，含溢出淘汰。极端CAS争用也计入dropped/contentionDrops。
+     * @return false重复/已播放旧帧/过时代次；true已接受，含溢出淘汰。极端CAS争用也计入 dropped。
      */
     bool push(const Frame &frame,uint32_t expectedEpoch=0) {
         const auto generation=epoch_.load(std::memory_order_acquire);
@@ -58,7 +59,7 @@ public:
             Slot *target=free ? free : oldest;auto expected=free ? freeTag : oldTag;
             if(!target) continue;
             if(!free && delta(frame.timestamp,uint32_t(oldKey))<0) { ++dropped;return true; }
-            if(!target->tag.compare_exchange_strong(expected,(expected&~uint64_t(3))|Writing,std::memory_order_acq_rel)) { ++pushRetries;continue; }
+            if(!target->tag.compare_exchange_strong(expected,(expected&~uint64_t(3))|Writing,std::memory_order_acq_rel)) continue;
             if(!free) ++dropped;
             target->frame=frame;target->order.store(++serial_,std::memory_order_release);target->metadata.store(key,std::memory_order_release);target->epoch.store(generation,std::memory_order_release);
             target->tag.store(((expected&~uint64_t(3))+4)|Ready,std::memory_order_release);
@@ -66,14 +67,14 @@ public:
             if(peak>highWater.load()) highWater.store(peak);
             return epoch_.load(std::memory_order_acquire)==generation;
         }
-        ++dropped;++contentionDrops;return true;
+        ++dropped;return true;
     }
     /** @brief 每20ms取最旧帧，预缓冲/欠载输出静音；只在播放线程调用。
      * @param[in] nowMs 本地单调毫秒。
      * @return 当前PCM或静音，不重放旧PCM；未就绪的Writing槽留待下一周期。
      */
     Frame take(int64_t nowMs) {
-        const auto generation=epoch_.load(std::memory_order_acquire);bool exhausted=true;
+        const auto generation=epoch_.load(std::memory_order_acquire);
         for(unsigned retry=0;retry<24;++retry) {
             Slot *oldest=nullptr;uint64_t oldTag=0,oldKey=0,oldOrder=0;size_t depth=0;
             for(auto &slot:slots_) {
@@ -84,28 +85,24 @@ public:
                 ++depth;
                 if(!oldest || delta(uint32_t(key),uint32_t(oldKey))<0 || (uint32_t(key)==uint32_t(oldKey) && order<oldOrder)) { oldest=&slot;oldTag=tag;oldKey=key;oldOrder=order; }
             }
-            if(!oldest) { exhausted=false;break; }
+            if(!oldest) break;
             auto expected=oldTag;
-            if(!oldest->tag.compare_exchange_strong(expected,(oldTag&~uint64_t(3))|Reading,std::memory_order_acq_rel)) { ++takeRetries;continue; }
+            if(!oldest->tag.compare_exchange_strong(expected,(oldTag&~uint64_t(3))|Reading,std::memory_order_acq_rel)) continue;
             const auto frame=oldest->frame;
             if(nowMs-frame.localMs>200) {
                 oldest->tag.store(oldTag&~uint64_t(3),std::memory_order_release);++dropped;continue;
             }
             if(!primed_ && (depth>=4 || nowMs-frame.localMs>=80)) primed_=true;
-            if(!primed_) { oldest->tag.store(oldTag,std::memory_order_release);exhausted=false;break; }
+            if(!primed_) { oldest->tag.store(oldTag,std::memory_order_release);break; }
             played_.store((uint64_t(1)<<32)|frame.timestamp,std::memory_order_release);
             oldest->tag.store(oldTag&~uint64_t(3),std::memory_order_release);consecutive_=0;return frame;
         }
-        if(exhausted) ++takeExhausted;
         if(primed_) { ++underruns;if(++consecutive_>=4) primed_=false; }
         Frame silence;silence.localMs=nowMs;return silence;
     }
-    /** @return 近似待播放深度，0..10；并发到达可使相邻快照不同，不消费槽。 */
-    size_t pendingFrames() const { size_t count=0;const auto e=epoch_.load();for(const auto &s:slots_) count+=((s.tag.load(std::memory_order_acquire)&3)==Ready && s.epoch.load()==e);return count; }
     /** @return 当前通话代次；接收函数应在解析之前保存，push时提交以排除迟到旧调用。 */
     uint32_t generation() const { return epoch_.load(std::memory_order_acquire); }
-    std::atomic<uint64_t> dropped{0},underruns{0},contentionDrops{0}; /**< 丢弃、已预缓冲欠载与达到CAS扫描上限次数；非PCM内存竞态。 */
-    std::atomic<uint64_t> pushRetries{0},takeRetries{0},takeExhausted{0}; /**< CAS碰撞及消费扫描上限次数；不把无互斥误写为无调度迟到。 */
+    std::atomic<uint64_t> dropped{0},underruns{0}; /**< 丢弃总数及已预缓冲后欠载次数。 */
     std::atomic<size_t> highWater{0}; /**< 生产者扫描估计峰值，最多10帧。 */
 private:
     /** @brief 32位时间戳有符号模差，要求真实差小于2^31毫秒。

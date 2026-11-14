@@ -2,7 +2,8 @@
  * @file ic_worker.cpp
  * @brief 在非 UI 线程中运行 IC 串口、二维码、RS485 和协议处理逻辑。
  *
- * @author Dulin
+ * @author Du lin
+ * @note 最近修改：2026-11-10；修改人：Du lin；将 IC 刷卡结果接到独立播报门，二维码分支继续使用原提示入口。
  * @date 2026-07-25
  */
 
@@ -147,7 +148,7 @@ bool IcWorker::handleStoredCard(const QString &cardId, const QByteArray &rawFram
                     .arg(names.join(QStringLiteral("和")));
         }
         qWarning().noquote() << "[IC-CARD-ROUTE]" << reason;
-        IcEventBridge::instance()->emitToastFailRequested(reason);
+        IcEventBridge::instance()->emitCardToastFailRequested(reason);
         return true;
     }
 
@@ -175,7 +176,7 @@ void IcWorker::finishNetworkCard(const NetworkAccessResult &result,
 
     if (!result.pass) {
         qInfo() << "[NETWORK-PERSON][IC] DENY" << "code=" << result.code << result.reason;
-        IcEventBridge::instance()->emitToastFailRequested(result.reason, result.code);
+        IcEventBridge::instance()->emitCardToastFailRequested(result.reason, result.code);
         IcEventBridge::instance()->emitCardAccessFinished(
                     result.personId, result.credential, floors,
                     result.rs485Frame, false, result.reason);
@@ -190,7 +191,7 @@ void IcWorker::finishNetworkCard(const NetworkAccessResult &result,
             << "frame=" << result.rs485Frame.toHex(' ');
     if (!sent) {
         const QString reason = QStringLiteral("RS485发送失败");
-        IcEventBridge::instance()->emitToastFailRequested(reason);
+        IcEventBridge::instance()->emitCardToastFailRequested(reason);
         IcEventBridge::instance()->emitCardAccessFinished(
                     result.personId, result.credential, floors,
                     result.rs485Frame, false, reason);
@@ -202,14 +203,14 @@ void IcWorker::finishNetworkCard(const NetworkAccessResult &result,
         qWarning().noquote() << "[NETWORK-PERSON][IC] DEDUCT_FAIL"
                              << "personId=" << result.personId
                              << "cardId=" << result.credential;
-        IcEventBridge::instance()->emitToastFailRequested(reason);
+        IcEventBridge::instance()->emitCardToastFailRequested(reason);
         IcEventBridge::instance()->emitCardAccessFinished(
                     result.personId, result.credential, floors,
                     result.rs485Frame, false, reason);
         return;
     }
 
-    IcEventBridge::instance()->emitToastPassRequested();
+    IcEventBridge::instance()->emitCardToastPassRequested();
     IcEventBridge::instance()->emitCardAccessFinished(
                 result.personId, result.credential, floors,
                 result.rs485Frame, true, QString());
@@ -219,7 +220,7 @@ void IcWorker::finishNetworkCard(const NetworkAccessResult &result,
 void IcWorker::finishLocalCard(const NetworkAccessResult &result)
 {
     if (!result.pass) {
-        IcEventBridge::instance()->emitToastFailRequested(result.reason, result.code);
+        IcEventBridge::instance()->emitCardToastFailRequested(result.reason, result.code);
         return;
     }
 
@@ -227,9 +228,9 @@ void IcWorker::finishLocalCard(const NetworkAccessResult &result)
     const bool recorded = sent && localAccess_
             && localAccess_->recordSuccessfulAccess(result);
     if (recorded) {
-        IcEventBridge::instance()->emitToastPassRequested();
+        IcEventBridge::instance()->emitCardToastPassRequested();
     } else {
-        IcEventBridge::instance()->emitToastFailRequested(
+        IcEventBridge::instance()->emitCardToastFailRequested(
                     !sent ? QStringLiteral("RS485发送失败")
                           : QStringLiteral("本地通行次数/金额扣减失败"));
     }
@@ -249,7 +250,7 @@ void IcWorker::finishEmbeddedPermissionCard(const QByteArray &frame)
     if (!result.pass) {
         qInfo().noquote() << QStringLiteral("[%1] DENY source=embedded reason=%2")
                              .arg(type, result.reason);
-        IcEventBridge::instance()->emitToastFailRequested(result.reason);
+        IcEventBridge::instance()->emitCardToastFailRequested(result.reason);
         return;
     }
 
@@ -257,7 +258,7 @@ void IcWorker::finishEmbeddedPermissionCard(const QByteArray &frame)
             << "relayNum=" << result.relayNum
             << "relayTimes=" << result.relayTimes
             << "fcbbuf36=" << result.fcbbuf36.toHex(' ');
-    IcEventBridge::instance()->emitToastPassRequested();
+    IcEventBridge::instance()->emitCardToastPassRequested();
     if (rs485_) rs485_->sendFrame(result.fcbbuf36);
 }
 
@@ -546,7 +547,7 @@ void IcWorker::start()
                      [this](const QString &cardId, const QByteArray &frame) {
         qInfo() << "[CARD-UID] RX cardId=" << cardId << "raw=" << frame;
         if (!handleStoredCard(cardId, frame)) {
-            IcEventBridge::instance()->emitToastFailRequested(
+            IcEventBridge::instance()->emitCardToastFailRequested(
                         QStringLiteral("空卡：%1").arg(cardId));
         }
     });

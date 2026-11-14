@@ -4,16 +4,18 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-04；修改人：Du lin；图片上传采用2项预算，普通回执按容量延迟/过载保留ID的小回执，高清只保留唯一已编码值后重试；接入高清场景共享后台，协议/音频/DSP不变。
+ * @note 最近修改：2026-11-10；修改人：Du lin；仅摄像头按开机开关建服务；广播常驻，运行时声音开关只控制定时播放。
  */
 
 #include "mqttmanager.h"
+#include "camera_screenshot_upload.h"
+#include "broadcast_service.h"
 #include "src/call/CallManager.h"
 #include "multimedia_update.h"
 #include "company_play_info.h"
 #include "common/media_content_policy.h"
 #include "common/configuration_work.h"
-#include "common/debug/ui_performance.h"
+#include "common/device_feature_switches.h"
 
 #include <QDebug>
 #include <QCryptographicHash>
@@ -865,6 +867,31 @@ MqttManager::MqttManager(QObject *parent)
     // 创建 IPC 通信对象与 MQTT 业务服务对象
     ipc_ = new MqttIpcClient(this);
     callManager_ = new CallManager(ipc_,this);
+    const auto &features=DeviceFeatureSwitches::boot();
+    if (features.cameraScreenshot) {
+        cameraScreenshot_=new CameraScreenshotUpload(true,this);
+        cameraScreenshot_->setTransport([this] {return ipc_ && ipc_->cameraSnapshotReady();},
+            [this](const QByteArray &line,const CameraScreenshotUpload::Cancel &cancel) {
+                return ipc_ && ipc_->sendCameraSnapshotRawLine(line,cancel);
+            });
+        connect(callManager_,&CallManager::changed,cameraScreenshot_,[this](const QString &) {
+            if(callManager_->state()==CallManager::Ending)cameraScreenshot_->stop();
+        });
+        connect(this,&MqttManager::mqttConnMarkChanged,cameraScreenshot_,[this](int mark) {
+            cameraScreenshot_->setOnline(mark==2);
+        });
+    }
+    broadcast_ = new BroadcastService([this](const QJsonObject &packet) {
+        return ipc_ && ipc_->sendJsonLine(packet);
+    }, this);
+    broadcast_->setScheduledEnabled(DeviceFeatureSwitches::current().broadcastAudio);
+    connect(&DeviceFeatureSwitches::soundChanges(), &DeviceSoundChanges::changed, broadcast_, [this] {
+        broadcast_->setScheduledEnabled(DeviceFeatureSwitches::current().broadcastAudio);
+    });
+    connect(ipc_, &MqttIpcClient::broadcastFrameReceived, broadcast_, broadcast_->mediaReceiver(), Qt::DirectConnection);
+    connect(this, &MqttManager::mqttConnMarkChanged, broadcast_, [this](int mark) {
+        broadcast_->setOnline(mark == 2);
+    });
     service_ = new MqttService(this);
     companyPlayInfo_ = new CompanyPlayInfo(this);
     connect(companyPlayInfo_, &CompanyPlayInfo::captureRequested,
@@ -1081,6 +1108,9 @@ MqttManager::MqttManager(QObject *parent)
 
 MqttManager::~MqttManager()
 {
+    delete broadcast_;
+    broadcast_ = nullptr;
+    delete cameraScreenshot_;cameraScreenshot_=nullptr;
     delete callManager_; callManager_=nullptr;
 
     if (multimediaUpdate_) {
@@ -4134,6 +4164,12 @@ void MqttManager::setConfig(const MqttConfig &cfg)
         if (callDevice.contains('/') || callDevice.contains('+') || callDevice.contains('#')) callDevice.clear();
     }
     callManager_->configure(callDevice);
+    if (cameraScreenshot_) cameraScreenshot_->configure(callEvent);
+    if (broadcast_) {
+        const QSettings settings(Rk3566Platform::netConfigPath(), QSettings::IniFormat);
+        const QString ftpHost = settings.value("ftp/host").toString().trimmed();
+        broadcast_->configure(callDevice, ftpHost.isEmpty() ? cfg_.host : ftpHost);
+    }
     const bool onlineV1Active = cfg_.publishTopic.trimmed()
             .startsWith(QStringLiteral("device/ycLinux/"))
             && cfg_.publishTopic.trimmed().endsWith(QStringLiteral("/event"));
@@ -4378,7 +4414,7 @@ void MqttManager::sendConfigToMqttd(bool applyNow)
 
     if (callManager_ && !callManager_->deviceId().isEmpty()) {
         const QString base=QStringLiteral("device/ycLinux/%1").arg(callManager_->deviceId());
-        topics << base+"/request" << base+"/audio";
+        topics << base+"/request" << base+"/audio" << base+"/broadcast/audio";
     }
     topics.removeDuplicates();
 
@@ -4413,7 +4449,7 @@ void MqttManager::sendConfigToMqttd(bool applyNow)
  * 本函数负责：
  * - 输出统一的接收日志；
  * - 提取 method；
- * - 按业务处理顺序调用各类 handler。
+ * - 摄像头协议先交独立控制器，其余按原业务顺序调用各类 handler。
  *
  * @param topic      消息 topic。
  * @param payloadObj 消息 payload 对象。
@@ -4423,6 +4459,9 @@ void MqttManager::sendConfigToMqttd(bool applyNow)
 bool MqttManager::dispatchPayloadMessage(const QString &topic, const QJsonObject &payloadObj)
 {
     if (callManager_ && callManager_->handleSignal(topic,payloadObj)) return true;
+    if (cameraScreenshot_ && cameraScreenshot_->handle(topic,payloadObj)) return true;
+    if (broadcast_ && broadcast_->handle(topic,payloadObj)) return true;
+    if (!cameraScreenshot_ && CameraScreenshotUpload::handlesMethod(payloadObj.value("method").toString())) return true;
     if (payloadObj.isEmpty()) {
         emit logMessage(QString("消息 payload 为空：topic=%1").arg(topic));
         return false;
@@ -4432,8 +4471,6 @@ bool MqttManager::dispatchPayloadMessage(const QString &topic, const QJsonObject
             ? payloadObj.value("methon").toString().trimmed()
             : payloadObj.value("method").toString().trimmed();
 
-    const auto methodTag=method.toLatin1();
-    UiPerformance::OperationScope performance(UiPerformance::Operation::MqttBusiness,this,methodTag.constData());
     emit logMessage(QStringLiteral("消息：topic=%1 method=%2 id=%3（正文已在后台解析）")
                     .arg(topic,method,payloadObj.value(QStringLiteral("id")).toString()));
 
@@ -4459,7 +4496,6 @@ bool MqttManager::handleGetPlayFileList(const QString &topic, const QJsonObject 
     if (method != "getPlayFileList") {
         return false;
     }
-    UiPerformance::OperationScope performance(UiPerformance::Operation::FileList,this);
 
     if (!service_ || !ipc_) {
         emit logMessage("处理 getPlayFileList 失败：内部对象未初始化");
@@ -4504,8 +4540,6 @@ bool MqttManager::handleGetPlayInfo(const QString &topic, const QJsonObject &pay
     if (method != "getPlayInfo" && !company) {
         return false;
     }
-    const auto methodTag=method.toLatin1();
-    UiPerformance::OperationScope performance(UiPerformance::Operation::GetPlayInfo,this,methodTag.constData());
 
     if (!service_ || !ipc_) {
         emit logMessage("处理 getPlayInfo 失败：内部对象未初始化");
@@ -5098,7 +5132,7 @@ void MqttManager::handleStatusLikeMessage(const QJsonObject &obj)
         if (callManager_) {
             if (!callManager_->deviceId().isEmpty()) {
                 const QString base=QStringLiteral("device/ycLinux/%1").arg(callManager_->deviceId());
-                configuredTopics << base+"/request" << base+"/audio";
+                configuredTopics << base+"/request" << base+"/audio" << base+"/broadcast/audio";
             }
         }
         configuredTopics.removeDuplicates();
@@ -5321,12 +5355,10 @@ void MqttManager::sendPlayInfoNow(const QString &reqTopic,
 
     QString respTopic;
     QJsonObject packet=[&] {
-        UiPerformance::OperationScope performance(UiPerformance::Operation::PlayInfoBuild,this);
         return service_->buildPlayInfoPublishPacket(reqTopic,reqId,deviceId,&respTopic);
     }();
 
     const bool submitted=[&] {
-        UiPerformance::OperationScope performance(UiPerformance::Operation::PlayInfoSubmit,this);
         auto payload=packet.value("payload").toObject();auto data=payload.value("data").toObject();auto info=data.value("info").toObject();
         bool ok=false;
         if(info.value("base64Image").toString().isEmpty()) ok=ipc_->sendJsonLine(packet);
@@ -5336,7 +5368,7 @@ void MqttManager::sendPlayInfoNow(const QString &reqTopic,
             info["base64Image"]=QString();info["deviceLog"]=info.value("deviceLog").toString()+QStringLiteral("\n截图上传忙，请稍后重试");
             data["info"]=info;payload["data"]=data;packet["payload"]=payload;ok=ipc_->sendJsonLine(packet);
         }
-        performance.setResult(ok);return ok;
+        return ok;
     }();
     if (submitted) {
         emit logMessage(QString("sendPlayInfo 已提交到 mqttd，respTopic=%1").arg(respTopic));

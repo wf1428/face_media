@@ -2,7 +2,8 @@
  * @file ic_event_bridge.cpp
  * @brief IC 本地链路、UI 与 MQTT 网关之间的进程内事件总线的实现。
  *
- * @author Dulin
+ * @author Du lin
+ * @note 最近修改：2026-11-10；修改人：Du lin；传递刷卡来源而非旧的音频快照，界面按即时开关决定是否播报。
  * @date 2026-07-25
  */
 
@@ -159,13 +160,23 @@ void IcEventBridge::emitRs485SendFinished(const QString &sourceTag, bool ok, con
 /** @brief 请求主线程显示验证通过提示。 */
 void IcEventBridge::emitToastPassRequested()
 {
-    emit toastPassRequested();
+    emit toastPassRequested(false);
 }
 
 /** @brief 请求主线程显示带原因的验证失败提示。 */
 void IcEventBridge::emitToastFailRequested(const QString &reason, int resultCode)
 {
-    emit toastFailRequested(reason, resultCode);
+    emit toastFailRequested(reason, resultCode, false);
+}
+
+void IcEventBridge::emitCardToastPassRequested()
+{
+    emit toastPassRequested(true);
+}
+
+void IcEventBridge::emitCardToastFailRequested(const QString &reason, int resultCode)
+{
+    emit toastFailRequested(reason,resultCode,true);
 }
 
 

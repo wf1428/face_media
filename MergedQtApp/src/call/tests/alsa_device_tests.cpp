@@ -3,7 +3,7 @@
  * @brief 通过实际 AlsaAudioDevice 实现验证部分传输、双声道复制、字节序和 XRUN 恢复。
  * @author Du lin
  * @date 2026-10-29
- * @note 最近修改：2026-11-04；修改人：Du lin；以隔离amixer子进程验证默认240逐通道上限、保留低值、显式覆盖、失败回滚及关闭恢复/外部变更保留；原PCM和XRUN回归不访问真实硬件。
+ * @note 最近修改：2026-11-05；修改人：Du lin；移除新增诊断与增益用例；原录放测试使用隔离 amixer 夹具以适配现有采集增益准备。
  */
 #include <QtTest>
 #include "src/call/AlsaAudioDevice.h"
@@ -27,8 +27,6 @@ struct _snd_config {
 };
 /** @brief 内存配置输入，持有规则正文，由input_close释放。 */
 struct _snd_input { QByteArray rules; };
-/** @brief 测试所有的软件参数快照，仅用于只读诊断。 */
-struct _snd_pcm_sw_params {};
 static _snd_config globalConfig; /**< 静态借用全局树，生产实现不得修改。 */
 static int configObjects=0,inputObjects=0,configReferences=0; /**< 未释放配置、内存输入及全局引用数。 */
 static int configFailure=0; /**< 1..6依次注入update/copy/search/input/load/open失败；0不注入。 */
@@ -40,11 +38,6 @@ static int timingQueries=0; /**< 同步延迟查询次数，关闭时必须保�
 static bool failTiming=false; /**< true注入元数据查询失败，不应让基础传输失败。 */
 static snd_pcm_state_t deviceState=SND_PCM_STATE_RUNNING; /**< 可注入尚未开始播放的状态。 */
 static bool failParameters=false; /**< true 让参数协商失败，检查句柄清理。 */
-static int geometryFailure=0,softwareObjects=0; /**< 1..5依次注入几何/malloc/current/start/avail失败；软件快照存量。 */
-static int64_t timingAvailable=640,timingDelay=640; /**< 时间查询数值注入，单位应用PCM采样帧。 */
-static int failQueryAt=-1; /**< 指定累计查询序号注入错误，用于区分重查错误与首查慢。 */
-static int querySlowRemaining=0; /**< 连续慢查询次数；0时原queryPauseMs仍只注入一次。 */
-static int ioPauseMs=0,waitPauseMs=0,queryPauseMs=0; /**< 下一I/O、wait、时间查询的一次性耗时注入，毫秒。 */
 extern "C" {
 /** @brief 分配测试句柄，验证非阻塞模式。
  * @param[out] pcm 返回测试拥有的句柄。
@@ -100,24 +93,6 @@ int snd_pcm_set_params(snd_pcm_t *pcm,int format,int access,unsigned channels,un
     Q_UNUSED(resample); Q_UNUSED(latency); pcm->channels=channels;
     return failParameters || format!=SND_PCM_FORMAT_S16_LE || rate!=16000 || access!=SND_PCM_ACCESS_RW_INTERLEAVED ? -EINVAL : 0;
 }
-/** @brief 返回固定应用PCM几何，故障只影响只读诊断。 */
-int snd_pcm_get_params(snd_pcm_t *,snd_pcm_uframes_t *buffer,snd_pcm_uframes_t *period) {
-    if(geometryFailure==1) return -EIO;
-    *buffer=960;*period=320;return 0;
-}
-/** @brief 分配一个测试快照或注入分配失败。 */
-int snd_pcm_sw_params_malloc(snd_pcm_sw_params_t **params) {
-    if(geometryFailure==2) return -ENOMEM;
-    *params=new _snd_pcm_sw_params;++softwareObjects;return 0;
-}
-/** @brief 配对释放软件快照。 */
-void snd_pcm_sw_params_free(snd_pcm_sw_params_t *params) { delete params;--softwareObjects; }
-/** @brief 注入只读快照加载失败，不修改PCM。 */
-int snd_pcm_sw_params_current(snd_pcm_t *,snd_pcm_sw_params_t *) { return geometryFailure==3 ? -EIO : 0; }
-/** @brief 返回固定启动阈值，支持单项查询失败。 */
-int snd_pcm_sw_params_get_start_threshold(const snd_pcm_sw_params_t *,snd_pcm_uframes_t *value) { if(geometryFailure==4) return -EIO;*value=960;return 0; }
-/** @brief 返回固定唤醒阈值，支持单项查询失败。 */
-int snd_pcm_sw_params_get_avail_min(const snd_pcm_sw_params_t *,snd_pcm_uframes_t *value) { if(geometryFailure==5) return -EIO;*value=320;return 0; }
 /** @brief 模拟copy插件输出mono：Channel 0为确定波形，Channel 1负满幅仅在错误映射时混入。 */
 snd_pcm_sframes_t snd_pcm_readi(snd_pcm_t *pcm,void *buffer,snd_pcm_uframes_t frames) {
     if (injectedError) { int error=injectedError; injectedError=0; return error; }
@@ -133,7 +108,6 @@ snd_pcm_sframes_t snd_pcm_readi(snd_pcm_t *pcm,void *buffer,snd_pcm_uframes_t fr
 }
 /** @brief 保留最多 80 帧双声道字节，以强制生产实现处理部分写入。 */
 snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm,const void *buffer,snd_pcm_uframes_t frames) {
-    if(ioPauseMs) { const int delay=ioPauseMs;ioPauseMs=0;QTest::qSleep(delay); }
     if (injectedError) { int error=injectedError; injectedError=0; return error; }
     if (pcm->channels!=2) return -EINVAL;
     const unsigned n=unsigned(qMin<snd_pcm_uframes_t>(frames,80));
@@ -141,7 +115,6 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm,const void *buffer,snd_pcm_ufram
 }
 /** @brief 可控等待；测试设备数据立即可用。 */
 int snd_pcm_wait(snd_pcm_t *,int timeout) {
-    if(waitPauseMs) { const int delay=waitPauseMs;waitPauseMs=0;QTest::qSleep(delay); }
     if(waitError) { const int error=waitError;waitError=0;return error; }
     if(noData) { QTest::qSleep(timeout);return 0; }return 1;
 }
@@ -151,8 +124,7 @@ int snd_pcm_prepare(snd_pcm_t *pcm) { ++prepared; pcm->offset=0;pcm->started=fal
 int snd_pcm_delay(snd_pcm_t *,snd_pcm_sframes_t *delay) { *delay=640; return 0; }
 /** @brief 同步查询替身，便于验证延迟被放在采集与播放时间公式的不同方向。 */
 int snd_pcm_avail_delay(snd_pcm_t *,snd_pcm_sframes_t *available,snd_pcm_sframes_t *delay) {
-    if(queryPauseMs) { const int pause=queryPauseMs;if(querySlowRemaining>0) --querySlowRemaining;if(querySlowRemaining==0) queryPauseMs=0;QTest::qSleep(pause); }
-    ++timingQueries;*available=timingAvailable;*delay=timingDelay;return failTiming || timingQueries==failQueryAt ? -EIO : 0;
+    ++timingQueries;*available=640;*delay=640;return failTiming ? -EIO : 0;
 }
 /** @return 注入的设备运行状态。 */
 snd_pcm_state_t snd_pcm_state(snd_pcm_t *pcm) {
@@ -187,40 +159,18 @@ private slots:
 private:
     /** @brief 每轮通过文件设置模拟实际硬件增益。 */
     void setMixer(const QByteArray &value) { QFile file(mixerFile);QVERIFY(file.open(QIODevice::WriteOnly));QCOMPARE(file.write(value),qint64(value.size())); }
-    /** @return 隔离硬件增益文件的当前内容。 */
-    QByteArray mixer() { QFile file(mixerFile);if(!file.open(QIODevice::ReadOnly)) return {};return file.readAll(); }
 private slots:
     /** @brief 各测试独立复位计时注入，不触及生产设备。 */
     void init() {
-        qunsetenv("QT_YCEST_CALL_CAPTURE_VOLUME");setMixer("255,255");
+        setMixer("240,240");
         QCOMPARE(handles,0);QCOMPARE(configObjects,0);QCOMPARE(inputObjects,0);QCOMPARE(configReferences,0);
-        timingAvailable=timingDelay=640;timingQueries=0;failTiming=false;deviceState=SND_PCM_STATE_RUNNING;
+        timingQueries=0;failTiming=false;deviceState=SND_PCM_STATE_RUNNING;
         configFailure=0;starts=0;waitError=0;noData=false;failStart=false;
-        failQueryAt=-1;querySlowRemaining=0;geometryFailure=0;ioPauseMs=waitPauseMs=queryPauseMs=0;injectedError=0;failParameters=false;
-        QCOMPARE(softwareObjects,0);
     }
     /** @brief 每项检查全局映射未污染且所有局部资源已释放。 */
     void cleanup() {
         QCOMPARE(handles,0);QCOMPARE(configObjects,0);QCOMPARE(inputObjects,0);QCOMPARE(configReferences,0);
         QCOMPARE(globalConfig.policy,QByteArray("average"));QCOMPARE(globalConfig.channel1,.5);
-        QCOMPARE(softwareObjects,0);
-    }
-    /** @brief 验证上限只降低高值、关闭恢复原非对称值；重复close不覆盖外部更改。 */
-    void captureGainHeadroom() {
-        QString error;AlsaAudioDevice capture;setMixer("255,225");
-        QVERIFY2(capture.open(true,error),qPrintable(error));QCOMPARE(mixer(),QByteArray("240,225"));
-        capture.close();QCOMPARE(mixer(),QByteArray("255,225"));
-        setMixer("190,200");QVERIFY(capture.open(true,error));QCOMPARE(mixer(),QByteArray("190,200"));capture.close();QCOMPARE(mixer(),QByteArray("190,200"));
-        setMixer("255,255");QVERIFY(capture.open(true,error));setMixer("210,210");capture.close();QCOMPARE(mixer(),QByteArray("210,210"));
-        capture.close();QCOMPARE(mixer(),QByteArray("210,210"));
-    }
-    /** @brief 显式原环境变量仍覆盖默认上限，关闭恢复原值；无效参数/开声卡失败不遗留增益更改。 */
-    void captureGainOverrideAndRollback() {
-        QString error;AlsaAudioDevice capture;qputenv("QT_YCEST_CALL_CAPTURE_VOLUME","245");setMixer("220,225");
-        QVERIFY(capture.open(true,error));QCOMPARE(mixer(),QByteArray("245,245"));capture.close();QCOMPARE(mixer(),QByteArray("220,225"));
-        qputenv("QT_YCEST_CALL_CAPTURE_VOLUME","256");QVERIFY(!capture.open(true,error));QCOMPARE(mixer(),QByteArray("220,225"));
-        qunsetenv("QT_YCEST_CALL_CAPTURE_VOLUME");setMixer("255,255");failParameters=true;QVERIFY(!capture.open(true,error));failParameters=false;QCOMPARE(mixer(),QByteArray("255,255"));
-        setMixer("bad");QVERIFY(!capture.open(true,error));QCOMPARE(mixer(),QByteArray("bad"));
     }
     /** @brief 验证只选Channel 0，不混入Channel 1满幅偏置；部分读拼接及L/R复制均保持。 */
     void monoStereo() {
@@ -304,86 +254,6 @@ private slots:
         QFETCH(int,stage);configFailure=stage;AlsaAudioDevice capture;QString error;
         QVERIFY(!capture.open(true,error));QVERIFY(!error.isEmpty());
         QCOMPARE(handles,0);QCOMPARE(configObjects,0);QCOMPARE(inputObjects,0);QCOMPARE(configReferences,0);
-    }
-    /** @brief 故障注入逐项验证只读诊断查询失败不影响打开或基础PCM播放。 */
-    void diagnosticGeometryFailures_data() {
-        QTest::addColumn<int>("stage");for(int stage=0;stage<=5;++stage) QTest::newRow(qPrintable(QString::number(stage)))<<stage;
-    }
-    /** @brief 几何/阈值查询仅读取一次；所有失败均保留录放且释放软件参数对象。 */
-    void diagnosticGeometryFailures() {
-        QFETCH(int,stage);geometryFailure=stage;AlsaAudioDevice playback;QString error;
-        QVERIFY(playback.open(false,error));QCOMPARE(softwareObjects,0);
-        const auto geometry=playback.geometry();
-        QCOMPARE(geometry.bufferFrames,int64_t(stage==1 ? -1 : 960));
-        QCOMPARE(geometry.startThreshold,int64_t(stage==2 || stage==3 || stage==4 ? -1 : 960));
-        QCOMPARE(geometry.availMin,int64_t(stage==2 || stage==3 || stage==5 ? -1 : 320));
-        VoiceCall::Pcm pcm{};std::atomic_bool stop{false};QVERIFY(playback.transfer(pcm,stop));QCOMPARE(timingQueries,0);
-        QVERIFY(playback.transferTrace().completed);QCOMPARE(playback.transferTrace().queryRc,1);
-        playback.close();QCOMPARE(playback.geometry().bufferFrames,int64_t(-1));
-    }
-    /** @brief 驱动查询失败原因逐分支独立注入，原查询阈值不放宽，关闭AEC不额外查询。 */
-    void timingFailureReasons() {
-        AlsaAudioDevice device;QString error;VoiceCall::Pcm pcm{};std::atomic_bool stop{false};QVERIFY(device.open(false,error));
-        QVERIFY(device.transfer(pcm,stop));QCOMPARE(int(device.timing().reason),int(VoiceCall::TimingReason::Disabled));
-        device.enableTiming(true);QVERIFY(device.transfer(pcm,stop));QCOMPARE(int(device.timing().reason),int(VoiceCall::TimingReason::Valid));
-        failTiming=true;QVERIFY(device.transfer(pcm,stop));QCOMPARE(int(device.timing().reason),int(VoiceCall::TimingReason::QueryError));failTiming=false;
-        deviceState=SND_PCM_STATE_PREPARED;QVERIFY(device.transfer(pcm,stop));QCOMPARE(int(device.timing().reason),int(VoiceCall::TimingReason::NotRunning));deviceState=SND_PCM_STATE_RUNNING;
-        timingAvailable=-1;QVERIFY(device.transfer(pcm,stop));QCOMPARE(int(device.timing().reason),int(VoiceCall::TimingReason::NegativeAvailable));timingAvailable=640;
-        timingDelay=-1;QVERIFY(device.transfer(pcm,stop));QCOMPARE(int(device.timing().reason),int(VoiceCall::TimingReason::NegativeDelay));
-        timingDelay=16001;QVERIFY(device.transfer(pcm,stop));QCOMPARE(int(device.timing().reason),int(VoiceCall::TimingReason::ExcessDelay));timingDelay=640;
-        queryPauseMs=6;querySlowRemaining=2;QVERIFY(device.transfer(pcm,stop));QCOMPARE(int(device.timing().reason),int(VoiceCall::TimingReason::SlowQuery));QVERIFY(device.timing().querySpanUs>=6000);
-        QVERIFY(!device.timing().valid);QVERIFY(device.transfer(pcm,stop));QCOMPARE(int(device.timing().reason),int(VoiceCall::TimingReason::Valid));
-    }
-    /** @brief 同一录放路径仅首查慢时恢复；连续两次慢时保持无效且不发生第三次查询。 */
-    void boundedTimingRetry() {
-        for(bool capture:{false,true}) for(int slow:{1,2}) {
-            AlsaAudioDevice device;QString error;VoiceCall::Pcm pcm{};std::atomic_bool stop{false};
-            QVERIFY(device.open(capture,error));device.enableTiming(true);
-            queryPauseMs=6;querySlowRemaining=slow;const auto before=timingQueries;
-            QVERIFY(device.transfer(pcm,stop));const auto timing=device.timing();
-            QCOMPARE(timingQueries-before,2);QCOMPARE(timing.queryAttempts,2U);
-            QVERIFY(timing.firstQuerySpanUs>=6000);QVERIFY(timing.queryTotalUs>=6000);
-            QCOMPARE(timing.valid,slow==1);
-            QCOMPARE(int(timing.reason),int(slow==1 ? VoiceCall::TimingReason::Valid : VoiceCall::TimingReason::SlowQuery));
-            if(slow==1) { QVERIFY(timing.querySpanUs<=2000);QVERIFY(timing.firstSampleUs>0); }
-            else { QVERIFY(timing.querySpanUs>=6000);QCOMPARE(timing.firstSampleUs,int64_t(0)); }
-            const auto trace=device.transferTrace();QCOMPARE(trace.queryAttempts,2U);QCOMPARE(trace.firstQueryUs,timing.firstQuerySpanUs);
-            device.enableTiming(false);const auto disabled=timingQueries;QVERIFY(device.transfer(pcm,stop));QCOMPARE(timingQueries,disabled);
-            QCOMPARE(device.transferTrace().queryAttempts,0U);
-        }
-    }
-    /** @brief 首查驱动错误不重查；首查慢后第二次驱动错误仍无效且严格限制两次。 */
-    void retryErrorIsBounded() {
-        AlsaAudioDevice device;QString error;VoiceCall::Pcm pcm{};std::atomic_bool stop{false};
-        QVERIFY(device.open(true,error));device.enableTiming(true);failTiming=true;
-        auto before=timingQueries;QVERIFY(device.transfer(pcm,stop));QCOMPARE(timingQueries-before,1);
-        QCOMPARE(int(device.timing().reason),int(VoiceCall::TimingReason::QueryError));
-        failTiming=false;queryPauseMs=6;querySlowRemaining=1;failQueryAt=timingQueries+2;
-        before=timingQueries;QVERIFY(device.transfer(pcm,stop));QCOMPARE(timingQueries-before,2);
-        QVERIFY(!device.timing().valid);QCOMPARE(int(device.timing().reason),int(VoiceCall::TimingReason::QueryError));
-        QCOMPARE(device.timing().queryAttempts,2U);QCOMPARE(device.timing().firstSampleUs,int64_t(0));
-    }
-    /** @brief 真实封装记录I/O、wait及时间查询的独立延迟，并保留XRUN前最近查询与写入时刻。 */
-    void diagnosticTransferStages() {
-        AlsaAudioDevice playback;QString error;std::atomic_bool stop{false};VoiceCall::Pcm pcm{};
-        QVERIFY(playback.open(false,error));playback.enableTiming(true);ioPauseMs=8;
-        QVERIFY(playback.transfer(pcm,stop));const auto first=playback.transferTrace();
-        QVERIFY(first.completed);QCOMPARE(first.frames,320);QCOMPARE(first.ioCalls,4);QCOMPARE(first.partial,3);
-        QVERIFY(first.ioMaxUs>=8000);QCOMPARE(first.queryRc,0);QCOMPARE(first.delayFrames,int64_t(640));
-        QTest::qSleep(25);injectedError=-EAGAIN;waitError=-EPIPE;waitPauseMs=12;queryPauseMs=6;
-        QVERIFY(playback.transfer(pcm,stop));const auto second=playback.transferTrace();
-        QCOMPARE(second.sequence,uint64_t(2));QCOMPARE(second.faultCode,-EPIPE);QCOMPARE(second.faultSource,2);
-        QCOMPARE(second.xrunsAfter-second.xrunsBefore,uint64_t(1));QCOMPARE(second.recoverRc,0);
-        QVERIFY(second.waitMaxUs>=12000);QCOMPARE(second.waitCalls,1);QCOMPARE(second.again,1);
-        QVERIFY(second.timingUs>=6000);QCOMPARE(second.previousDelayFrames,int64_t(640));
-        QCOMPARE(second.previousQueryUs,first.queryEndUs);QVERIFY(second.faultSinceWriteUs>=25000);
-        QVERIFY(second.endUs>=second.faultUs);QVERIFY(second.lastWriteBeforeUs>0);QCOMPARE(second.frames,320);
-        injectedError=-EPIPE;QVERIFY(playback.transfer(pcm,stop));QCOMPARE(playback.transferTrace().faultSource,1);
-        playback.enableTiming(false);const int previous=timingQueries;
-        QVERIFY(playback.transfer(pcm,stop));QCOMPARE(timingQueries,previous);QCOMPARE(playback.transferTrace().queryRc,1);
-        QCOMPARE(playback.transferTrace().faultCode,0);QCOMPARE(playback.transferTrace().waitCalls,0);
-        injectedError=-ENODEV;QVERIFY(!playback.transfer(pcm,stop));
-        QVERIFY(!playback.transferTrace().completed);QCOMPARE(playback.transferTrace().faultCode,-ENODEV);
     }
 };
 /** @brief 测试子进程amixer替身与实际封装回归主入口，无真实硬件命令。

@@ -1,7 +1,7 @@
 # @file qt_ycest.pro
 # @brief RK3566 融合 Qt 应用构建入口与模块登记。
 # @author Du lin
-# @note 最近修改：2026-11-04；修改人：Du lin；登记截图场景记录/后台回放及共享队列，保留原构建依赖、C++17与单mqttd/音频配置。
+# @note 最近修改：2026-11-13；修改人：Du lin；登记网络线程直播源探测实现和接口，供播放重试与告警复用。
 TARGET = MergedQtApp
 QT += core gui widgets opengl serialport network sql virtualkeyboard qml quick quickwidgets
 
@@ -82,7 +82,6 @@ INCLUDEPATH += \
 unix: LIBS += -lpthread -lz
 
 SOURCES += \
-    common/debug/ui_performance.cpp \
     common/face_image_sync_bridge.cpp \
     common/storage_policy.cpp \
     common/clients/icboard_client.cpp \
@@ -109,6 +108,7 @@ SOURCES += \
     components/file_manager/file_manager_page.cpp \
     components/multimedia/disk_usage_monitor.cpp \
     components/multimedia/network_status_monitor.cpp \
+    components/multimedia/live_stream_probe.cpp \
     components/multimedia/media_toast.cpp \
     components/multimedia/netInfo_popup.cpp \
     components/multimedia/snapshot_processor.cpp \
@@ -194,7 +194,6 @@ SOURCES += \
     components/multimedia/multimediademo.cpp
 
 HEADERS += \
-    common/debug/ui_performance.h \
     common/face_image_sync_bridge.h \
     common/responsive_ui.h \
     common/toggle_switch.h \
@@ -228,6 +227,7 @@ HEADERS += \
     components/file_manager/file_manager_page.h \
     components/multimedia/disk_usage_monitor.h \
     components/multimedia/network_status_monitor.h \
+    components/multimedia/live_stream_probe.h \
     components/multimedia/media_toast.h \
     components/multimedia/netinfo_popup.h \
     components/multimedia/snapshot_processor.h \
@@ -343,21 +343,27 @@ else: unix:!android: target.path = /opt/$${TARGET}/bin
 
 # 通话复用原mqttd；ALSA仍由sysroot提供，SpeexDSP运行时可选加载，缺库回退V1。
 PKGCONFIG += alsa
-SOURCES += src/call/AudioProcessing.cpp src/call/SpeexDsp.cpp src/call/CallGpioButton.cpp src/call/AlsaAudioDevice.cpp src/call/AudioEngine.cpp src/call/MqttCallAdapter.cpp src/call/CallManager.cpp src/call/CallPanel.cpp
-HEADERS += src/call/PlaybackReference.h src/call/SpeexDsp.h src/call/CallGpioButton.h src/call/AudioOutputFocus.h src/call/CallProtocol.h src/call/AudioProcessing.h src/call/AlsaAudioDevice.h src/call/AudioEngine.h src/call/MqttCallAdapter.h src/call/CallManager.h src/call/CallPanel.h
+SOURCES += src/call/AudioProcessing.cpp src/call/SpeexDsp.cpp src/call/CallGpioButton.cpp src/call/AlsaAudioDevice.cpp src/call/AudioEngine.cpp src/call/MqttCallAdapter.cpp src/call/CallManager.cpp src/call/CallPanel.cpp src/call/CallRingtone.cpp
+HEADERS += src/call/PlaybackReference.h src/call/SpeexDsp.h src/call/CallGpioButton.h src/call/AudioOutputFocus.h src/call/CallProtocol.h src/call/AudioProcessing.h src/call/AlsaAudioDevice.h src/call/AudioEngine.h src/call/MqttCallAdapter.h src/call/CallManager.h src/call/CallPanel.h src/call/CallRingtone.h
 
 # IPC独立线程与原媒体逻辑的音频调度线程；业务JSON解析由工作任务执行。
 SOURCES += components/settings/mqtt/mqttpacketparser.cpp src/call/CallAudioTransport.cpp
 HEADERS += components/settings/mqtt/mqttpacketparser.h src/call/CallAudioTransport.h
-HEADERS += src/call/AudioDiagnostics.h src/call/RealtimeAudio.h
+HEADERS += src/call/RealtimeAudio.h
 
 HEADERS += src/call/ConcurrentJitterBuffer.h src/call/CaptureContinuity.h
 
-HEADERS += common/serial_work_queue.h common/configuration_work.h
+HEADERS += common/serial_work_queue.h common/configuration_work.h common/device_feature_switches.h
 HEADERS += common/fixed_mailbox.h common/media_selection_cache.h
 
-HEADERS += common/debug/thread_observation.h src/call/PcmDiagnostics.h src/call/PcmDiagnosticRecorder.h src/call/SchedulingDiagnostics.h
 
 # 普通/高清共用只读场景和单一后台，视频不经截图GPU读回。
 SOURCES += common/snapshot_scene.cpp
 HEADERS += common/snapshot_scene.h common/snapshot_work.h
+
+# 摄像头截图使用现有采集与共享后台队列，不增加硬件依赖。
+SOURCES += components/settings/mqtt/camera_screenshot_upload.cpp
+HEADERS += components/settings/mqtt/camera_screenshot_upload.h common/camera_screenshot_source.h
+
+SOURCES += components/settings/mqtt/broadcast_service.cpp components/settings/mqtt/broadcast_live.cpp
+HEADERS += components/settings/mqtt/broadcast_service.h components/settings/mqtt/broadcast_live.h

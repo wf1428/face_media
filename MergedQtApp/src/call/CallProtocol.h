@@ -3,7 +3,7 @@
  * @brief 定义与 UI、ALSA 无关的 V1 PCM 帧、编解码和有界抖动队列。
  * @author Du lin
  * @date 2026-10-29
- * @note 最近修改：2026-11-04；修改人：Du lin；更新本地processingMode的AEC旁路语义，bit2可与bit1组合表示后备预处理；本地字段不序列化，MQTT650B帧不变。
+ * @note 最近修改：2026-11-05；修改人：Du lin；移除仅供诊断的本地帧字段，650 字节 MQTT 序列化保持原样。
  */
 #pragma once
 #include <array>
@@ -52,13 +52,11 @@ struct Frame {
     Pcm pcm{}; /**< 本机字节序的有符号采样；序列化时转为小端。 */
     uint8_t seq = 0; /**< 远端帧序号，按 256 回绕。 */
     uint32_t timestamp = 0; /**< 远端发送毫秒低 32 位，按 2^32 回绕。 */
-    uint64_t captureIndex=0; /**< 本地采集序号，仅诊断；不序列化，非TALKING采集也推进。 */
-    uint8_t processingMode=0; /**< 本地诊断bit0=AEC已运行、bit1=预处理已运行、bit2=AEC/整处理旁路（可同时有bit1后备预处理）；不写入协议。 */
     int64_t localMs = 0; /**< 接收/采集/实际播放估计时刻，本地单调时钟毫秒。 */
 };
 
 /** @brief 编码固定 650B 帧。
- * @param[in] frame 音频及seq；localMs、captureIndex、processingMode仅本地，不写入协议。
+ * @param[in] frame 音频及seq；localMs 仅本地，不写入协议。
  * @param[in] sendMs 发送时刻毫秒低 32 位，写为大端。
  * @return 含小端 PCM 的 MQTT 二进制包。
  */

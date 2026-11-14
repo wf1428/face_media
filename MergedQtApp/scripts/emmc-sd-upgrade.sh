@@ -1,4 +1,9 @@
 #!/bin/bash
+# @file emmc-sd-upgrade.sh
+# @brief 从 SD 启动后离线写入并校验 eMMC，按配置在成功后关机。
+# @author Du lin
+# @note 最近修改：2026-11-05；修改人：Du lin；成功提示的额外等待默认改为 0 秒，
+#       保留原有 3 秒关机等待；SD 卡配置仍可显式设置额外等待。
 # RK3568：从 SD 卡启动 Ubuntu，将系统离线升级到 eMMC（不备份旧系统、不提供自动回滚）。
 # 如果升级被中断，重新插入同一张 SD 启动卡并启动，即可重新执行完整升级。
 
@@ -15,8 +20,8 @@ UPGRADE_UI=${UPGRADE_UI:-1}
 UPGRADE_UI_TTY=${UPGRADE_UI_TTY:-/dev/tty1}
 UPGRADE_UI_FONT=${UPGRADE_UI_FONT:-auto}  # auto=自动选择字体；off=不修改字体；也可指定 .psf 字体的绝对路径
 UPGRADE_UI_SWITCH=${UPGRADE_UI_SWITCH:-1}
-# 升级成功后的额外展示时间，之后仍会执行原有的 3 秒关机前延时。
-UPGRADE_UI_SUCCESS_HOLD=${UPGRADE_UI_SUCCESS_HOLD:-5}
+# 成功提示的额外展示时间（秒），默认 0；仅升级界面已启动时叠加到固定的 3 秒等待上。
+UPGRADE_UI_SUCCESS_HOLD=${UPGRADE_UI_SUCCESS_HOLD:-0}
 
 LOG=/run/emmc-sd-upgrade.log
 STATE_DIR=/var/lib/emmc-sd-upgrade
@@ -455,26 +460,55 @@ unmount_emmc()
 rsync_rootfs()
 {
     local src="$1" dst="$2"
+
+    # 排除不需要同步的目录及设备本地数据
+    local -a excludes=(
+        '/boot/***'                                # 排除启动分区
+        '/proc/***'                                # 排除内核进程虚拟文件系统
+        '/sys/***'                                 # 排除内核设备虚拟文件系统
+        '/dev/***'                                 # 排除设备节点
+        '/run/***'                                 # 排除系统运行时数据
+        '/tmp/***'                                 # 排除临时文件
+        '/mnt/***'                                 # 排除临时挂载目录
+
+        # 门禁业务数据
+        '/home/cat/face_media/*.db*'               # 排除门禁主库文件
+        '/home/cat/face_media/volume.dat'          # 排除设备音量配置
+        '/home/cat/face_media/modules'             # 排除门禁管理员配置
+
+        # 人员照片及通行记录
+        '/home/cat/face_media/network_faces/'      # 排除网络人员照片
+        '/home/cat/face_media/enrollments/'        # 排除本地人员照片
+        '/home/cat/face_media/data/'               # 排除通行文本日志和验证抓拍数据
+        '/home/cat/face_media/通行记录_*.csv'      # 排除通行记录 CSV 文件
+        '/home/cat/face_media/backup/'             # 排除数据库备份
+
+        # Web 服务本地数据
+        '/home/cat/web-stage/imports/'             # 排除 Web 服务导入文件
+
+        # 系统相关目录及状态文件
+        '/media/***'                               # 排除外部媒体挂载目录
+        '/var/log/***'                             # 排除系统日志
+        '/usr/local/first_boot_flag'               # 排除首次启动标记文件
+        '/lost+found'                              # 排除文件系统恢复目录
+        '/var/lib/emmc-sd-upgrade/***'             # 排除 eMMC/SD 升级工作目录
+    )
+
+    # 将排除路径转换为 rsync 参数
+    local -a exclude_args=()
+    local path
+
+    for path in "${excludes[@]}"; do
+        exclude_args+=(--exclude="$path")
+    done
+
+    # 执行根文件系统同步
     rsync \
         -aHAXxSO \
         --numeric-ids \
         --delete \
         --info=progress2 \
-        --exclude='/boot/***' \
-        --exclude='/proc/***' \
-        --exclude='/sys/***' \
-        --exclude='/dev/***' \
-        --exclude='/run/***' \
-        --exclude='/tmp/***' \
-        --exclude='/mnt/***' \
-        --exclude='/home/cat/face_media/*.db*' \
-        --exclude='/home/cat/face_media/volume.dat' \
-        --exclude='/home/cat/face_media/modules' \
-        --exclude='/media/***' \
-        --exclude='/var/log/***' \
-        --exclude='/usr/local/first_boot_flag' \
-        --exclude='/lost+found' \
-        --exclude='/var/lib/emmc-sd-upgrade/***' \
+        "${exclude_args[@]}" \
         "$src" "$dst"
 }
 

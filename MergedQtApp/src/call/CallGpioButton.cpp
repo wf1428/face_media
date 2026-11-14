@@ -3,7 +3,7 @@
  * @brief 实现 GPIO40 输入轮询、60ms 消抖、长按抑制和可用性代次过滤。
  * @author Du lin
  * @date 2026-10-30
- * @note 最近修改：2026-11-03；修改人：Du lin；每次业务状态刷新均推进按键代次，防止拨号/挂断切换后执行旧按下；保留60ms消抖、长按抑制和后台GPIO访问。
+ * @note 最近修改：2026-11-05；修改人：Du lin；同步仅拨号后的代次过滤说明，GPIO 实现和消抖行为保持原样。
  */
 #include "CallGpioButton.h"
 #include <QDir>
@@ -52,7 +52,7 @@ CallGpioButton::CallGpioButton(const QString &sysfsRoot,QObject *parent)
     : QThread(parent),sysfsRoot_(sysfsRoot)
 {
     connect(this,&CallGpioButton::pressDetected,this,[this](quint64 token) {
-        // 即使前后都允许按键，键盘先呼叫或会话状态改变后也不能将旧按下解释为挂断。
+        // 键盘先拨号或可用状态改变后，丢弃已经排队的旧按下。
         if ((token & 1) && eligibility_.load()==token && !isInterruptionRequested()) emit callRequested();
     },Qt::QueuedConnection);
 }
@@ -60,7 +60,7 @@ CallGpioButton::~CallGpioButton() { stopAsync();wait(); }
 void CallGpioButton::setCallAvailable(bool available)
 {
     const quint64 before=eligibility_.load();
-    // 同为可用也推进代次：空闲拨号与会话中挂断是不同动作，排队事件不可跨状态复用。
+    // 即使恢复为空闲可用，旧代次的按下也不能发起新呼叫。
     eligibility_.store(((before & ~quint64(1))+2) | quint64(available));
 }
 void CallGpioButton::stopAsync() { setCallAvailable(false);requestInterruption(); }

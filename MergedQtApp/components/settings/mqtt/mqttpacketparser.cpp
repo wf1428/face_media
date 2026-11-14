@@ -3,6 +3,7 @@
  * @brief 在后台兼容解析mqttd标准信封、字符串payload及旧格式消息。
  * @author Du lin
  * @date 2026-11-03
+ * @note 最近修改：2026-11-05；修改人：Du lin；广播文件配置和补发消息的RX日志仅保留摘要，避免输出FTP凭据。
  */
 #include "mqttpacketparser.h"
 #include <QJsonDocument>
@@ -160,6 +161,8 @@ MqttParsedPacket parseMqttPacket(const QByteArray &input)
 {
     MqttParsedPacket result;const auto raw=input.trimmed();
     result.display=raw.size()>16384 ? QStringLiteral("RX: large MQTT frame, bytes=%1").arg(raw.size()) : QStringLiteral("RX: %1").arg(QString::fromUtf8(raw));
+    if (raw.contains("broadcastSet") || raw.contains("broadcastAudioSync"))
+        result.display = QStringLiteral("RX: broadcast file configuration, bytes=%1").arg(raw.size());
     if(raw.isEmpty() || raw.startsWith('[')) return result;
     QString topic,error;QJsonObject payload;
     if(!raw.startsWith('{')) {

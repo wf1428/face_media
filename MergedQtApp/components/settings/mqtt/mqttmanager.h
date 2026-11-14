@@ -4,7 +4,7 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-04；修改人：Du lin；接入高清场景值和有界异步图片上传接口，保留原图像接口/请求ID/单mqttd；图片容量满时延迟后继抓图。
+ * @note 最近修改：2026-11-10；修改人：Du lin；广播控制器常驻以保证直播；摄像头仍按开机开关可选创建。
  */
 
 #pragma once
@@ -37,6 +37,8 @@ class IcMqttGateway;
 class QThread;
 class MultimediaUpdate;
 class CompanyPlayInfo;
+class CameraScreenshotUpload;
+class BroadcastService;
 
 /** @brief mqttd IPC、Broker 路由和在线 IC 硬件参数的统一配置。 */
 struct MqttConfig
@@ -144,7 +146,7 @@ class MqttManager : public QObject
 {
     Q_OBJECT
 public:
-    /** @brief 创建 IPC、业务服务、通话控制器、IC 网关和独立高清截图控制器。
+    /** @brief 创建IPC、业务服务、通话、IC与截图控制器；启动读取本地摄像头开关，缺省false。
      * @param[in] parent QObject 所有者；通话控制器复用本对象创建的唯一 IPC。
      */
     explicit MqttManager(QObject *parent = nullptr);
@@ -518,6 +520,8 @@ private:
 
 private:
     MqttConfig cfg_;
+    BroadcastService *broadcast_ = nullptr; /**< 主线程广播控制器，先于 IPC 销毁；定时开关不销毁直播。 */
+    CameraScreenshotUpload *cameraScreenshot_=nullptr; /**< 自有摄像头截图控制器，禁用时为空；先于IPC销毁以取消待发图像。 */
     CallManager *callManager_ = nullptr; /**< 通话子对象；先于 IPC 销毁，异步管理声卡交接。 */
     MqttIpcClient *ipc_ = nullptr;
     quint64 videoControlRevision_=0; /**< UI递增的已受理播放指令代次；旧准备完成不重启旧源，下载保留原处理。 */

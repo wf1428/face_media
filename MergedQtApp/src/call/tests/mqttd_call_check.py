@@ -2,7 +2,7 @@
 
 Author: Du lin
 Date: 2026-10-29
-Note: 最近修改：2026-10-30；修改人：Du lin；验证 5 帧窗口、上行限长/过期及发送失败 token 缺口的信用恢复，复用原重连回归。
+Note: 最近修改：2026-11-06；修改人：Du lin；验证直播四帧队列保留突发、过期丢弃及通话打断时清队。
 Run from MergedQtApp. Requires a C compiler and cJSON.c/.h via --cjson-dir.
 No broker or device is accessed. Also reruns the existing threaded reconnect fixture.
 """
@@ -84,11 +84,13 @@ static int mosquitto_publish(struct mosquitto *m,int *mid,const char *topic,int 
         'static void call_connected(mqttd_cfg_t *cfg)',
         'static void call_release_rx(mqttd_cfg_t *cfg,const char *epoch,unsigned long token)',
         'static void call_send_rx(mqttd_cfg_t *cfg)',
+        'static void broadcast_send_rx(mqttd_cfg_t *cfg)',
         'static void call_ack(mqttd_cfg_t *cfg,const char *type,const char *epoch,int ok)',
         'static void on_call_publish(struct mosquitto *mosq,void *userdata,int mid)',
         'static void call_tick(mqttd_cfg_t *cfg)',
         'static int call_hex(unsigned char c)',
         'static void call_command(mqttd_cfg_t *cfg,const char *line)',
+        'static void broadcast_command(mqttd_cfg_t *cfg, const char *line)',
         'static void on_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_message *msg)',
     ]
     code = '\n\n'.join(function(source, signature) for signature in signatures)
@@ -153,7 +155,41 @@ int main(void) {
     call_reset(cfg);check(!cfg->call_rx_count && !cfg->call_rx_pending,"hangup flushes all audio");
     cfg->call_tx_mid=7;call_connected(cfg);check(!cfg->call_tx_mid,"successful reconnect releases abandoned QoS0 credit");
     msg.topic="business/request";on_message(cfg->mosq,cfg,&msg);check(business==1,"business queue unchanged");
-    free(cfg);puts("PASS: real mqttd binary framing, single in-flight credit, early callback, bounded receive, expiry, exact topics, reset, backpressure");return 0;
+    call_reset(cfg);
+    const char *broadcast_topic="device/ycLinux/D/broadcast/audio";
+    const char *live_start="{\"cmd\":\"broadcast_media\",\"enabled\":true,\"frameMs\":40,"
+        "\"epoch\":\"12345678-1234-1234-1234-123456789abc\",\"topic\":\"device/ycLinux/D/broadcast/audio\"}";
+    broadcast_command(cfg,live_start);
+    unsigned char live_packet[1290]={0xa1,0xc0,0x01,0x00,1};
+    msg.topic=(char *)broadcast_topic;msg.payload=live_packet;msg.payloadlen=650;
+    on_message(cfg->mosq,cfg,&msg);check(!cfg->broadcast_count,"live rejects wrong frame length");
+    msg.payloadlen=1290;msg.retain=true;
+    on_message(cfg->mosq,cfg,&msg);check(!cfg->broadcast_count,"live rejects retained frames");
+    msg.retain=false;send_mode=0;
+    on_message(cfg->mosq,cfg,&msg);check(cfg->broadcast_count==1 && !cfg->call_rx_count,"40ms live stays outside call ring");
+    live_packet[10]=42;on_message(cfg->mosq,cfg,&msg);
+    check(cfg->broadcast_count==2,"live keeps both frames in a short burst");
+    for(int i=3;i<=5;++i) { live_packet[10]=(unsigned char)i;on_message(cfg->mosq,cfg,&msg); }
+    check(cfg->broadcast_count==4 && cfg->broadcast_queue_drops==1,"bounded live burst drops only the oldest");
+    broadcast_send_rx(cfg);
+    out=cJSON_Parse(sent);
+    check(out && strcmp(cJSON_GetObjectItemCaseSensitive(out,"type")->valuestring,"broadcast_audio")==0 &&
+        strlen(cJSON_GetObjectItemCaseSensitive(out,"hex")->valuestring)==2580 &&
+        strncmp(cJSON_GetObjectItemCaseSensitive(out,"hex")->valuestring+20,"2a",2)==0 &&
+        cJSON_GetObjectItemCaseSensitive(out,"arrivalMs")->valuedouble==now,"live dedicated IPC frame");
+    cJSON_Delete(out);
+    on_message(cfg->mosq,cfg,&msg);now+=121;
+    const int live_sends=send_count;broadcast_send_rx(cfg);
+    check(send_count==live_sends,"expired live frame dropped");
+    on_message(cfg->mosq,cfg,&msg);check(cfg->broadcast_count==1,"fresh live frame remains after expiry");
+    enable(cfg);on_message(cfg->mosq,cfg,&msg);check(!cfg->broadcast_count,"call gate clears queued live and suppresses new frames");
+    call_reset(cfg);
+    broadcast_command(cfg,"{\"cmd\":\"broadcast_media\",\"enabled\":true,\"frameMs\":20,"
+        "\"epoch\":\"12345678-1234-1234-1234-123456789abc\",\"topic\":\"device/ycLinux/D/broadcast/audio\"}");
+    msg.payloadlen=650;on_message(cfg->mosq,cfg,&msg);check(cfg->broadcast_count==1,"20ms live accepted");
+    broadcast_command(cfg,"{\"cmd\":\"broadcast_media\",\"enabled\":false}");
+    check(!cfg->broadcast_count && !cfg->broadcast_expected,"live stop discards queued PCM");
+    free(cfg);puts("PASS: real mqttd binary framing, single in-flight credit, early callback, bounded receive, expiry, exact topics, reset, backpressure, 20/40ms live isolation");return 0;
 }
 '''
     return backend + definitions + io + code + tests
@@ -184,14 +220,15 @@ def main():
     # Keep the existing threaded fixture and production lifecycle bodies intact;
     # add only the new callback registration seam and real reset helper.
     index = old.index('static int mqtt_stop_and_destroy_locked(')
-    old = old[:index] + function(source, 'static void call_reset(mqttd_cfg_t *cfg)') + '\n' + old[index:]
+    old = old[:index] + function(source, 'static void call_reset(mqttd_cfg_t *cfg)') + '\n' + \
+        function(source, 'static void broadcast_reset(mqttd_cfg_t *cfg)') + '\n' + old[index:]
     old = '#define mosquitto_publish_callback_set(m,cb) ((void)(m))\n' + old
     old = old.replace('pthread_mutex_init(&cfg->mosq_lock,NULL);', 'pthread_mutex_init(&cfg->ipc_tx_lock,NULL);pthread_mutex_init(&cfg->mosq_lock,NULL);')
     for name, code in [('media', harness(source)), ('lifecycle', old)]:
         cfile = args.output / (name + '.c')
         cfile.write_text(code, encoding='utf-8')
         binary = args.output / (name + ('.exe' if os.name == 'nt' else ''))
-        command = [str(compiler), '-std=c11', '-D_DEFAULT_SOURCE', '-Wall', '-Wextra', '-pthread', str(cfile), '-o', str(binary)]
+        command = [str(compiler), '-std=c11', '-D_DEFAULT_SOURCE', '-D__USE_MINGW_ANSI_STDIO=1', '-Wall', '-Wextra', '-pthread', str(cfile), '-o', str(binary)]
         if name == 'media':
             command += ['-I' + str(args.cjson_dir), str(args.cjson_dir / 'cJSON.c')]
         subprocess.run(command, check=True, timeout=60, env=env)

@@ -3,13 +3,14 @@
  * @brief 保留UI调用接口的线程安全IPC代理，实际套接字由独立收发线程拥有。
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-04；修改人：Du lin；图片上传增加独立2项预算，保留普通64/紧急16和音频优先；未受理时由截图门面延迟，不增加图片积压或改变单socket/协议。
+ * @note 最近修改：2026-11-05；修改人：Du lin；独立交接广播直播媒体，避免进入通话和普通JSON接收队列。
  */
 #pragma once
 #include <QObject>
 #include <QLocalSocket>
 #include <QJsonObject>
 #include <memory>
+#include <atomic>
 class QThread;
 class MqttIpcWorker;
 struct MqttIpcShared;
@@ -58,6 +59,14 @@ public:
     bool sendSnapshotRawLine(const QByteArray &line);
     /** @return 已受理但尚未完成本地IPC写入提交的图片请求数0..2；不代表mqttd解析、Broker确认或网络积压。 */
     int pendingSnapshotPublishes() const;
+    /** @return IPC后台空闲且大帧预算到期时true；仅本地准入，不表示Broker/网络容量。 */
+    bool cameraSnapshotReady() const;
+    /** @brief 在原普通/图片预算内提交可取消的摄像头帧，大图忙时拒绝供调用方跳帧；不超过4096字节的失败包沿用有界普通提交。
+     * @param[in] line 后台生成的完整JSON行，最多1,000,000字节。
+     * @param[in] cancelled 本次会话共享令牌；true拒绝或取消尚未开始写入的帧；本地等待超过1000ms的摄像头帧也丢弃。
+     * @return true本地受理；false忙、离线、已取消或超限。已开始的单行无法撤回/交错。
+     */
+    bool sendCameraSnapshotRawLine(const QByteArray &line,const std::shared_ptr<std::atomic_bool> &cancelled);
     /** @brief 提交完整实时JSON行，仅有界复制/CAS，不等待共享锁或投递Qt事件。
      * @param[in] line 调用期间有效的完整行，含末尾换行；内容须由可信音频封装器生成。
      * @param[in] length 1..2048字节，包含换行；不解析或修改协议。
@@ -100,6 +109,10 @@ signals:
      * @param[in] object audio/call_ready/call_sent原信封。
      */
     void mediaFrameReceived(const QJsonObject &object);
+    /** @brief IPC线程直接发出的单向直播媒体。
+     * @param[in] object 含精确主题、IPC代次和十六进制帧。
+     */
+    void broadcastFrameReceived(const QJsonObject &object);
     /** @brief 非阻塞提交或套接字错误，不含大包正文。
      * @param[in] err 诊断文本。
      */
@@ -114,9 +127,10 @@ private:
      * @param[in] line 原始行；JSON模式为空。
      * @param[in] raw true为原始行模式。
      * @param[in] snapshot true额外预留2项图片预算；false保留原普通/音频规则。
+     * @param[in] cancelled 摄像头可选取消令牌，普通请求为空；不改变线上信封。
      * @return true已接受，false有界队列拒绝。
      */
-    bool submit(const QJsonObject &object,const QByteArray &line,bool raw,bool snapshot=false);
+    bool submit(const QJsonObject &object,const QByteArray &line,bool raw,bool snapshot=false,const std::shared_ptr<std::atomic_bool> &cancelled={});
     std::shared_ptr<MqttIpcShared> shared_; /**< 跨线程有界提交及原子快照，生命周期锁不进入提交，IPC5ms取槽。 */
     QThread *ioThread_=nullptr; /**< 代理所有的IPC事件循环；仅析构等待。 */
     MqttIpcWorker *worker_=nullptr; /**< IPC线程拥有并在退出时deleteLater，不从UI调用其设备方法。 */

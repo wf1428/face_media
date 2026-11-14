@@ -2,7 +2,7 @@
  * @file company_play_info.cpp
  * @brief 高清UI像素/视频值与普通截图共用后台合成编码，按容量异步提交上传。
  * @author Du lin
- * @note 最近修改：2026-11-04；修改人：Du lin；高清直接接收原DPR的UI像素及NV12值，取消UI命令回放约定；后台视频合成/JPEG/Base64/JSON及有界上传流程保持。
+ * @note 最近修改：2026-11-05；修改人：Du lin；移除已取消的串行队列耗时开关引用，原任务和回调行为不变。
  */
 #include "company_play_info.h"
 #include "common/snapshot_work.h"
@@ -123,7 +123,7 @@ void CompanyPlayInfo::queueFrame(const QString &token,const SnapshotScene &scene
     captureTimer_.stop();processing_=true;
     const auto packet=active_.packet;const auto cancelled=cancelled_;const QPointer<CompanyPlayInfo> alive(this);auto result=std::make_shared<QByteArray>();
     SnapshotWork::queue().enqueue([=] {
-        SerialWorkQueue::Task task;task.reportSlow=false;
+        SerialWorkQueue::Task task;
         task.run=[sceneValue=scene,uiValue=uiImage,videoValue=videoImage,packet,useScene,reason,videoRect,cancelled,result]() mutable {
             // 后台移走UI像素/视频大值，run结束前销毁，避免完成回调在UI释放在途像素。
             auto ownedScene=std::move(sceneValue);auto ui=std::move(uiValue);auto video=std::move(videoValue);

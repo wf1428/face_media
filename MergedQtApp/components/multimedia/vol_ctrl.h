@@ -4,7 +4,7 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-04；修改人：Du lin；注明音量文件后台串行读改写及volumeApplied完成语义；增加保存代次过滤旧回执，保持硬件通话保护及音量映射。
+ * @note 最近修改：2026-11-12；修改人：Du lin；广播文件音频持有焦点期间丢弃系统音量请求，并让播报增益等待旧异步写入退出，结束后恢复原用户音量。
  */
 
 #ifndef VOL_CTRL_H
@@ -13,11 +13,15 @@
 #include <QObject>
 #include <QPointer>
 #include <QSet>
+#include <QHash>
 #include <QTimer>
 #include <QStringList>
 #include <QVector>
+#include <atomic>
+#include <memory>
 
 class QProcess;
+class SerialWorkQueue;
 class GstPlayerWidget;
 
 /**
@@ -26,8 +30,9 @@ class GstPlayerWidget;
  * 系统音量 0% 为 raw0 静音，1~100% 线性映射到 RK809 Playback Volume 的 100~230；
  * 语音播报音量独立使用 0~100，并线性映射到原始值 200~250。
  * 两个百分比共同保存在 volume.dat 中，临时硬件调整不改变持久化值。
- * 所有接口在 UI 线程调用；通话持有共享硬件控制权时，其他实例只保存逻辑音量，
- * 不覆盖增益或关闭功放。已启动的旧异步命令必须退出后，通话增益才可就绪。
+ * 所有接口在 UI 线程调用；通话持有共享硬件控制权时，其他实例只保存逻辑音量；
+ * 广播文件音频持有焦点期间，外部系统音量请求直接丢弃。已启动的旧异步命令必须退出后，
+ * 通话或播报增益才可就绪。
  */
 class AmpVolumeController : public QObject
 {
@@ -78,11 +83,14 @@ signals:
     void rawVolumeTemporaryApplied(int rawValue, bool success);
 
 public slots:
-    /** @brief 更新 0~100 用户音量，保留原 80ms 防抖、保存和回执通知。
+    /** @brief 更新 0~100 用户音量，重复值不再写硬件；播报焦点期间直接丢弃。
      * @param[in] value 用户系统音量百分比，限制到 0~100。
-     * @note 0% 保存关闭功放的逻辑标志；通话期间只更新恢复值，不关闭通话功放或覆盖增益。
+     * @note 播报期间不更新缓存、文件或硬件，也不在结束后补写；通话期间仍更新恢复值。
      */
     void setVolume(int value);
+
+    /** @return true 表示本控制器的用户音量请求会被当前播报焦点丢弃；仅 UI 线程调用。 */
+    bool userVolumeBlocked() const;
 
     /** @brief 保存 0~100 语音播报音量；不立即改变正常媒体硬件音量。 */
     void setPromptVolume(int value);
@@ -92,9 +100,9 @@ public slots:
      */
     void setRawVolumeTemporary(int rawValue);
 
-    /** @brief 排队异步临时增益；通话保护期间非持有者请求不操作硬件，也不积压。
+    /** @brief 排队异步临时增益；通话或广播文件音频保护期间非持有者请求不操作硬件。
      * @param[in] rawValue 限制到 0~255；旧硬件代次的等待请求自动丢弃。
-     * @note 通话持有者须等其他实例已经启动的 amixer 退出后才启动增益命令。
+     * @note 焦点持有者须等其他实例已经启动的 amixer 退出后才启动增益命令。
      */
     void setRawVolumeTemporaryAsync(int rawValue);
 
@@ -108,9 +116,13 @@ private:
     int callRestoreRawVolume();
     /** @brief 恢复完成后放开本实例持有的硬件控制权，并使旧等待请求失效。 */
     void releaseCallOutput();
-    /** @return true 表示另一实例正保护通话硬件，本实例不能修改音量/功放。 */
+    /** @brief 占有广播文件音频的硬件写入权；非通话场景废弃此前排队的外部增益请求。 */
+    void claimPromptOutput();
+    /** @brief 用户音量恢复完成后释放广播文件音频写入权；不重放期间丢弃的请求。 */
+    void releasePromptOutput();
+    /** @return true 表示另一实例正保护通话或广播文件音频硬件，本实例不能修改音量/功放。 */
     bool callBlocksHardware() const;
-    /** @brief 结束一个异步硬件写者并唤醒等待中的通话持有者；仅 UI 线程调用。
+    /** @brief 结束一个异步硬件写者并唤醒等待中的通话或广播持有者；仅 UI 线程调用。
      * @param[in] process 已退出或已析构的进程指针，仅作为集合键，不解引用。
      */
     static void completeHardwareWrite(QProcess *process);
@@ -190,10 +202,10 @@ private:
 /**
  * @brief 统一管理通话与人脸、刷卡、二维码提示的静音所有权和 RK809 临时音量。
  *
- * 多个播报重叠时只执行一次压低和硬件增益；最后一个播报结束后才恢复，
- * 避免各入口分别保存/恢复音量造成永久静音或相互覆盖。
- * 有通话时跨控制器保护硬件，等待旧写者退出；最后一个持有者释放后，
- * 按最新系统音量异步恢复，再解除保护。所有方法与回调都在 UI 线程串行执行。
+ * 每次仅授予一个播放者，同级保留先到者。高优先级挂起低优先级，
+ * 释放后恢复仍在申请的最高级；全部结束后恢复视频与用户音量。
+ * 有通话或广播文件音频时跨控制器保护硬件，等待旧写者退出；最后一个持有者释放后，
+ * 按原恢复规则异步恢复，再解除保护。所有方法与回调都在 UI 线程串行执行。
  */
 class AudioPromptFocusManager final : public QObject
 {
@@ -201,10 +213,27 @@ class AudioPromptFocusManager final : public QObject
 public:
     static AudioPromptFocusManager &instance();
 
-    /** @brief 获取播报焦点；本轮硬件请求完成后发出 focusReady，失败沿用原日志兜底。
-     * @param[in] owner 非空 UI 持有者；可与通话及其他播报重叠。
+    /** @brief 焦点优先级由低至高，视频为无持有者时的默认输出。 */
+    enum class Priority {
+        Prompt, /**< 人脸、刷卡及普通播报。 */
+        Tagged, /**< 平台标识符播报。 */
+        Schedule, /**< 精细化定时广播。 */
+        Live, /**< 单向实时直播。 */
+        Call /**< 双向通话和其铃声。 */
+    };
+    /** @brief 申请焦点；获准并完成增益准备后发出 focusReady。
+     * @param[in] owner 非空主线程业务持有者，析构自动归还。
+     * @param[in] player 借用的输出分支身份，寿命应覆盖申请。
+     * @param[in] priority 音频来源优先级；通话用 acquireCall 申请。
      */
-    void acquire(QObject *owner);
+    void acquire(QObject *owner, GstPlayerWidget *player, Priority priority = Priority::Prompt);
+    /** @return 通话是否持有仲裁焦点，包括铃声和释放声卡之前。 */
+    bool callOwnsFocus() const;
+    /** @brief 检查当前输出是否高于候选优先级。
+     * @param[in] priority 候选请求级别。
+     * @return true 表示候选不能立即播放。
+     */
+    bool blocks(Priority priority) const;
     /** @brief 获取通话焦点并保护全进程 RK809/功放；等待旧异步命令退出后才就绪。
      * @param[in] owner 非空 UI 对象，通常为 CallManager；销毁时由原释放路径归还。
      * @note 保持到全部重叠焦点结束且最新系统音量恢复完成，不阻止视频切源/回执。
@@ -221,6 +250,14 @@ signals:
      * @param[in] owner 仍持有焦点的 UI 对象；失败场景沿用日志并继续的原策略。
      */
     void focusReady(QObject *owner);
+    /** @brief 更高优先级抢占后通知原持有者暂停。
+     * @param[in] owner 被挂起的主线程业务对象，申请仍保留。
+     */
+    void focusSuspended(QObject *owner);
+    /** @brief 通话焦点变更时同步通知，普通音源切换不发送。
+     * @param[in] active true 通话占用焦点，false 通话释放焦点（含暂停时释放）。
+     */
+    void callFocusChanged(bool active);
 
 private:
     /** @brief 在应用初始化阶段创建硬件控制器并绑定增益/恢复完成回调。
@@ -235,13 +272,34 @@ private:
     bool hasDuckedPlayer(GstPlayerWidget *player) const;
     void duckNewActiveVideoPlayers();
     void restoreVideoPlayers();
+    /** @brief 非通话播报后台清除旧 PCM；确认清空后即使共享输出恢复失败，也先写本轮增益再授予文件播报焦点。
+     * @note 清空未确认时沿用当前音量；此处不修复共享输出重开失败或保证 PCM 已送达声卡。
+     */
+    void beginPromptHandoff();
+    /** @brief 使旧后台交接结果失效，不阻塞主线程。 */
+    void cancelPromptHandoff();
     void requestBoost();
 
     QSet<QObject *> owners_;
-    QSet<QObject *> pendingReadyOwners_;
+    /** @brief 选择当前唯一输出，发送暂停/恢复通知并保留硬件恢复快照。 */
+    void selectOwner();
+    /** @brief 本次请求的播放器身份及优先级，均由 UI 线程访问。 */
+    struct Request {
+        QPointer<GstPlayerWidget> player; /**< 借用播放器，销毁后失效。 */
+        Priority priority; /**< 决定抢占顺序。 */
+        QMetaObject::Connection destroyed; /**< 请求释放时解除本次生命周期连接。 */
+    };
+    QHash<QObject *, Request> requests_; /**< 活跃及挂起的有序请求索引。 */
+    QList<QObject *> order_; /**< 先到先服务顺序，释放时移除。 */
+    QObject *activeOwner_ = nullptr; /**< 当前拥有输出的请求键，不解引用。 */
     QVector<QPointer<GstPlayerWidget>> duckedPlayers_;
     AmpVolumeController *volumeController_ = nullptr;
-    QTimer boostDelayTimer_;
+    QTimer boostDelayTimer_; /**< 通话和独立直播沿用的硬件准备延时。 */
+    std::unique_ptr<SerialWorkQueue> promptHandoff_; /**< 按需创建的普通播报音频交接队列。 */
+    std::atomic<quint64> promptHandoffGeneration_{0}; /**< 主线程推进，后台检查是否取消。 */
+    bool promptHandoffPending_ = false; /**< 同一批普通播报共用一个清除操作。 */
+    bool requirePromptRestore_ = false; /**< 普通播报或直播要求确认功放恢复；失败时保持视频静音。 */
+    bool restoreRetried_ = false; /**< 本次普通播报功放恢复至多额外重试一次。 */
     int savedAmpRawVolume_ = -1;
     int requestedBoostRaw_ = -1;   /**< 本轮根据播报百分比映射出的 200~250 原始值。 */
     bool boostReady_ = false;

@@ -2,7 +2,8 @@
  * @file ic_event_bridge.h
  * @brief IC 本地链路、UI 与 MQTT 网关之间的进程内事件总线。
  *
- * @author Dulin
+ * @author Du lin
+ * @note 最近修改：2026-11-10；修改人：Du lin；结果提示信号携带刷卡来源，用于界面应用即时声音开关。
  * @date 2026-07-25
  */
 
@@ -99,6 +100,14 @@ public:
     /** @brief 请求主线程显示带原因的验证失败提示。 */
     void emitToastFailRequested(const QString &reason, int resultCode = 0);
 
+    /** @brief 发布刷卡通过结果，标记来源以应用 IC 声音开关。 */
+    void emitCardToastPassRequested();
+    /** @brief 发布刷卡失败结果，标记来源以应用 IC 声音开关。
+     * @param[in] reason 失败原因码或文本。
+     * @param[in] resultCode 失败提示音结果码，0 使用通用提示。
+     */
+    void emitCardToastFailRequested(const QString &reason, int resultCode = 0);
+
     /** @brief 发布 RS485 异步发送结果。 */
     void emitRs485SendFinished(const QString &sourceTag, bool ok, const QString &reason);
 
@@ -180,11 +189,17 @@ signals:
     /** @brief 投递给 IcWorker、由刷卡器串口执行的命令请求。 */
     void cardReaderCommandRequested(const QByteArray &command, const QString &sourceTag);
 
-    /** @brief UI 通过提示请求。 */
-    void toastPassRequested();
+    /** @brief UI 通过提示请求。
+     * @param[in] fromCard true 表示刷卡来源，false 表示普通提示。
+     */
+    void toastPassRequested(bool fromCard);
 
-    /** @brief UI 失败提示请求。 */
-    void toastFailRequested(const QString &reason, int resultCode);
+    /** @brief UI 失败提示请求。
+     * @param[in] reason 失败原因。
+     * @param[in] resultCode 失败提示音结果码。
+     * @param[in] fromCard true 表示刷卡来源，false 表示普通提示。
+     */
+    void toastFailRequested(const QString &reason, int resultCode, bool fromCard);
 
     /** @brief RS485 发送完成回执。 */
     void rs485SendFinished(const QString &sourceTag, bool ok, const QString &reason);

@@ -2,7 +2,7 @@
  * @file snapshot_processor.cpp
  * @brief 普通截图后台视频转换/合成/JPEG编码，复用高清单一执行线程。
  * @author Du lin
- * @note 最近修改：2026-11-04；修改人：Du lin；普通截图继续在共享后台转换视频/合成/编码，输入改为UI已绘制的小图像素；同步取消命令回放的文档约定，编码参数及信号保持。
+ * @note 最近修改：2026-11-05；修改人：Du lin；移除已取消的串行队列耗时开关引用，原任务和回调行为不变。
  */
 #include "snapshot_processor.h"
 #include "common/snapshot_work.h"
@@ -61,7 +61,7 @@ static bool encodeSnapshotToBase64(const QImage &sourceImage, QString *base64Str
 void submit(SnapshotProcessor *owner,std::function<QImage()> create) {
     auto result=std::make_shared<QString>();const QPointer<SnapshotProcessor> alive(owner);
     SnapshotWork::queue().enqueue([alive,result,create] {
-        SerialWorkQueue::Task task;task.reportSlow=false;
+        SerialWorkQueue::Task task;
         task.run=[result,create]() mutable {auto work=std::move(create);QString error;encodeSnapshotToBase64(work(),result.get(),&error);work={};return error;};
         task.done=[alive,result](const QString &error) {if(!alive)return;if(error.isEmpty())emit alive->finished(*result);else emit alive->failed(error);};return task;
     },QStringLiteral("normal-%1").arg(quintptr(owner)),[alive]{return !alive;});

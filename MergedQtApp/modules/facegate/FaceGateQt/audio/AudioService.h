@@ -2,7 +2,8 @@
  * @file AudioService.h
  * @brief 使用进程内 GStreamer 播放门禁语音提示。
  *
- * @author Dulin
+ * @author Du lin
+ * @note 最近修改：2026-11-10；修改人：Du lin；保存当前提示来源，允许运行时关闭刷脸播报而保留其他提示。
  * @date 2026-07-25
  */
 
@@ -60,11 +61,25 @@ public:
     /** @return volume.dat 中当前语音播报音量百分比。 */
     int volume() const;
 
-    /** @brief 在提示类型启用且冷却允许时播放对应音频。 */
-    void playPrompt(Prompt prompt);
+    /** @brief 在提示类型启用且冷却允许时播放对应音频。
+     * @param[in] prompt 提示类型。
+     * @param[in] fromFace true 标记为刷脸来源，关闭刷脸声音时停止。
+     */
+    void playPrompt(Prompt prompt, bool fromFace = false);
 
-    /** @brief 按统一通行结果码播放对应失败音，未知结果使用 fail.wav。 */
-    void playAccessFailure(int resultCode);
+    /** @brief 按统一通行结果码播放对应失败音，未知结果使用 fail.wav。
+     * @param[in] resultCode 通行失败结果码。
+     * @param[in] fromFace true 标记为刷脸来源。
+     */
+    void playAccessFailure(int resultCode, bool fromFace = false);
+    /** @brief 刷脸开关开启时播放识别提示。
+     * @param[in] prompt 人脸业务提示类型。
+     */
+    void playFacePrompt(Prompt prompt);
+    /** @brief 刷脸开关开启时播放指定通行失败码。
+     * @param[in] resultCode 人脸通行业务失败码。
+     */
+    void playFaceAccessFailure(int resultCode);
 
     /** @brief 按配置键测试播放指定提示，忽略业务冷却。 */
     void testPlay(const QString &promptKey);
@@ -107,8 +122,14 @@ private:
     /** @return 距同类提示上次播放达到 audioCooldownMs 时返回 true。 */
     bool cooldownAllowed(Prompt prompt) const;
 
-    /** @brief 校验文件并通过 GStreamer 启动播放。 */
-    bool startGstreamer(const QString &path, bool ignoreCooldown, Prompt prompt);
+    /** @brief 校验文件并通过 GStreamer 启动播放。
+     * @param[in] path 本地提示音路径。
+     * @param[in] ignoreCooldown true 为后台试听。
+     * @param[in] prompt 提示类型。
+     * @param[in] fromFace true 标记本次播放可被人脸声音开关停止。
+     * @return true 表示已申请播放焦点，false 表示前置检查失败。
+     */
+    bool startGstreamer(const QString &path, bool ignoreCooldown, Prompt prompt, bool fromFace);
 
 private:
     struct MutedVideoState {
@@ -117,6 +138,7 @@ private:
     };
 
     AppConfig config_;                       /**< 音频开关、设备、目录和提示文件配置。 */
+    bool facePlayback_ = false;             /**< 当前在播或待播的是刷脸提示或试听。 */
     mutable QHash<int, qint64> lastPromptMs_; /**< 各提示类型最近播放时间，单位 ms。 */
     GstPlayerWidget *player_ = nullptr;       /**< 无视频输出的 GStreamer 提示音播放器。 */
     AmpVolumeController *volumeController_ = nullptr; /**< RK809 音量和持久化控制器。 */

@@ -2,6 +2,7 @@
  * @file RealtimeAudio.h
  * @brief 提供固定容量音频队列、无等待单生产者交接及有界播放追赶节拍。
  * @author Du lin
+ * @note 最近修改：2026-11-05；修改人：Du lin；移除仅供日志的节拍累计计数，保留 XRUN 恢复与最多连续补写两帧的规则。
  * @date 2026-11-03
  */
 #pragma once
@@ -97,12 +98,11 @@ public:
         if(recovered) { deadlineUs_=nowUs-40000;immediate_=0; }
         deadlineUs_+=20000;
         if(deadlineUs_<=nowUs) {
-            if(immediate_<2) { ++immediate_;++catchups;return nowUs; }
-            deadlineUs_=nowUs+20000;immediate_=0;++rebases;
+            if(immediate_<2) { ++immediate_;return nowUs; }
+            deadlineUs_=nowUs+20000;immediate_=0;
         } else immediate_=0;
         return deadlineUs_;
     }
-    uint64_t catchups=0,rebases=0; /**< 立即补写和债务丢弃次数，非网络丢帧；仅播放线程访问。 */
 private:
     int64_t deadlineUs_=0; /**< 下一截止时间线，单调微秒。 */
     unsigned immediate_=0; /**< 已连续立即执行次数，最多2次。 */
