@@ -1,3 +1,7 @@
+# @file emmc-sd-upgrade
+# @brief SD 卡升级时由 /etc/default/emmc-sd-upgrade 加载的配置。
+# @author Du lin
+# @note 最近修改：2026-11-05；修改人：Du lin；取消成功提示的额外等待，保留脚本的 3 秒关机延时。
 # 第一次测试保持 0：只检测，不真正写盘
 # 验证日志全部正确以后改成 1
 AUTO_APPLY=1
@@ -8,5 +12,6 @@ AUTO_POWEROFF=1
 #升级界面
 UPGRADE_UI=1
 UPGRADE_UI_FONT=auto
-UPGRADE_UI_SUCCESS_HOLD=10
+# 成功提示的额外展示时间（秒）；0 表示只保留脚本的固定 3 秒等待。
+UPGRADE_UI_SUCCESS_HOLD=0
 

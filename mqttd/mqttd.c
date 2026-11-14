@@ -2,8 +2,7 @@
  * @file mqttd.c
  * @brief libmosquitto 网络连接、配置重建与 Qt 本地 IPC 的守护进程。
  * @author Du lin
- * @note 最近修改：2026-10-24；修改人：Du lin；重连和退出统一先 disconnect 再非强制停止网络线程，
- *       避免 pthread_cancel 遗留发包互斥锁；记录线程启动状态，停止失败保留旧句柄，修正 apply 后周期发布的句柄读取时机并补充构建依赖说明。
+ * @note 最近修改：2026-11-06；修改人：Du lin；直播下行单槽改为四帧限时队列，保留通话与业务优先及原通话媒体链路。
  */
 /*
  * mqttd.c - minimal MQTT daemon using libmosquitto
@@ -73,6 +72,22 @@ typedef enum {
     IPC_TX_ITEM_LINE = 0,
     IPC_TX_ITEM_MQTT_MESSAGE = 1
 } ipc_tx_item_kind_t;
+
+/** @brief 直播突发帧暂存容量；按120ms上限丢弃陈旧帧。 */
+#define BROADCAST_RX_CAPACITY 4
+
+/** @brief 音频接收环元素；由 ipc_tx_lock 保护，回调只拷贝固定长度数据。 */
+typedef struct {
+    unsigned char pcm[650]; /**< 已校验的完整协议帧，含 10B 头。 */
+    char topic[512]; /**< 精确下行音频主题，超长主题拒绝。 */
+    long long arrival_ms; /**< CLOCK_MONOTONIC 接收时刻，毫秒。 */
+} call_rx_frame_t;
+
+/** @brief 尚未提交 MQTT 的上行 PCM；由 IPC 主线程生产/消费，短锁保护清理。 */
+typedef struct {
+    unsigned char pcm[650]; /**< 完整二进制音频帧。 */
+    long long deadline_ms; /**< 本地单调时钟过期时间，最长接收后 100ms。 */
+} call_up_frame_t;
 
 typedef struct ipc_tx_item {
     ipc_tx_item_kind_t kind;
@@ -155,6 +170,34 @@ typedef struct {
     int ipc_tx_thread_started;
     int ipc_tx_stop;
 
+    /* 以下通话状态统一由 ipc_tx_lock 保护；不得在持锁时调用 mosquitto/IPC 写入。 */
+    unsigned char broadcast_packets[BROADCAST_RX_CAPACITY][1290]; /**< 直播下行FIFO，仅ipc_tx_lock保护。 */
+    long long broadcast_arrival_ms[BROADCAST_RX_CAPACITY]; /**< 每槽的本地单调接收毫秒。 */
+    unsigned int broadcast_head, broadcast_count; /**< 队首及有效帧数，最多四帧。 */
+    size_t broadcast_expected; /**< 直播门接受的帧长度，0关闭。 */
+    char broadcast_topic[160]; /**< 精确主题，受ipc_tx_lock保护。 */
+    char broadcast_epoch[37]; /**< Qt本地UUID，切换会话时重置。 */
+    unsigned long broadcast_seen, broadcast_accepted, broadcast_ipc_picked; /**< 每代次主题收帧、验帧和出队统计，受ipc_tx_lock保护。 */
+    unsigned long broadcast_queue_drops; /**< 当前代次的FIFO溢出和过期丢弃数。 */
+    int call_enabled; /**< true 允许当前本地媒体代次的 PCM。 */
+    char call_audio_topic[512]; /**< 当前媒体精确下行主题，拒绝其他设备或通配符。 */
+    char call_epoch[48]; /**< Qt 为每次媒体门切换生成 UUID，仅在 IPC 使用。 */
+    call_rx_frame_t call_rx[10]; /**< 下行最多 200ms，溢出覆盖最旧帧。 */
+    unsigned int call_rx_head, call_rx_count; /**< 接收环读游标与有效帧数。 */
+    int call_rx_pending; /**< 已交给 IPC 尚未消费的帧数，最多 5，脱离逐帧停等。 */
+    unsigned long call_rx_outstanding[5]; /**< 已成功/正在写出的 token 集，写失败可准确撤销，不以序号差代替窗口数量。 */
+    unsigned long call_rx_acked_token; /**< 当前代次最后累计确认 token，重复确认不增加信用。 */
+    call_up_frame_t call_up[5]; /**< 上行待提交最多 5 帧，过期/溢出丢最旧。 */
+    unsigned int call_up_head,call_up_count; /**< 上行环游标/深度，由 ipc_tx_lock 保护。 */
+    char call_tx_epoch[48]; /**< 唯一 MQTT 在途帧所属代次，隔离旧完成回调。 */
+    unsigned long call_rx_token; /**< 下行信用序号；代次和序号都匹配才释放。 */
+    int call_tx_mid; /**< 0 无在途；非零为唯一在途 QoS0 音频消息。 */
+    unsigned long long call_callback_serial; /**< 发布回调递增计数，区分 mid 回绕。 */
+    unsigned long long call_completed[65536]; /**< 每个 mid 最近一次完成序号，解决回调先于 publish 返回的竞争。 */
+    unsigned long long call_tx_before; /**< 当前 publish 前回调计数。 */
+    long long call_tx_since; /**< 唯一在途帧提交的本地毫秒。 */
+    unsigned long call_rx_drops, call_tx_drops; /**< 音频溢出/过期及提交失败次数。 */
+
     /* ======== mosquitto 句柄（用于 apply 重建） ======== */
     struct mosquitto *mosq;
     int mosq_loop_started; /**< 1 表示 loop_start 成功且尚未 join；仅主线程在 mosq_lock 内读写。 */
@@ -179,6 +222,13 @@ typedef struct {
 static int mqtt_apply_reconnect(mqttd_cfg_t *cfg);
 static void on_log(struct mosquitto *mosq, void *userdata, int level, const char *str);
 static void cancel_apply_retry(mqttd_cfg_t *cfg);
+static void call_reset(mqttd_cfg_t *cfg);
+static void broadcast_reset(mqttd_cfg_t *cfg);
+static void call_connected(mqttd_cfg_t *cfg);
+static void call_send_rx(mqttd_cfg_t *cfg);
+static void call_tick(mqttd_cfg_t *cfg);
+static void call_command(mqttd_cfg_t *cfg, const char *line);
+static void on_call_publish(struct mosquitto *mosq, void *userdata, int mid);
 static void schedule_apply_retry(mqttd_cfg_t *cfg, int delay_sec);
 
 /*
@@ -699,17 +749,27 @@ static int ipc_dup_client(mqttd_cfg_t *cfg, unsigned long *generation_out)
     return duplicate_fd;
 }
 
+/** @brief 仅关闭匹配代次的 IPC，并在实际关闭时禁用通话媒体。
+ * @param cfg 非空运行配置，连接代次由 ipc_lock 保护。
+ * @param generation 调用方复制 socket 时取得的代次；过期代次不影响新连接。
+ */
 static void ipc_close_client_if_generation(mqttd_cfg_t *cfg,
                                            unsigned long generation)
 {
+    int closed=0;
     pthread_mutex_lock(&cfg->ipc_lock);
     if (cfg->ipc_client_fd >= 0 && cfg->ipc_client_generation == generation) {
+        closed=1;
         shutdown(cfg->ipc_client_fd, SHUT_RDWR);
         close(cfg->ipc_client_fd);
         cfg->ipc_client_fd = -1;
         cfg->ipc_client_generation++;
     }
     pthread_mutex_unlock(&cfg->ipc_lock);
+    if (closed) {
+        broadcast_reset(cfg);
+        call_reset(cfg);
+    }
 }
 
 static void ipc_tx_wait_for_client(mqttd_cfg_t *cfg)
@@ -725,13 +785,182 @@ static void ipc_tx_wait_for_client(mqttd_cfg_t *cfg)
     pthread_mutex_unlock(&cfg->ipc_tx_lock);
 }
 
+/** @brief 禁止当前媒体并清空环；不取消已提交 MQTT 的唯一一帧。
+ * @param cfg 非空运行配置；本函数自行获取 ipc_tx_lock。
+ * @note 日志在锁外输出；在途 mid 保留到回调完成、新 CONNACK 或旧客户端销毁。
+ */
+static void call_reset(mqttd_cfg_t *cfg)
+{
+    char epoch[48]; unsigned long rx_drops,tx_drops; int was_enabled;
+    pthread_mutex_lock(&cfg->ipc_tx_lock);
+    was_enabled=cfg->call_enabled;
+    memcpy(epoch,cfg->call_epoch,sizeof(epoch)); rx_drops=cfg->call_rx_drops; tx_drops=cfg->call_tx_drops;
+    cfg->call_enabled=0;
+    cfg->call_rx_head=cfg->call_rx_count=0;
+    cfg->call_rx_pending=0;
+    cfg->call_up_head=cfg->call_up_count=0;
+    pthread_mutex_unlock(&cfg->ipc_tx_lock);
+    if (was_enabled) fprintf(stderr,"[call-mqtt] epoch=%s rxDrop=%lu txDrop=%lu\n",epoch,rx_drops,tx_drops);
+}
+
+/** @brief 连接断开或重建时关闭直播收帧门并丢弃旧帧。
+ * @param cfg 非空运行配置；本函数自行获取 ipc_tx_lock。
+ */
+static void broadcast_reset(mqttd_cfg_t *cfg)
+{
+    pthread_mutex_lock(&cfg->ipc_tx_lock);
+    cfg->broadcast_head=cfg->broadcast_count=0;
+    cfg->broadcast_expected=0;
+    pthread_mutex_unlock(&cfg->ipc_tx_lock);
+}
+
+/** @brief 新 CONNACK 成功后清除已被 libmosquitto 重连清理的 QoS0 在途信用。
+ * @param cfg 非空运行配置；由网络连接回调调用，内部获取 ipc_tx_lock。
+ * @note libmosquitto reconnect 在发送新 CONNECT 前清理旧 packet 队列，QoS0 不在重发消息表中；
+ *       此处只恢复本地信用，不改变原业务 QoS1/2 重发、连接或订阅管理。
+ */
+static void call_connected(mqttd_cfg_t *cfg)
+{
+    pthread_mutex_lock(&cfg->ipc_tx_lock);
+    cfg->call_tx_mid=0;
+    pthread_mutex_unlock(&cfg->ipc_tx_lock);
+}
+
+/** @brief 撤销未完整写入 IPC 的下行 token，不影响已在途的其他帧信用。
+ * @param cfg 非空配置；内部只获取短队列锁。
+ * @param epoch 写入失败帧的媒体代次，旧代次不影响新信用。
+ * @param token 需要撤销的已预留下行序号。
+ */
+static void call_release_rx(mqttd_cfg_t *cfg,const char *epoch,unsigned long token)
+{
+    pthread_mutex_lock(&cfg->ipc_tx_lock);
+    if (strcmp(epoch,cfg->call_epoch)==0) {
+        for (int i=0;i<cfg->call_rx_pending;++i) if (cfg->call_rx_outstanding[i]==token) {
+            memmove(&cfg->call_rx_outstanding[i],&cfg->call_rx_outstanding[i+1],
+                (size_t)(cfg->call_rx_pending-i-1)*sizeof(unsigned long));
+            --cfg->call_rx_pending;break;
+        }
+        ++cfg->call_rx_drops;
+    }
+    pthread_mutex_unlock(&cfg->ipc_tx_lock);
+}
+
+/** @brief 同一 IPC 写线程发送一帧音频；窗口满暂停，过期或背压时丢弃，不重放。
+ * @param cfg 非空运行配置，接收环和信用由 ipc_tx_lock 保护。
+ * @note 不持锁写 socket；部分 JSON 写入后关闭当前连接，避免破坏后续业务帧。
+ */
+static void call_send_rx(mqttd_cfg_t *cfg)
+{
+    call_rx_frame_t packet;
+    char epoch[48];
+    unsigned long token=0;
+    int have=0;
+    pthread_mutex_lock(&cfg->ipc_tx_lock);
+    while (cfg->call_enabled && cfg->call_rx_pending<5 && cfg->call_rx_count) {
+        packet=cfg->call_rx[cfg->call_rx_head];
+        cfg->call_rx_head=(cfg->call_rx_head+1)%10; --cfg->call_rx_count;
+        if (monotonic_millis()-packet.arrival_ms>200) { ++cfg->call_rx_drops; continue; }
+        memcpy(epoch,cfg->call_epoch,sizeof(epoch));
+        token=++cfg->call_rx_token; cfg->call_rx_outstanding[cfg->call_rx_pending++]=token; have=1; break;
+    }
+    pthread_mutex_unlock(&cfg->ipc_tx_lock);
+    if (!have) return;
+    char hex[1301];
+    const char *digits="0123456789abcdef";
+    for (int i=0;i<650;++i) { hex[i*2]=digits[packet.pcm[i]>>4]; hex[i*2+1]=digits[packet.pcm[i]&15]; }
+    hex[1300]=0;
+    cJSON *root=cJSON_CreateObject();
+    if (!root) { call_release_rx(cfg,epoch,token);return; }
+    cJSON_AddStringToObject(root,"type","audio");
+    cJSON_AddStringToObject(root,"epoch",epoch);
+    cJSON_AddStringToObject(root,"topic",packet.topic);
+    cJSON_AddStringToObject(root,"hex",hex);
+    cJSON_AddNumberToObject(root,"retain",0);
+    cJSON_AddNumberToObject(root,"token",(double)token);
+    cJSON_AddNumberToObject(root,"arrivalMs",(double)packet.arrival_ms);
+    char *text=cJSON_PrintUnformatted(root); cJSON_Delete(root);
+    if (!text) { call_release_rx(cfg,epoch,token);return; }
+    size_t len=strlen(text); char *line=malloc(len+2);
+    if (!line) { free(text);call_release_rx(cfg,epoch,token);return; }
+    memcpy(line,text,len); line[len++]='\n'; free(text);
+    unsigned long generation=0; int fd=ipc_dup_client(cfg,&generation);
+    if (fd>=0) {
+        // 小帧只尝试一次；部分写入必须关闭连接，不能拼接破损 JSON 后继续。
+        ssize_t n=send(fd,line,len,MSG_NOSIGNAL);
+        const int send_error=errno;close(fd);
+        if (n!=(ssize_t)len) {
+            if (n>=0 || (send_error!=EAGAIN && send_error!=EWOULDBLOCK)) ipc_close_client_if_generation(cfg,generation);
+            call_release_rx(cfg,epoch,token);
+        }
+    } else call_reset(cfg);
+    free(line);
+}
+
+/** @brief 在普通消息和通话媒体均未占用时提交一条最新直播帧。
+ * @param cfg 非空运行配置；锁内取值、锁外一次非阻塞写入。
+ * @note 过期或背压时丢弃。发生部分写入时退役连接以维持JSON行边界。
+ */
+static void broadcast_send_rx(mqttd_cfg_t *cfg)
+{
+    unsigned char packet[1290];
+    char topic[160], epoch[37];
+    size_t length=0;
+    long long arrival=0;
+    pthread_mutex_lock(&cfg->ipc_tx_lock);
+    const long long now=monotonic_millis();
+    while (!cfg->call_enabled && cfg->broadcast_count) {
+        const unsigned int head=cfg->broadcast_head;
+        cfg->broadcast_head=(head+1)%BROADCAST_RX_CAPACITY;
+        --cfg->broadcast_count;
+        arrival=cfg->broadcast_arrival_ms[head];
+        if (now-arrival>120) {
+            ++cfg->broadcast_queue_drops;
+            continue;
+        }
+        length=cfg->broadcast_expected;
+        ++cfg->broadcast_ipc_picked;
+        memcpy(packet,cfg->broadcast_packets[head],length);
+        memcpy(topic,cfg->broadcast_topic,sizeof(topic));
+        memcpy(epoch,cfg->broadcast_epoch,sizeof(epoch));
+        break;
+    }
+    pthread_mutex_unlock(&cfg->ipc_tx_lock);
+    if (!length) return;
+    char hex[2581];
+    const char digits[]="0123456789abcdef";
+    for (size_t i=0;i<length;++i) {
+        hex[2*i]=digits[packet[i]>>4];
+        hex[2*i+1]=digits[packet[i]&15];
+    }
+    hex[2*length]='\0';
+    char line[3000];
+    const int len=snprintf(line,sizeof(line),
+        "{\"type\":\"broadcast_audio\",\"topic\":\"%s\",\"epoch\":\"%s\",\"hex\":\"%s\",\"arrivalMs\":%lld}\n",
+        topic,epoch,hex,arrival);
+    if (len<=0 || (size_t)len>=sizeof(line)) return;
+    unsigned long generation=0;
+    const int fd=ipc_dup_client(cfg,&generation);
+    if (fd<0) return;
+    const ssize_t sent=send(fd,line,(size_t)len,MSG_NOSIGNAL);
+    const int error=errno;
+    close(fd);
+    if (sent!=len && (sent>=0 || (error!=EAGAIN && error!=EWOULDBLOCK)))
+        ipc_close_client_if_generation(cfg,generation);
+}
+
+/** @brief 唯一 IPC 写线程，保留原业务发送队列，并在空隙发送有信用的新鲜音频。
+ * @param arg 非空 mqttd_cfg_t；停止标志和队列由 ipc_tx_lock 保护。
+ * @return 停止后返回 NULL；主线程 join 后才可释放配置。
+ */
 static void *ipc_tx_worker(void *arg)
 {
     mqttd_cfg_t *cfg = (mqttd_cfg_t *)arg;
 
     for (;;) {
         pthread_mutex_lock(&cfg->ipc_tx_lock);
-        while (!cfg->ipc_tx_stop && cfg->ipc_tx_head == NULL) {
+        while (!cfg->ipc_tx_stop && cfg->ipc_tx_head == NULL &&
+               !(cfg->call_enabled && cfg->call_rx_count && cfg->call_rx_pending<5) &&
+               !(!cfg->call_enabled && cfg->broadcast_count)) {
             pthread_cond_wait(&cfg->ipc_tx_cond, &cfg->ipc_tx_lock);
         }
         if (cfg->ipc_tx_stop) {
@@ -739,6 +968,13 @@ static void *ipc_tx_worker(void *arg)
             break;
         }
 
+        if (!cfg->ipc_tx_head) {
+            const int call=cfg->call_enabled;
+            pthread_mutex_unlock(&cfg->ipc_tx_lock);
+            if (call) call_send_rx(cfg);
+            else broadcast_send_rx(cfg);
+            continue;
+        }
         ipc_tx_item_t *item = cfg->ipc_tx_head;
         cfg->ipc_tx_head = item->next;
         if (!cfg->ipc_tx_head) cfg->ipc_tx_tail = NULL;
@@ -1126,6 +1362,190 @@ static void dump_hex(const char *tag, const unsigned char *buf, int len)
     fprintf(stderr, "\n");
 }
 
+/** @brief 发回当前代次的控制信用；不代表 QoS0 已到达平台。
+ * @param cfg 非空配置，复用原可靠 IPC 队列。
+ * @param type call_ready 或 call_sent。
+ * @param epoch 需要回显的本地媒体代次 UUID。
+ * @param ok 非零为就绪/完成，0 要求 Qt 停止通话。
+ */
+static void call_ack(mqttd_cfg_t *cfg,const char *type,const char *epoch,int ok)
+{
+    cJSON *obj=cJSON_CreateObject();
+    if (!obj) return;
+    cJSON_AddStringToObject(obj,"type",type); cJSON_AddStringToObject(obj,"epoch",epoch);
+    cJSON_AddBoolToObject(obj,"ok",ok);
+    if (strcmp(type,"call_ready")==0) cJSON_AddNumberToObject(obj,"window",5);
+    char *text=cJSON_PrintUnformatted(obj); cJSON_Delete(obj);
+    if (text) { ipc_send_line(cfg,text); free(text); }
+}
+
+/** @brief 网络线程仅记录发布完成序号，不调用 IPC 写入或音频设备。
+ * @param mosq 原客户端，本回调不访问其状态。
+ * @param userdata 非空 mqttd_cfg_t，由主线程在网络线程 join 后释放。
+ * @param mid libmosquitto 分配的 1..65535 消息号，QoS0 也分配。
+ */
+static void on_call_publish(struct mosquitto *mosq,void *userdata,int mid)
+{
+    (void)mosq; mqttd_cfg_t *cfg=userdata;
+    if (mid<=0 || mid>65535) return;
+    pthread_mutex_lock(&cfg->ipc_tx_lock);
+    cfg->call_completed[mid]=++cfg->call_callback_serial;
+    pthread_mutex_unlock(&cfg->ipc_tx_lock);
+}
+
+/** @brief 主线程确认唯一 QoS0 帧已离开 libmosquitto，或超时后禁止继续提交。
+ * @param cfg 非空运行配置；只由 IPC 主线程调用。
+ * @note 500ms 是停发兜底；TCP/Broker 内已经发送的消息无法由 V1 协议撤回。
+ */
+static void call_tick(mqttd_cfg_t *cfg)
+{
+    char completed_epoch[48]={0},epoch[48]={0},topic[516]={0};
+    int notify=0,ok=0,expired=0,have=0;
+    call_up_frame_t frame;
+    unsigned long long before=0;
+    pthread_mutex_lock(&cfg->ipc_tx_lock);
+    if (cfg->call_tx_mid>0) {
+        ok=cfg->call_completed[cfg->call_tx_mid]>cfg->call_tx_before;
+        if (ok || monotonic_millis()-cfg->call_tx_since>500) {
+            memcpy(completed_epoch,cfg->call_tx_epoch,sizeof(completed_epoch)); notify=cfg->call_enabled;
+            if (ok) cfg->call_tx_mid=0;
+            else {
+                if (cfg->call_enabled) ++cfg->call_tx_drops;
+                cfg->call_enabled=0;cfg->call_rx_count=0;cfg->call_up_count=0;
+            }
+        }
+    }
+    memcpy(epoch,cfg->call_epoch,sizeof(epoch));
+    if (cfg->call_enabled && !cfg->call_tx_mid) {
+        while (cfg->call_up_count) {
+            frame=cfg->call_up[cfg->call_up_head];
+            cfg->call_up_head=(cfg->call_up_head+1)%5; --cfg->call_up_count;
+            if (monotonic_millis()>frame.deadline_ms) { ++expired; ++cfg->call_tx_drops; continue; }
+            snprintf(topic,sizeof(topic),"%s/up",cfg->call_audio_topic);
+            before=cfg->call_callback_serial;have=1;break;
+        }
+    }
+    pthread_mutex_unlock(&cfg->ipc_tx_lock);
+    if (notify) call_ack(cfg,"call_sent",completed_epoch,ok);
+    for (int i=0;i<expired;++i) call_ack(cfg,"call_sent",epoch,1);
+    if (!have) return;
+    pthread_mutex_lock(&cfg->state_lock);int connected=cfg->mqtt_connected;pthread_mutex_unlock(&cfg->state_lock);
+    int mid=0;
+    int rc=connected && cfg->mosq ? mosquitto_publish(cfg->mosq,&mid,topic,650,frame.pcm,0,false) : MOSQ_ERR_INVAL;
+    if (rc==MOSQ_ERR_SUCCESS && mid>0 && mid<=65535) {
+        pthread_mutex_lock(&cfg->ipc_tx_lock);
+        cfg->call_tx_mid=mid;cfg->call_tx_before=before;cfg->call_tx_since=monotonic_millis();
+        memcpy(cfg->call_tx_epoch,epoch,sizeof(cfg->call_tx_epoch));
+        pthread_mutex_unlock(&cfg->ipc_tx_lock);
+    } else { call_reset(cfg); call_ack(cfg,"call_sent",epoch,0); }
+}
+
+/** @brief 十六进制单字符解码。
+ * @param c ASCII 字符，大小写字母均可。
+ * @return 0..15 表示成功；-1 表示不是十六进制字符。
+ */
+static int call_hex(unsigned char c)
+{
+    if (c>='0' && c<='9') return c-'0';
+    if (c>='a' && c<='f') return c-'a'+10;
+    if (c>='A' && c<='F') return c-'A'+10;
+    return -1;
+}
+
+/** @brief 主线程处理媒体代次门、下行信用及 650B 二进制上行。
+ * @param cfg 非空运行配置；仅主线程执行命令。
+ * @param line 完整的单行 JSON，解析失败或代次错误时拒绝/忽略。
+ * @details 本地 IPC 使用 hex 保留零字节，MQTT 发布显式长度 650、QoS0、retain=false。
+ *          IPC 最多 5 帧窗口与 5 帧待发环之外不排队；libmosquitto 仍只保留一个音频在途帧；所有库调用均在短队列锁外。
+ */
+static void call_command(mqttd_cfg_t *cfg,const char *line)
+{
+    cJSON *obj=cJSON_Parse(line);
+    if (!obj) return;
+    cJSON *cmd=cJSON_GetObjectItemCaseSensitive(obj,"cmd");
+    cJSON *epoch=cJSON_GetObjectItemCaseSensitive(obj,"epoch");
+    if (!cJSON_IsString(cmd) || !cJSON_IsString(epoch) || strlen(epoch->valuestring)!=36) { cJSON_Delete(obj); return; }
+    if (strcmp(cmd->valuestring,"call_media")==0) {
+        int enabled=cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(obj,"enabled"));
+        if (!enabled) call_reset(cfg);
+        cJSON *topic=cJSON_GetObjectItemCaseSensitive(obj,"topic");
+        int valid_topic=cJSON_IsString(topic);
+        if (valid_topic) {
+            size_t len=strlen(topic->valuestring);
+            valid_topic=len>21 && len<sizeof(cfg->call_audio_topic)-3 &&
+                strncmp(topic->valuestring,"device/ycLinux/",15)==0 &&
+                strcmp(topic->valuestring+len-6,"/audio")==0 &&
+                !strchr(topic->valuestring,'+') && !strchr(topic->valuestring,'#');
+        }
+        pthread_mutex_lock(&cfg->ipc_tx_lock);
+        int ready=!cfg->call_tx_mid && (!enabled || valid_topic);
+        cfg->call_enabled=enabled && ready;
+        if (cfg->call_enabled) cfg->broadcast_head=cfg->broadcast_count=0;
+        if (enabled && ready) {
+            strcpy(cfg->call_audio_topic,topic->valuestring);
+            cfg->call_rx_drops=cfg->call_tx_drops=0;
+        }
+        memcpy(cfg->call_epoch,epoch->valuestring,37);
+        cfg->call_rx_count=cfg->call_rx_head=0; cfg->call_rx_pending=0;
+        cfg->call_rx_acked_token=cfg->call_rx_token;
+        cfg->call_up_head=cfg->call_up_count=0;
+        pthread_mutex_unlock(&cfg->ipc_tx_lock);
+        call_ack(cfg,"call_ready",epoch->valuestring,ready);
+    } else if (strcmp(cmd->valuestring,"audio_received")==0) {
+        cJSON *token=cJSON_GetObjectItemCaseSensitive(obj,"token");
+        pthread_mutex_lock(&cfg->ipc_tx_lock);
+        if (cJSON_IsNumber(token) && strcmp(cfg->call_epoch,epoch->valuestring)==0 &&
+            token->valuedouble>(double)cfg->call_rx_acked_token && token->valuedouble<=(double)cfg->call_rx_token) {
+            unsigned long acked=(unsigned long)token->valuedouble;
+            int consumed=0;
+            while (consumed<cfg->call_rx_pending && cfg->call_rx_outstanding[consumed]<=acked) ++consumed;
+            memmove(cfg->call_rx_outstanding,&cfg->call_rx_outstanding[consumed],
+                (size_t)(cfg->call_rx_pending-consumed)*sizeof(unsigned long));
+            cfg->call_rx_pending-=consumed;cfg->call_rx_acked_token=acked;
+        }
+        pthread_cond_signal(&cfg->ipc_tx_cond);
+        pthread_mutex_unlock(&cfg->ipc_tx_lock);
+    } else if (strcmp(cmd->valuestring,"publish_audio")==0) {
+        cJSON *topic=cJSON_GetObjectItemCaseSensitive(obj,"topic");
+        cJSON *hex=cJSON_GetObjectItemCaseSensitive(obj,"hex");
+        unsigned char packet[650]; int valid=cJSON_IsString(topic) && cJSON_IsString(hex);
+        if (valid) {
+            const size_t tl=strlen(topic->valuestring);
+            valid=tl>9 && tl<512 && strncmp(topic->valuestring,"device/ycLinux/",15)==0 &&
+                strcmp(topic->valuestring+tl-9,"/audio/up")==0 && strlen(hex->valuestring)==1300;
+        }
+        for (int i=0;valid && i<650;++i) {
+            int a=call_hex((unsigned char)hex->valuestring[2*i]),b=call_hex((unsigned char)hex->valuestring[2*i+1]);
+            if (a<0 || b<0) valid=0; else packet[i]=(unsigned char)((a<<4)|b);
+        }
+        if (valid) valid=packet[0]==0xA1 && packet[1]==0xC0 && packet[2]==1 && packet[3]==0 && packet[4]==1;
+        pthread_mutex_lock(&cfg->ipc_tx_lock);
+        char expected[516]; snprintf(expected,sizeof(expected),"%s/up",cfg->call_audio_topic);
+        valid=valid && cfg->call_enabled && strcmp(cfg->call_epoch,epoch->valuestring)==0 &&
+            strcmp(topic->valuestring,expected)==0;
+        int dropped=0;
+        cJSON *age=cJSON_GetObjectItemCaseSensitive(obj,"ageMs");
+        double age_ms=cJSON_IsNumber(age) ? age->valuedouble : 0;
+        if (age_ms<0 || age_ms>100) valid=0;
+        if (valid) {
+            if (cfg->call_up_count==5) {
+                cfg->call_up_head=(cfg->call_up_head+1)%5;--cfg->call_up_count;++cfg->call_tx_drops;dropped=1;
+            }
+            call_up_frame_t *slot=&cfg->call_up[(cfg->call_up_head+cfg->call_up_count)%5];
+            memcpy(slot->pcm,packet,650);slot->deadline_ms=monotonic_millis()+100-(long long)age_ms;
+            ++cfg->call_up_count;
+        }
+        pthread_mutex_unlock(&cfg->ipc_tx_lock);
+        // 过期音频只丢帧并归还窗口，不把可恢复背压升级为整个通话失败。
+        if (!valid || dropped) call_ack(cfg,"call_sent",epoch->valuestring,1);
+    }
+    cJSON_Delete(obj);
+}
+
+/** @brief 沿原路径发布 JSON/文本；call.* 事件固定 QoS2，其余保持配置 QoS。
+ * @param cfg 非空配置，只由 IPC 主线程访问客户端生命周期。
+ * @param line 完整 publish JSON；字段缺失、离线或发布失败通过原 ack 上报。
+ */
 static void handle_publish(mqttd_cfg_t *cfg, const char *line)
 {
     cJSON *root = cJSON_Parse(line);
@@ -1187,15 +1607,30 @@ static void handle_publish(mqttd_cfg_t *cfg, const char *line)
 
     //dump_hex("publish-payload", (const unsigned char *)payloadText, (int)strlen(payloadText));
 
+    int publish_qos=cfg->qos;
+    const char *live_method=NULL;
+    if (cJSON_IsObject(payloadItem)) {
+        cJSON *method=cJSON_GetObjectItemCaseSensitive(payloadItem,"method");
+        if (cJSON_IsString(method)) {
+            const char *name=method->valuestring;
+            if (strcmp(name,"broadcastLiveAck")==0 || strcmp(name,"broadcastLiveState")==0) live_method=name;
+            if (strncmp(name,"call.",5)==0 || strcmp(name,"broadcastAck")==0 ||
+                    strcmp(name,"broadcastState")==0 || strcmp(name,"broadcastTagPlay")==0 ||
+                    strcmp(name,"broadcastLiveAck")==0 || strcmp(name,"broadcastLiveState")==0)
+                publish_qos=2;
+        }
+    }
     int r = mosquitto_publish(
         m,
         NULL,
         topicItem->valuestring,
         (int)strlen(payloadText),
         payloadText,
-        cfg->qos,
+        publish_qos,
         false
     );
+    if (live_method)
+        fprintf(stderr,"[mqttd-live] publish method=%s qos=%d rc=%d\n",live_method,publish_qos,r);
 
     if (r == MOSQ_ERR_SUCCESS) {
         if (cfg->verbose) {
@@ -1214,12 +1649,69 @@ static void handle_publish(mqttd_cfg_t *cfg, const char *line)
 }
 
 
+/** @brief 设置独立直播媒体门并汇总上一代次的收帧和出队统计。
+ * @param cfg 非空配置，入口在IPC主线程，状态由ipc_tx_lock保护。
+ * @param line 非空、以NUL结束的本地JSON行。
+ */
+static void broadcast_command(mqttd_cfg_t *cfg, const char *line)
+{
+    cJSON *root=cJSON_Parse(line);
+    if (!root) return;
+    const cJSON *topic=cJSON_GetObjectItemCaseSensitive(root,"topic");
+    const cJSON *epoch=cJSON_GetObjectItemCaseSensitive(root,"epoch");
+    const cJSON *frame=cJSON_GetObjectItemCaseSensitive(root,"frameMs");
+    const int enabled=cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root,"enabled"));
+    const char *name=cJSON_IsString(topic) ? topic->valuestring : "";
+    const char *token=cJSON_IsString(epoch) ? epoch->valuestring : "";
+    const char *suffix="/broadcast/audio";
+    const size_t name_len=strlen(name);
+    const char *end=name_len>31 ? name+name_len-16 : NULL;
+    const char *allowed="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
+    const size_t device_len=end && end>name+15 ? (size_t)(end-name-15) : 0;
+    const int valid=device_len && strlen(name)<sizeof(cfg->broadcast_topic) &&
+        strncmp(name,"device/ycLinux/",15)==0 && strcmp(end,suffix)==0 &&
+        strspn(name+15,allowed)==device_len &&
+        strlen(token)==36 && strspn(token,"abcdefABCDEF0123456789-")==36 &&
+        cJSON_IsNumber(frame) && (frame->valuedouble==20 || frame->valuedouble==40);
+    char previous_epoch[37];
+    pthread_mutex_lock(&cfg->ipc_tx_lock);
+    const int was_enabled=cfg->broadcast_expected!=0;
+    const unsigned long seen=cfg->broadcast_seen, accepted=cfg->broadcast_accepted;
+    const unsigned long picked=cfg->broadcast_ipc_picked, dropped=cfg->broadcast_queue_drops;
+    memcpy(previous_epoch,cfg->broadcast_epoch,sizeof(previous_epoch));
+    cfg->broadcast_head=cfg->broadcast_count=0;
+    cfg->broadcast_expected=0;
+    cfg->broadcast_seen=cfg->broadcast_accepted=cfg->broadcast_ipc_picked=cfg->broadcast_queue_drops=0;
+    if (enabled && valid) {
+        strcpy(cfg->broadcast_topic,name);
+        strcpy(cfg->broadcast_epoch,token);
+        cfg->broadcast_expected=(size_t)(10+frame->valueint*32);
+    }
+    pthread_mutex_unlock(&cfg->ipc_tx_lock);
+    if (was_enabled)
+        fprintf(stderr,"[mqttd-live] media_summary epoch=%s mqttFrames=%lu acceptedFrames=%lu ipcPicked=%lu queueDrops=%lu\n",
+                previous_epoch,seen,accepted,picked,dropped);
+    fprintf(stderr,"[mqttd-live] media_gate enabled=%d accepted=%d epoch=%s frameMs=%d\n",
+            enabled,!enabled || valid,enabled && valid ? token : "-",enabled && valid ? frame->valueint : 0);
+    cJSON_Delete(root);
+}
+
 /* ========== IPC：处理 Qt 发来的命令，并返回结果（本回合先做 test/status） ========== */
+/** @brief 分派本地命令，通话二进制命令使用独立信用，不改变原 JSON 命令路径。
+ * @param cfg 非空配置，仅由 IPC 主线程调用。
+ * @param line 以零结束的完整 JSON 行，未知命令保留原错误响应。
+ */
 static void ipc_handle_command(mqttd_cfg_t *cfg, const char *line)
 {
     const char *cmd = json_find_cmd(line);
     if (!cmd) return;
+    if (strncmp(cmd,"call_media\"",11)==0 || strncmp(cmd,"publish_audio\"",14)==0 ||
+        strncmp(cmd,"audio_received\"",15)==0) { call_command(cfg,line); return; }
 
+    if (strncmp(cmd, "broadcast_media\"", 16) == 0) {
+        broadcast_command(cfg,line);
+        return;
+    }
     if (strncmp(cmd, "test\"", 5) == 0) {
         ipc_send_status(cfg, "test_result");
         return;
@@ -1389,6 +1881,11 @@ static void ipc_read_loop(mqttd_cfg_t *cfg)
  * userdata：我们在 mosquitto_new() 里传进去的 &cfg
  * rc：连接结果（0 表示成功，其它表示失败）
  */
+/** @brief 在既有连接中恢复订阅，ycLinux request 使用 QoS2、audio 使用 QoS0。
+ * @param mosq 触发回调的既有客户端。
+ * @param userdata 非空运行配置，生命周期覆盖网络线程。
+ * @param rc CONNACK 结果；0 成功，其他值按原连接失败流程上报。
+ */
 static void on_connect(struct mosquitto *mosq, void *userdata, int rc)
 {
     mqttd_cfg_t *cfg = (mqttd_cfg_t *)userdata;
@@ -1399,6 +1896,7 @@ static void on_connect(struct mosquitto *mosq, void *userdata, int rc)
     pthread_mutex_unlock(&cfg->state_lock);
 
     if (rc == 0) {
+        call_connected(cfg);
         cancel_apply_retry(cfg);
 
         // rc==0：CONNACK 接受，连接成功
@@ -1408,7 +1906,13 @@ static void on_connect(struct mosquitto *mosq, void *userdata, int rc)
 
         // 连接成功后订阅所有 topic
         for (int i = 0; i < cfg->topic_count; i++) {
-            int s = mosquitto_subscribe(mosq, NULL, cfg->topics[i], cfg->qos);
+            int sub_qos=cfg->qos;
+            const char *tp=cfg->topics[i]; size_t tl=strlen(tp);
+            if (strncmp(tp,"device/ycLinux/",15)==0) {
+                if (tl>6 && strcmp(tp+tl-6,"/audio")==0) sub_qos=0;
+                else if (tl>8 && strcmp(tp+tl-8,"/request")==0) sub_qos=2;
+            }
+            int s = mosquitto_subscribe(mosq, NULL, cfg->topics[i], sub_qos);
             if (s != MOSQ_ERR_SUCCESS) {
                 // 订阅失败时输出错误原因
                 fprintf(stderr, "[mqttd] subscribe failed (%s): %s\n",
@@ -1468,6 +1972,8 @@ static void on_disconnect(struct mosquitto *mosq, void *userdata, int rc)
 {
     (void)mosq;
     mqttd_cfg_t *cfg = (mqttd_cfg_t *)userdata;
+    broadcast_reset(cfg);
+    call_reset(cfg);
 
     pthread_mutex_lock(&cfg->state_lock);
     cfg->mqtt_connected = 0;
@@ -1518,10 +2024,60 @@ static void on_disconnect(struct mosquitto *mosq, void *userdata, int rc)
 // }
 
 
+/** @brief 网络线程分流音频到固定 10 帧接收环，其他消息仍复制到原业务队列。
+ * @param mosq 原客户端，回调不创建其他客户端或网络循环。
+ * @param userdata 非空运行配置，媒体门和接收环由 ipc_tx_lock 保护。
+ * @param msg 借用的 MQTT 消息，回调返回后不保留其指针。
+ * @note 仅接收当前精确主题、非 retain、V1头和协商长度；直播只累计计数，回调不写日志或 socket。
+ */
 static void on_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_message *msg)
 {
     (void)mosq;
     mqttd_cfg_t *cfg = (mqttd_cfg_t *)userdata;
+    if (msg && msg->topic) {
+        const size_t len=strlen(msg->topic);
+        if (len>31 && strncmp(msg->topic,"device/ycLinux/",15)==0 &&
+                strcmp(msg->topic+len-16,"/broadcast/audio")==0) {
+            const unsigned char *data=msg->payload;
+            const int valid=!msg->retain && data && (msg->payloadlen==650 || msg->payloadlen==1290) &&
+                memcmp(data,"\xA1\xC0\x01\x00\x01",5)==0;
+            pthread_mutex_lock(&cfg->ipc_tx_lock);
+            if (cfg->broadcast_expected && strcmp(msg->topic,cfg->broadcast_topic)==0) {
+                ++cfg->broadcast_seen;
+                if (valid && !cfg->call_enabled && cfg->broadcast_expected==(size_t)msg->payloadlen) {
+                    ++cfg->broadcast_accepted;
+                    if (cfg->broadcast_count==BROADCAST_RX_CAPACITY) {
+                        cfg->broadcast_head=(cfg->broadcast_head+1)%BROADCAST_RX_CAPACITY;
+                        --cfg->broadcast_count;
+                        ++cfg->broadcast_queue_drops;
+                    }
+                    const unsigned int slot=(cfg->broadcast_head+cfg->broadcast_count)%BROADCAST_RX_CAPACITY;
+                    memcpy(cfg->broadcast_packets[slot],data,(size_t)msg->payloadlen);
+                    cfg->broadcast_arrival_ms[slot]=monotonic_millis();
+                    ++cfg->broadcast_count;
+                    pthread_cond_signal(&cfg->ipc_tx_cond);
+                }
+            }
+            pthread_mutex_unlock(&cfg->ipc_tx_lock);
+            return;
+        }
+        if (strncmp(msg->topic,"device/ycLinux/",15)==0 && len>6 && strcmp(msg->topic+len-6,"/audio")==0) {
+            const unsigned char *data=msg->payload;
+            if (len>=512 || msg->retain || msg->payloadlen!=650 || !data ||
+                data[0]!=0xA1 || data[1]!=0xC0 || data[2]!=1 || data[3]!=0 || data[4]!=1) return;
+            pthread_mutex_lock(&cfg->ipc_tx_lock);
+            if (cfg->call_enabled && strcmp(msg->topic,cfg->call_audio_topic)==0) {
+                if (cfg->call_rx_count==10) { cfg->call_rx_head=(cfg->call_rx_head+1)%10; --cfg->call_rx_count; ++cfg->call_rx_drops; }
+                call_rx_frame_t *slot=&cfg->call_rx[(cfg->call_rx_head+cfg->call_rx_count)%10];
+                memcpy(slot->pcm,data,650); memcpy(slot->topic,msg->topic,len+1);
+                slot->arrival_ms=monotonic_millis(); ++cfg->call_rx_count;
+                pthread_cond_signal(&cfg->ipc_tx_cond);
+            }
+            pthread_mutex_unlock(&cfg->ipc_tx_lock);
+            return;
+        }
+    }
+
     if (!msg || !msg->topic) return;
 
     if (cfg->verbose) {
@@ -1590,6 +2146,11 @@ static int mqtt_build_and_start_locked(mqttd_cfg_t *cfg)
     int stopped = mqtt_stop_and_destroy_locked(cfg);
     if (stopped != MOSQ_ERR_SUCCESS) return stopped;
 
+    broadcast_reset(cfg);
+    call_reset(cfg);
+    pthread_mutex_lock(&cfg->ipc_tx_lock);
+    cfg->call_tx_mid=0; // 旧网络线程已 join，库内唯一音频包已随旧客户端销毁。
+    pthread_mutex_unlock(&cfg->ipc_tx_lock);
     cfg->mosq = mosquitto_new(cfg->client_id, cfg->clean_session, cfg);
     if (!cfg->mosq) {
         return MOSQ_ERR_NOMEM;
@@ -1618,6 +2179,7 @@ static int mqtt_build_and_start_locked(mqttd_cfg_t *cfg)
     mosquitto_disconnect_callback_set(cfg->mosq, on_disconnect);
     mosquitto_message_callback_set(cfg->mosq, on_message);
     mosquitto_subscribe_callback_set(cfg->mosq, on_subscribe);
+    mosquitto_publish_callback_set(cfg->mosq,on_call_publish);
     if (cfg->verbose) mosquitto_log_callback_set(cfg->mosq, on_log);
 
     mosquitto_reconnect_delay_set(cfg->mosq, 1, 60, true);
@@ -1696,6 +2258,12 @@ static void on_log(struct mosquitto *mosq, void *userdata, int level, const char
 }
 
 
+/** @brief 启动单 MQTT 网络循环和单 IPC 写线程，通话期间以 5ms 节奏服务音频命令。
+ * @param argc 命令行参数个数。
+ * @param argv 命令行参数数组，沿用原选项和周期发布行为。
+ * @return 0 正常退出；非零为参数、IPC 启动或无法安全停止网络线程等错误。
+ * @note 不增加 MQTT 客户端；网络线程必须退出后才能释放共享配置。
+ */
 int main(int argc, char **argv)
 {
     mqttd_cfg_t cfg;
@@ -1873,6 +2441,7 @@ int main(int argc, char **argv)
 
         // 如果 Qt 已连上，读取它发来的命令并回复（test/status）
         ipc_read_loop(&cfg);
+        call_tick(&cfg);
 
         if (cfg.retry_apply_enabled) {
             time_t now = time(NULL);
@@ -1917,11 +2486,18 @@ int main(int argc, char **argv)
                     fprintf(stderr, "[mqttd] published: %s\n", cfg.pub_topic);
                 }
                 // 分秒 sleep，确保 g_running 变 0 时可以更快退出
-                for (int i = 0; i < cfg.pub_interval_sec && g_running; i++) sleep(1);
+                for (int i=0;i<cfg.pub_interval_sec && g_running;++i) {
+                    for (int step=0;step<200 && g_running;++step) {
+                        ipc_accept_if_needed(&cfg); ipc_read_loop(&cfg); call_tick(&cfg); usleep(5000);
+                    }
+                }
             }
 
         } else {
-            usleep(100 * 1000); // 100ms：IPC 响应更快
+            pthread_mutex_lock(&cfg.ipc_tx_lock);
+            int calling=cfg.call_enabled;
+            pthread_mutex_unlock(&cfg.ipc_tx_lock);
+            usleep(calling ? 5000 : 100000); // 空闲保留原节奏，通话 5ms 服务 20ms PCM。
         }
     }
 
