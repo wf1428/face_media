@@ -4,7 +4,7 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-13；修改人：Du lin；本地视频预卷后开播并在直播回退失败时换独立播放器；直播重试把链路检测和协议请求交给网络线程，GUI 仅使用有效结果切回。
+ * @note 最近修改：2026-11-17；修改人：Du lin；videoRect 连续扫描到同一空混播目录时仅首次打印统计，发现资源后恢复原日志。
  */
 
 #include "multimediademo.h"
@@ -1170,6 +1170,7 @@ void MultimediaDemo::reloadVideoFileList()
 
 /**
  * @brief 按配置顺序重建 videoRect 视频/图片混播列表。
+ * @note 同一目录的连续空列表只在首次扫描时打印统计。
  */
 void MultimediaDemo::rebuildVideoRectMediaList()
 {
@@ -1233,10 +1234,14 @@ void MultimediaDemo::rebuildVideoRectMediaList()
         m_currentVideoRectMediaPath.clear();
     }
 
-    LOG_VIDEO("videoRect 混播目录:" << mediaDirPath);
-    LOG_VIDEO("videoRect 混播视频数量:" << videoFileList.size());
-    LOG_VIDEO("videoRect 混播图片数量:" << videoRectPictureFileList.size());
-    LOG_VIDEO("videoRect 混播总数量:" << videoRectMediaList.size());
+    const bool empty = videoRectMediaList.isEmpty();
+    if (!empty || m_loggedEmptyVideoRectDir != mediaDirPath) {
+        LOG_VIDEO("videoRect 混播目录:" << mediaDirPath);
+        LOG_VIDEO("videoRect 混播视频数量:" << videoFileList.size());
+        LOG_VIDEO("videoRect 混播图片数量:" << videoRectPictureFileList.size());
+        LOG_VIDEO("videoRect 混播总数量:" << videoRectMediaList.size());
+    }
+    m_loggedEmptyVideoRectDir = empty ? mediaDirPath : QString();
 
     for (int i = 0; i < videoRectMediaList.size(); ++i) {
         LOG_VIDEO("videoRect 混播顺序[" << i << "]"
@@ -2468,7 +2473,7 @@ void MultimediaDemo::initializeComponents()
     LOG_INIT("初始显示状态: 楼层数字和状态标签已显示，方向/日期/星期标签根据配置显示");
 }
 
-/** @brief 把主播放器的错误、截图和到帧信号绑定到当前页面；换管线后可重复绑定新实例。 */
+/** @brief 绑定主播放器的错误、截图、到帧和直播恢复信号；换管线后可重复绑定新实例。 */
 void MultimediaDemo::connectMainMediaPlayer()
 {
     connect(mediaPlayer, &GstPlayerWidget::snapshotReady,
@@ -2540,7 +2545,6 @@ void MultimediaDemo::connectMainMediaPlayer()
             [this, player](const QString &reason) {
         if (player != mediaPlayer || !m_isLiveMode || !m_liveDesired || m_liveRecovering) return;
         m_liveRecovering = true;
-        LOG_VIDEO("直播MPP输出持续失速或时间轴异常，原地完整重建LIVE管线:" << reason);
         restartLivePipelineAfterDecoderStall(reason);
     }, Qt::QueuedConnection);
 }
@@ -3162,7 +3166,7 @@ void MultimediaDemo::initializeConfiguration()
 }
 
 /**
- * @brief 创建透明裁剪区域，并只读取 U 盘静态目录中的 notice.txt。
+ * @brief 创建透明裁剪区域，并从当前业务分区的媒体资源目录读取 notice.txt。
  */
 void MultimediaDemo::initializeMovingText()
 {
@@ -3198,8 +3202,8 @@ void MultimediaDemo::initializeMovingText()
     m_moveTextLabel->setStyleSheet(QStringLiteral("background:transparent;color:%1;")
                                    .arg(textColor.name()));
 
-    const QString noticePath = QStringLiteral(
-                "/mnt/UDISK/res/static/demoResources/images/logo/notice.txt");
+    const QString noticePath = QDir(Rk3566Platform::staticRoot()).filePath(
+                QStringLiteral("demoResources/images/logo/notice.txt"));
     QFile noticeFile(noticePath);
     QString noticeText;
     if (noticeFile.open(QIODevice::ReadOnly)) {
@@ -5817,7 +5821,7 @@ void MultimediaDemo::forceStopCurrentLivePlayerForFallback(const QString& reason
  * 该路径不启动本地 4K 轮播，也不再用仅能证明 RTP 可达的轻量探测作为
  * 恢复条件；完整销毁 playbin 后直接重新建立当前 LIVE 会话，以释放异常的
  * MPP 解码上下文和 DMA-BUF 池。
- * @param[in] reason 触发重建的诊断原因。
+ * @param[in] reason 播放器提供的诊断原因，无法继续重建当前直播会话时交给中断处理。
  * @note 同一 LIVE 会话的重建保留原无帧期限，实际收到新帧后才更新；视频资源服从 VideoDisplay_en。
  */
 void MultimediaDemo::restartLivePipelineAfterDecoderStall(const QString& reason)
@@ -5838,9 +5842,6 @@ void MultimediaDemo::restartLivePipelineAfterDecoderStall(const QString& reason)
     invalidatePendingLocalPlaybackStarts();
     stopEmptyVideoListWatch();
     stopVideoRectPictureDisplay(true);
-
-    LOG_VIDEO("检测到解码器停滞，完整重建当前LIVE管线，不启动本地4K轮播:"
-              << reason << url);
 
     disconnect(mediaPlayer, &GstPlayerWidget::videoFinished,
                this, &MultimediaDemo::playNextVideo);

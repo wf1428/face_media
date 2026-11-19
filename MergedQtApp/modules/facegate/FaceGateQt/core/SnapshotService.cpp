@@ -2,8 +2,9 @@
  * @file SnapshotService.cpp
  * @brief 验证抓拍文件命名和持久化服务的实现。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-11-16；修改人：Du lin；将配置的绝对或相对抓拍目录解析到共享数据分区，保存和配额使用同一路径。
  */
 
 #include "SnapshotService.h"
@@ -22,20 +23,19 @@ SnapshotService::SnapshotService(const AppConfig &config) : config_(config)
 {
 }
 
-/** @return 基于应用目录解析并确保存在的抓拍根路径。 */
+/** @return 配置在当前数据分区上的绝对抓拍目录。 */
 QString SnapshotService::snapshotRootPath() const
 {
     const QString configured = config_.snapshotDir.trimmed().isEmpty()
         ? QStringLiteral("./data/snapshots")
         : config_.snapshotDir.trimmed();
     const QFileInfo info(configured);
-    if (info.isAbsolute()) {
-        return info.absoluteFilePath();
-    }
-    return QDir(Rk3566Platform::applicationRoot()).absoluteFilePath(configured);
+    const QString absolute = info.isAbsolute() ? info.absoluteFilePath()
+            : QDir(Rk3566Platform::applicationRoot()).absoluteFilePath(configured);
+    return Rk3566Platform::dataPath(absolute);
 }
 
-/** @return 基于应用目录解析后的抓拍根路径。 */
+/** @return 当前数据分区上的绝对抓拍目录。 */
 QString SnapshotService::rootPath() const
 {
     return snapshotRootPath();

@@ -2,10 +2,22 @@
 # @file udisk_watcher.sh
 # @brief 监听 U 盘并导入 UI、视频及协调人员导入导出。
 # @author Du lin
-# @note 最近修改：2026-11-03；修改人：Du lin；保留UI整批暂存校验与回滚，按本批文件总量保留剩余空间检查、取消固定预留；兼容文件属性复制；日志不可写和提交后备份清理失败不再误判文件错误，任一UI文件最终失败仍禁止整批发布。
+# @note 最近修改：2026-11-17；修改人：Du lin；共享分区挂载失败时随启动脚本终止监控，避免向根分区写入；保留拔盘错误自动隐藏。
 
-# 最终拷贝目的目录（视频仍然拷到这里的根目录）
-UDISK_DIR="/mnt/UDISK"
+storage_script="$(dirname -- "$0")/start_face_media.sh"
+if [ ! -r "$storage_script" ]; then
+    storage_script="$(dirname -- "$0")/../../scripts/start_face_media.sh"
+fi
+if [ ! -r "$storage_script" ]; then
+    printf '%s\n' '[face-media] missing start_face_media.sh' >&2
+    exit 1
+fi
+FACE_MEDIA_LOAD_STORAGE_ONLY=1 . "$storage_script"
+unset FACE_MEDIA_LOAD_STORAGE_ONLY
+face_media_detect_storage || exit $?
+
+# U 盘资源和媒体的目标根目录。
+UDISK_DIR=$(face_media_data_path /mnt/UDISK)
 
 # 资源最终拷贝根目录
 RES_DIR="${UDISK_DIR}/res"
@@ -39,7 +51,7 @@ QRC_DST_SUBDIR="res/static/demoResources/images"
 
 # qrc拷贝完成后，额外同步的配置文件
 NET_CFG_SRC="${UDISK_DIR}/${QRC_DST_SUBDIR}/logo/net_cfg.ini"
-NET_CFG_DST_DIR="/mnt/app"
+NET_CFG_DST_DIR=$(face_media_data_path /mnt/app)
 NET_CFG_DST="${NET_CFG_DST_DIR}/net_cfg.ini"
 
 POLL_INTERVAL=1
@@ -58,8 +70,25 @@ PERSON_IMPORT_READY="${PERSON_IMPORT_CONTROL_DIR}/person-import.ready"
 PERSON_EXPORT_REQUEST="${PERSON_IMPORT_CONTROL_DIR}/person-export.request"
 PERSON_EXPORT_READY="${PERSON_IMPORT_CONTROL_DIR}/person-export.ready"
 
-# 可选日志
-LOG_FILE="/tmp/udisk_watcher.log"
+# @brief 每次开机按错误键向 journal 提交一次错误，跨服务重启生效。
+# @param $1 无斜杠的稳定错误键；其余参数为首条错误的详细信息。
+# /run 中仅建立空标记。mkdir 原子占用键；提交失败释放标记，记录故障不影响业务返回值。
+journal_error_once() (
+    error_key=$1
+    shift
+    error_dir=/run/face-media-errors/udisk-watcher
+    claimed=0
+    if mkdir -p "$error_dir" 2>/dev/null; then
+        if mkdir "$error_dir/$error_key" 2>/dev/null; then
+            claimed=1
+        elif [ -d "$error_dir/$error_key" ]; then
+            exit 0
+        fi
+    fi
+    if ! logger -p daemon.err -t udisk-watcher -- "$*" 2>/dev/null; then
+        [ "$claimed" -eq 0 ] || rmdir "$error_dir/$error_key" 2>/dev/null || true
+    fi
+)
 
 # 程序的停止、启动和旋转统一交给 Weston 控制脚本管理。
 WESTON_CONTROL="/usr/local/sbin/weston-control"
@@ -68,23 +97,23 @@ FACE_MEDIA_APP_PIDFILE="/run/face-media/app.pid"
 # Weston 控制脚本会使用 [backRect] 的宽高自动选择横屏0°或竖屏90°。
 UI_CONFIG="${STATIC_DST_DIR}/logo/ycest_cfg.ini"
 
+# @brief 交由 Weston 应用已复制资源，随后验证 Qt 监督进程记录的 PID 是否稳定。
 restart_current_program() {
     if [ ! -x "$WESTON_CONTROL" ]; then
-        ulog "Weston control script not found or not executable: $WESTON_CONTROL"
+        journal_error_once weston-control-missing "Weston control script not found or not executable: $WESTON_CONTROL"
         return 1
     fi
 
     # apply-layout 是U盘更新与显示管理之间的唯一入口：方向改变时执行
     # Weston+触摸+Qt完整旋转事务，方向不变时仅重启一次Qt。这样避免
     # 先restart-app再rotate造成连续杀进程，并复用同一把旋转锁。
-    ulog "applying UI layout and restarting MergedQtApp through Weston control: $UI_CONFIG"
-    "$WESTON_CONTROL" apply-layout "$UI_CONFIG" >> "$LOG_FILE" 2>&1 || return 1
+    "$WESTON_CONTROL" apply-layout "$UI_CONFIG" >/dev/null || return 1
 
     # Weston 返回成功后再次核对监督脚本记录的 PID，确认 Qt 已稳定恢复。
     managed_pid="$(sed -n '1p' "$FACE_MEDIA_APP_PIDFILE" 2>/dev/null)"
     case "$managed_pid" in
         ''|*[!0-9]*)
-            ulog "Face Media supervised app pid is missing or invalid"
+            journal_error_once app-pid-invalid "Face Media supervised app pid is missing or invalid"
             return 1
             ;;
     esac
@@ -97,7 +126,7 @@ restart_current_program() {
 
     managed_name="$(sed -n '1p' "/proc/$managed_pid/comm" 2>/dev/null)"
     if [ "$managed_name" != "MergedQtApp" ]; then
-        ulog "Face Media supervised pid has unexpected process name: pid=$managed_pid name=$managed_name"
+        journal_error_once app-pid-name "Face Media supervised pid has unexpected process name: pid=$managed_pid name=$managed_name"
         return 1
     fi
 
@@ -105,28 +134,13 @@ restart_current_program() {
     sleep 1
     current_managed_pid="$(sed -n '1p' "$FACE_MEDIA_APP_PIDFILE" 2>/dev/null)"
     if [ "$current_managed_pid" != "$managed_pid" ] || ! kill -0 "$managed_pid" 2>/dev/null; then
-        ulog "Face Media supervised app changed or exited during verification: old=$managed_pid new=$current_managed_pid"
+        journal_error_once app-pid-changed "Face Media supervised app changed or exited during verification: old=$managed_pid new=$current_managed_pid"
         return 1
     fi
 
-    ulog "MergedQtApp restart verified through Weston: pid=$managed_pid"
     return 0
 }
 
-
-# 日志是辅助信息；不可打开时改用空设备，避免stderr重定向失败阻断实际文件操作。
-# 仅调整本进程的LOG_FILE，不影响状态JSON或文件完整性校验。
-prepare_update_log() {
-    if ! ( : >> "$LOG_FILE" ) 2>/dev/null; then
-        LOG_FILE="/dev/null"
-    fi
-}
-
-ulog() {
-    ts="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
-    [ -z "$ts" ] && ts="TIME"
-    echo "$ts $*" >> "$LOG_FILE"
-}
 
 json_escape() {
     echo "$1" | sed \
@@ -140,6 +154,7 @@ write_status() {
     # $1=state, $2=message, $3=mountp, $4=src_dir, $5=dst_dir
     # $6=progress(0-100), $7=done_count, $8=total_count, $9=current_file, $10=error_code
     # $11=task(optional): video/static/...
+    # $12=auto_hide(optional): true 仅用于拔盘后的文件更新错误；默认 false。
     state="$1"
     message="$2"
     mountp="$3"
@@ -151,10 +166,25 @@ write_status() {
     current_file="$9"
     error_code="${10}"
     task="${11:-video}"
+    auto_hide="${12:-false}"
+
+    # all 阶段通常复述已记录的文件错误；异常中断、重启失败则是独立原因。
+    if [ "$error_code" -ne 0 ]; then
+        case "$task:$error_code" in
+            all:699|all:701|video:203|qrc:615) status_error_key="status-$task-$error_code" ;;
+            all:*) status_error_key= ;;
+            *)
+                status_fingerprint=$(printf '%s\n' "$message" | cksum)
+                status_error_key="status-$task-$error_code-${status_fingerprint%% *}"
+                ;;
+        esac
+        if [ -n "$status_error_key" ]; then
+            journal_error_once "$status_error_key" "task=$task code=$error_code${current_file:+ file=$current_file} $message"
+        fi
+    fi
 
     # 同一批次只记住首个实际错误，后续复制进度不能把文件错误覆盖为成功。
     if [ "${JOB_TRACKING:-0}" -eq 1 ] && [ "$error_code" -ne 0 ]; then
-        ulog "update file error: code=$error_code file=$current_file message=$message"
         if [ "${JOB_ERROR_CODE:-0}" -eq 0 ]; then
             JOB_ERROR_CODE="$error_code"
             JOB_ERROR_TEXT="$message"
@@ -188,7 +218,8 @@ write_status() {
   "done_count": $done_count,
   "total_count": $total_count,
   "current_file": "$cur_e",
-  "error_code": $error_code
+  "error_code": $error_code,
+  "auto_hide": $auto_hide
 }
 EOF
     mv -f "$tmp" "$STATUS_FILE" 2>/dev/null
@@ -364,7 +395,7 @@ ui_resource_name_valid() {
 ui_remove_work() {
     [ "$1" = "$STATIC_DST_DIR/.udisk-ui-update" ] && [ ! -L "$1" ] || return 1
     [ "$(cat "$1/format" 2>/dev/null)" = "udisk-ui-v1" ] || return 1
-    rm -rf "$1" 2>>"$LOG_FILE"
+    rm -rf "$1" 2>/dev/null
 }
 
 # 持独占锁调用；根据发布前落盘的 plan/original 恢复未提交更新。
@@ -385,26 +416,24 @@ recover_ui_transaction() {
             ur_backup="$ur_work/backup/$ur_name"
             if [ -f "$ur_work/original/$ur_name" ]; then
                 if [ -e "$ur_backup" ] || [ -L "$ur_backup" ]; then
-                    rm -rf "$ur_target" 2>>"$LOG_FILE" || return 1
-                    mv "$ur_backup" "$ur_target" 2>>"$LOG_FILE" || return 1
+                    rm -rf "$ur_target" 2>/dev/null || return 1
+                    mv "$ur_backup" "$ur_target" 2>/dev/null || return 1
                 else
                     [ -e "$ur_target" ] || [ -L "$ur_target" ] || return 1
                 fi
             elif [ ! -e "$ur_work/stage/$ur_name" ]; then
                 # 原先不存在且已发布的目录，回滚时移除；尚在 stage 的不动正式目录。
-                rm -rf "$ur_target" 2>>"$LOG_FILE" || return 1
+                rm -rf "$ur_target" 2>/dev/null || return 1
             fi
         done < "$ur_work/plan"
         sync || return 1
-        ulog "unfinished UI update rolled back: $ur_work"
     fi
     ui_remove_work "$ur_work"
 }
 
-# $1=错误码，$2=说明，$3=可选文件。只记录错误，待工作函数返回、清单句柄关闭后统一回滚。
+# $1=错误码，$2=说明，$3=可选文件。暂存处理结果，外层回滚后通过终态提交错误。
 ui_update_failed() {
     UI_FAILURE_CODE="$1"; UI_FAILURE_MESSAGE="$2"; UI_FAILURE_FILE="${3:-}"
-    ulog "UI update failed: code=$UI_FAILURE_CODE message=$UI_FAILURE_MESSAGE file=$UI_FAILURE_FILE"
     return 1
 }
 
@@ -452,9 +481,9 @@ stage_and_publish_ui_resources() {
         }
     done
     ensure_dir_writable "$STATIC_DST_DIR" || return 1
-    mkdir "$ui_work" 2>>"$LOG_FILE" || return 1
+    mkdir "$ui_work" 2>/dev/null || return 1
     printf 'udisk-ui-v1\n' > "$ui_work/format" || return 1
-    mkdir "$ui_work/stage" "$ui_work/backup" "$ui_work/original" 2>>"$LOG_FILE" || {
+    mkdir "$ui_work/stage" "$ui_work/backup" "$ui_work/original" 2>/dev/null || {
         ui_update_failed 603 "文件暂存目录创建失败，设备原文件已保留"; return 1;
     }
     : > "$ui_work/plan"; : > "$ui_work/files"; : > "$ui_work/checksums"
@@ -469,8 +498,8 @@ stage_and_publish_ui_resources() {
             ui_update_failed 606 "目录错误，设备原文件已保留" "$ui_name"; return 1
         fi
         # 单独检查 find 的退出码，不用管道的最后一条命令掩盖读取失败。
-        if ! find "$ui_item" ! -type f ! -type d -print > "$ui_work/special" 2>>"$LOG_FILE" ||
-           ! find "$ui_item" -type f -print > "$ui_work/current" 2>>"$LOG_FILE"; then
+        if ! find "$ui_item" ! -type f ! -type d -print > "$ui_work/special" 2>/dev/null ||
+           ! find "$ui_item" -type f -print > "$ui_work/current" 2>/dev/null; then
             ui_update_failed 606 "文件读取失败，设备原文件已保留" "$ui_name"; return 1
         fi
         if [ -s "$ui_work/special" ]; then
@@ -481,19 +510,19 @@ stage_and_publish_ui_resources() {
         while IFS= read -r ui_full; do
             case "$ui_full" in "$ui_source"/*) ui_rel="${ui_full#"$ui_source"/}" ;; *) ui_update_failed 606 "文件路径错误"; return 1 ;; esac
             [ -f "$ui_full" ] && [ ! -L "$ui_full" ] || { ui_update_failed 606 "文件不存在或名称不支持" "$ui_rel"; return 1; }
-            ui_sum="$(cksum < "$ui_full" 2>>"$LOG_FILE")" || { ui_update_failed 606 "文件校验失败" "$ui_rel"; return 1; }
+            ui_sum="$(cksum < "$ui_full" 2>/dev/null)" || { ui_update_failed 606 "文件校验失败" "$ui_rel"; return 1; }
             printf '%s\n' "$ui_rel" >> "$ui_work/files" && printf '%s\n' "$ui_sum" >> "$ui_work/checksums" || {
                 ui_update_failed 603 "清单写入失败" "$ui_rel"; return 1;
             }
             set -- $ui_sum
             ui_bytes=$((ui_bytes + $2)); ui_total=$((ui_total + 1))
         done < "$ui_work/current"
-        if ! find "$ui_item" -type d -print > "$ui_work/directories" 2>>"$LOG_FILE"; then
+        if ! find "$ui_item" -type d -print > "$ui_work/directories" 2>/dev/null; then
             ui_update_failed 606 "目录读取失败" "$ui_name"; return 1
         fi
         while IFS= read -r ui_full; do
             case "$ui_full" in "$ui_source"/*) ui_rel="${ui_full#"$ui_source"/}" ;; *) ui_update_failed 606 "目录路径错误"; return 1 ;; esac
-            mkdir -p "$ui_work/stage/$ui_rel" 2>>"$LOG_FILE" || { ui_update_failed 604 "暂存目录创建失败" "$ui_rel"; return 1; }
+            mkdir -p "$ui_work/stage/$ui_rel" 2>/dev/null || { ui_update_failed 604 "暂存目录创建失败" "$ui_rel"; return 1; }
         done < "$ui_work/directories"
     done
     if [ "$ui_total" -eq 0 ]; then
@@ -503,10 +532,10 @@ stage_and_publish_ui_resources() {
     fi
     # 空间检查必做：按本批文件总字节数比较剩余空间，不额外强制预留64MiB。
     # 读不到可靠空间信息就停止；实际复制写入和整批内容校验仍全部检查。
-    if ! df -Pk "$STATIC_DST_DIR" > "$ui_work/space" 2>>"$LOG_FILE"; then
+    if ! df -Pk "$STATIC_DST_DIR" > "$ui_work/space" 2>/dev/null; then
         ui_update_failed 607 "无法检查设备空间，原文件已保留"; return 1
     fi
-    ui_free="$(awk 'NR > 1 { n=$4 } END { print n }' "$ui_work/space" 2>>"$LOG_FILE")"
+    ui_free="$(awk 'NR > 1 { n=$4 } END { print n }' "$ui_work/space" 2>/dev/null)"
     case "$ui_free" in ''|*[!0-9]*) ui_update_failed 607 "设备空间信息错误，原文件已保留"; return 1 ;; esac
     if [ "$ui_free" -lt "$(((ui_bytes + 1023) / 1024))" ]; then
         ui_update_failed 607 "设备空间不足，原文件已保留"; return 1
@@ -518,15 +547,14 @@ stage_and_publish_ui_resources() {
             ui_update_failed 611 "U盘已移除，更新未完成，设备原文件已保留" "$ui_rel"; return 2
         fi
         write_status "copying" "正在校验..." "$ui_mount" "$ui_source" "$STATIC_DST_DIR" "$((ui_done * 100 / ui_total))" "$ui_done" "$ui_total" "$ui_rel" 0 "qrc"
-        if ! cp -p -f "$ui_source/$ui_rel" "$ui_work/stage/$ui_rel" 2>>"$LOG_FILE"; then
+        if ! cp -p -f "$ui_source/$ui_rel" "$ui_work/stage/$ui_rel" 2>/dev/null; then
             # 某些文件系统无法保留时间/权限；普通复制重试后仍必须通过全部内容校验。
-            ulog "UI attribute-preserving copy failed; retrying ordinary copy: $ui_rel"
-            if ! cp -f "$ui_source/$ui_rel" "$ui_work/stage/$ui_rel" 2>>"$LOG_FILE"; then
+            if ! cp -f "$ui_source/$ui_rel" "$ui_work/stage/$ui_rel" 2>/dev/null; then
                 ui_update_failed 612 "文件复制失败，设备原文件已保留" "$ui_rel"; return 1
             fi
         fi
-        ui_actual="$(cksum < "$ui_work/stage/$ui_rel" 2>>"$LOG_FILE")" || { ui_update_failed 612 "暂存文件校验失败" "$ui_rel"; return 1; }
-        ui_source_sum="$(cksum < "$ui_source/$ui_rel" 2>>"$LOG_FILE")" || { ui_update_failed 611 "U盘文件读取失败" "$ui_rel"; return 1; }
+        ui_actual="$(cksum < "$ui_work/stage/$ui_rel" 2>/dev/null)" || { ui_update_failed 612 "暂存文件校验失败" "$ui_rel"; return 1; }
+        ui_source_sum="$(cksum < "$ui_source/$ui_rel" 2>/dev/null)" || { ui_update_failed 611 "U盘文件读取失败" "$ui_rel"; return 1; }
         if [ "$ui_actual" != "$ui_expected" ] || [ "$ui_source_sum" != "$ui_expected" ]; then
             ui_update_failed 612 "文件不完整或复制期间已变化，原文件已保留" "$ui_rel"; return 1
         fi
@@ -544,17 +572,17 @@ stage_and_publish_ui_resources() {
     write_status "copying" "文件校验通过，正在替换UI资源..." "$ui_mount" "$ui_source" "$STATIC_DST_DIR" 100 "$ui_total" "$ui_total" "" 0 "qrc"
     while IFS= read -r ui_name; do
         if [ -f "$ui_work/original/$ui_name" ]; then
-            mv "$STATIC_DST_DIR/$ui_name" "$ui_work/backup/$ui_name" 2>>"$LOG_FILE" || {
+            mv "$STATIC_DST_DIR/$ui_name" "$ui_work/backup/$ui_name" 2>/dev/null || {
                 ui_update_failed 614 "旧备份失败，已尝试恢复原文件" "$ui_name"; return 1;
             }
         fi
-        mv "$ui_work/stage/$ui_name" "$STATIC_DST_DIR/$ui_name" 2>>"$LOG_FILE" || {
+        mv "$ui_work/stage/$ui_name" "$STATIC_DST_DIR/$ui_name" 2>/dev/null || {
             ui_update_failed 614 "替换失败，已尝试恢复原文件" "$ui_name"; return 1;
         }
     done < "$ui_work/plan"
     sync || { ui_update_failed 614 "替换同步失败，已尝试恢复原文件"; return 1; }
     if ! : > "$ui_work/committed" || ! sync; then
-        if ! rm -f "$ui_work/committed" 2>>"$LOG_FILE"; then
+        if ! rm -f "$ui_work/committed" 2>/dev/null; then
             UI_KEEP_WORK=1
             UI_PUBLISHED_COUNT="$(wc -l < "$ui_work/plan")"
             ui_update_failed 615 "UI文件已更新，但完成状态写入失败，备份已保留"; return 1
@@ -564,7 +592,7 @@ stage_and_publish_ui_resources() {
     UI_PUBLISHED_COUNT="$(wc -l < "$ui_work/plan")"
     if ! ui_remove_work "$ui_work"; then
         # 已完成整批发布与同步，备份清理问题不代表UI文件错误，后续恢复入口再清理。
-        ulog "committed UI backup cleanup deferred; validated UI update remains successful"
+        journal_error_once ui-backup-cleanup "committed UI backup cleanup deferred; validated UI update remains successful"
     fi
     write_status "copying" "UI资源更新完成，未提供及空目录的原资源已保留" "$ui_mount" "$ui_source" "$STATIC_DST_DIR" 100 "$ui_total" "$ui_total" "" 0 "qrc"
     return 0
@@ -583,10 +611,10 @@ copy_net_cfg_to_app() {
     fi
     nc_tmp="$NET_CFG_DST_DIR/.net_cfg.ini.udisk-$$"
     write_status "copying" "正在同步net_cfg.ini..." "$nc_mount" "$nc_source" "$nc_target" 0 0 1 "net_cfg.ini" 0 "netcfg"
-    if ! cp -p -f "$nc_source" "$nc_tmp" 2>>"$LOG_FILE" ||
-       ! cmp -s "$nc_source" "$nc_tmp" 2>>"$LOG_FILE" ||
-       ! mv -f "$nc_tmp" "$nc_target" 2>>"$LOG_FILE"; then
-        rm -f "$nc_tmp" 2>>"$LOG_FILE"
+    if ! cp -p -f "$nc_source" "$nc_tmp" 2>/dev/null ||
+       ! cmp -s "$nc_source" "$nc_tmp" 2>/dev/null ||
+       ! mv -f "$nc_tmp" "$nc_target" 2>/dev/null; then
+        rm -f "$nc_tmp" 2>/dev/null
         write_status "error" "net_cfg.ini文件同步失败，原配置已保留" "$nc_mount" "$nc_source" "$nc_target" 100 0 1 "net_cfg.ini" 622 "netcfg"
         return 0
     fi
@@ -621,7 +649,7 @@ copy_file_to_tmp_checked() {
     src="$1"
     tmp="$2"
 
-    cp -f "$src" "$tmp" 2>>"$LOG_FILE" || return 1
+    cp -f "$src" "$tmp" 2>/dev/null || return 1
 
     src_size="$(get_file_size "$src")"
     tmp_size="$(get_file_size "$tmp")"
@@ -724,7 +752,6 @@ copy_video_with_progress() {
                     write_status "error" "视频文件格式问题或文件不完整，已跳过该视频" \
                         "$mountp" "$src_dir" "$dst_dir" "$prog" "$done" "$total" "$base" 203 "video"
 
-                    ulog "video invalid or incomplete, skipped: $base"
                     continue
                 fi
 
@@ -776,7 +803,7 @@ copy_video_with_progress() {
         tmp_name="$(basename "$tmp_file" 2>/dev/null)"
         final_name="${tmp_name%.copying}"
 
-        mv -f "$tmp_file" "${dst_dir}/${final_name}" 2>>"$LOG_FILE"
+        mv -f "$tmp_file" "${dst_dir}/${final_name}" 2>/dev/null
         if [ $? -ne 0 ]; then
             write_status "error" "可播放文件更新失败" \
                 "$mountp" "$src_dir" "$dst_dir" 100 "$done" "$total" "$final_name" 205 "video"
@@ -838,7 +865,6 @@ finish_update_job() {
 
 # 与 Qt/Web 共用独占锁；75仅表示忙碌，可重试，不清理或覆盖任何正式资源。
 do_job_once() (
-    prepare_update_log
     mkdir -p "$STATIC_DST_DIR" || return 1
     exec 8>"$STATIC_DST_DIR/.ycest-update.lock" || return 1
     flock -n 8 || return 75
@@ -853,6 +879,7 @@ do_job_once_locked() {
     if ! copy_ycest_non_video_dirs_to_udisk_images_with_progress "$job_mount"; then
         if [ "$JOB_ERROR_CODE" -eq 0 ]; then
             JOB_ERROR_CODE=603; JOB_ERROR_TEXT="目录创建或恢复失败，未完成UI更新"
+            journal_error_once ui-update-aborted "$JOB_ERROR_TEXT"
         fi
         finish_update_job
         return 1
@@ -869,7 +896,6 @@ do_job_once_locked() {
 
 # 脚本启动时先恢复本脚本未完成事务；锁忙不抢占，下一次资源更新仍会先恢复。
 recover_ui_on_startup() (
-    prepare_update_log
     [ -e "$STATIC_DST_DIR/.udisk-ui-update" ] || return 0
     exec 8>"$STATIC_DST_DIR/.ycest-update.lock" || return 1
     flock -n 8 || return 75
@@ -883,8 +909,6 @@ recover_ui_on_startup() (
 
 
 daemon_loop() {
-    prepare_update_log
-    ulog "===== watcher started pid=$$ ====="
     running=1
     trap 'running=0' INT TERM
 
@@ -953,7 +977,6 @@ daemon_loop() {
                     if publish_person_export_ready "$export_token" "$mountp"; then
                         write_status "person_ready" "人员导出U盘已就绪" \
                             "$mountp" "${mountp}/Ycest/person" "" 0 0 0 "" 0 "person"
-                        ulog "person export session reserved: mount=$mountp token=$export_token"
                     else
                         write_status "error" "人员导出就绪状态写入失败" \
                             "$mountp" "${mountp}/Ycest/person" "" 0 0 0 "" 802 "person"
@@ -988,7 +1011,6 @@ daemon_loop() {
                 if publish_person_import_ready "$person_token" "$mountp"; then
                     write_status "person_ready" "人员导入U盘已就绪" \
                         "$mountp" "${mountp}/Ycest/person" "" 0 0 0 "" 0 "person"
-                    ulog "person import session reserved: mount=$mountp token=$person_token"
                 else
                     write_status "error" "人员导入就绪状态写入失败" \
                         "$mountp" "${mountp}/Ycest/person" "" 0 0 0 "" 801 "person"
@@ -1086,14 +1108,14 @@ daemon_loop() {
                     if [ $? -ne 0 ]; then
                         if [ "$was_error_code" -ne 0 ]; then
                             write_status "error" "U盘已拔出，程序重启失败；文件错误：$was_error_message" \
-                                "" "" "$UDISK_DIR" 100 0 0 "" 701 "all"
+                                "" "" "$UDISK_DIR" 100 0 0 "" 701 "all" true
                         else
                             write_status "error" "U盘已拔出，程序重启失败" \
                                 "" "" "$UDISK_DIR" 100 0 0 "" 701 "all"
                         fi
                     elif [ "$was_error_code" -ne 0 ]; then
                         write_status "error" "U盘已拔出，程序已重启；本次更新存在文件错误：$was_error_message" \
-                            "" "" "$UDISK_DIR" 100 0 0 "" "$was_error_code" "all"
+                            "" "" "$UDISK_DIR" 100 0 0 "" "$was_error_code" "all" true
                     else
                         write_status "done" "U盘已拔出，程序重启完成" \
                             "" "" "$UDISK_DIR" 100 0 0 "" 0 "all"
@@ -1104,7 +1126,7 @@ daemon_loop() {
                     write_status "removed" "人员导入U盘已拔出" "" "" "$UDISK_DIR" 0 0 0 "" 0 "person"
                 elif [ "$was_error_code" -ne 0 ]; then
                     write_status "error" "U盘已拔出，本次文件更新未完成：$was_error_message" \
-                        "" "" "$UDISK_DIR" 0 0 0 "" "$was_error_code" "all"
+                        "" "" "$UDISK_DIR" 0 0 0 "" "$was_error_code" "all" true
                 else
                     write_status "removed" "U盘已拔出，未更新文件，设备原文件已保留" "" "" "$UDISK_DIR" 0 0 0 "" 0 "all"
                 fi
@@ -1125,7 +1147,6 @@ daemon_loop() {
         sleep "$POLL_INTERVAL"
     done
 
-    ulog "===== watcher stopped pid=$$ ====="
     rm -f "$PID_FILE" 2>/dev/null
     exit 0
 }
@@ -1174,9 +1195,9 @@ status_daemon() {
 }
 
 case "$1" in
-    run)      daemon_loop ;;
+    run)      daemon_loop >/dev/null 2>&1 ;;
     start|"") start_daemon ;;
     stop)     stop_daemon ;;
     status)   status_daemon ;;
-    *) echo "Usage: $0 {run|start|stop|status}"; exit 1 ;;
+    *) journal_error_once invalid-arguments "Usage: $0 {run|start|stop|status}"; exit 1 ;;
 esac

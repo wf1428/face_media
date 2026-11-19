@@ -1,7 +1,7 @@
 # @file qt_ycest.pro
 # @brief RK3566 融合 Qt 应用构建入口与模块登记。
 # @author Du lin
-# @note 最近修改：2026-11-13；修改人：Du lin；登记网络线程直播源探测实现和接口，供播放重试与告警复用。
+# @note 最近修改：2026-11-18；修改人：Du lin；登记 OTA 协议、异步协调器和进度窗口，保留原模块配置。
 TARGET = MergedQtApp
 QT += core gui widgets opengl serialport network sql virtualkeyboard qml quick quickwidgets
 
@@ -367,3 +367,7 @@ HEADERS += components/settings/mqtt/camera_screenshot_upload.h common/camera_scr
 
 SOURCES += components/settings/mqtt/broadcast_service.cpp components/settings/mqtt/broadcast_live.cpp
 HEADERS += components/settings/mqtt/broadcast_service.h components/settings/mqtt/broadcast_live.h
+
+# MQTT 6.18 OTA：下载/安装在独立执行器，Qt 仅协调协议与提示。
+SOURCES += components/ota/ota_protocol.cpp components/ota/ota_service.cpp components/ota/ota_progress_dialog.cpp
+HEADERS += components/ota/ota_protocol.h components/ota/ota_service.h components/ota/ota_progress_dialog.h

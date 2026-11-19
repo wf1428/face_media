@@ -4,7 +4,7 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-10；修改人：Du lin；广播控制器常驻以保证直播；摄像头仍按开机开关可选创建。
+ * @note 最近修改：2026-11-18；修改人：Du lin；登记 MQTT 6.18 OTA 协调器，保留原业务路由和线程所有权。
  */
 
 #pragma once
@@ -39,6 +39,7 @@ class MultimediaUpdate;
 class CompanyPlayInfo;
 class CameraScreenshotUpload;
 class BroadcastService;
+class OtaService;
 
 /** @brief mqttd IPC、Broker 路由和在线 IC 硬件参数的统一配置。 */
 struct MqttConfig
@@ -521,6 +522,7 @@ private:
 private:
     MqttConfig cfg_;
     BroadcastService *broadcast_ = nullptr; /**< 主线程广播控制器，先于 IPC 销毁；定时开关不销毁直播。 */
+    OtaService *ota_ = nullptr; /**< 自有 OTA 协调器，与 MQTT 同线程，安装由 systemd 独立接管。 */
     CameraScreenshotUpload *cameraScreenshot_=nullptr; /**< 自有摄像头截图控制器，禁用时为空；先于IPC销毁以取消待发图像。 */
     CallManager *callManager_ = nullptr; /**< 通话子对象；先于 IPC 销毁，异步管理声卡交接。 */
     MqttIpcClient *ipc_ = nullptr;

@@ -3,7 +3,7 @@
  * @brief 应用程序入口及启动环境初始化。
  *
  * @author Du lin
- * @note 最近修改：2026-11-10；修改人：Du lin；运行配置准备成功后固定摄像头和声音开关的开机快照，并记录启用状态。
+ * @note 最近修改：2026-11-17；修改人：Du lin；裸启动时在 QApplication 创建前委托正式启动脚本检测挂载；挂载不安全时终止初始化。
  * @date 2026-07-25
  */
 
@@ -14,7 +14,9 @@
 #include <QLocale>
 #include <QTextCodec>
 #include <QProcessEnvironment>
+#include <QProcess>
 #include <QDebug>
+#include <QFileInfo>
 #include <QApplication>
 #include <QTimer>
 #include <QSaveFile>
@@ -258,6 +260,25 @@ static void setupQtHeartbeat(QCoreApplication *app)
  */
 int main(int argc, char *argv[])
 {
+#ifdef Q_OS_LINUX
+    // 正式的手动和 systemd 脚本已完成探测。仅处理 Qt Creator 直启等未传入模式的入口。
+    if (qEnvironmentVariableIsEmpty("FACE_MEDIA_AB_STORAGE")) {
+        if (QFileInfo(QStringLiteral("/userdata")).isDir()) {
+            QProcess probe;
+            probe.setProcessChannelMode(QProcess::ForwardedErrorChannel);
+            probe.start(QStringLiteral("/usr/local/sbin/start_face_media.sh"),
+                        {QStringLiteral("--storage-mode")});
+            if (!probe.waitForFinished(10000) || probe.exitStatus() != QProcess::NormalExit
+                    || probe.exitCode() != 0 || probe.readAllStandardOutput().trimmed() != "1") {
+                qCritical("Cannot verify /userdata through the startup script");
+                return 78;
+            }
+            qputenv("FACE_MEDIA_AB_STORAGE", QByteArrayLiteral("1"));
+        } else {
+            qputenv("FACE_MEDIA_AB_STORAGE", QByteArrayLiteral("0"));
+        }
+    }
+#endif
     removeLegacyLinuxFbArguments(argc, argv);
 
     // 尊重标准 Qt 外部平台变量；未指定时，RK3566 正式运行默认 Wayland-EGL。

@@ -1,0 +1,23 @@
+# @file face-media-ota-health.service
+# @brief 独立检查重启后的 OTA 系统，Qt 启动失败时仍能切回旧槽。
+# @author Du lin
+# @date 2026-11-18
+# 输出关闭；最终新槽/回退槽结果由执行器通过 systemd-cat 写 journal。
+[Unit]
+Description=Face Media OTA boot health and recovery
+After=local-fs.target
+Before=face-media.service
+ConditionPathIsMountPoint=/userdata
+ConditionPathExists=/userdata/var/lib/face-media/ota/active.json
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/update_ab_system.sh --ota-health
+Restart=on-failure
+RestartSec=5
+StandardOutput=null
+StandardError=null
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

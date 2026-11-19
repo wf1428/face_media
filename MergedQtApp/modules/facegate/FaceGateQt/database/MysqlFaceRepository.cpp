@@ -2,11 +2,13 @@
  * @file MysqlFaceRepository.cpp
  * @brief 实现 SQLite、MySQL 和旧本地文件兼容的门禁数据仓储。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-11-16；修改人：Du lin；统一映射数据库、旧人员照片及抓拍引用；删除前按当前数据分区校验清理范围。
  */
 
 #include "MysqlFaceRepository.h"
+#include "../core/SnapshotService.h"
 
 #include "common/storage_policy.h"
 #include "platform/rk3566_platform.h"
@@ -331,7 +333,7 @@ bool MysqlFaceRepository::loadAllEnabledFaces(QVector<FaceRecord> &records)
         r.person.createdAt = q.value(4).toString();
         r.person.updatedAt = q.value(5).toString();
         r.featureId = q.value(6).toLongLong();
-        r.imagePath = q.value(7).toString();
+        r.imagePath = Rk3566Platform::dataPath(q.value(7).toString());
         r.feature.blob = q.value(8).toByteArray();
         r.feature.modelVersion = q.value(10).toString();
         r.feature.quality = q.value(11).toFloat();
@@ -413,7 +415,7 @@ bool MysqlFaceRepository::loadAllEnabledNetworkFaces(
         record.person.createdAt = q.value(2).toString();
         record.person.updatedAt = q.value(3).toString();
         record.faceHash = q.value(10).toString().trimmed();
-        record.imagePath = q.value(6).toString();
+        record.imagePath = Rk3566Platform::dataPath(q.value(6).toString());
         record.feature.blob = featureBlob;
         record.feature.modelVersion = modelVersion;
         record.enrolledAt = q.value(9).toString();
@@ -580,7 +582,7 @@ bool MysqlFaceRepository::loadPassedVerifyLogs(QVector<VerifyLogViewRecord> &rec
         record.result = q.value(4).toString();
         record.cosine = q.value(5).toFloat();
         record.liveScore = q.value(6).toFloat();
-        record.snapshotPath = q.value(7).toString();
+        record.snapshotPath = Rk3566Platform::dataPath(q.value(7).toString());
         record.nameSnapshot = q.value(8).toString();
         record.failReason = q.value(9).toString();
         record.deviceSn = q.value(10).toString();
@@ -932,15 +934,13 @@ bool MysqlFaceRepository::deletePerson(qint64 personId)
     }
 
     const QString appRoot = QDir::cleanPath(Rk3566Platform::applicationRoot());
-    const QString enrollmentRoot = QDir(appRoot).absoluteFilePath(QStringLiteral("enrollments"));
-    const QString configuredSnapshotRoot = config_.snapshotDir.trimmed().isEmpty()
-            ? QStringLiteral("./data/snapshots") : config_.snapshotDir.trimmed();
-    const QString snapshotRoot = QFileInfo(configuredSnapshotRoot).isAbsolute()
-            ? QDir::cleanPath(configuredSnapshotRoot)
-            : QDir(appRoot).absoluteFilePath(configuredSnapshotRoot);
+    const QString enrollmentRoot = QDir(Rk3566Platform::applicationDataRoot())
+            .absoluteFilePath(QStringLiteral("enrollments"));
+    const QString snapshotRoot = SnapshotService(config_).rootPath();
     const auto controlledPath = [&appRoot, &enrollmentRoot, &snapshotRoot](const QString &path) {
-        const QString absolute = QFileInfo(path).isAbsolute()
+        const QString stored = QFileInfo(path).isAbsolute()
                 ? QDir::cleanPath(path) : QDir(appRoot).absoluteFilePath(path);
+        const QString absolute = Rk3566Platform::dataPath(stored);
         const auto inside = [&absolute](const QString &root) {
             const QString cleanRoot = QDir::cleanPath(root);
             return absolute == cleanRoot
@@ -1112,7 +1112,7 @@ bool MysqlFaceRepository::loadVerifyLogs(const VerifyLogFilter &filter, QVector<
         record.result = q.value(4).toString();
         record.cosine = q.value(5).toFloat();
         record.liveScore = q.value(6).toFloat();
-        record.snapshotPath = q.value(7).toString();
+        record.snapshotPath = Rk3566Platform::dataPath(q.value(7).toString());
         record.nameSnapshot = q.value(8).toString();
         record.failReason = q.value(9).toString();
         record.deviceSn = q.value(10).toString();
@@ -1786,7 +1786,7 @@ bool MysqlFaceRepository::loadAllEnabledFacesFromLocal(QVector<FaceRecord> &reco
         FaceRecord record;
         record.featureId = entry.id;
         record.person = enabledPersons.value(entry.personId);
-        record.imagePath = entry.imagePath;
+        record.imagePath = Rk3566Platform::dataPath(entry.imagePath);
         record.feature = entry.feature;
         record.enrolledAt = entry.createdAt;
         records.push_back(record);
@@ -1860,7 +1860,7 @@ bool MysqlFaceRepository::loadPassedVerifyLogsFromLocal(QVector<VerifyLogViewRec
         record.result = log.result;
         record.cosine = log.cosine;
         record.liveScore = log.liveScore;
-        record.snapshotPath = log.snapshotPath;
+        record.snapshotPath = Rk3566Platform::dataPath(log.snapshotPath);
         record.nameSnapshot = log.nameSnapshot;
         record.failReason = log.failReason;
         record.deviceSn = log.deviceSn;
@@ -2016,7 +2016,7 @@ bool MysqlFaceRepository::loadVerifyLogsFromLocal(const VerifyLogFilter &filter,
         record.result = log.result;
         record.cosine = log.cosine;
         record.liveScore = log.liveScore;
-        record.snapshotPath = log.snapshotPath;
+        record.snapshotPath = Rk3566Platform::dataPath(log.snapshotPath);
         record.nameSnapshot = log.nameSnapshot;
         record.failReason = log.failReason;
         record.deviceSn = log.deviceSn;
@@ -2611,7 +2611,8 @@ QString MysqlFaceRepository::quoteIdentifier(const QString &identifier) const
 }
 
 /**
- * @brief 基于可执行文件目录解析配置的 SQLite 文件路径。
+ * @brief 解析配置的 SQLite 文件路径并应用数据分区前缀。
+ * @return SQLite 文件绝对路径；相对配置以可执行文件目录为基准。
  */
 QString MysqlFaceRepository::sqliteDatabasePath() const
 {
@@ -2619,14 +2620,14 @@ QString MysqlFaceRepository::sqliteDatabasePath() const
         ? QStringLiteral("/home/cat/face_media/access_control.db")
         : config_.sqlitePath.trimmed();
     const QFileInfo info(configuredPath);
-    if (info.isAbsolute()) {
-        return info.absoluteFilePath();
-    }
-    return QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(configuredPath);
+    const QString absolute = info.isAbsolute() ? info.absoluteFilePath()
+            : QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(configuredPath);
+    return Rk3566Platform::dataPath(absolute);
 }
 
 /**
- * @brief 基于可执行文件目录解析配置的本地文件数据库路径。
+ * @brief 解析配置的兼容本地文件数据库路径并应用数据分区前缀。
+ * @return 兼容库文件绝对路径；相对配置以可执行文件目录为基准。
  */
 QString MysqlFaceRepository::localStoreFilePath() const
 {
@@ -2634,10 +2635,9 @@ QString MysqlFaceRepository::localStoreFilePath() const
         ? QStringLiteral("/home/cat/face_media/access_control.db")
         : config_.localStorePath.trimmed();
     const QFileInfo info(configuredPath);
-    if (info.isAbsolute()) {
-        return info.absoluteFilePath();
-    }
-    return QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(configuredPath);
+    const QString absolute = info.isAbsolute() ? info.absoluteFilePath()
+            : QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(configuredPath);
+    return Rk3566Platform::dataPath(absolute);
 }
 
 /**

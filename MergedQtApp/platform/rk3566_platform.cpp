@@ -2,8 +2,9 @@
  * @file rk3566_platform.cpp
  * @brief RK3566 部署路径、设备节点和系统操作的统一适配层的实现。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-11-17；修改人：Du lin；在已挂载共享分区持久化首次确认的设备标识，供 A/B 两槽复用。
  */
 
 #include "rk3566_platform.h"
@@ -20,6 +21,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QLockFile>
 #include <QNetworkInterface>
 #include <QProcess>
 #include <QProcessEnvironment>
@@ -263,10 +265,11 @@ QString uiConfigPath()
             QStringLiteral("demoResources/images/logo/ycest_cfg.ini"));
 }
 
+/** @return 已映射到应用数据分区的门禁配置文件路径。 */
 QString faceGateConfigPath()
 {
-    return QStringLiteral(
-            "/home/cat/face_media/modules/facegate/FaceGateQt/config/facegate.ini");
+    return dataPath(QStringLiteral(
+            "/home/cat/face_media/modules/facegate/FaceGateQt/config/facegate.ini"));
 }
 
 bool prepareRuntimeConfigFiles(QString *error)
@@ -301,30 +304,30 @@ QString netConfigDir()
     return QFileInfo(netConfigPath()).path();
 }
 
-/** @return 设备可移动存储根目录。 */
+/** @return 媒体存储根目录；共享模式下位于 /userdata。 */
 QString storageRoot()
 {
-    return QStringLiteral("/mnt/UDISK");
+    return dataPath(QStringLiteral("/mnt/UDISK"));
 }
 
-/** @return 部署在可移动存储上的静态资源根目录。 */
+/** @return 与媒体存储位于同一文件系统的静态资源根目录。 */
 QString staticRoot()
 {
-    return QStringLiteral("/mnt/UDISK/res/static");
+    return QDir(storageRoot()).filePath(QStringLiteral("res/static"));
 }
 
 /** @return 可播放视频目录，并在首次使用时补充缺失的默认媒体文件。 */
 QString videoDir()
 {
     return prepareVideoDirectory(
-            QStringLiteral("/mnt/UDISK/res/static/demoResources/images/video"));
+            QDir(staticRoot()).filePath(QStringLiteral("demoResources/images/video")));
 }
 
 /** @return SQLite 数据库路径，并确保其父目录存在。 */
 QString databasePath()
 {
     // IC、二维码、离线人脸和网络人员只允许使用这一份统一门禁数据库。
-    const QString path = QStringLiteral("/home/cat/face_media/access_control.db");
+    const QString path = dataPath(QStringLiteral("/home/cat/face_media/access_control.db"));
     QDir().mkpath(QFileInfo(path).absolutePath());
     return path;
 }
@@ -332,7 +335,7 @@ QString databasePath()
 /** @return 音量持久化文件路径。 */
 QString volumeFile()
 {
-    const QString audioStateDir = QStringLiteral("/home/cat/face_media");
+    const QString audioStateDir = dataPath(QStringLiteral("/home/cat/face_media"));
     QDir().mkpath(audioStateDir);
     return QDir(audioStateDir).filePath(QStringLiteral("volume.dat"));
 }
@@ -455,11 +458,8 @@ QString amplifierDevice()
     return env.isEmpty() ? settingValue(QStringLiteral("audio/amp_device")) : env;
 }
 
-/**
- * @return 设备序列号，依次尝试环境变量、设备树、machine-id 和非回环网卡 MAC；
- * 均不可用时返回 "rk3566-unknown"。
- */
-QString deviceSerial()
+/** @return 初次识别的设备序列号；无法识别时返回空值。 */
+static QString detectDeviceSerial()
 {
     const QString env = envValue("QT_YCEST_DEVICE_SERIAL");
     if (!env.isEmpty()) {
@@ -489,7 +489,45 @@ QString deviceSerial()
         }
     }
 
-    return QStringLiteral("rk3566-unknown");
+    return {};
+}
+
+QString deviceSerial()
+{
+    const QString unknown = QStringLiteral("rk3566-unknown");
+    if (!usesSharedDataStorage()) {
+        const QString detected = detectDeviceSerial();
+        return detected.isEmpty() ? unknown : detected;
+    }
+
+    // 首次探测仍优先使用显式配置；发布后两槽均采用这份身份。
+    const QString directory = persistentConfigDir();
+    const QString path = QDir(directory).filePath(QStringLiteral("device-serial"));
+    const QString stored = readTextFile(path);
+    if (!stored.isEmpty()) return stored;
+    if (!QDir().mkpath(directory)) {
+        qCritical("Cannot create shared device identity directory");
+        return unknown;
+    }
+    QLockFile lock(path + QStringLiteral(".lock"));
+    if (!lock.tryLock(2000)) {
+        const QString concurrentValue = readTextFile(path);
+        if (!concurrentValue.isEmpty()) return concurrentValue;
+        qCritical("Cannot lock shared device identity file");
+        return unknown;
+    }
+    const QString concurrentValue = readTextFile(path);
+    if (!concurrentValue.isEmpty()) return concurrentValue;
+
+    const QString detected = detectDeviceSerial();
+    if (detected.isEmpty()) return unknown;
+    QSaveFile file(path);
+    const QByteArray value = detected.toUtf8() + '\n';
+    if (!file.open(QIODevice::WriteOnly) || file.write(value) != value.size() || !file.commit()) {
+        qCritical("Cannot persist shared device identity");
+        return unknown;
+    }
+    return detected;
 }
 
 /** @return names 中第一个可执行程序的完整路径；均不可用时返回空字符串。 */

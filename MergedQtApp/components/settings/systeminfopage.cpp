@@ -2,11 +2,13 @@
  * @file systeminfopage.cpp
  * @brief 展示 RK3566 硬件、软件、网络和运行时长的系统信息页面的实现。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-11-16；修改人：Du lin；共享模式下系统信息页查询 /userdata 容量，单分区继续显示根文件系统容量。
  */
 
 #include "systeminfopage.h"
+#include "platform/rk3566_platform.h"
 
 #include <algorithm>
 
@@ -186,10 +188,10 @@ QString formatBytes(quint64 bytes)
     return QStringLiteral("%1 B").arg(bytes);
 }
 
-/** @brief 汇总应用数据所在文件系统的容量、已用量和使用率。 */
+/** @return 当前数据文件系统的已用及总容量，查询失败时返回提示。 */
 QString storageSummary()
 {
-    QStorageInfo storage(QStringLiteral("/"));
+    QStorageInfo storage(Rk3566Platform::dataVolumePath(QStringLiteral("/")));
     storage.refresh();
     if (!storage.isValid() || !storage.isReady() || storage.bytesTotal() <= 0) {
         return QStringLiteral("无法读取");

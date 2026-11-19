@@ -1,6 +1,8 @@
 /**
  * @file network_personnel_store.cpp
  * @brief MQTT 网络人员聚合数据的 SQLite 持久化与哈希幂等处理实现。
+ * @author Du lin
+ * @note 最近修改：2026-11-16；修改人：Du lin；网络人员旧照片记录在检查、显示和清理时解析到当前数据分区。
  */
 
 #include "network_personnel_store.h"
@@ -289,6 +291,13 @@ QStringList faceDeleteKeys(const QString &item)
     return keys;
 }
 
+/**
+ * @brief 在网络人员照片目录内清理数据库引用及按哈希匹配的历史照片。
+ * @param[in] personId 所属网络人员标识。
+ * @param[in] storedImagePaths 数据库保存的照片路径，按当前数据分区解析。
+ * @param[in] faceHashes 在当前人员目录中用于匹配遗留照片的哈希。
+ * @param[in] removeWholePersonDirectory 为 true 时尝试删除该人员整个照片目录。
+ */
 void removeDeletedFaceImages(const QString &personId,
                              const QStringList &storedImagePaths,
                              const QStringList &faceHashes,
@@ -333,7 +342,7 @@ void removeDeletedFaceImages(const QString &personId,
     const QString personDirPrefix = absolutePersonFaceDir
             + QDir::separator();
     auto removeFile = [&](const QString &path) {
-        const QString absolutePath = QFileInfo(path).absoluteFilePath();
+        const QString absolutePath = Rk3566Platform::dataPath(QFileInfo(path).absoluteFilePath());
         if (!absolutePath.startsWith(personDirPrefix)) {
             qWarning().noquote()
                     << "[PERSONNEL-SYNC] skip face image outside person directory"
@@ -985,8 +994,8 @@ QJsonArray NetworkPersonnelStore::networkPersonnelList() const
             QJsonObject face;
             face.insert(QStringLiteral("faceHash"),
                         faceRow.value(QStringLiteral("face_hash")).toString());
-            face.insert(QStringLiteral("imagePath"),
-                        faceRow.value(QStringLiteral("image_path")).toString());
+            face.insert(QStringLiteral("imagePath"), Rk3566Platform::dataPath(
+                        faceRow.value(QStringLiteral("image_path")).toString()));
             face.insert(QStringLiteral("status"),
                         faceRow.value(QStringLiteral("status")).toString());
             faces.append(face);
@@ -1453,7 +1462,7 @@ QJsonArray NetworkPersonnelStore::pendingFaceImageRequests() const
                 row.value(QStringLiteral("image_path")).toString().trimmed();
         // Base64 只作为 MQTT 传输数据使用。数据库完整性以本地图片是否存在为准；
         // 特征提取和 IMAGE_READY 状态由后续校验流程负责。
-        const QFileInfo imageFile(imagePath);
+        const QFileInfo imageFile(Rk3566Platform::dataPath(imagePath));
         const bool imageMissing = imagePath.isEmpty()
                 || !imageFile.isFile() || imageFile.size() <= 0
                 || row.value(QStringLiteral("status")).toString()
@@ -1499,7 +1508,7 @@ QJsonObject NetworkPersonnelStore::pendingFaceImageRequest(
                 .toString().trimmed();
         const QString imagePath = row.value(QStringLiteral("image_path"))
                 .toString().trimmed();
-        const QFileInfo imageFile(imagePath);
+        const QFileInfo imageFile(Rk3566Platform::dataPath(imagePath));
         const bool incomplete = imagePath.isEmpty()
                 || !imageFile.isFile() || imageFile.size() <= 0
                 || row.value(QStringLiteral("status")).toString()
@@ -2084,7 +2093,7 @@ bool NetworkPersonnelStore::finalizeFaceImageValidation(
     for (const QVariantMap &row : committedFaceRows) {
         const QString imagePath = row.value(QStringLiteral("image_path"))
                 .toString().trimmed();
-        const QFileInfo imageFile(imagePath);
+        const QFileInfo imageFile(Rk3566Platform::dataPath(imagePath));
         if (row.value(QStringLiteral("status")).toString()
                     != QStringLiteral("IMAGE_READY")
                 || imagePath.isEmpty() || !imageFile.isFile()
@@ -2133,7 +2142,7 @@ bool NetworkPersonnelStore::finalizeFaceImageValidation(
     const QString expectedPrefix = QDir(expectedDir).absolutePath()
             + QDir::separator();
     for (const QString &path : failedImagePaths) {
-        const QString absolutePath = QFileInfo(path).absoluteFilePath();
+        const QString absolutePath = Rk3566Platform::dataPath(QFileInfo(path).absoluteFilePath());
         if (absolutePath.startsWith(expectedPrefix)
                 && QFileInfo::exists(absolutePath)
                 && !QFile::remove(absolutePath)) {
@@ -2363,7 +2372,7 @@ NetworkPersonnelSyncResult NetworkPersonnelStore::applyFullPersonnel(
                     .toString().trimmed();
             const QString imagePath = row.value(QStringLiteral("image_path"))
                     .toString().trimmed();
-            const QFileInfo imageFile(imagePath);
+            const QFileInfo imageFile(Rk3566Platform::dataPath(imagePath));
             if (!incomingFaceHashes.contains(faceHash)
                     || row.value(QStringLiteral("status")).toString()
                         != QStringLiteral("IMAGE_READY")

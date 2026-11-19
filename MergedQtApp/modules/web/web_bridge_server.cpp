@@ -3,6 +3,7 @@
  * @brief 独立 C++ daemon 与 Qt 的受控本地通信入口；不监听网络端口。
  * @author Du lin
  * @date 2026-10-09
+ * @note 最近修改：2026-11-16；修改人：Du lin；Web IPC 使用映射后的媒体、资源更新和导入目录，并保留门户配置及运行时 IPC 路径。
  */
 
 #include "web_bridge_server.h"
@@ -194,13 +195,15 @@ WebRuntime::WebRuntime(QObject *parent) : QObject(parent)
     const WebServiceConfig config = {
         Rk3566Platform::databasePath(),
         QDir(Rk3566Platform::staticRoot()).filePath("demoResources/images/video"),
-        setting("MERGEDQT_WEB_MEDIA_MOUNT", QStringLiteral("/mnt/UDISK")),
-        setting("MERGEDQT_WEB_IMPORTS", QStringLiteral("/home/cat/web-stage/imports")),
+        Rk3566Platform::dataPath(setting("MERGEDQT_WEB_MEDIA_MOUNT", QStringLiteral("/mnt/UDISK"))),
+        Rk3566Platform::dataPath(setting("MERGEDQT_WEB_IMPORTS",
+                                        QStringLiteral("/home/cat/web-stage/imports"))),
         setting("MERGEDQT_WEB_FACTORY", QStringLiteral("/home/cat/web-stage/factory-account.json")),
         Rk3566Platform::netConfigPath(),
         setting("MERGEDQT_WEB_HOTSPOT_HELPER",
                 QStringLiteral("/usr/local/sbin/portal-network.sh")),
-        setting("MERGEDQT_WEB_READY_FILE", QStringLiteral("/run/mergedqt/web-ready"))};
+        setting("MERGEDQT_WEB_READY_FILE", QStringLiteral("/run/mergedqt/web-ready")),
+        QDir(Rk3566Platform::staticRoot()).filePath("demoResources/images")};
     server_ = new WebBridgeServer(
         config,
         setting("MERGEDQT_WEB_SOCKET", QStringLiteral("/run/mergedqt/web.sock")));

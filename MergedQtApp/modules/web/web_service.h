@@ -3,7 +3,7 @@
  * @brief Qt 独立 Web 工作线程：上传发布、文件清单和本地 Excel 批次。
  * @author Du lin
  * @date 2026-10-09
- * @note 最近修改：2026-10-23；修改人：Du lin；人员批次支持图片压缩包的后台解压及原图片匹配流程，退出时等待解压线程停止。
+ * @note 最近修改：2026-11-17；修改人：Du lin；空间检查接收视频或小图实际目标目录，并按目标分区预留上传空间。
  */
 
 #pragma once
@@ -158,11 +158,12 @@ private:
     QString taskRoot(const QVariantMap &task) const;
 
     /**
-     * @brief 根据当前真实空间、原配额及 Web 预留检查资源。
-     * @param kind 资源或任务类型，用于选择目录、配额和校验规则。
-     * @param incoming 本次新增资源大小，单位为字节。
+     * @brief 校验目标分区可写空间与未落盘上传预留，按任务类型应用相应规则。
+     * @param kind 资源或任务类型。
+     * @param incoming 本次新增预留的字节数。
+     * @param targetRoot 视频或小图的实际目标根目录，其他任务可留空。
      */
-    void checkBudget(const QString &kind, qint64 incoming = 0);
+    void checkBudget(const QString &kind, qint64 incoming = 0, const QString &targetRoot = {});
 
     /**
      * @brief 后台执行封存批次；图片包先在独立线程解压，成功后使用原人员及图片入口。

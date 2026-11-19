@@ -2,10 +2,58 @@
 # @file start_face_media.sh
 # @brief 初始化运行环境并监督 mqttd、Qt 程序及看门狗。
 # @author Du lin
-# @note 最近修改：2026-10-26；修改人：Du lin；将 Qt 的 Wayland 目录统一为 /run/face-media-wayland，
-#       加载 profile 后再次固定该目录，避免登录会话环境覆盖；保留原 Weston 等待、重启、看门狗和驱动加载逻辑。
+# @note 最近修改：2026-11-17；修改人：Du lin；在确认 A/B 启动后写入 journald 运行时容量配置并重启服务。
+
+# @brief 探测共享分区并导出 FACE_MEDIA_AB_STORAGE。
+# @return 0 表示可安全启动；78 表示 /userdata 存在但未挂载，已尝试请求关机。
+# @note 只检查 /userdata 自身；不创建该目录。无关机权限时仍拒绝启动。
+face_media_detect_storage()
+{
+    FACE_MEDIA_AB_STORAGE=0
+    if [ -d /userdata ]; then
+        if ! mountpoint -q /userdata; then
+            printf '%s\n' '[face-media] /userdata exists but is not mounted; powering off' >&2
+            systemctl --no-ask-password --no-block poweroff ||
+                sudo -n systemctl --no-ask-password --no-block poweroff ||
+                printf '%s\n' '[face-media] poweroff request failed; application startup blocked' >&2
+            return 78
+        fi
+        FACE_MEDIA_AB_STORAGE=1
+    fi
+    export FACE_MEDIA_AB_STORAGE
+}
+
+# @brief 根据已检测的模式输出原路径或 /userdata 下的对应路径。
+# @param $1 原业务绝对路径；已带 /userdata 前缀的路径可重复传入。
+# @return printf 的退出状态；输出只包含解析后的路径和换行。
+face_media_data_path()
+{
+    case "$1" in
+        /userdata|/userdata/*) printf '%s\n' "$1" ;;
+        /*)
+            if [ "$FACE_MEDIA_AB_STORAGE" = 1 ]; then
+                printf '/userdata%s\n' "$1"
+            else
+                printf '%s\n' "$1"
+            fi
+            ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+# 配套脚本只加载存储函数。直接启动时从这里进入应用监督流程。
+if [ "${FACE_MEDIA_LOAD_STORAGE_ONLY:-0}" = 1 ]; then
+    return 0
+fi
 
 set -eu
+
+face_media_detect_storage
+# Qt Creator 或直接执行二进制时复用这里的探测，只输出 0 或 1。
+if [ "${1:-}" = --storage-mode ]; then
+    printf '%s\n' "$FACE_MEDIA_AB_STORAGE"
+    exit 0
+fi
 
 APP_DIR=/home/cat/face_media
 APP_START_DELAY_SECONDS=${APP_START_DELAY_SECONDS:-5}
@@ -17,7 +65,7 @@ WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}
 STATE_DIR=${FACE_MEDIA_STATE_DIR:-/run/face-media}
 APP_PID_FILE=${FACE_MEDIA_APP_PID_FILE:-$STATE_DIR/app.pid}
 MAINTENANCE_FILE=${FACE_MEDIA_MAINTENANCE_FILE:-$STATE_DIR/maintenance}
-NET_CONFIG_FILE=${FACE_MEDIA_NET_CONFIG_FILE:-/mnt/UDISK/res/static/demoResources/images/logo/net_cfg.ini}
+NET_CONFIG_FILE=$(face_media_data_path "${FACE_MEDIA_NET_CONFIG_FILE:-/mnt/UDISK/res/static/demoResources/images/logo/net_cfg.ini}")
 HEARTBEAT_FILE=${FACE_MEDIA_HEARTBEAT_FILE:-$STATE_DIR/heartbeat}
 WATCHDOG_RESTART_HISTORY=${FACE_MEDIA_WATCHDOG_RESTART_HISTORY:-$STATE_DIR/watchdog-restarts}
 HARDWARE_WATCHDOG_DEVICE=${FACE_MEDIA_HARDWARE_WATCHDOG_DEVICE:-/dev/watchdog}
@@ -26,7 +74,7 @@ WATCHDOG_START_GRACE_SECONDS=60
 WATCHDOG_MISSED_LIMIT=6
 WATCHDOG_RESTART_WINDOW_SECONDS=300
 WATCHDOG_RESTART_LIMIT=3
-LOG_DIR=/var/log/face-media
+LOG_DIR=$(face_media_data_path /var/log/face-media)
 LOG_FILE=$LOG_DIR/face_media.log
 LOG_DATE_FILE=$LOG_DIR/.active_date
 LOG_FIFO=$STATE_DIR/qt-log.fifo
@@ -52,6 +100,55 @@ log()
 {
     printf '%s\n' "[face-media] $*"
 }
+
+# @brief 从当前槽位启动标记或当前根盘的 GPT 标签识别 A/B 系统。
+# @return 识别到明确的槽位标记，或当前根分区属于同盘的 rootfs_a/rootfs_b 时返回 0。
+# @note /userdata 的存在与挂载状态只用于业务数据路径选择。
+face_media_is_ab_boot()
+{
+    if grep -Eq '(^|[[:space:]])(androidboot\.slot_suffix=_[ab]|androidboot\.slot=[ab])([[:space:]]|$)' /proc/cmdline 2>/dev/null; then
+        return 0
+    fi
+
+    root_device_id=$(findmnt -nro MAJ:MIN --mountpoint / 2>/dev/null) || return 1
+    [ -n "$root_device_id" ] || return 1
+    root_disk=$(lsblk -dnro PARTLABEL,PKNAME "/dev/block/$root_device_id" 2>/dev/null |
+        awk '$1 ~ /^rootfs_[ab]$/ && NF == 2 { print $2; exit }')
+    [ -n "$root_disk" ] || return 1
+
+    lsblk -nro PARTLABEL "/dev/$root_disk" 2>/dev/null |
+        awk '$0 == "rootfs_a" { a = 1 } $0 == "rootfs_b" { b = 1 } END { exit !(a && b) }'
+}
+
+# @brief 安装 A/B 系统的 journald 容量配置，并同步重启 journald 以加载配置。
+# @return 非 A/B、配置已生效或成功应用时返回 0，写入或重启失败时返回非零。
+# @note 仅在重启成功后记录本次开机的应用状态，失败可在下次启动脚本时重试。
+configure_ab_journal_limits()
+(
+    face_media_is_ab_boot || exit 0
+
+    dropin_dir=/run/systemd/journald.conf.d
+    dropin_file=$dropin_dir/90-journal-limits.conf
+    applied_file=$STATE_DIR/journald-limits.applied
+
+    install -d -m 0755 "$dropin_dir" || exit 1
+    dropin_tmp=$(mktemp "$dropin_dir/.90-journal-limits.XXXXXX") || exit 1
+    trap 'rm -f -- "$dropin_tmp"' EXIT
+    cat > "$dropin_tmp" <<'JOURNAL_LIMITS' || exit 1
+# Set the journald capacity limit
+[Journal]
+SystemMaxUse=400M
+SystemMaxFileSize=40M
+JOURNAL_LIMITS
+
+    if cmp -s "$dropin_tmp" "$dropin_file" && [ -f "$applied_file" ]; then
+        exit 0
+    fi
+    rm -f -- "$applied_file" || exit 1
+    chmod 0644 "$dropin_tmp" && mv -f -- "$dropin_tmp" "$dropin_file" || exit 1
+    systemctl restart systemd-journald.service || exit 1
+    : > "$applied_file"
+)
 
 get_file_size()
 {
@@ -938,20 +1035,22 @@ ensure_runtime_environment()
     export QT_YCEST_HEARTBEAT_FILE="$HEARTBEAT_FILE"
 }
 
-# Lightweight setup only: no WiFi detection or Web child in the Qt supervisor.
+# @brief 配置 Qt Web IPC，并在当前数据分区准备导入目录。
+# @note 目录创建失败会写入启动日志，Qt 仍继续启动。
 prepare_qt_web_environment()
 {
     export MERGEDQT_WEB_ENABLE=1
     export MERGEDQT_WEB_SOCKET=${MERGEDQT_WEB_SOCKET:-/run/mergedqt/web.sock}
     export MERGEDQT_WEB_MEDIA_MOUNT=${MERGEDQT_WEB_MEDIA_MOUNT:-/mnt/UDISK}
     export MERGEDQT_WEB_IMPORTS=${MERGEDQT_WEB_IMPORTS:-/home/cat/web-stage/imports}
+    web_imports_dir=$(face_media_data_path "$MERGEDQT_WEB_IMPORTS")
     export MERGEDQT_WEB_FACTORY=${MERGEDQT_WEB_FACTORY:-/home/cat/web-stage/factory-account.json}
     export MERGEDQT_WEB_READY_FILE=${MERGEDQT_WEB_READY_FILE:-/run/mergedqt/web-ready}
     export MERGEDQT_WEB_HOTSPOT_HELPER=${MERGEDQT_WEB_HOTSPOT_HELPER:-/usr/local/sbin/portal-network.sh}
     if ! install -d -m 0750 "$(dirname -- "$MERGEDQT_WEB_SOCKET")" "$(dirname -- "$MERGEDQT_WEB_READY_FILE")"; then
         log 'Optional Web runtime directory could not be prepared; continuing Qt startup'
     fi
-    if ! install -d -m 0770 "$MERGEDQT_WEB_IMPORTS"; then
+    if ! install -d -m 0770 "$web_imports_dir"; then
         log 'Optional Web imports directory could not be prepared; continuing Qt startup'
     fi
 }
@@ -992,6 +1091,7 @@ install -d -m 0755 "$STATE_DIR"
 rm -f "$APP_PID_FILE" 2>/dev/null || true
 trap cleanup EXIT HUP INT TERM
 
+configure_ab_journal_limits || log "failed to apply A/B journald limits; continuing startup"
 prepare_log_storage
 start_log_maintenance
 
@@ -1009,7 +1109,7 @@ if [ ! -x "$APP_DIR/MergedQtApp" ]; then
 fi
 
 log "starting mqttd"
-./mqttd -h 192.168.3.73 -p 1883 -i rk3566-001 -t test -v &
+./mqttd -h 192.168.3.73 -p 1883 -i rk3566-001 -t test &
 MQTT_PID=$!
 
 if command -v udevadm >/dev/null 2>&1; then

@@ -4,7 +4,7 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-12；修改人：Du lin；移除播报增益请求、完成和焦点交接的逐步诊断输出，保留焦点变更及失败告警；增益串行写入、播报期间音量丢弃与恢复流程不变。
+ * @note 最近修改：2026-11-16；修改人：Du lin；音量持久化路径及旧配置目录中的音量兼容路径应用共享分区前缀。
  */
 
 #include "vol_ctrl.h"
@@ -100,11 +100,14 @@ bool writePersistedVolumeState(const QString &path, const PersistedVolumeState &
 }
 }
 
-/** @brief 解析平台路径并初始化音量防抖定时器。 */
+/**
+ * @brief 从当前业务分区恢复音量并初始化功放与防抖定时器。
+ * @param[in] parent 可选的 Qt 父对象。
+ */
 AmpVolumeController::AmpVolumeController(QObject *parent)
     : QObject(parent),
-      // 音量属于业务持久化数据，路径固定，不受 QT_YCEST_CONFIG_DIR 影响。
-      dataFile_(QString::fromLatin1(kVolumeStatePath)),
+      // 音量使用平台数据分区中的固定路径，不依赖 QT_YCEST_CONFIG_DIR。
+      dataFile_(Rk3566Platform::dataPath(QString::fromLatin1(kVolumeStatePath))),
       ampDevice_(Rk3566Platform::amplifierDevice()),
       alsaCard_(Rk3566Platform::alsaCard())
 {
@@ -149,7 +152,7 @@ AmpVolumeController::AmpVolumeController(QObject *parent)
 
     // 兼容旧版随 QT_YCEST_CONFIG_DIR 保存的 volume.dat。目标文件不存在时
     // 只迁移一次，保留用户上次音量；旧文件不删除，便于现场回退旧程序。
-    const QString legacyFile = QDir(Rk3566Platform::configDir())
+    const QString legacyFile = QDir(Rk3566Platform::persistentConfigDir())
             .filePath(QStringLiteral("volume.dat"));
     if (legacyFile != dataFile_ &&
         !QFileInfo::exists(dataFile_) && QFileInfo::exists(legacyFile)) {

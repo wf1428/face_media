@@ -2,9 +2,26 @@
 # @file weston_control.sh
 # @brief 管理 Weston 运行环境、显示旋转和维护后的 Qt 启停。
 # @author Du lin
-# @note 最近修改：2026-10-26；修改人：Du lin；将 Wayland 运行目录固定为 /run/face-media-wayland，
-#       同步生成的 /etc/profile 环境，避免继承 SSH 会话目录；不新增恢复策略，保留原就绪和旋转流程。
+# @note 最近修改：2026-11-17；修改人：Du lin；共享存储模式保存 LCD 角度，Weston 启动及旋转回滚恢复该角度，继续读取本槽硬件配置。
 set -eu
+
+# 触摸矩阵等查询和 Weston 日志过滤不访问业务存储。
+case "${1:-}" in
+    start|validate-rotation|rotate|apply-layout|restart-app)
+        storage_script="$(dirname -- "$0")/start_face_media.sh"
+        if [ ! -r "$storage_script" ]; then
+            storage_script="$(dirname -- "$0")/../../scripts/start_face_media.sh"
+        fi
+        if [ ! -r "$storage_script" ]; then
+            printf '%s\n' '[face-media] missing start_face_media.sh' >&2
+            exit 1
+        fi
+        FACE_MEDIA_LOAD_STORAGE_ONLY=1 . "$storage_script"
+        unset FACE_MEDIA_LOAD_STORAGE_ONLY
+        face_media_detect_storage || exit $?
+        ;;
+    *) FACE_MEDIA_AB_STORAGE=0 ;;
+esac
 
 CONFIG=${WESTON_CONFIG:-/etc/xdg/weston/weston.ini}
 SERVICE=${WESTON_SERVICE:-weston-kiosk.service}
@@ -17,18 +34,48 @@ TOUCH_RULE=${WESTON_TOUCH_RULE:-/etc/udev/rules.d/99-goodix-weston-rotation.rule
 APP_NAME=${YCEST_APP_NAME:-MergedQtApp}
 APP_BIN_DEFAULT=${YCEST_APP_BIN:-/home/cat/face_media/MergedQtApp}
 APP_QPA_PLATFORM=${YCEST_APP_QPA_PLATFORM:-wayland-egl}
-APP_LOG=${YCEST_APP_LOG:-/var/log/merged-qt-app.log}
+UI_CONFIG=${YCEST_UI_CONFIG:-/mnt/UDISK/res/static/demoResources/images/logo/ycest_cfg.ini}
+APP_LOG=${YCEST_APP_LOG:-/var/log/face-media/face_media.log}
+if [ "$FACE_MEDIA_AB_STORAGE" = 1 ]; then
+    UI_CONFIG=$(face_media_data_path "$UI_CONFIG")
+    APP_LOG=$(face_media_data_path "$APP_LOG")
+    ROTATION_STATE=$(face_media_data_path /var/lib/qt_ycest/weston-rotation)
+fi
 APP_SERVICE=${YCEST_APP_SERVICE:-face-media.service}
 APP_STATE_DIR=${YCEST_APP_STATE_DIR:-/run/face-media}
 APP_PIDFILE=${YCEST_APP_PIDFILE:-$APP_STATE_DIR/app.pid}
 APP_MAINTENANCE_FILE=${YCEST_APP_MAINTENANCE_FILE:-$APP_STATE_DIR/maintenance}
-UI_CONFIG=${YCEST_UI_CONFIG:-/mnt/UDISK/res/static/demoResources/images/logo/ycest_cfg.ini}
 ROTATE_LOCK=/run/weston-rotate.lock
 MAINTENANCE_OWNED=0
+WESTON_START_STAGE=
+
+# 脚本失败由对应分支提交；查询结果仍通过 stdout 返回。
+exec 2>/dev/null
+
+# @brief 每次开机按错误键向 journal 提交一次错误，跨服务重启生效。
+# @param $1 无斜杠的稳定错误键；其余参数为首条错误的详细信息。
+# /run 中仅建立空标记。mkdir 原子占用键；提交失败释放标记，记录故障不影响业务返回值。
+journal_error_once() (
+    error_key=$1
+    shift
+    error_dir=/run/face-media-errors/weston-kiosk
+    claimed=0
+    if mkdir -p "$error_dir" 2>/dev/null; then
+        if mkdir "$error_dir/$error_key" 2>/dev/null; then
+            claimed=1
+        elif [ -d "$error_dir/$error_key" ]; then
+            exit 0
+        fi
+    fi
+    if ! logger -p daemon.err -t weston-kiosk -- "$*" 2>/dev/null; then
+        [ "$claimed" -eq 0 ] || rmdir "$error_dir/$error_key" 2>/dev/null || true
+    fi
+)
+
 
 usage()
 {
-    echo "Usage: $0 prepare-environment | start | current | touch-matrix | restart-app | apply-layout [ycest_cfg.ini] | validate-rotation normal|0|90|180|270 [ycest_cfg.ini] | rotate normal|0|90|180|270" >&2
+    journal_error_once invalid-arguments "Usage: $0 prepare-environment | start | current | touch-matrix | restart-app | apply-layout [ycest_cfg.ini] | validate-rotation normal|0|90|180|270 [ycest_cfg.ini] | rotate normal|0|90|180|270"
     exit 2
 }
 
@@ -134,7 +181,7 @@ rotation_from_ui_config()
 {
     ui_config_path=$1
     if [ ! -r "$ui_config_path" ]; then
-        echo "[weston] UI config is missing or unreadable: $ui_config_path" >&2
+        journal_error_once layout-unreadable "UI config is missing or unreadable: $ui_config_path"
         return 1
     fi
 
@@ -171,7 +218,7 @@ rotation_from_ui_config()
             exit 1
         }
     ' "$ui_config_path") || {
-        echo "[weston] invalid [backRect] size in $ui_config_path; both dimensions must be integers >= 600" >&2
+        journal_error_once layout-invalid-size "invalid [backRect] size in $ui_config_path; both dimensions must be integers >= 600"
         return 1
     }
 
@@ -187,7 +234,7 @@ rotation_from_ui_config()
     fi
 
     # 正方形尺寸不能表达横竖方向，不能擅自改变当前物理显示方向。
-    echo "[weston] square UI size ${layout_width}x${layout_height} has no orientation" >&2
+    journal_error_once layout-square "square UI size ${layout_width}x${layout_height} has no orientation"
     return 1
 }
 
@@ -207,18 +254,19 @@ validate_rotation_from_ui_config()
     [ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage
     degrees=$(normalize_rotation "$1") || usage
     ui_config_path=${2:-$UI_CONFIG}
+    if [ "$FACE_MEDIA_AB_STORAGE" = 1 ]; then
+        ui_config_path=$(face_media_data_path "$ui_config_path")
+    fi
 
     if ! layout_rotation=$(rotation_from_ui_config "$ui_config_path"); then
-        echo "[weston] cannot determine UI layout orientation: $ui_config_path" >&2
         return 4
     fi
 
     if rotation_matches_layout "$degrees" "$layout_rotation"; then
-        echo "[weston] rotation ${degrees} degrees matches the UI layout orientation"
         return 0
     fi
 
-    echo "[weston] rotation ${degrees} degrees conflicts with the UI layout orientation; request ignored" >&2
+    journal_error_once layout-conflict "rotation ${degrees} degrees conflicts with the UI layout orientation; request ignored"
     return 3
 }
 
@@ -248,25 +296,35 @@ touchscreen_present()
 refresh_touch_properties()
 {
     if ! touchscreen_present; then
-        echo "[weston] touchscreen not found; skip touch calibration"
         return 0
     fi
 
     if ! command -v udevadm >/dev/null 2>&1; then
-        echo "[weston] udevadm not found; touch calibration was not refreshed" >&2
+        journal_error_once udevadm-missing "udevadm not found; touch calibration was not refreshed"
         return 1
     fi
     if [ ! -r "$TOUCH_RULE" ]; then
-        echo "[weston] touchscreen rule not found: $TOUCH_RULE" >&2
+        journal_error_once touch-rule-missing "touchscreen rule not found: $TOUCH_RULE"
         return 1
     fi
 
-    udevadm control --reload-rules
-    udevadm trigger --action=change --subsystem-match=input
-    udevadm settle --timeout=5 || true
-    echo "[weston] touchscreen calibration refreshed: $TOUCH_NAME"
+    # 保留原 set -e 行为以及 settle 可失败的约定。
+    udevadm control --reload-rules >/dev/null || {
+        udev_status=$?
+        journal_error_once touch-reload "udevadm control --reload-rules failed (rc=$udev_status)"
+        (exit "$udev_status")
+    }
+    udevadm trigger --action=change --subsystem-match=input >/dev/null || {
+        udev_status=$?
+        journal_error_once touch-trigger "udevadm trigger failed (rc=$udev_status)"
+        (exit "$udev_status")
+    }
+    udevadm settle --timeout=5 >/dev/null || true
 }
 
+# @brief 修改本槽 Weston 配置中指定 LCD 的 transform。
+# @param $1 已验证的角度，取值 0、90、180、270。
+# @return 0 表示成功；输出段缺失或配置写入失败时返回非零。
 set_rotation()
 {
     degrees=$1
@@ -277,13 +335,19 @@ set_rotation()
     esac
 
     if [ ! -r "$CONFIG" ]; then
-        echo "[weston] config not found: $CONFIG" >&2
+        journal_error_once weston-config-missing "config not found: $CONFIG"
         return 1
     fi
 
     # 只更新指定 output 段；HDMI 的 transform 必须保持独立。
-    rotation_config=$(readlink -f "$CONFIG") || return 1
-    rotation_tmp=$(mktemp "${rotation_config}.XXXXXX") || return 1
+    rotation_config=$(readlink -f "$CONFIG") || {
+        journal_error_once rotation-path "cannot resolve Weston config: $CONFIG"
+        return 1
+    }
+    rotation_tmp=$(mktemp "${rotation_config}.XXXXXX") || {
+        journal_error_once rotation-temp "cannot create temporary Weston config: $rotation_config"
+        return 1
+    }
     if ! awk -v target="$OUTPUT_NAME" -v replacement="$transform" '
         function trim(value) {
             sub(/^[[:space:]]+/, "", value)
@@ -327,60 +391,103 @@ set_rotation()
         END { finish_section(); if (matched != 1) exit 2 }
     ' "$CONFIG" > "$rotation_tmp"; then
         rm -f "$rotation_tmp"
-        echo "[weston] expected one output section named $OUTPUT_NAME in $CONFIG" >&2
+        journal_error_once rotation-output-invalid "expected one output section named $OUTPUT_NAME in $CONFIG"
         return 1
     fi
     if ! chmod --reference="$rotation_config" "$rotation_tmp" ||
        ! chown --reference="$rotation_config" "$rotation_tmp" ||
        ! mv -f "$rotation_tmp" "$rotation_config"; then
         rm -f "$rotation_tmp"
+        journal_error_once rotation-write "cannot replace Weston config: $rotation_config"
         return 1
     fi
-    echo "[weston] transform=$transform"
 }
+
+# @brief 原子保存供两槽共用的旋转角度；单分区由 Weston 配置保存。
+# @param $1 角度，取值 0、90、180、270。
+# @return 0 表示成功；共享状态写入失败返回非零。
+save_rotation() (
+    [ "$FACE_MEDIA_AB_STORAGE" = 1 ] || exit 0
+    install -d -m 0755 "$(dirname -- "$ROTATION_STATE")" || exit 1
+    tmp=$(mktemp "${ROTATION_STATE}.XXXXXX") || exit 1
+    trap 'rm -f -- "$tmp"' EXIT
+    printf '%s\n' "$1" > "$tmp" && mv -f -- "$tmp" "$ROTATION_STATE"
+)
 
 # @brief 在专用运行目录启动 Weston，保留原布局和触摸初始化。
 # @note 系统服务先通过 RuntimeDirectory 创建目录；直接调用时沿用原 install -d 兜底。
 start_weston()
 {
+    WESTON_START_STAGE=environment
     install_and_activate_runtime_environment
+    WESTON_START_STAGE=
 
     if [ ! -r "$CONFIG" ]; then
-        echo "[weston] config not found: $CONFIG" >&2
+        journal_error_once weston-config-missing "config not found: $CONFIG"
         exit 1
     fi
 
+    WESTON_START_STAGE=runtime-directory
     install -d -m 0700 "$RUNTIME_DIR"
     rm -f "$RUNTIME_DIR/$SOCKET" "$RUNTIME_DIR/$SOCKET.lock"
+    WESTON_START_STAGE=
 
-    # 每次启动都核对界面配置的横竖方向。已保存角度与布局同向时保留
-    # 0/180 或 90/270 的正反朝向；只有横竖方向冲突时才回到布局默认角度。
+    # 共享角度优先，布局的横竖方向仍是约束。只修改本槽 LCD 段，其他输出使用镜像配置。
+    slot_rotation=$(current_rotation)
+    saved_rotation=$slot_rotation
+    if [ "$FACE_MEDIA_AB_STORAGE" = 1 ] && [ -r "$ROTATION_STATE" ]; then
+        shared_rotation=$(sed -n '1p' "$ROTATION_STATE")
+        if [ -n "$shared_rotation" ]; then
+            saved_rotation=$(normalize_rotation "$shared_rotation") || saved_rotation=$slot_rotation
+        fi
+    fi
     if [ -r "$UI_CONFIG" ]; then
         initial_rotation=$(rotation_from_ui_config "$UI_CONFIG" 2>/dev/null || true)
-        if [ -n "$initial_rotation" ]; then
-            saved_rotation=$(current_rotation)
-            if rotation_matches_layout "$saved_rotation" "$initial_rotation"; then
-                echo "[weston] saved rotation ${saved_rotation} degrees matches UI layout; keeping it"
-            else
-                set_rotation "$initial_rotation" ||
-                    echo "[weston] failed to apply initial rotation; keeping current transform" >&2
-            fi
+        if [ -n "$initial_rotation" ] && ! rotation_matches_layout "$saved_rotation" "$initial_rotation"; then
+            saved_rotation=$initial_rotation
         fi
+    fi
+    if [ "$saved_rotation" != "$slot_rotation" ]; then
+        if ! set_rotation "$saved_rotation" && [ "$FACE_MEDIA_AB_STORAGE" = 1 ]; then exit 1; fi
+    fi
+    if [ "$FACE_MEDIA_AB_STORAGE" = 1 ] &&
+       { [ ! -s "$ROTATION_STATE" ] || [ "$saved_rotation" != "${shared_rotation:-}" ]; }; then
+        save_rotation "$saved_rotation" || {
+            journal_error_once shared-rotation-save "cannot persist Weston rotation: $ROTATION_STATE"
+            exit 1
+        }
     fi
 
     # 每次服务启动都按当前 transform 刷新一次触摸属性，保证重启主板或
     # 手动重启 Weston 后仍使用正确矩阵。触摸校正失败不阻止显示启动。
-    refresh_touch_properties ||
-        echo "[weston] continuing without refreshed touch calibration" >&2
+    refresh_touch_properties || true
 
     export XDG_RUNTIME_DIR="$RUNTIME_DIR"
     export WAYLAND_DISPLAY="$SOCKET"
-    exec /usr/bin/weston \
-        --backend=drm-backend.so \
-        --tty=1 \
-        --socket="$SOCKET" \
-        --config="$CONFIG" \
-        --log=/var/log/weston-kiosk.log
+    # 过滤器只消费输出；两层 exec 保持 Weston 为 systemd 追踪的主进程。
+    WESTON_START_STAGE=launch
+    exec /bin/bash -c 'exec /usr/bin/weston "$@" > >(/bin/sh "$0" filter-weston-errors) 2>&1' \
+        "$0" --backend=drm-backend.so --tty=1 --socket="$SOCKET" --config="$CONFIG"
+}
+
+# @brief Weston 原生输出缺少统一优先级，按错误措辞挑选需提交的行。
+# @note 后台持续消费管道。去重键忽略时间戳、PID 和重试序号；不改变 Weston 的退出状态。
+filter_weston_errors()
+{
+    LC_ALL=C awk '
+        {
+            sub(/^[[:space:]]*\[[[:space:]0-9:.]+\][[:space:]]*/, "");
+            sub(/^[[:space:]]+/, "");
+            if (tolower($0) ~ /(^|[^[:alnum:]_])(error|fatal|fail(ed|ure)?|cannot|could not|unable to|permission denied|not found|no such|no .* found|no space left)([^[:alnum:]_]|$)/) {
+                print;
+                fflush();
+            }
+        }
+    ' | while IFS= read -r weston_error; do
+        fingerprint=$(printf '%s\n' "$weston_error" |
+            sed -E 's/((pid|attempt|retry)[=: ]+)[0-9]+/\1#/Ig' | cksum)
+        journal_error_once "native-${fingerprint%% *}" "$weston_error"
+    done
 }
 
 wait_for_weston()
@@ -566,7 +673,7 @@ stop_qt_app()
         fi
     done
     if [ -n "$forced_pids" ]; then
-        echo "[weston] Qt did not exit after SIGINT; forced shutdown:$forced_pids" >&2
+        journal_error_once app-stop-timeout "Qt did not exit after SIGINT; forced shutdown:$forced_pids"
     fi
 
     attempts=0
@@ -586,7 +693,7 @@ stop_qt_app()
 
     for candidate_pid in $APP_PIDS; do
         if pid_is_running_app "$candidate_pid"; then
-            echo "[weston] Qt process is still alive after SIGKILL: pid=$candidate_pid" >&2
+            journal_error_once app-stop-failed "Qt process is still alive after SIGKILL: pid=$candidate_pid"
             return 1
         fi
     done
@@ -600,8 +707,8 @@ start_qt_app_once()
     # 退出维护态后，Qt 只能由常驻的 start_face_media 监督脚本拉起。
     leave_app_maintenance
     if ! systemctl is-active --quiet "$APP_SERVICE"; then
-        systemctl start "$APP_SERVICE" || {
-            echo "[weston] failed to start $APP_SERVICE" >&2
+        systemctl start "$APP_SERVICE" >/dev/null || {
+            journal_error_once app-service-start "failed to start $APP_SERVICE"
             return 1
         }
     fi
@@ -620,7 +727,7 @@ start_qt_app_once()
         sleep 0.1
     done
     if [ "$app_detected" -ne 1 ]; then
-        echo "[weston] supervised Qt did not start; service=$APP_SERVICE log=$APP_LOG" >&2
+        journal_error_once app-pid-timeout "supervised Qt did not start; service=$APP_SERVICE log=$APP_LOG"
         return 1
     fi
 
@@ -629,7 +736,7 @@ start_qt_app_once()
     attempts=0
     while [ "$attempts" -lt 60 ]; do
         if ! pid_is_running_app "$new_app_pid"; then
-            echo "[weston] Qt exited during startup; see $APP_LOG" >&2
+            journal_error_once app-start-exit "Qt exited during startup; see $APP_LOG"
             if kill -0 "$new_app_pid" 2>/dev/null; then
                 kill -9 "$new_app_pid" 2>/dev/null || true
             fi
@@ -639,7 +746,6 @@ start_qt_app_once()
         attempts=$((attempts + 1))
         sleep 0.1
     done
-    echo "[weston] Qt restarted successfully by $APP_SERVICE: pid=$new_app_pid"
 }
 
 start_qt_app()
@@ -652,10 +758,9 @@ start_qt_app()
             return 0
         fi
 
-        echo "[weston] Qt launch attempt $launch_attempt failed" >&2
         if [ "$launch_attempt" -lt 3 ]; then
             if ! wait_for_weston_stable; then
-                echo "[weston] compositor became unavailable before Qt retry" >&2
+                journal_error_once qt-retry-compositor "compositor became unavailable before Qt retry"
                 return 1
             fi
             sleep "$launch_attempt"
@@ -672,7 +777,7 @@ restart_qt_app_locked()
         return 1
     fi
     if ! wait_for_weston_stable; then
-        echo "[weston] compositor is not ready; Qt was not restarted" >&2
+        journal_error_once qt-restart-compositor "compositor is not ready; Qt was not restarted"
         return 1
     fi
     start_qt_app
@@ -681,14 +786,14 @@ restart_qt_app_locked()
 restart_qt_app()
 {
     if [ "$(id -u)" -ne 0 ]; then
-        echo "[weston] Qt restart requires root privileges" >&2
+        journal_error_once restart-permission "Qt restart requires root privileges"
         return 1
     fi
 
     # 与旋转共用锁，防止 U 盘触发的重启和旋转事务交叉执行。
     exec 9>"$ROTATE_LOCK"
     if ! flock 9; then
-        echo "[weston] failed to acquire the rotation lock" >&2
+        journal_error_once rotation-lock "failed to acquire the rotation lock"
         return 1
     fi
 
@@ -697,21 +802,27 @@ restart_qt_app()
 
 restart_weston()
 {
-    systemctl restart "$SERVICE"
+    systemctl restart "$SERVICE" >/dev/null || {
+        service_status=$?
+        journal_error_once weston-restart "cannot restart $SERVICE (rc=$service_status)"
+        (exit "$service_status")
+    }
     if ! wait_for_weston_stable; then
-        echo "[weston] compositor did not become stable" >&2
+        journal_error_once weston-ready-timeout "compositor did not become stable"
         return 1
     fi
 }
 
+# @brief 失败时恢复本槽输出、共享角度以及原 Qt 会话。
+# @param $1 原角度。
 rollback_rotation()
 {
     old_degrees=$1
-    echo "[weston] rolling back to ${old_degrees} degrees" >&2
     set_rotation "$old_degrees" || true
+    save_rotation "$old_degrees" || journal_error_once shared-rotation-rollback "cannot restore shared Weston rotation"
     refresh_touch_properties || true
-    systemctl restart "$SERVICE" || true
-    wait_for_weston_stable || true
+    systemctl restart "$SERVICE" >/dev/null || journal_error_once rollback-restart "cannot restart $SERVICE during rotation recovery"
+    wait_for_weston_stable || journal_error_once rollback-ready "Weston did not become stable during rotation recovery"
     start_qt_app || true
 }
 
@@ -734,7 +845,7 @@ rotate_weston()
     fi
 
     if [ "$(id -u)" -ne 0 ]; then
-        echo "[weston] rotation requires root privileges" >&2
+        journal_error_once rotation-permission "rotation requires root privileges"
         exit 1
     fi
 
@@ -744,19 +855,18 @@ rotate_weston()
     exec 9>"$ROTATE_LOCK"
     if [ "$restart_if_unchanged" -eq 1 ]; then
         if ! flock 9; then
-            echo "[weston] failed to acquire the rotation lock" >&2
+            journal_error_once rotation-lock "failed to acquire the rotation lock"
             exit 1
         fi
     else
         if ! flock -n 9; then
-            echo "[weston] another rotation is already running" >&2
+            journal_error_once rotation-busy "another rotation is already running"
             exit 1
         fi
     fi
 
     old_degrees=$(current_rotation)
     if [ "$degrees" = "$old_degrees" ]; then
-        echo "[weston] rotation already set to ${degrees} degrees"
         if [ "$restart_if_unchanged" -eq 1 ]; then
             # 已持有旋转锁，直接调用无锁版本，避免嵌套 flock 导致死锁。
             if restart_qt_app_locked; then
@@ -767,21 +877,26 @@ rotate_weston()
         return 0
     fi
     if [ ! -r "$CONFIG" ] || ! grep -q '^[[:space:]]*transform[[:space:]]*=' "$CONFIG"; then
-        echo "[weston] transform entry not found in $CONFIG" >&2
+        journal_error_once transform-missing "transform entry not found in $CONFIG"
         exit 1
     fi
 
     capture_app_context
     if [ ! -x "$APP_BIN" ]; then
-        echo "[weston] captured Qt executable is unavailable: $APP_BIN" >&2
+        journal_error_once app-bin-unavailable "captured Qt executable is unavailable: $APP_BIN"
         exit 1
     fi
     if ! stop_qt_app; then
-        echo "[weston] Qt could not be stopped; rotation was not changed" >&2
         exit 1
     fi
 
     if ! set_rotation "$degrees"; then
+        start_qt_app || true
+        exit 1
+    fi
+    if ! save_rotation "$degrees"; then
+        journal_error_once shared-rotation-save "cannot persist Weston rotation"
+        set_rotation "$old_degrees" || true
         start_qt_app || true
         exit 1
     fi
@@ -794,23 +909,24 @@ rotate_weston()
         exit 1
     fi
     if ! start_qt_app; then
-        echo "[weston] Qt restart failed after rotation; rolling back" >&2
+        journal_error_once app-rotation-restart "Qt restart failed after rotation; rolling back"
         rollback_rotation "$old_degrees"
         exit 1
     fi
 
-    echo "[weston] rotation completed: ${degrees} degrees; output=$OUTPUT_NAME"
 }
 
 apply_layout_from_config()
 {
     [ "$#" -le 1 ] || usage
     layout_config=${1:-$UI_CONFIG}
+    if [ "$FACE_MEDIA_AB_STORAGE" = 1 ]; then
+        layout_config=$(face_media_data_path "$layout_config")
+    fi
 
     # 配置异常时保留当前 Weston 方向，但仍重启 Qt，让U盘更新的其他
-    # 合法资源正常生效；错误会写入U盘脚本日志，避免错误尺寸误转屏幕。
+    # 合法资源正常生效；布局错误已写入 journal，避免错误尺寸误转屏幕。
     if ! target_rotation=$(rotation_from_ui_config "$layout_config"); then
-        echo "[weston] keep current rotation and restart Qt only" >&2
         restart_qt_app
         return $?
     fi
@@ -821,24 +937,38 @@ apply_layout_from_config()
         target_rotation=$current_degrees
     fi
 
-    echo "[weston] UI config requests ${target_rotation} degrees: $layout_config"
     # rotate_weston 自己持有统一锁。目标方向未变化时也只重启一次 Qt；
     # 方向变化时则复用既有的 Weston、触摸与 Qt 完整事务。
     rotate_weston "$target_rotation" 1
 }
 
 # 任意失败或中断都必须退出维护态；监督脚本会在 Weston 可用后恢复 Qt。
-trap 'leave_app_maintenance' EXIT
+# @brief 清除维护标记，并补报初始化中由 set -e 直接结束的失败。
+weston_exit()
+{
+    weston_status=$1
+    leave_app_maintenance
+    if [ "$weston_status" -ne 0 ] && [ -n "$WESTON_START_STAGE" ]; then
+        journal_error_once "startup-$WESTON_START_STAGE" "Weston startup failed during $WESTON_START_STAGE (rc=$weston_status)"
+    fi
+}
+
+trap 'weston_exit "$?"' EXIT
 trap 'exit 1' HUP INT TERM
 
 case "${1:-}" in
     prepare-environment)
         [ "$#" -eq 1 ] || usage
-        install_and_activate_runtime_environment
+        WESTON_START_STAGE=environment
+        install_and_activate_runtime_environment >/dev/null
+        WESTON_START_STAGE=
+        ;;
+    filter-weston-errors)
+        filter_weston_errors
         ;;
     start)
         [ "$#" -eq 1 ] || usage
-        start_weston
+        start_weston >/dev/null
         ;;
     current)
         [ "$#" -eq 1 ] || usage
@@ -850,11 +980,11 @@ case "${1:-}" in
         ;;
     restart-app)
         [ "$#" -eq 1 ] || usage
-        restart_qt_app
+        restart_qt_app >/dev/null
         ;;
     apply-layout)
         shift
-        apply_layout_from_config "$@"
+        apply_layout_from_config "$@" >/dev/null
         ;;
     validate-rotation)
         shift
@@ -862,7 +992,7 @@ case "${1:-}" in
         ;;
     rotate)
         shift
-        rotate_weston "$@"
+        rotate_weston "$@" >/dev/null
         ;;
     *)
         usage

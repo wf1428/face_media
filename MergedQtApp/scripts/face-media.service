@@ -1,11 +1,11 @@
 # @file face-media.service
 # @brief 启动依赖 Weston 的应用监督脚本、驱动和 MQTT 子进程。
 # @author Du lin
-# @note 最近修改：2026-10-26；修改人：Du lin；显式设置 Qt 与 Weston 共用的运行目录，不持有或清理该目录；保留原服务顺序及监督策略。
+# @note 最近修改：2026-11-18；修改人：Du lin；将独立 OTA 健康服务加入启动依赖，单分区由服务条件自动跳过。
 [Unit]
 Description=Face Media drivers, MQTT daemon and Qt application
-Wants=network-online.target disable-console-blank.service weston-kiosk.service
-After=network-online.target systemd-udev-settle.service disable-console-blank.service weston-kiosk.service
+Wants=network-online.target disable-console-blank.service weston-kiosk.service face-media-ota-health.service
+After=local-fs.target face-media-ota-health.service network-online.target systemd-udev-settle.service disable-console-blank.service weston-kiosk.service
 Before=udisk-watcher.service
 
 [Service]
@@ -17,6 +17,7 @@ Environment=APP_START_DELAY_SECONDS=5
 Environment=APP_RESTART_DELAY_SECONDS=2
 ExecStart=/usr/local/sbin/start_face_media.sh
 Restart=always
+RestartPreventExitStatus=78
 RestartSec=5
 KillMode=control-group
 TimeoutStopSec=15

@@ -1,6 +1,8 @@
 /**
  * @file storage_policy.cpp
  * @brief 媒体、注册照以及通行记录存储配额策略的实现。
+ * @author Du lin
+ * @note 最近修改：2026-11-17；修改人：Du lin；媒体按目标文件系统实际可写余量动态增长，注册照和通行记录继续按各自比例校验。
  */
 
 #include "storage_policy.h"
@@ -21,62 +23,51 @@
 #include <QSet>
 #include <QStorageInfo>
 
-#include <algorithm>
+#include <limits>
 
 namespace {
 
 const qint64 kGiB = 1024LL * 1024LL * 1024LL;
 const qint64 kMiB = 1024LL * 1024LL;
-const qint64 kLargeEmmcFilesystemThreshold = 24LL * kGiB;
+const int kRegistrationPercent = 45;  /**< 本地与网络注册照占业务分区比例。 */
+const int kAccessHardPercent = 6;     /**< 通行文本和抓拍的硬上限占比。 */
+const qint64 kReferencePhotoBytes = 300 * 1024; /**< 界面估算每张注册照的字节数。 */
 const int kAccessRetentionDays = 15;
 
-/** @brief 一档设备存储容量对应的各业务配额。 */
+/** @brief 按业务分区实际容量计算的字节配额及注册照参考数量。 */
 struct StorageLimits {
-    qint64 mediaBytes;
     qint64 registrationBytes;
     qint64 accessSoftBytes;
     qint64 accessHardBytes;
     int registrationPhotoCapacity;
 };
 
-const StorageLimits kLegacyStorageLimits = {
-    2LL * kGiB,
-    1LL * kGiB,
-    400LL * kMiB,
-    500LL * kMiB,
-    3000
-};
-
-const StorageLimits kLargeEmmcStorageLimits = {
-    8LL * kGiB,
-    15LL * kGiB,
-    2LL * kGiB * 4LL / 5LL,
-    2LL * kGiB,
-    52000
-};
-
 QMutex g_storageMutex;
 
-/**
- * @brief 按应用数据所在文件系统选择 8GB 或 32GB eMMC 配额档位。
- *
- * 标称 32GB eMMC 格式化后的根文件系统通常约为 29 GiB，因此使用
- * 24 GiB 作为两档之间的安全分界；容量读取失败时保守沿用原 8GB 策略。
- */
-const StorageLimits &currentStorageLimits()
+/** @brief 计算整数百分比，按整字节向下取整，避免总字节数乘百分数溢出。 */
+qint64 percentOf(qint64 total, int percent)
 {
-    QStorageInfo storage(Rk3566Platform::applicationRoot());
+    return total / 100 * percent + (total % 100) * percent / 100;
+}
+
+/** @return 业务分区的比例配额；无法确认可写分区时按零配额处理。 */
+StorageLimits currentStorageLimits()
+{
+    const bool shared = Rk3566Platform::usesSharedDataStorage();
+    const QString volume = shared ? QStringLiteral("/userdata") : QDir::rootPath();
+    QStorageInfo storage(volume);
     storage.refresh();
-    if (!storage.isValid() || !storage.isReady() || storage.bytesTotal() <= 0) {
-        storage = QStorageInfo::root();
-        storage.refresh();
+    if (!storage.isValid() || !storage.isReady() || storage.isReadOnly()
+            || storage.bytesTotal() <= 0 || (shared && storage.rootPath() != volume)) {
+        return {};
     }
-    if (storage.isValid()
-            && storage.isReady()
-            && storage.bytesTotal() >= kLargeEmmcFilesystemThreshold) {
-        return kLargeEmmcStorageLimits;
-    }
-    return kLegacyStorageLimits;
+    const qint64 total = storage.bytesTotal();
+    const qint64 registration = percentOf(total, kRegistrationPercent);
+    const qint64 accessHard = percentOf(total, kAccessHardPercent);
+    return {registration,
+            percentOf(accessHard, 80),
+            accessHard,
+            int(qMin<qint64>(registration / kReferencePhotoBytes, std::numeric_limits<int>::max()))};
 }
 
 QString capacityText(qint64 bytes)
@@ -100,16 +91,11 @@ bool isInside(const QString &path, const QString &root)
             || absolutePath.startsWith(absoluteRoot + QLatin1Char('/'));
 }
 
-QString mediaRoot()
-{
-    return QDir(Rk3566Platform::staticRoot()).filePath(
-                QStringLiteral("demoResources/images/video"));
-}
-
+/** @return 本地和网络注册照片所在的业务目录，用于共用配额统计。 */
 QStringList registrationRoots()
 {
     return {
-        QDir(Rk3566Platform::applicationRoot()).filePath(
+        QDir(Rk3566Platform::applicationDataRoot()).filePath(
                     QStringLiteral("enrollments")),
         QDir(QFileInfo(Rk3566Platform::databasePath()).absolutePath()).filePath(
                     QStringLiteral("network_faces"))
@@ -236,7 +222,11 @@ bool prepareAccessWriteUnlocked(const QString &snapshotRoot,
                                 qint64 incomingBytes,
                                 QString *error)
 {
-    const StorageLimits &limits = currentStorageLimits();
+    const StorageLimits limits = currentStorageLimits();
+    if (limits.accessHardBytes <= 0) {
+        if (error) *error = QStringLiteral("无法确认通行记录所在的数据分区容量");
+        return false;
+    }
     if (incomingBytes < 0 || incomingBytes > limits.accessHardBytes) {
         if (error) {
             *error = QStringLiteral("单条通行数据超过 %1 限制")
@@ -265,7 +255,7 @@ bool prepareAccessWriteUnlocked(const QString &snapshotRoot,
     qint64 projected = accessUsageBytes(snapshotRoot) + incomingBytes;
     QStringList days = accessDays(snapshotRoot);
 
-    // 到达当前档位软上限时，本次只主动清理最早的一天；后续写入继续逐日处理。
+    // 到达当前分区配额软上限时，本次只主动清理最早的一天；后续写入继续逐日处理。
     if (!cleanedOneDay
             && projected >= limits.accessSoftBytes
             && !days.isEmpty()
@@ -277,7 +267,7 @@ bool prepareAccessWriteUnlocked(const QString &snapshotRoot,
         days = accessDays(snapshotRoot);
     }
 
-    // 当前档位硬上限不可突破；仍超限时继续逐日清理，但绝不删除当天记录。
+    // 当前分区配额硬上限不可突破；仍超限时继续逐日清理，但绝不删除当天记录。
     while (projected > limits.accessHardBytes
            && !days.isEmpty()
            && days.first() != today) {
@@ -299,11 +289,54 @@ bool prepareAccessWriteUnlocked(const QString &snapshotRoot,
     return true;
 }
 
+/**
+ * @brief 从目标分区实际可用容量扣除 5% 或调用方要求的更高余量。
+ * @param path 下载或上传的目标路径，允许尚未存在。
+ * @param reserveBytes 要保留的最小可用字节数。
+ * @param[out] headroom 当前可额外写入的字节数，负值表示已越过保护线。
+ * @return 能确认可写分区时返回 true，失败时不读取 headroom。
+ */
+bool queryDownloadHeadroom(const QString &path, qint64 reserveBytes, qint64 &headroom)
+{
+    QDir directory = QFileInfo(path).isDir() ? QDir(path) : QFileInfo(path).absoluteDir();
+    while (!directory.exists()) {
+        const QString parent = QFileInfo(directory.absolutePath()).absolutePath();
+        if (parent == directory.absolutePath()) return false;
+        directory.setPath(parent);
+    }
+    QStorageInfo storage(directory.absolutePath());
+    storage.refresh();
+    const qint64 total = storage.bytesTotal();
+    const qint64 available = storage.bytesAvailable();
+    if (!storage.isValid() || !storage.isReady() || storage.isReadOnly()
+            || total <= 0 || available < 0 || available > total || reserveBytes < 0
+            || (Rk3566Platform::usesSharedDataStorage()
+                && isInside(directory.absolutePath(), QStringLiteral("/userdata"))
+                && !isInside(storage.rootPath(), QStringLiteral("/userdata")))) {
+        return false;
+    }
+    const qint64 thresholdReserve = total - percentOf(total, StoragePolicy::DownloadUsageLimitPercent);
+    headroom = available - qMax(reserveBytes, thresholdReserve);
+    return true;
+}
+
 } // namespace
 
 namespace StoragePolicy {
 
-qint64 mediaLimitBytes() { return currentStorageLimits().mediaBytes; }
+qint64 downloadWritableBytes(const QString &path, qint64 reserveBytes)
+{
+    qint64 headroom = 0;
+    return queryDownloadHeadroom(path, reserveBytes, headroom) ? qMax<qint64>(0, headroom) : -1;
+}
+
+bool canWriteDownloadBytes(const QString &path, qint64 incomingBytes, qint64 reserveBytes)
+{
+    qint64 headroom = 0;
+    return incomingBytes >= 0 && queryDownloadHeadroom(path, reserveBytes, headroom)
+            && incomingBytes <= headroom;
+}
+
 qint64 registrationLimitBytes() { return currentStorageLimits().registrationBytes; }
 qint64 accessSoftLimitBytes() { return currentStorageLimits().accessSoftBytes; }
 qint64 accessHardLimitBytes() { return currentStorageLimits().accessHardBytes; }
@@ -312,86 +345,10 @@ int registrationPhotoCapacity()
     return currentStorageLimits().registrationPhotoCapacity;
 }
 
-Usage mediaUsage()
-{
-    QMutexLocker locker(&g_storageMutex);
-    return directoryUsage(mediaRoot());
-}
-
 Usage registrationUsage()
 {
     QMutexLocker locker(&g_storageMutex);
     return registrationUsageUnlocked();
-}
-
-bool canStoreMediaFile(const QString &targetPath,
-                       qint64 incomingBytes,
-                       QString *error)
-{
-    QMutexLocker locker(&g_storageMutex);
-    const qint64 mediaLimit = currentStorageLimits().mediaBytes;
-    if (!isInside(targetPath, mediaRoot())) {
-        return true;
-    }
-    const qint64 oldSize = QFileInfo(targetPath).isFile()
-            ? QFileInfo(targetPath).size() : 0;
-    const QString partPath = targetPath + QStringLiteral(".part");
-    const qint64 oldPartSize = QFileInfo(partPath).isFile()
-            ? QFileInfo(partPath).size() : 0;
-    const qint64 projected = directoryUsage(mediaRoot()).bytes
-            - oldSize - oldPartSize + qMax<qint64>(0, incomingBytes);
-    if (incomingBytes < 0 || projected > mediaLimit) {
-        if (error) {
-            *error = QStringLiteral(
-                        "媒体目录容量不足：视频和图片总量限制为 %1，当前文件无法写入")
-                    .arg(capacityText(mediaLimit));
-        }
-        return false;
-    }
-    return true;
-}
-
-qint64 mediaWritableBytes(const QString &targetPath)
-{
-    QMutexLocker locker(&g_storageMutex);
-    const qint64 mediaLimit = currentStorageLimits().mediaBytes;
-    if (!isInside(targetPath, mediaRoot())) {
-        return -1;
-    }
-    const qint64 oldSize = QFileInfo(targetPath).isFile()
-            ? QFileInfo(targetPath).size() : 0;
-    const QString partPath = targetPath + QStringLiteral(".part");
-    const qint64 oldPartSize = QFileInfo(partPath).isFile()
-            ? QFileInfo(partPath).size() : 0;
-    return qMax<qint64>(0, mediaLimit - directoryUsage(mediaRoot()).bytes
-                        + oldSize + oldPartSize);
-}
-
-bool canCommitMediaFile(const QString &targetPath,
-                        const QString &partPath,
-                        QString *error)
-{
-    QMutexLocker locker(&g_storageMutex);
-    const qint64 mediaLimit = currentStorageLimits().mediaBytes;
-    if (!isInside(targetPath, mediaRoot())) {
-        return true;
-    }
-    if (!QFileInfo(partPath).isFile()) {
-        if (error) *error = QStringLiteral("媒体下载临时文件不存在");
-        return false;
-    }
-    const qint64 oldSize = QFileInfo(targetPath).isFile()
-            ? QFileInfo(targetPath).size() : 0;
-    const qint64 projected = directoryUsage(mediaRoot()).bytes - oldSize;
-    if (projected > mediaLimit) {
-        if (error) {
-            *error = QStringLiteral(
-                        "媒体目录容量不足：下载完成后视频和图片总量将超过 %1")
-                    .arg(capacityText(mediaLimit));
-        }
-        return false;
-    }
-    return true;
 }
 
 bool writeRegistrationPhoto(const QString &targetPath,
@@ -480,7 +437,7 @@ bool appendAccessRecord(const QString &snapshotRoot,
 
 QString accessLogDirectory()
 {
-    return QDir(Rk3566Platform::applicationRoot()).filePath(
+    return QDir(Rk3566Platform::applicationDataRoot()).filePath(
                 QStringLiteral("data/access_logs"));
 }
 

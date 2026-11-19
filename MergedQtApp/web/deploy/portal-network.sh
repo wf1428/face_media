@@ -2,6 +2,7 @@
 # @file portal-network.sh
 # @brief NetworkManager 专用热点的检测、配置、隔离、SSID 保存和重新激活。
 # @author Du lin
+# @note 最近修改：2026-11-17；修改人：Du lin；将专用热点名称与密码一起保存在共享分区，切槽时恢复至本槽专用 NetworkManager 配置。
 # @date 2026-10-16
 
 set -eu
@@ -12,6 +13,19 @@ export LC_ALL=C
 : "${PORTAL_RUNTIME:=/run/device-webd}"
 AP_IP=${AP_ADDRESS%/*}
 RULE_TAG=yc-device-portal
+
+# 仅专用热点的用户配置进入共享分区，其他 NetworkManager 连接仍由系统管理。
+storage_script="$(dirname -- "$0")/start_face_media.sh"
+if [ ! -r "$storage_script" ]; then
+    storage_script="$(dirname -- "$0")/../../scripts/start_face_media.sh"
+fi
+FACE_MEDIA_LOAD_STORAGE_ONLY=1 . "$storage_script"
+unset FACE_MEDIA_LOAD_STORAGE_ONLY
+face_media_detect_storage || exit $?
+HOTSPOT_STATE=
+if [ "$FACE_MEDIA_AB_STORAGE" = 1 ]; then
+    HOTSPOT_STATE=$(face_media_data_path /var/lib/NetworkManager/yc-device-portal/hotspot.conf)
+fi
 
 # @brief 按脚本来源输出一条控制台日志。
 # @param ... 日志文本，按原样连接后输出单行。
@@ -168,8 +182,20 @@ validate_ssid() {
     case "$1" in ' '* | *' ') return 1 ;; esac
 }
 
-# @brief 校验接口、网段和配置后建立专用共享热点，并落实隔离规则。
-# @return 专用热点准备成功返回 0；无候选网卡返回 10，其余失败为非 0。
+# 原子交付 SSID 和 PSK；通过数据行读取，文件内容从不作为 Shell 命令加载。
+# @param $1 SSID。
+# @param $2 WPA-PSK。
+# @return 0 表示两项均已保存；临时文件在出错时清理。
+save_shared_hotspot() (
+    umask 077
+    install -d -m 0700 "$(dirname -- "$HOTSPOT_STATE")" || exit 1
+    tmp=$(mktemp "${HOTSPOT_STATE}.XXXXXX") || exit 1
+    trap 'rm -f -- "$tmp"' EXIT
+    printf '%s\n%s\n' "$1" "$2" > "$tmp" && mv -f -- "$tmp" "$HOTSPOT_STATE"
+)
+
+# @brief 校验接口、网段和配置后建立专用热点，并落实隔离规则。
+# @return 准备成功返回 0；无候选网卡返回 10，其余失败为非 0。
 prepare() {
     iface=$(detect) || return 10
     install -d -m 0750 "$PORTAL_RUNTIME"
@@ -183,7 +209,15 @@ prepare() {
         log "Portal IP already used by $conflicts"
         return 1
     }
-    if [ -s "$PORTAL_CUSTOM_SSID" ]; then
+    shared_password=
+    if [ -n "$HOTSPOT_STATE" ] && [ -e "$HOTSPOT_STATE" ]; then
+        {
+            IFS= read -r ssid && IFS= read -r shared_password
+        } < "$HOTSPOT_STATE" && validate_password "$shared_password" || {
+            log 'Invalid shared hotspot settings'
+            return 1
+        }
+    elif [ -z "$HOTSPOT_STATE" ] && [ -s "$PORTAL_CUSTOM_SSID" ]; then
         IFS= read -r ssid < "$PORTAL_CUSTOM_SSID"
     else
         ssid=$(sed -n '3p' "$QT_READY_FILE")
@@ -198,21 +232,28 @@ prepare() {
             return 1
         }
     else
-        case "${AP_PASSWORD:-}" in '' | __FACTORY_*)
+        provision_password=${shared_password:-${AP_PASSWORD:-}}
+        case "$provision_password" in '' | __FACTORY_*)
             log 'Provision the AP password before creating a new hotspot'
             return 1
             ;;
         esac
-        [ "${#AP_PASSWORD}" -ge 8 ] && [ "${#AP_PASSWORD}" -le 63 ] || {
+        if [ -z "$shared_password" ] && { [ "${#provision_password}" -lt 8 ] || [ "${#provision_password}" -gt 63 ]; }; then
             log 'Invalid AP password length'
             return 1
-        }
+        fi
         nm connection add type wifi ifname "$iface" con-name "$AP_CONNECTION" autoconnect no ssid "$ssid" > /dev/null
-        if ! nm connection modify id "$AP_CONNECTION" wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$AP_PASSWORD" > /dev/null 2>&1; then
+        if ! nm connection modify id "$AP_CONNECTION" wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$provision_password" > /dev/null 2>&1; then
             log 'Could not provision the new hotspot password'
             nm connection delete id "$AP_CONNECTION" > /dev/null 2>&1 || true
             return 1
         fi
+    fi
+    if [ -n "$shared_password" ] &&
+       ! nm connection modify id "$AP_CONNECTION" wifi-sec.key-mgmt wpa-psk \
+            wifi-sec.psk "$shared_password" wifi-sec.psk-flags 0 >/dev/null 2>&1; then
+        log 'Could not apply shared hotspot password'
+        return 1
     fi
     nm connection modify id "$AP_CONNECTION" connection.interface-name "$iface" connection.autoconnect no \
         802-11-wireless.mode ap 802-11-wireless.ssid "$ssid" ipv4.method shared \
@@ -230,6 +271,13 @@ prepare() {
         log 'Hotspot did not acquire the configured IP'
         return 1
     }
+    if [ -n "$HOTSPOT_STATE" ] && [ -z "$shared_password" ]; then
+        active_password=$(nm --show-secrets -g 802-11-wireless-security.psk connection show id "$AP_CONNECTION")
+        if ! validate_password "$active_password" || ! save_shared_hotspot "$ssid" "$active_password"; then
+            log 'Could not persist initial shared hotspot settings'
+            return 1
+        fi
+    fi
     log "Hotspot ready: interface=$iface address=$AP_ADDRESS"
     iptables -vnL FORWARD --line-numbers >&2
 }
@@ -259,9 +307,11 @@ save_ssid() {
         return 1
     }
     previous=$(read_ssid)
-    if [ -n "$password" ]; then
-        # 回滚用的旧密钥只保留在本次进程内，不输出或另存明文文件。
+    if [ -n "$password" ] || [ -n "$HOTSPOT_STATE" ]; then
+        # 不输出密钥；共享模式下仅在本次新配置写入成功后更新持久化副本。
         previous_password=$(nm --show-secrets -g 802-11-wireless-security.psk connection show id "$AP_CONNECTION")
+    fi
+    if [ -n "$password" ]; then
         previous_flags=$(nm -g 802-11-wireless-security.psk-flags connection show id "$AP_CONNECTION")
         # 部分 NM 版本返回“0 (none)”；回滚时只使用原始标志数值。
         previous_flags=${previous_flags%% *}
@@ -278,12 +328,17 @@ save_ssid() {
     else
         nm connection modify id "$AP_CONNECTION" 802-11-wireless.ssid "$ssid" > /dev/null
     fi
-    tmp="$PORTAL_CUSTOM_SSID.tmp.$$"
     if ! (
-        umask 077
-        printf '%s\n' "$ssid" > "$tmp" && mv -f "$tmp" "$PORTAL_CUSTOM_SSID"
+        if [ -n "$HOTSPOT_STATE" ]; then
+            next_password=${password:-$previous_password}
+            validate_password "$next_password" && save_shared_hotspot "$ssid" "$next_password"
+        else
+            umask 077
+            tmp="$PORTAL_CUSTOM_SSID.tmp.$$"
+            trap 'rm -f -- "$tmp"' EXIT
+            printf '%s\n' "$ssid" > "$tmp" && mv -f "$tmp" "$PORTAL_CUSTOM_SSID"
+        fi
     ); then
-        rm -f "$tmp"
         if [ -n "$password" ]; then
             nm connection modify id "$AP_CONNECTION" 802-11-wireless.ssid "$previous" \
                 wifi-sec.psk "$previous_password" wifi-sec.psk-flags "$previous_flags" > /dev/null 2>&1 || true

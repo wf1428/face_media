@@ -3,8 +3,8 @@
  * @brief 处理 MQTT 媒体命令、维护播放状态并构建协议响应包。
  *
  * @author Du lin
- * @note 最近修改：2026-11-12；修改人：Du lin；视频控制音量先记录请求再交给设备执行，避免同步回调报告实际音量后被请求值覆盖；广播期间被忽略的音量请求按实际值回执失败。
  * @date 2026-07-25
+ * @note 最近修改：2026-11-16；修改人：Du lin；FTP 配置中保留的旧 /mnt/UDISK 下载目录按当前数据分区解析后再创建目录。
  */
 
 #include "mqttservice.h"
@@ -143,7 +143,7 @@ bool MqttService::writeFtpIni(const QString& host,
 /**
  * @brief 从 ini 文件中读取 FTP 本地目录配置。
  *
- * 从 平台 net_cfg.ini 的 [ftp].local_path 读取本地目录路径。
+ * 从 平台 net_cfg.ini 的 [ftp].local_path 读取本地目录路径，并按启动模式解析旧媒体目录。
  *
  * @param localDirOut 输出参数，返回读取到的本地目录。
  * @param err         输出参数，失败时返回错误描述。
@@ -166,7 +166,7 @@ bool MqttService::readIniFtpLocalDir(QString& localDirOut, QString* err)
     if (localDirOut.isEmpty()) {
         localDirOut = Rk3566Platform::videoDir();
     }
-    localDirOut = QDir::cleanPath(localDirOut);
+    localDirOut = Rk3566Platform::storedMediaPath(QDir::cleanPath(localDirOut));
     set.setValue("local_path", localDirOut);
     set.endGroup();
     set.sync();

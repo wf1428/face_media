@@ -2,8 +2,9 @@
  * @file udisk_status.cpp
  * @brief 轮询 U 盘状态 JSON 并在宿主底部显示状态/进度的覆盖层的实现。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-11-17；修改人：Du lin；拔盘后的文件更新错误保留详情，并使用完成提示的自动隐藏时间。
  */
 
 #include "udisk_status.h"
@@ -159,7 +160,7 @@ void UdiskStatusOverlay::pollOnce()
     updateFromJson(data);
 }
 
-/** @brief 解析状态 JSON，处理插入、复制进度、完成和拔出。 */
+/** @brief 解析 U 盘状态并刷新提示，拔盘后的终态错误按完成提示的时长显示。 */
 void UdiskStatusOverlay::updateFromJson(const QByteArray &data)
 {
     QJsonParseError err;
@@ -177,6 +178,8 @@ void UdiskStatusOverlay::updateFromJson(const QByteArray &data)
     const int totalCount = o.value("total_count").toInt(0);
     const QString curFile = o.value("current_file").toString();
     const int errorCode = o.value("error_code").toInt(0);
+    const bool removedUpdateError = state == "error" && mountPoint.isEmpty()
+            && o.value("auto_hide").toBool();
 
     if (state.isEmpty()) return;
 
@@ -251,7 +254,8 @@ void UdiskStatusOverlay::updateFromJson(const QByteArray &data)
     }
 
     // 记住：确实发生过插入（后续才允许显示“已拔出”）
-    if (state == "inserted" || state == "waiting" || state == "copying" || state == "done" || state == "error") {
+    if (state == "inserted" || state == "waiting" || state == "copying" || state == "done"
+            || (state == "error" && !removedUpdateError)) {
         m_seenInserted = true;
     }
 
@@ -371,8 +375,9 @@ void UdiskStatusOverlay::updateFromJson(const QByteArray &data)
             m_progress->setValue(0);
         }
 
-        // ✅ 重要：error 不自动隐藏，让用户能看到
-        ++m_hideToken; // 取消任何旧的延迟隐藏
+        if (removedUpdateError) {
+            m_seenInserted = false;
+        }
     }
     else {
         // 兜底：直接显示脚本 msg
@@ -387,8 +392,8 @@ void UdiskStatusOverlay::updateFromJson(const QByteArray &data)
     setVisible(true);
     m_overlay->raise();
 
-    // ========= 4) done/removed：显示 2~3s 后隐藏 =========
-    if (state == "done" || state == "removed") {
+    // 完成、拔出及拔盘后的文件更新错误共用同一个隐藏计时器。
+    if (state == "done" || state == "removed" || removedUpdateError) {
         const int token = ++m_hideToken;
         QTimer::singleShot(m_doneTipMs, this, [this, token]() {
             if (token != m_hideToken) return;

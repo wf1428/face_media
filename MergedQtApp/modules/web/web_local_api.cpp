@@ -3,7 +3,7 @@
  * @brief 标准 Web 本地业务：源数据读取、差量事务、幂等和异步任务。
  * @author Du lin
  * @date 2026-10-16
- * @note 最近修改：2026-10-23；修改人：Du lin；通行权限保存及其幂等回执不附带人脸图片路径，避免 HTTP 重读和传输图片；保留查询图片、额度同步及原事务行为。
+ * @note 最近修改：2026-11-16；修改人：Du lin；Web 录入照、导入路径和旧上传任务引用统一解析到当前应用数据目录。
  */
 
 #include "web_local_api.h"
@@ -491,10 +491,10 @@ QJsonObject WebLocalApi::credential(qint64 id, bool images) const
                       {"name", QFileInfo(r.value("image_path").toString()).completeBaseName()},
                       {"registerTime", r.value("created_at").toString()}};
         if (images) {
-            const auto path = r.value("image_path").toString();
+            const auto path = Rk3566Platform::dataPath(r.value("image_path").toString());
             try {
                 WebPaths::inside(path,
-                                 QDir(Rk3566Platform::applicationRoot()).filePath("enrollments"),
+                                 QDir(Rk3566Platform::applicationDataRoot()).filePath("enrollments"),
                                  true);
                 f.insert("_assetPath", path);
             } catch (const WebError &) {
@@ -914,7 +914,7 @@ WebLocalApi::mutateCredential(const QString &operation, const QJsonObject &args,
                           {data.value("assetId").toString(), owner});
         if (assets.isEmpty())
             throw WebError(404, "人脸图片资源不存在");
-        const auto assetPath = assets.first().value("path").toString();
+        const auto assetPath = Rk3566Platform::dataPath(assets.first().value("path").toString());
         WebPaths::inside(assetPath, QDir(config_.imports).filePath("_local"), true);
         QFile source(assetPath);
         if (!source.open(QIODevice::ReadOnly) || source.size() <= 0 || source.size() > 512 * 1024)
@@ -1320,10 +1320,11 @@ WebLocalApi::mutateCredential(const QString &operation, const QJsonObject &args,
     if (!removedPhoto.isEmpty() && QFileInfo(removedPhoto).fileName().startsWith("web_") &&
         WebSql::query("SELECT id FROM face_feature WHERE image_path=?", {removedPhoto}).isEmpty()) {
         try {
-            WebPaths::inside(removedPhoto,
-                             QDir(Rk3566Platform::applicationRoot()).filePath("enrollments"),
+            const auto path = Rk3566Platform::dataPath(removedPhoto);
+            WebPaths::inside(path,
+                             QDir(Rk3566Platform::applicationDataRoot()).filePath("enrollments"),
                              true);
-            QFile::remove(removedPhoto);
+            QFile::remove(path);
         } catch (const WebError &) {
         }
     }
@@ -1377,7 +1378,7 @@ bool WebLocalApi::applyFaces(const QString &token,
         QFile source(args.value("imagePath").toString());
         if (!source.open(QIODevice::ReadOnly))
             throw WebError(503, "人脸原图不可读");
-        const auto dir = QDir(Rk3566Platform::applicationRoot()).filePath("enrollments");
+        const auto dir = QDir(Rk3566Platform::applicationDataRoot()).filePath("enrollments");
         if (!QDir().mkpath(dir))
             throw WebError(503, "注册照目录不可用");
         const auto path = QDir(dir).filePath("web_" + token + ".jpg");
@@ -1624,7 +1625,7 @@ QJsonObject WebLocalApi::dispatch(const QString &operation, const QJsonObject &a
                                   1,
                                   rows.first().value("expected_bytes").toLongLong(),
                                   "视频长度");
-        const auto path = rows.first().value("part_path").toString();
+        const auto path = Rk3566Platform::dataPath(rows.first().value("part_path").toString());
         WebPaths::mounted(config_.media, config_.mount);
         WebPaths::inside(path, config_.media, true);
         if (!QFileInfo(path).isFile() || QFileInfo(path).size() != size)
@@ -1656,7 +1657,7 @@ QJsonObject WebLocalApi::dispatch(const QString &operation, const QJsonObject &a
         for (const auto &r :
              WebSql::query("SELECT path FROM web_local_assets WHERE id=? AND owner=?",
                            {args.value("assetId").toString(), owner}))
-            QFile::remove(r.value("path").toString());
+            QFile::remove(Rk3566Platform::dataPath(r.value("path").toString()));
         WebSql::execute("DELETE FROM web_local_assets WHERE id=? AND owner=?",
                         {args.value("assetId").toString(), owner});
         return reply(QJsonObject{});

@@ -3,10 +3,11 @@
  * @brief 上传表读写；流式传输期间不占用数据库事务。
  * @author Du lin
  * @date 2026-10-09
- * @note 最近修改：2026-10-23；修改人：Du lin；人员图片归档纳入原人员上传预留容量统计，保留原资源包独立预算。
+ * @note 最近修改：2026-11-16；修改人：Du lin；计算预留空间时从当前数据分区读取旧任务的临时文件与目标文件大小。
  */
 
 #include "web_upload_repository.h"
+#include "platform/rk3566_platform.h"
 #include "web_sql.h"
 #include <QDateTime>
 #include <QFileInfo>
@@ -94,8 +95,8 @@ qint64 WebUploads::reserved(const QString &kind)
         if (kind == "video" ? (taskKind != "video" && taskKind != "ad_image")
                             : (taskKind != "person_excel" && taskKind != "person_face" && taskKind != "person_face_archive"))
             continue;
-        const QFileInfo part(task.value("part_path").toString()),
-            final(task.value("final_path").toString());
+        const QFileInfo part(Rk3566Platform::dataPath(task.value("part_path").toString())),
+            final(Rk3566Platform::dataPath(task.value("final_path").toString()));
         const qint64 written =
             part.exists()
                 ? part.size()

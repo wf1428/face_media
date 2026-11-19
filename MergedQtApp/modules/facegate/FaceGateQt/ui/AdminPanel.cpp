@@ -4,10 +4,11 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-10；修改人：Du lin；声音开关移至多媒体后台，保留人脸管理页原音频设置。
+ * @note 最近修改：2026-11-16；修改人：Du lin；存储页面按共享分区显示容量；通行 CSV 导出按启动模式写入应用数据分区。
  */
 
 #include "AdminPanel.h"
+#include "platform/rk3566_platform.h"
 #include "FaceEnrollWidget.h"
 #include "AppMessageDialog.h"
 #include "components/quick/QuickNavigationWidget.h"
@@ -384,15 +385,20 @@ QString formatBytes(qint64 bytes)
     return QString("%1%2").arg(value, 0, unitIndex == 0 ? 'f' : 'f', unitIndex == 0 ? 0 : 1).arg(units[unitIndex]);
 }
 
-/** @brief 定位应用数据目录所在且已经就绪的文件系统。 */
+/**
+ * @brief 获取应用数据分区的容量信息。
+ * @return 所选分区的 QStorageInfo，查询失败时可为无效对象。
+ */
 QStorageInfo storageForApplicationData()
 {
     // root() 在部分嵌入式系统上会命中只读 /rom 或 overlay 上层，
     // 容易显示成“已用=总容量”。按应用所在目录取挂载点，
     // 才能反映人脸库、抓拍和日志实际占用的存储分区。
-    QStorageInfo storage(QCoreApplication::applicationDirPath());
+    QStorageInfo storage(Rk3566Platform::dataVolumePath(
+                             QCoreApplication::applicationDirPath()));
     storage.refresh();
-    if (!storage.isValid() || !storage.isReady() || storage.bytesTotal() <= 0) {
+    if (!Rk3566Platform::usesSharedDataStorage()
+            && (!storage.isValid() || !storage.isReady() || storage.bytesTotal() <= 0)) {
         storage = QStorageInfo::root();
         storage.refresh();
     }
@@ -1409,8 +1415,9 @@ QWidget *AdminPanel::createLogPage()
         if (!passedLogTable_) {
             return;
         }
-        const QString path = QDir(QCoreApplication::applicationDirPath())
-            .absoluteFilePath(QString("通行记录_%1.csv").arg(QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss")));
+        const QString directory = Rk3566Platform::dataPath(QCoreApplication::applicationDirPath());
+        const QString path = QDir(directory).absoluteFilePath(
+                    QString("通行记录_%1.csv").arg(QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss")));
         QFile file(path);
         if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
             AppMessageDialog::warning(this, "导出CSV", "导出文件失败：" + file.errorString());

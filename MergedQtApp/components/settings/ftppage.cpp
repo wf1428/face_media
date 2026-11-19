@@ -4,7 +4,7 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-10-24；修改人：Du lin；提取视频与资源包共用的 FTP URL 和低优先级进程工具；媒体预检、下载及发布持共享锁，避免资源更新清理正在写入的文件。
+ * @note 最近修改：2026-11-17；修改人：Du lin；根据目标分区真实余量限制 HTTP 和 FTP 写入，并在暂存完成后复核 95% 保护线。
  */
 
 #include "ftppage.h"
@@ -24,6 +24,32 @@
 // url历史记忆保存
 static const char* kStreamUrlHistoryKey = "stream/url_history";
 static const int kMaxUrlHistory = 8;
+static constexpr qint64 kDownloadReserveBytes = 10LL * 1024 * 1024;
+
+/** @return 共享模式使用的数据分区直播历史 INI 文件路径。 */
+static QString streamHistoryPath()
+{
+    return QDir(Rk3566Platform::persistentConfigDir()).filePath(QStringLiteral("stream-history.ini"));
+}
+
+/** @return 分区超过保护线或容量不可用时的统一下载错误提示。 */
+static QString downloadSpaceError()
+{
+    return QStringLiteral("分区已达 %1% 下载保护阈值或容量不可用")
+            .arg(StoragePolicy::DownloadUsageLimitPercent);
+}
+
+/** @return 同目录临时文件成功替换目标时返回 true。 */
+static bool publishDownload(const QString &partPath, const QString &targetPath)
+{
+#ifdef Q_OS_UNIX
+    return std::rename(QFile::encodeName(partPath).constData(),
+                       QFile::encodeName(targetPath).constData()) == 0;
+#else
+    QFile::remove(targetPath);
+    return QFile::rename(partPath, targetPath);
+#endif
+}
 
 
 /** @brief 复用视频和资源包共用的逐段 FTP URL 编码；encoded 输出是否编码。 */
@@ -48,6 +74,30 @@ bool FtpPage::acquireTransferLock(const QString &name)
     }
     transferLock_ = std::move(lock);
     return true;
+}
+
+/**
+ * @brief 写入已接收的 curl 数据。无远端长度时也按本地预算限制临时文件。
+ * @param process 输出数据的子进程。
+ * @param file 已打开的 .part 文件。
+ * @param remaining 可继续接收的字节数，成功写入后扣减。
+ * @param exceeded 本次接收超限时置为 true。
+ * @param error 输出本地写盘错误。
+ */
+static void writeDownloadChunk(QProcess *process, QFile &file, qint64 &remaining,
+                               bool &exceeded, QString &error)
+{
+    const QByteArray chunk = process->readAllStandardOutput();
+    if (chunk.isEmpty() || !file.isOpen() || exceeded || !error.isEmpty()) return;
+    if (chunk.size() > remaining) {
+        exceeded = true;
+    } else if (file.write(chunk) != chunk.size()) {
+        error = file.errorString();
+    } else {
+        remaining -= chunk.size();
+        return;
+    }
+    if (process->state() != QProcess::NotRunning) process->kill();
 }
 
 // ------------------------------
@@ -113,15 +163,10 @@ FtpPage::FtpPage(QWidget *parent) : QWidget(parent)
     ftpProc = new QProcess(this);
 
     connect(ftpProc, &QProcess::readyReadStandardOutput, this, [this]{
-        const QString out = QString::fromLocal8Bit(ftpProc->readAllStandardOutput()).trimmed();
-
-        if (out.isEmpty()) return;
-
         if (curlMode == CurlMode::Listing) {
-            listBuffer += out; // 先收集
+            listBuffer += ftpProc->readAllStandardOutput();
         } else {
-            const QString t = out.trimmed();
-            if (!t.isEmpty()) appendLog(t);
+            writeDownloadChunk(ftpProc, ftpPartFile_, ftpBytesRemaining_, ftpLimitExceeded_, ftpWriteError_);
         }
     });
     connect(ftpProc, &QProcess::readyReadStandardError, this, [this]{
@@ -136,6 +181,7 @@ FtpPage::FtpPage(QWidget *parent) : QWidget(parent)
         }
 
         ftpProcessStartFailureReported_ = true;
+        if (ftpPartFile_.isOpen()) ftpPartFile_.remove();
         const QString reason = QStringLiteral("Failed to start FTP download process: %1")
                 .arg(ftpProc ? ftpProc->errorString() : QStringLiteral("ftp process is null"));
         appendLog(reason);
@@ -158,6 +204,7 @@ FtpPage::FtpPage(QWidget *parent) : QWidget(parent)
         const bool ok = (st == QProcess::NormalExit && code == 0);
         ftpProgressBuffer_.clear();
         if (curlMode == CurlMode::Listing) {
+            listBuffer += ftpProc->readAllStandardOutput();
             if (!ok) {
                 setStatusText(QStringLiteral("列目录失败"));
                 appendLog(QStringLiteral("列目录失败（exit=%1）").arg(code));
@@ -166,13 +213,13 @@ FtpPage::FtpPage(QWidget *parent) : QWidget(parent)
             }
 
             // 解析 listBuffer：每行一个文件名
-            QStringList lines = listBuffer.split('\n', QString::SkipEmptyParts);
+            const QStringList lines = QString::fromUtf8(listBuffer).split('\n', QString::SkipEmptyParts);
             QStringList files;
             for (QString s : lines) {
                 s = s.trimmed();
                 if (s.isEmpty()) continue;
                 // --list-only 一般就是文件名；这里简单过滤一下
-                if (s == "." || s == "..") continue;
+                if (s == "." || s == ".." || s.contains('/') || s.contains('\\')) continue;
                 files << s;
             }
 
@@ -191,7 +238,30 @@ FtpPage::FtpPage(QWidget *parent) : QWidget(parent)
             return;
         }
 
-        // 下载单文件/目录中的某个文件
+        // 先接收并关闭最后一批数据；失败时保留原有的正式文件。
+        writeDownloadChunk(ftpProc, ftpPartFile_, ftpBytesRemaining_, ftpLimitExceeded_, ftpWriteError_);
+        if (ftpPartFile_.isOpen() && !ftpPartFile_.flush() && ftpWriteError_.isEmpty()) {
+            ftpWriteError_ = ftpPartFile_.errorString();
+        }
+        ftpPartFile_.close();
+        if (ftpLimitExceeded_ || (st == QProcess::NormalExit && code == 63)) {
+            QFile::remove(currentDownloadPartFile_);
+            curlMode = CurlMode::Idle;
+            clearAutoDownloadState();
+            reportStorageRejection(QFileInfo(currentDownloadLocalFile_).fileName(),
+                                   QStringLiteral("FTP 文件大小超过本次下载的安全容量"));
+            return;
+        }
+        if (!ftpWriteError_.isEmpty()) {
+            QFile::remove(currentDownloadPartFile_);
+            curlMode = CurlMode::Idle;
+            clearAutoDownloadState();
+            setStatusText(QStringLiteral("FTP下载写入失败"));
+            appendLog(ftpWriteError_);
+            emit ftpDownloadFailed(QFileInfo(currentDownloadLocalFile_).fileName(), ftpWriteError_);
+            return;
+        }
+
         if (ok) {
             appendLog(QStringLiteral("FTP本地下载成功"));
 
@@ -210,22 +280,15 @@ FtpPage::FtpPage(QWidget *parent) : QWidget(parent)
                 return;
             }
 
-            QString quotaError;
-            if (!StoragePolicy::canCommitMediaFile(
-                        finalFile, partFile, &quotaError)) {
+            if (!StoragePolicy::canWriteDownloadBytes(partFile, 0, kDownloadReserveBytes)) {
                 QFile::remove(partFile);
-                setStatusText(QStringLiteral("媒体目录容量不足"));
-                showToast(quotaError, 3500);
-                appendLog(quotaError);
-                emit ftpDownloadStorageRejected(
-                            QFileInfo(finalFile).fileName(), quotaError);
+                reportStorageRejection(QFileInfo(finalFile).fileName(), downloadSpaceError());
                 curlMode = CurlMode::Idle;
                 clearAutoDownloadState();
                 return;
             }
 
-            QFile::remove(finalFile);   // 若已有旧文件，先删
-            if (!QFile::rename(partFile, finalFile)) {
+            if (!publishDownload(partFile, finalFile)) {
                 setStatusText(QStringLiteral("下载完成但改名失败"));
                 appendLog(QStringLiteral("FTP下载完成，但rename失败：%1 -> %2").arg(partFile, finalFile));
                 emit ftpDownloadFailed(QFileInfo(finalFile).fileName(),
@@ -301,9 +364,13 @@ FtpPage::FtpPage(QWidget *parent) : QWidget(parent)
     // ---------- HTTP mp4 下载进程 ----------
     httpProc = new QProcess(this);
 
-    connect(httpProc, &QProcess::readyReadStandardOutput, this, [this]{
-        const QString out = QString::fromLocal8Bit(httpProc->readAllStandardOutput()).trimmed();
-        if (!out.isEmpty()) appendLog(QStringLiteral("[HTTP] %1").arg(out));
+    connect(httpProc, &QProcess::readyReadStandardOutput, this, &FtpPage::writeHttpDownloadChunk);
+    connect(httpProc, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
+        if (error != QProcess::FailedToStart) return;
+        httpDownloading_ = false;
+        httpPartFile_.remove();
+        setStatusText(QStringLiteral("HTTP下载进程启动失败"));
+        emit ftpDownloadFailed(QFileInfo(currentHttpDownloadLocalFile_).fileName(), httpProc->errorString());
     });
 
     connect(httpProc, &QProcess::readyReadStandardError, this, [this]{
@@ -315,53 +382,52 @@ FtpPage::FtpPage(QWidget *parent) : QWidget(parent)
     connect(httpProc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
             this, [this](int code, QProcess::ExitStatus st){
 
-        const bool ok = (st == QProcess::NormalExit && code == 0);
-
+        writeHttpDownloadChunk();
         const QString finalFile = currentHttpDownloadLocalFile_;
-        const QString partFile  = finalFile + ".part";
-
+        const QString name = QFileInfo(finalFile).fileName();
+        const QString partFile = httpPartFile_.fileName();
+        if (httpPartFile_.isOpen() && !httpPartFile_.flush() && httpWriteError_.isEmpty()) {
+            httpWriteError_ = httpPartFile_.errorString();
+        }
+        httpPartFile_.close();
         httpDownloading_ = false;
 
-        if (ok) {
-               QString quotaError;
-               if (!StoragePolicy::canCommitMediaFile(
-                           finalFile, partFile, &quotaError)) {
-                   QFile::remove(partFile);
-                   setStatusText(QStringLiteral("媒体目录容量不足"));
-                   showToast(quotaError, 3500);
-                   appendLog(quotaError);
-                   emit ftpDownloadStorageRejected(
-                               QFileInfo(finalFile).fileName(), quotaError);
-                   return;
-               }
-               // 用 rename 原子替换，避免半截文件
-               QFile::remove(finalFile); // 若存在旧文件，先删（也可以不删，用 rename 覆盖策略取决于系统）
-               if (QFile::rename(partFile, finalFile)) {
-                   setStatusText(QStringLiteral("HTTP下载完成"));
-                   showToast(QStringLiteral("下载完成：%1").arg(QFileInfo(finalFile).fileName()), 2500);
-                   appendLog(QStringLiteral("HTTP下载成功：%1").arg(finalFile));
-
-                   httpLastProgress_ = 100;
-                   emit ftpDownloadProgress(QFileInfo(finalFile).fileName(), 100);
-                   emit ftpDownloadFinished(finalFile);
-               } else {
-                   setStatusText(QStringLiteral("下载完成但改名失败"));
-                   showToast(QStringLiteral("下载完成但保存失败(重命名失败)"), 3000);
-                   appendLog(QStringLiteral("HTTP下载完成，但rename失败：%1 -> %2").arg(partFile, finalFile));
-
-                   emit ftpDownloadFailed(QFileInfo(finalFile).fileName(), QStringLiteral("Local renaming failed"));
-               }
-               return;
-           }
-
-        // 失败：保留 partFile 方便排查
-        setStatusText(QStringLiteral("HTTP下载失败"));
-        showToast(QStringLiteral("HTTP下载失败"), 2500);
-        appendLog(QStringLiteral("HTTP下载失败（exit=%1, %2）")
-                  .arg(code)
-                  .arg(st == QProcess::NormalExit ? "NormalExit" : "CrashExit"));
-
-        emit ftpDownloadFailed(QFileInfo(finalFile).fileName(), QStringLiteral("HTTP download failed（exit=%1）").arg(st));
+        if (httpLimitExceeded_ || (st == QProcess::NormalExit && code == 63)) {
+            QFile::remove(partFile);
+            reportStorageRejection(name, QStringLiteral("HTTP 文件大小超过本次下载的安全容量"));
+            return;
+        }
+        if (!httpWriteError_.isEmpty()) {
+            QFile::remove(partFile);
+            setStatusText(QStringLiteral("HTTP下载写入失败"));
+            appendLog(httpWriteError_);
+            emit ftpDownloadFailed(name, httpWriteError_);
+            return;
+        }
+        if (st != QProcess::NormalExit || code != 0) {
+            setStatusText(QStringLiteral("HTTP下载失败"));
+            showToast(QStringLiteral("HTTP下载失败"), 2500);
+            appendLog(QStringLiteral("HTTP下载失败（exit=%1）").arg(code));
+            emit ftpDownloadFailed(name, QStringLiteral("HTTP download failed (exit=%1)").arg(code));
+            return;
+        }
+        if (!StoragePolicy::canWriteDownloadBytes(partFile, 0, kDownloadReserveBytes)) {
+            QFile::remove(partFile);
+            reportStorageRejection(name, downloadSpaceError());
+            return;
+        }
+        if (!publishDownload(partFile, finalFile)) {
+            setStatusText(QStringLiteral("下载完成但改名失败"));
+            showToast(QStringLiteral("下载完成但保存失败(重命名失败)"), 3000);
+            emit ftpDownloadFailed(name, QStringLiteral("Local renaming failed"));
+            return;
+        }
+        setStatusText(QStringLiteral("HTTP下载完成"));
+        showToast(QStringLiteral("下载完成：%1").arg(name), 2500);
+        appendLog(QStringLiteral("HTTP下载成功：%1").arg(finalFile));
+        httpLastProgress_ = 100;
+        emit ftpDownloadProgress(name, 100);
+        emit ftpDownloadFinished(finalFile);
     });
 
 
@@ -752,23 +818,18 @@ void FtpPage::startFtpListDirByProcess(const QString &host, int port,
         return;
     }
 
-    // 如果进程在跑，先停
-    if (ftpProc->state() != QProcess::NotRunning) {
-        ftpProc->kill();
-    }
-
     // 组 URL
     bool encodedMode = false;
     const QString url = buildFtpUrl(host, port, dir, &encodedMode);
 
     // 组参数：列目录
     QStringList args;
-    args << "--ftp-ssl"
+    args << "--ftp-ssl" << "--globoff"
          << "--ftp-pasv"
          << "--insecure"          // 证书：二选一
          << "-u" << QString("%1:%2").arg(user, pass)
          << "--list-only"
-         << "-v"
+         << "--silent" << "--show-error"
          << url;
 
     // 切到 Listing 模式，清空 buffer
@@ -776,7 +837,7 @@ void FtpPage::startFtpListDirByProcess(const QString &host, int port,
     listBuffer.clear();
 
     setStatusText(QStringLiteral("正在列目录..."));
-    appendLog(QStringLiteral("列目录：%1 %2").arg(curlPath, args.join(' ')));
+    appendLog(QStringLiteral("列目录：%1").arg(url));
 
     FtpTransfer::start(ftpProc, curlPath, args);
 }
@@ -820,6 +881,7 @@ void FtpPage::startFtpDownloadByProcess(const QString &host, int port,
 {
     if (!ftpProc) {
         const QString reason = QStringLiteral("FTP download process is not initialized");
+        curlMode = CurlMode::Idle;
         clearAutoDownloadState();
         emit ftpDownloadFailed(QFileInfo(localPath).fileName(), reason);
         return;
@@ -846,12 +908,6 @@ void FtpPage::startFtpDownloadByProcess(const QString &host, int port,
         return;
     }
 
-    // 如果已有下载在跑，先停掉
-    if (ftpProc->state() != QProcess::NotRunning) {
-        appendLog(QStringLiteral("已有下载任务在执行，终止旧任务"));
-        ftpProc->kill();
-    }
-
     // 选择 curl 路径
     QString curlPath;
     if (QFileInfo("/usr/bin/curl").exists()) curlPath = "/usr/bin/curl";
@@ -860,6 +916,7 @@ void FtpPage::startFtpDownloadByProcess(const QString &host, int port,
         setStatusText(QStringLiteral("缺少 curl"));
         appendLog(QStringLiteral("系统找不到 curl"));
         appendLog(QStringLiteral("返回 530 TLS required，ftpget 不支持 TLS"));
+        curlMode = CurlMode::Idle;
         clearAutoDownloadState();
         emit ftpDownloadFailed(QFileInfo(localPath).fileName(), QStringLiteral("The system is lacking curl."));
         return;
@@ -873,30 +930,53 @@ void FtpPage::startFtpDownloadByProcess(const QString &host, int port,
     const QString partPath = localPath + ".part";
 
     // 清理上次残留的 part 文件
-    if (QFileInfo::exists(partPath)) {
-        QFile::remove(partPath);
+    const QFileInfo partInfo(partPath);
+    if ((partInfo.exists() || partInfo.isSymLink()) && !QFile::remove(partPath)) {
+        curlMode = CurlMode::Idle;
+        clearAutoDownloadState();
+        emit ftpDownloadFailed(fi.fileName(), QStringLiteral("无法清理 FTP 下载临时文件"));
+        return;
     }
 
     // curl 参数：
     // --ftp-ssl: 显式 FTPS（AUTH TLS）
     // --ftp-pasv: 被动模式（常见更稳）
     // -u user:pass
-    // -o localPath
+    // 由 Qt 限额写入响应体，curl 的 --max-filesize 用于已知长度时提前拒绝。
     // --connect-timeout: 连接超时
     // --max-time: 总超时（大文件可以不设或设大点）
-    // -v: 输出详细日志，便于定位 530/证书等问题
     QStringList args;
-    args << "--ftp-ssl"
+    args << "--ftp-ssl" << "--globoff"
          << "--ftp-pasv"
          << "-u" << QString("%1:%2").arg(user, pass)
-         << "-o" << partPath
          << "--connect-timeout" << "8"
          << "--speed-limit" << "1"
          << "--speed-time" << "60"
          << "--max-time" << "0"
-         << "-v"
          << "--insecure"    // 临时跳过证书校验
          << url;
+
+    // 目录中的每个文件和异步预检后的文件都以正式开始时的容量为准。
+    const qint64 writable = StoragePolicy::downloadWritableBytes(localPath, kDownloadReserveBytes);
+    if (writable <= 0) {
+        curlMode = CurlMode::Idle;
+        clearAutoDownloadState();
+        reportStorageRejection(fi.fileName(), downloadSpaceError());
+        return;
+    }
+    args.insert(args.size() - 1, QStringLiteral("--max-filesize"));
+    args.insert(args.size() - 1, QString::number(writable));
+
+    ftpPartFile_.setFileName(partPath);
+    if (!ftpPartFile_.open(QIODevice::WriteOnly)) {
+        curlMode = CurlMode::Idle;
+        clearAutoDownloadState();
+        emit ftpDownloadFailed(fi.fileName(), ftpPartFile_.errorString());
+        return;
+    }
+    ftpBytesRemaining_ = writable;
+    ftpLimitExceeded_ = false;
+    ftpWriteError_.clear();
 
     // 记录正式文件和临时文件下载的本地文件路径，finished(ok) 时用它触发播放
     currentDownloadLocalFile_ = localPath;
@@ -907,7 +987,7 @@ void FtpPage::startFtpDownloadByProcess(const QString &host, int port,
     ftpProcessStartFailureReported_ = false;
 
     setStatusText(QStringLiteral("正在下载..."));
-    appendLog(QStringLiteral("执行：%1 %2").arg(curlPath, args.join(' ')));
+    appendLog(QStringLiteral("FTP下载：%1").arg(url));
     appendLog(QStringLiteral("FTP下载采用临时文件：%1 -> %2").arg(partPath, localPath));
 
     emit ftpDownloadStarted(QFileInfo(localPath).fileName());
@@ -1051,6 +1131,15 @@ void FtpPage::onDownloadClicked()
     if (remotePathEdit) remotePathEdit->setText(remotePath);
     if (localPathEdit)  localPathEdit->setText(localDir);   // 放目录
 
+    if (httpDownloading_ || autoDownloadInProgress_ || curlMode != CurlMode::Idle
+            || (ftpProc && ftpProc->state() != QProcess::NotRunning)) {
+        const QString reason = QStringLiteral("已有文件下载或预检查任务正在执行");
+        setStatusText(reason);
+        appendLog(reason);
+        emit ftpDownloadRequestRejected(QFileInfo(remotePath).fileName(), reason);
+        return;
+    }
+
     if (isRemoteDir(remotePath)) {
         dirHost = host;
         dirPort = port;
@@ -1076,16 +1165,6 @@ void FtpPage::onDownloadClicked()
     // 下载前的远端大小和空间检查必须异步执行，不能在 Qt 主线程中
     // waitForFinished；否则网络响应慢时会连同摄像头预览一起冻结最多 20 秒。
     const QString displayName = QFileInfo(finalLocalPath).fileName();
-    if (autoDownloadInProgress_ ||
-            (ftpPreflightProc_ && ftpPreflightProc_->state() != QProcess::NotRunning) ||
-            (ftpProc && ftpProc->state() != QProcess::NotRunning)) {
-        const QString reason = QStringLiteral("已有 FTP 下载或预检查任务正在执行");
-        setStatusText(reason);
-        appendLog(reason);
-        emit ftpDownloadRequestRejected(displayName, reason);
-        return;
-    }
-
     autoDownloadInProgress_ = true;
     const QString taskKey = QStringLiteral("manual|%1|%2|%3|%4")
             .arg(host)
@@ -1138,11 +1217,16 @@ static bool looksLikeFileSegment(const QString& name)
     return kKnownFileExts.contains(ext);
 }
 
-/** @brief 将本地输入归一化为目录，并兼容误填文件路径。 */
+/**
+ * @brief 归一化本地 FTP 目录，识别旧媒体路径及误填的文件名。
+ * @param[in] rawLocalPath 本地输入或配置路径。
+ * @param[in] remotePath 用于识别本地尾部误填的远端文件名。
+ * @return 规范化目录，空输入返回空字符串。
+ */
 QString FtpPage::normalizeLocalDirPath(const QString& rawLocalPath,
                                        const QString& remotePath) const
 {
-    QString p = cleanPathSeparators(rawLocalPath);
+    QString p = Rk3566Platform::storedMediaPath(cleanPathSeparators(rawLocalPath));
     if (p.isEmpty()) return QString();
 
     QString remoteName = fileNameFromRemotePath(remotePath);
@@ -1455,190 +1539,13 @@ void FtpPage::onStopStreamClicked()
 }
 
 
-// 查 FTP 文件大小
-qint64 FtpPage::queryFtpRemoteFileSize(const QString &host, int port, const QString &user, const QString &pass,
-                                        const QString &remotePath, QString *errorMessage) const
+void FtpPage::reportStorageRejection(const QString &fileName, const QString &reason)
 {
-    QString curlPath;
-    if (QFileInfo("/usr/bin/curl").exists()) curlPath = "/usr/bin/curl";
-    else if (QFileInfo("/bin/curl").exists()) curlPath = "/bin/curl";
-    else {
-        if (errorMessage) *errorMessage = QStringLiteral("The system is lacking curl.");
-        return -1;
-    }
-
-    bool encodedMode = false;
-    const QString url = buildFtpUrl(host, port, remotePath, &encodedMode);
-
-    QProcess proc;
-    QStringList args;
-    args << "--ftp-ssl"
-         << "--ftp-pasv"
-         << "--insecure"
-         << "-u" << QString("%1:%2").arg(user, pass)
-         << "--head"
-         << "--silent"
-         << "--show-error"
-         << url;
-
-    proc.start(curlPath, args);
-    if (!proc.waitForStarted(3000)) {
-        if (errorMessage) *errorMessage = QStringLiteral("Failed to start the curl command to query the size of the remote file");
-        return -1;
-    }
-
-    if (!proc.waitForFinished(20000)) {
-        proc.kill();
-        if (errorMessage) *errorMessage = QStringLiteral("Timeout for querying the size of remote files");
-        return -1;
-    }
-
-    const QString stdOut = QString::fromLocal8Bit(proc.readAllStandardOutput());
-    const QString stdErr = QString::fromLocal8Bit(proc.readAllStandardError());
-    const QString allText = stdOut + "\n" + stdErr;
-
-    if (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0) {
-        if (errorMessage) {
-            *errorMessage = QStringLiteral("Failed to query the size of the remote file（exit=%1） %2")
-                    .arg(proc.exitCode())
-                    .arg(stdErr.trimmed());
-        }
-        return -1;
-    }
-
-    QRegularExpression re("Content-Length\\s*:\\s*(\\d+)", QRegularExpression::CaseInsensitiveOption);
-    QRegularExpressionMatch m = re.match(allText);
-    if (!m.hasMatch()) {
-        if (errorMessage) *errorMessage = QStringLiteral("Failed to obtain the size of the remote file");
-        return -1;
-    }
-
-    bool ok = false;
-    const qint64 size = m.captured(1).toLongLong(&ok);
-    if (!ok || size < 0) {
-        if (errorMessage) *errorMessage = QStringLiteral("Failed to parse the size of the remote file");
-        return -1;
-    }
-
-    return size;
+    setStatusText(QStringLiteral("存储空间不足"));
+    showToast(reason, 3500);
+    appendLog(reason);
+    emit ftpDownloadStorageRejected(fileName, reason);
 }
-
-
-// 查本地剩余空间
-qint64 FtpPage::queryAvailableBytesForPath(const QString &localPath,
-                                            qint64 *totalBytes,
-                                            QString *errorMessage) const
-{
-    if (totalBytes) *totalBytes = 0;
-
-    QFileInfo fi(localPath);
-    QString dirPath = fi.isDir() ? fi.absoluteFilePath() : fi.absolutePath();
-    if (dirPath.isEmpty()) {
-        if (errorMessage) *errorMessage = QStringLiteral("Local path is illegal");
-        return -1;
-    }
-
-    QStorageInfo storage(dirPath);
-    storage.refresh();
-
-    if (!storage.isValid() || !storage.isReady()) {
-        if (errorMessage) {
-            *errorMessage = QStringLiteral("Unable to obtain storage space information：%1").arg(dirPath);
-        }
-        return -1;
-    }
-
-    if (totalBytes) *totalBytes = storage.bytesTotal();
-    return storage.bytesAvailable();
-}
-
-
-/** @brief 比较远端大小和本地余量，并统一记录和发送拒绝原因。 */
-bool FtpPage::checkDownloadSpaceOrReport(const QString &host, int port,
-                                         const QString &user, const QString &pass,
-                                         const QString &remotePath,
-                                         const QString &localPath,
-                                         const QString &displayName)
-{
-    QString err;
-
-    qint64 totalBytes = 0;
-    const qint64 availableBytes = queryAvailableBytesForPath(localPath, &totalBytes, &err);
-    if (availableBytes < 0 || totalBytes <= 0 || availableBytes > totalBytes) {
-        if (err.isEmpty()) {
-            err = QStringLiteral("存储空间数据无效");
-        }
-        setStatusText(QStringLiteral("存储空间检查失败"));
-        appendLog(QStringLiteral("存储空间检查失败：%1").arg(err));
-        showToast(QStringLiteral("存储空间检查失败"), 2500);
-        emit ftpDownloadFailed(displayName, err);
-        return false;
-    }
-
-    const qint64 usedBytes = totalBytes - availableBytes;
-    const int usedPercent = static_cast<int>((usedBytes * 100) / totalBytes);
-    const qint64 maxAllowedUsedBytes = (totalBytes * 90) / 100;
-    const qint64 bytesBeforeDownloadLimit = qMax<qint64>(0, maxAllowedUsedBytes - usedBytes);
-
-    if (usedBytes >= maxAllowedUsedBytes) {
-        const QString msg = QStringLiteral("存储空间不足：当前已使用%1%")
-                .arg(usedPercent);
-        setStatusText(QStringLiteral("存储空间不足"));
-        showToast(QStringLiteral("存储空间不足"), 3000);
-        appendLog(msg);
-        emit ftpDownloadFailed(displayName, msg);
-        return false;
-    }
-
-    const qint64 remoteSize = queryFtpRemoteFileSize(host, port, user, pass, remotePath, &err);
-    if (remoteSize < 0) {
-        setStatusText(QStringLiteral("下载前校验失败"));
-        appendLog(QStringLiteral("下载前校验失败：%1").arg(err));
-        showToast(QStringLiteral("下载前校验失败"), 2500);
-        emit ftpDownloadFailed(displayName, err);
-        return false;
-    }
-
-    QString quotaError;
-    if (!StoragePolicy::canStoreMediaFile(localPath, remoteSize, &quotaError)) {
-        setStatusText(QStringLiteral("媒体目录容量不足"));
-        showToast(quotaError, 3500);
-        appendLog(quotaError);
-        emit ftpDownloadStorageRejected(displayName, quotaError);
-        return false;
-    }
-
-    if (remoteSize > bytesBeforeDownloadLimit) {
-        const QString msg = QStringLiteral("存储空间不足：文件大小=%1 bytes，仅可写入=%2 bytes")
-                .arg(remoteSize)
-                .arg(bytesBeforeDownloadLimit);
-        setStatusText(QStringLiteral("存储空间不足"));
-        showToast(QStringLiteral("存储空间不足"), 3000);
-        appendLog(msg);
-        emit ftpDownloadFailed(displayName, msg);
-        return false;
-    }
-
-    // 预留 10MB 安全余量，避免文件系统波动/日志/rename 等边界问题
-    static const qint64 kSafetyMarginBytes = 10LL * 1024 * 1024;
-    if (remoteSize > availableBytes - kSafetyMarginBytes) {
-        const QString msg = QStringLiteral("Insufficient storage space: File size=%1 bytes，space available=%2 bytes")
-                .arg(remoteSize)
-                .arg(availableBytes);
-
-        setStatusText(QStringLiteral("存储空间不足"));
-        showToast(QStringLiteral("存储空间不足"), 3000);
-        appendLog(msg);
-        emit ftpDownloadFailed(displayName, msg);
-        return false;
-    }
-
-    appendLog(QStringLiteral("下载前校验通过：文件大小=%1 bytes，可用空间=%2 bytes")
-              .arg(remoteSize)
-              .arg(availableBytes));
-    return true;
-}
-
 
 // ------------------------------
 // worker -> UI
@@ -1805,7 +1712,7 @@ void FtpPage::startTcpTest(const QString &host, int port)
 }
 
 
-/** @brief 根据 URL 文件名和视频目录选择安全的本地保存路径。 */
+/** @brief 读取输入的保存路径并映射业务媒体目录。 */
 QString FtpPage::pickHttpSaveFilePath(const QString& urlStr)
 {
     // 优先使用你页面上“Local Path”（如果是目录就拼文件名）
@@ -1819,22 +1726,14 @@ QString FtpPage::pickHttpSaveFilePath(const QString& urlStr)
         if (localPathEdit) localPathEdit->setText(base);
     }
 
-    QFileInfo baseInfo(base);
-    QDir saveDir;
-
-    // base 是目录：直接用
-    if (baseInfo.exists() && baseInfo.isDir()) {
-        saveDir = QDir(base);
-    } else if (base.endsWith('/')) {
-        saveDir = QDir(base);
-        if (!saveDir.exists()) saveDir.mkpath(".");
-    } else {
-        // base 是一个文件路径：直接返回（用户自己指定文件名）
-        QFileInfo fi(base);
-        QDir d = fi.dir();
-        if (!d.exists()) d.mkpath(".");
+    base = cleanPathSeparators(base);
+    const bool directoryHint = base.endsWith('/');
+    base = Rk3566Platform::storedMediaPath(base);
+    const QFileInfo baseInfo(base);
+    if (baseInfo.isFile() || (!baseInfo.isDir() && !directoryHint && !baseInfo.suffix().isEmpty())) {
         return base;
     }
+    const QDir saveDir(base);
 
     // 从 URL 提取文件名
     QUrl u(urlStr);
@@ -1853,10 +1752,14 @@ QString FtpPage::pickHttpSaveFilePath(const QString& urlStr)
 /** @brief 通过 curl 子进程下载 HTTP 媒体文件。 */
 void FtpPage::startHttpMp4DownloadByProcess(const QString& urlStr, const QString& localFile)
 {
-    if (!acquireTransferLock(QFileInfo(localFile).fileName())) return;
-    emit ftpDownloadStarted(QFileInfo(localFile).fileName());
-
+    const QString name = QFileInfo(localFile).fileName();
     if (!httpProc) return;
+    if (httpDownloading_ || autoDownloadInProgress_ || curlMode != CurlMode::Idle
+            || (ftpProc && ftpProc->state() != QProcess::NotRunning)) {
+        emit ftpDownloadRequestRejected(name, QStringLiteral("已有文件下载或预检查任务正在执行"));
+        return;
+    }
+    if (!acquireTransferLock(name)) return;
 
     // 1) curl 路径
     QString curlPath;
@@ -1884,32 +1787,32 @@ void FtpPage::startHttpMp4DownloadByProcess(const QString& urlStr, const QString
         return;
     }
 
-    // 3) 确保目录存在
-    QFileInfo fi(localFile);
-    QDir d = fi.dir();
-    if (!d.exists()) d.mkpath(".");
-
-    // 4) 临时文件 + 最终文件
-    const QString partFile = localFile + ".part";
-
-    const qint64 mediaWritable = StoragePolicy::mediaWritableBytes(localFile);
-    if (mediaWritable == 0) {
-        const qint64 gibibyte = 1024LL * 1024LL * 1024LL;
-        const QString reason = QStringLiteral(
-                    "媒体目录容量不足：视频和图片总量限制为 %1 GiB")
-                .arg(StoragePolicy::mediaLimitBytes() / gibibyte);
-        setStatusText(QStringLiteral("媒体目录容量不足"));
-        showToast(reason, 3500);
-        appendLog(reason);
-        emit ftpDownloadStorageRejected(QFileInfo(localFile).fileName(), reason);
+    QDir dir = QFileInfo(localFile).absoluteDir();
+    if (!dir.exists() && !dir.mkpath(QStringLiteral("."))) {
+        emit ftpDownloadFailed(name, QStringLiteral("无法创建 HTTP 下载目录"));
         return;
     }
 
-    // 5) 若已有任务在跑，先终止
-    if (httpProc->state() != QProcess::NotRunning) {
-        appendLog(QStringLiteral("已有HTTP下载任务，终止旧任务"));
-        httpProc->kill();
+    const QString partFile = localFile + QStringLiteral(".part");
+    const QFileInfo partInfo(partFile);
+    if ((partInfo.exists() || partInfo.isSymLink()) && !QFile::remove(partFile)) {
+        emit ftpDownloadFailed(name, QStringLiteral("无法清理 HTTP 下载临时文件"));
+        return;
     }
+    const qint64 writable = StoragePolicy::downloadWritableBytes(localFile, kDownloadReserveBytes);
+    if (writable <= 0) {
+        reportStorageRejection(name, downloadSpaceError());
+        return;
+    }
+
+    httpPartFile_.setFileName(partFile);
+    if (!httpPartFile_.open(QIODevice::WriteOnly)) {
+        emit ftpDownloadFailed(name, httpPartFile_.errorString());
+        return;
+    }
+    httpBytesRemaining_ = writable;
+    httpLimitExceeded_ = false;
+    httpWriteError_.clear();
 
     // 6) 记录状态
     currentHttpDownloadLocalFile_ = localFile;
@@ -1921,35 +1824,40 @@ void FtpPage::startHttpMp4DownloadByProcess(const QString& urlStr, const QString
     // -L 跟随重定向
     // -f/--fail：HTTP 4xx/5xx 直接失败（否则会把错误页保存下来）
     // --show-error：失败时输出原因
-    // -o partFile：先写 part，成功再改名
+    // 响应体通过标准输出写入 .part，兼容无 Content-Length 的服务器。
     QStringList args;
-    args << "-L"
+    args << "-L" << "--globoff"
          << "--fail"
          << "--show-error"
-         << "-o" << partFile
          << "--connect-timeout" << "8"
          << "--max-time" << "0"
+         << "--max-filesize" << QString::number(writable)
          << url;
-    if (mediaWritable > 0) {
-        args.insert(args.size() - 1, QStringLiteral("--max-filesize"));
-        args.insert(args.size() - 1, QString::number(mediaWritable));
-    }
 
     setStatusText(QStringLiteral("正在HTTP下载..."));
     showToast(QStringLiteral("开始HTTP下载..."), 1500);
     appendLog(QStringLiteral("HTTP下载：%1 %2").arg(curlPath, args.join(' ')));
 
-    emit ftpDownloadProgress(QFileInfo(localFile).fileName(), 0);
+    emit ftpDownloadStarted(name);
+    emit ftpDownloadProgress(name, 0);
 
     // 8) 开始
     FtpTransfer::start(httpProc, curlPath, args);
 }
 
-/** @brief 从设置中加载最近使用的流地址。 */
+/** @brief 在 Qt 线程收取响应体并执行写入上限；超过预算的块不落盘。 */
+void FtpPage::writeHttpDownloadChunk()
+{
+    writeDownloadChunk(httpProc, httpPartFile_, httpBytesRemaining_, httpLimitExceeded_, httpWriteError_);
+}
+
+/** @brief 共享模式仅从数据分区加载历史，单分区沿用原 Qt 设置。 */
 void FtpPage::loadStreamUrlHistory()
 {
-    QSettings s; // 默认 OrganizationName/ApplicationName
-    streamUrlHistory_ = s.value(kStreamUrlHistoryKey).toStringList();
+    const auto settings = Rk3566Platform::usesSharedDataStorage()
+            ? std::make_unique<QSettings>(streamHistoryPath(), QSettings::IniFormat)
+            : std::make_unique<QSettings>();
+    streamUrlHistory_ = settings->value(kStreamUrlHistoryKey).toStringList();
 
     // 清理空项 + 截断
     QStringList cleaned;
@@ -1964,8 +1872,14 @@ void FtpPage::loadStreamUrlHistory()
 /** @brief 持久化最多八条流地址历史。 */
 void FtpPage::saveStreamUrlHistory()
 {
-    QSettings s;
-    s.setValue(kStreamUrlHistoryKey, streamUrlHistory_);
+    const auto settings = Rk3566Platform::usesSharedDataStorage()
+            ? std::make_unique<QSettings>(streamHistoryPath(), QSettings::IniFormat)
+            : std::make_unique<QSettings>();
+    settings->setValue(kStreamUrlHistoryKey, streamUrlHistory_);
+    settings->sync();
+    if (settings->status() != QSettings::NoError) {
+        appendLog(QStringLiteral("直播地址历史写入失败"));
+    }
 }
 
 /** @brief 去重后把地址移到历史首位。 */
@@ -2188,7 +2102,7 @@ void FtpPage::startAutoDownloadPreflight(const QString &host, int port,
     const QString url = buildFtpUrl(host, port, remotePath, &encodedMode);
 
     QStringList args;
-    args << "--ftp-ssl"
+    args << "--ftp-ssl" << "--globoff"
          << "--ftp-pasv"
          << "--insecure"
          << "-u" << QString("%1:%2").arg(user, pass)
@@ -2269,58 +2183,18 @@ void FtpPage::handleAutoDownloadPreflightFinished(int exitCode, QProcess::ExitSt
         return;
     }
 
-    QString storageError;
-    qint64 totalBytes = 0;
-    const qint64 availableBytes = queryAvailableBytesForPath(localPath, &totalBytes, &storageError);
-    if (availableBytes < 0 || totalBytes <= 0 || availableBytes > totalBytes) {
-        failAutoDownloadPreflight(storageError.isEmpty()
-                                  ? QStringLiteral("Invalid storage space information")
-                                  : storageError);
-        return;
-    }
-
-    const qint64 usedBytes = totalBytes - availableBytes;
-    const int usedPercent = static_cast<int>((usedBytes * 100) / totalBytes);
-    const qint64 maxAllowedUsedBytes = (totalBytes * 90) / 100;
-    const qint64 bytesBeforeDownloadLimit = qMax<qint64>(0, maxAllowedUsedBytes - usedBytes);
-    static const qint64 kSafetyMarginBytes = 10LL * 1024 * 1024;
-
-    QString storageReason;
-    if (usedBytes >= maxAllowedUsedBytes) {
-        storageReason = QStringLiteral("存储空间不足：当前已使用%1%，已达到90%下载保护阈值")
-                .arg(usedPercent);
-    } else if (remoteSize > bytesBeforeDownloadLimit) {
-        storageReason = QStringLiteral("存储空间不足：文件大小=%1 bytes，90%阈值前仅可写入=%2 bytes")
-                .arg(remoteSize)
-                .arg(bytesBeforeDownloadLimit);
-    } else if (remoteSize > availableBytes - kSafetyMarginBytes) {
-        storageReason = QStringLiteral("存储空间不足：文件大小=%1 bytes，可用空间=%2 bytes")
-                .arg(remoteSize)
-                .arg(availableBytes);
-    }
-
-    if (!storageReason.isEmpty()) {
+    const qint64 writable = StoragePolicy::downloadWritableBytes(localPath, kDownloadReserveBytes);
+    if (writable <= 0 || remoteSize > writable) {
+        const QString storageReason = QStringLiteral("存储空间不足：%1% 下载保护阈值内可再写 %2 字节，文件为 %3 字节")
+                .arg(StoragePolicy::DownloadUsageLimitPercent).arg(qMax<qint64>(0, writable)).arg(remoteSize);
         clearAutoDownloadState();
-        setStatusText(QStringLiteral("存储空间不足"));
-        showToast(QStringLiteral("存储空间不足"), 3000);
-        appendLog(storageReason);
-        emit ftpDownloadStorageRejected(displayName, storageReason);
+        reportStorageRejection(displayName, storageReason);
         return;
     }
 
-    if (!StoragePolicy::canStoreMediaFile(
-                localPath, remoteSize, &storageReason)) {
-        clearAutoDownloadState();
-        setStatusText(QStringLiteral("媒体目录容量不足"));
-        showToast(storageReason, 3500);
-        appendLog(storageReason);
-        emit ftpDownloadStorageRejected(displayName, storageReason);
-        return;
-    }
-
-    appendLog(QStringLiteral("FTP下载预检查通过：远端大小=%1 bytes，可用空间=%2 bytes")
+    appendLog(QStringLiteral("FTP下载预检查通过：远端大小=%1 bytes，可下载空间=%2 bytes")
               .arg(remoteSize)
-              .arg(availableBytes));
+              .arg(writable));
 
     startFtpDownloadByProcess(host, port, user, pass, remotePath, localPath);
 }
@@ -2417,8 +2291,9 @@ void FtpPage::startAutoDownloadFromConfig()
         appendLog(QStringLiteral("自动下载忽略：相同任务正在进行中"));
         return;
     }
-    if (autoDownloadInProgress_) {
-        appendLog(QStringLiteral("自动下载忽略：已有自动下载任务正在执行"));
+    if (autoDownloadInProgress_ || httpDownloading_ || curlMode != CurlMode::Idle
+            || (ftpProc && ftpProc->state() != QProcess::NotRunning)) {
+        appendLog(QStringLiteral("自动下载忽略：已有文件下载任务正在执行"));
         return;
     }
 
@@ -2429,33 +2304,6 @@ void FtpPage::startAutoDownloadFromConfig()
 
     autoDownloadInProgress_ = true;
     activeAutoDownloadKey_ = taskKey;
-
-    QString storageError;
-    qint64 totalBytes = 0;
-    const qint64 availableBytes = queryAvailableBytesForPath(finalLocalPath, &totalBytes, &storageError);
-    if (availableBytes < 0 || totalBytes <= 0 || availableBytes > totalBytes) {
-        clearAutoDownloadState();
-        const QString reason = storageError.isEmpty()
-                ? QStringLiteral("Invalid storage space information")
-                : storageError;
-        appendLog(reason);
-        emit ftpDownloadRequestRejected(displayName, reason);
-        return;
-    }
-
-    const qint64 usedBytes = totalBytes - availableBytes;
-    const qint64 maxAllowedUsedBytes = (totalBytes * 90) / 100;
-    if (usedBytes >= maxAllowedUsedBytes) {
-        const int usedPercent = static_cast<int>((usedBytes * 100) / totalBytes);
-        const QString reason = QStringLiteral("存储空间不足：当前已使用%1%，已达到90%下载保护阈值")
-                .arg(usedPercent);
-        clearAutoDownloadState();
-        setStatusText(QStringLiteral("存储空间不足"));
-        showToast(QStringLiteral("存储空间不足"), 3000);
-        appendLog(reason);
-        emit ftpDownloadStorageRejected(displayName, reason);
-        return;
-    }
 
     startAutoDownloadPreflight(host, port, user, pass, remotePath,
                                finalLocalPath, displayName, taskKey);

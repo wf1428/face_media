@@ -3,12 +3,27 @@
  * @brief 在后台兼容解析mqttd标准信封、字符串payload及旧格式消息。
  * @author Du lin
  * @date 2026-11-03
- * @note 最近修改：2026-11-05；修改人：Du lin；广播文件配置和补发消息的RX日志仅保留摘要，避免输出FTP凭据。
+ * @note 最近修改：2026-11-18；修改人：Du lin；OTA 帧关闭正文摘要，并在 Qt 5 JSON 解析前保护 long 任务号精度。
  */
 #include "mqttpacketparser.h"
+#include "components/ota/ota_protocol.h"
 #include <QJsonDocument>
 #include <QJsonParseError>
 namespace {
+/** @brief 先识别 method，再仅为 OTA 重解析 long token，其他协议字段类型不变。
+ * @param json 待解析的 UTF-8 对象或 IPC 信封。
+ * @param error 解析结果，沿用 QJsonDocument 的错误行为。
+ * @return 标准 JSON 文档；仅 OTA taskId 使用内部十进制字符串。
+ */
+QJsonDocument parsePreservingOtaTask(const QByteArray &json, QJsonParseError *error)
+{
+    auto document = QJsonDocument::fromJson(json, error);
+    const auto object = document.object();
+    if (object.value("method").toString().startsWith("ota.")
+            || object.value("payload").toObject().value("method").toString().startsWith("ota."))
+        document = QJsonDocument::fromJson(OtaProtocol::preserveTaskIds(json), error);
+    return document;
+}
 /**
  * @brief 从格式损坏的 mqttd 消息中尝试提取 topic 与 payload 对象。
  *
@@ -97,7 +112,7 @@ static bool extractPayloadObjectFromBrokenMsg(const QByteArray& raw,
 
     // 4) 对截取出的 payload JSON 进行标准解析
     QJsonParseError e2;
-    QJsonDocument d2 = QJsonDocument::fromJson(payloadJson, &e2);
+    QJsonDocument d2 = parsePreservingOtaTask(payloadJson, &e2);
     if (e2.error != QJsonParseError::NoError || !d2.isObject()) {
         errOut = QString("payload JSON 解析失败：%1").arg(e2.errorString());
         return false;
@@ -145,7 +160,7 @@ static bool parseTopicJsonLine(const QByteArray &raw,
     const QByteArray payloadJson = raw.mid(lb, rb - lb + 1).trimmed();
 
     QJsonParseError e;
-    QJsonDocument doc = QJsonDocument::fromJson(payloadJson, &e);
+    QJsonDocument doc = parsePreservingOtaTask(payloadJson, &e);
     if (e.error != QJsonParseError::NoError || !doc.isObject()) {
         return false;
     }
@@ -160,31 +175,34 @@ static bool parseTopicJsonLine(const QByteArray &raw,
 MqttParsedPacket parseMqttPacket(const QByteArray &input)
 {
     MqttParsedPacket result;const auto raw=input.trimmed();
+    const bool ota = raw.contains("ota.");
     result.display=raw.size()>16384 ? QStringLiteral("RX: large MQTT frame, bytes=%1").arg(raw.size()) : QStringLiteral("RX: %1").arg(QString::fromUtf8(raw));
     if (raw.contains("broadcastSet") || raw.contains("broadcastAudioSync"))
         result.display = QStringLiteral("RX: broadcast file configuration, bytes=%1").arg(raw.size());
+    if (ota) result.display.clear(); // No in-progress OTA journal/file log, including credentials.
     if(raw.isEmpty() || raw.startsWith('[')) return result;
     QString topic,error;QJsonObject payload;
+    const auto quietOta = [&result](const QJsonObject &body) { if (body.value("method").toString().startsWith("ota.")) result.display.clear(); };
     if(!raw.startsWith('{')) {
         if(!parseTopicJsonLine(raw,topic,payload)) { result.error=QStringLiteral("不是有效的 topic+JSON 行");return result; }
-        result.object={{"type","msg"},{"topic",topic},{"payload",payload}};return result;
+        result.object={{"type","msg"},{"topic",topic},{"payload",payload}};quietOta(payload);return result;
     }
-    QJsonParseError failure;const auto document=QJsonDocument::fromJson(raw,&failure);
+    QJsonParseError failure;const auto document=parsePreservingOtaTask(raw,&failure);
     if(failure.error!=QJsonParseError::NoError || !document.isObject()) {
         if(extractPayloadObjectFromBrokenMsg(raw,topic,payload,error)) result.object={{"type","msg"},{"topic",topic},{"payload",payload}};
         else result.error=QStringLiteral("JSON 解析失败：%1；fallback也失败：%2").arg(failure.errorString(),error);
-        return result;
+        quietOta(payload);return result;
     }
     result.object=document.object();
     if(result.object.value("type").toString()!=QStringLiteral("msg")) return result;
     const auto value=result.object.value("payload");
-    if(value.isObject()) return result;
+    if(value.isObject()) { quietOta(value.toObject()); return result; }
     if(!value.isString()) { result.error=QStringLiteral("msg payload 不是 object/string，已忽略");result.object={};return result; }
     const auto text=value.toString().trimmed();
     if(!text.startsWith('{') || !text.endsWith('}')) { result.error=QStringLiteral("msg payload 不是 JSON object 字符串，已忽略");result.object={};return result; }
-    const auto nested=QJsonDocument::fromJson(text.toUtf8(),&failure);
+    const auto nested=parsePreservingOtaTask(text.toUtf8(),&failure);
     if(failure.error!=QJsonParseError::NoError || !nested.isObject()) {
         result.error=QStringLiteral("msg payload 二次解析失败：%1").arg(failure.errorString());result.object={};return result;
     }
-    result.object.insert("payload",nested.object());return result;
+    result.object.insert("payload",nested.object());quietOta(nested.object());return result;
 }

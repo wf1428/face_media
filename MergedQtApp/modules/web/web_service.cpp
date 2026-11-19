@@ -3,7 +3,7 @@
  * @brief Web 命令协调；不链接 HTTP 库、不控制播放/空调/电梯、不发送 MQTT。
  * @author Du lin
  * @date 2026-10-09
- * @note 最近修改：2026-10-23；修改人：Du lin；增加人员图片归档上传及异步展开，复用原账号匹配和防重入库，保留媒体限制及存储空间检查。
+ * @note 最近修改：2026-11-17；修改人：Du lin；网页视频和小图使用目标分区实际剩余空间，并只扣除上传任务尚未写入的预留字节。
  */
 
 #include "web_service.h"
@@ -162,7 +162,7 @@ QJsonObject WebService::publicTask(const QVariantMap &task) const
     result.remove("final_path");
     result.remove("owner_id");
     if (task.value("kind") == "resource_package" && task.value("state") == "READY") {
-        QFile status(task.value("part_path").toString() + ".result.json");
+        QFile status(Rk3566Platform::dataPath(task.value("part_path").toString()) + ".result.json");
         if (status.open(QIODevice::ReadOnly)) {
             const auto details = QJsonDocument::fromJson(status.readAll()).object();
             for (const QString &key : {QStringLiteral("updatedDirectories"),
@@ -192,17 +192,18 @@ QString WebService::pictureDirectory() const
 QString WebService::taskRoot(const QVariantMap &task) const
 {
     const QString kind = task.value("kind").toString();
-    if (kind == "ad_image" && MediaContentPolicy::isInDirectory(task.value("final_path").toString(), pictureDirectory()))
+    if (kind == "ad_image" && MediaContentPolicy::isInDirectory(Rk3566Platform::dataPath(task.value("final_path").toString()), pictureDirectory()))
         return pictureDirectory();
     return kind == "video" || kind == "ad_image" ? config_.media : config_.imports;
 }
 
 /**
- * @brief 校验已占用空间、未完成上传预留及新增资源所需字节。
- * @param kind 资源或任务类型，用于选择目录、配额和校验规则。
- * @param incoming 本次新增资源大小，单位为字节。
+ * @brief 校验实际空闲空间、未落盘的上传预留和新增资源大小。
+ * @param kind 任务类型，用于选择容量校验规则。
+ * @param incoming 新增预留的字节数。
+ * @param targetRoot 视频或小图的实际目标根目录。
  */
-void WebService::checkBudget(const QString &kind, qint64 incoming)
+void WebService::checkBudget(const QString &kind, qint64 incoming, const QString &targetRoot)
 {
     if (kind == "resource_package") {
         QStorageInfo storage(config_.imports);
@@ -212,19 +213,20 @@ void WebService::checkBudget(const QString &kind, qint64 incoming)
             throw WebError(507, QStringLiteral("资源包存储空间不足"));
         return; // 展开空间由独立进程按目标 eMMC 的实际剩余空间逐项核对。
     }
-    const bool video = kind == "video" || kind == "ad_image";
-    const QString root = video ? config_.media : config_.imports;
-    if (video)
-        WebPaths::mounted(root, config_.mount);
-    const qint64 used =
-        video ? StoragePolicy::mediaUsage().bytes + WebPaths::usage(pictureDirectory())
-              : WebPaths::usage(root) - WebPaths::usage(QDir(root).filePath("resource-packages"));
-    const qint64 reserved =
-        WebUploads::reserved(video ? QStringLiteral("video") : QStringLiteral("person"));
-    const qint64 limit = video ? StoragePolicy::mediaLimitBytes() : 200 * MiB;
-    QStorageInfo storage(root);
+    if (kind == "video" || kind == "ad_image") {
+        WebPaths::mounted(targetRoot, config_.mount);
+        // 已写入的 .part 和正式文件均已反映在分区空闲容量中。
+        const qint64 pending = WebUploads::reserved(QStringLiteral("video"));
+        if (incoming < 0 || !StoragePolicy::canWriteDownloadBytes(targetRoot, pending + incoming, 64 * MiB))
+            throw WebError(507, QStringLiteral("目标分区可用空间不足，无法保留 95% 保护阈值内的上传空间"));
+        return;
+    }
+    const qint64 used = WebPaths::usage(config_.imports)
+            - WebPaths::usage(QDir(config_.imports).filePath("resource-packages"));
+    const qint64 reserved = WebUploads::reserved(QStringLiteral("person"));
+    QStorageInfo storage(config_.imports);
     storage.refresh();
-    if (incoming < 0 || used + reserved + incoming > limit || !storage.isReady() ||
+    if (incoming < 0 || used + reserved + incoming > 200 * MiB || !storage.isReady() ||
         storage.bytesAvailable() < reserved + incoming + 64 * MiB)
         throw WebError(507, QStringLiteral("设备可用空间或上传配额不足"));
 }
@@ -345,7 +347,7 @@ QJsonObject WebService::createUpload(const QJsonObject &args, int owner)
         advertisement ? QDir(root).filePath("_uploads/" + id + ".part") : target + ".part";
     WebPaths::inside(target, advertisement ? root : config_.imports);
     WebPaths::inside(part, advertisement ? root : config_.imports);
-    checkBudget(kind, size);
+    checkBudget(kind, size, root);
     const QVariantMap task = {{"id", id},
                               {"owner_id", owner},
                               {"kind", kind},
@@ -411,7 +413,7 @@ QJsonObject WebService::commit(const QString &id, int owner)
     if (kind == "resource_package") {
         if (state == "COMMITTING")
             return publicTask(task); // 重复提交只查询，不重复覆盖资源。
-        const QString part = task.value("part_path").toString();
+        const QString part = Rk3566Platform::dataPath(task.value("part_path").toString());
         WebPaths::inside(part, config_.imports, true);
         if (QFileInfo(part).size() != task.value("expected_bytes").toLongLong())
             throw WebError(400, QStringLiteral("资源包接收长度不完整"));
@@ -421,15 +423,15 @@ QJsonObject WebService::commit(const QString &id, int owner)
     const QString root = taskRoot(task);
     if (kind == "video" || kind == "ad_image")
         WebPaths::mounted(root, config_.mount);
-    const QString part = task.value("part_path").toString(),
-                  final = task.value("final_path").toString();
+    const QString part = Rk3566Platform::dataPath(task.value("part_path").toString()),
+                  final = Rk3566Platform::dataPath(task.value("final_path").toString());
     const bool renamed =
         state == "COMMITTING" && !QFileInfo::exists(part) && QFileInfo::exists(final);
     const QString candidate = renamed ? final : part;
     WebPaths::inside(candidate, root, true);
     if (QFileInfo(candidate).size() != task.value("expected_bytes").toLongLong())
         throw WebError(400, QStringLiteral("上传文件长度不完整"));
-    checkBudget(kind);
+    checkBudget(kind, 0, root);
     WebUploads::setState(id, renamed ? "COMMITTING" : "VALIDATING", QFileInfo(candidate).size());
     reportVideoUpload(WebUploads::get(id, owner), "VALIDATING");
 
@@ -509,7 +511,7 @@ QJsonObject WebService::startResourcePackage(const QVariantMap &task, bool recov
     if (resourceWorker_ && resourceWorker_->isRunning())
         throw WebError(409, QStringLiteral("已有资源更新任务正在执行"));
     const QString id = task.value("id").toString();
-    const QString part = task.value("part_path").toString();
+    const QString part = Rk3566Platform::dataPath(task.value("part_path").toString());
     WebPaths::inside(part, config_.imports);
     QStringList restart = config_.resourceRestartPrefix;
     restart << "--unit=ycest-web-resource-" + id << "--on-active=3s"
@@ -551,7 +553,7 @@ QJsonObject WebService::startResourcePackage(const QVariantMap &task, bool recov
 void WebService::finishResourcePackage(const QString &id, const QJsonObject &result)
 {
     const auto task = WebUploads::get(id);
-    const QString part = task.value("part_path").toString();
+    const QString part = Rk3566Platform::dataPath(task.value("part_path").toString());
     const bool ready = result.value("state") == "READY";
     WebUploads::setState(id,
                          ready ? "READY" : "FAILED",
@@ -642,12 +644,12 @@ QJsonObject WebService::dispatch(const QString &operation, const QJsonObject &ar
         return commit(args.value("id").toString(), owner);
     if (operation == "local.resource.received") {
         const auto task = WebUploads::get(args.value("id").toString(), owner);
-        const qint64 bytes = QFileInfo(task.value("part_path").toString()).size();
+        const qint64 bytes = QFileInfo(Rk3566Platform::dataPath(task.value("part_path").toString())).size();
         if (task.value("kind") != "resource_package" || task.value("state") != "RECEIVING" ||
             bytes <= 0 || bytes > task.value("expected_bytes").toLongLong() ||
             args.value("size").toDouble() != double(bytes))
             throw WebError(400, QStringLiteral("资源包实际接收长度无效"));
-        WebPaths::inside(task.value("part_path").toString(), config_.imports, true);
+        WebPaths::inside(Rk3566Platform::dataPath(task.value("part_path").toString()), config_.imports, true);
         WebSql::execute("UPDATE web_upload_tasks SET expected_bytes=? WHERE id=?",
                         {bytes, task.value("id")});
         return {};
@@ -667,19 +669,19 @@ QJsonObject WebService::dispatch(const QString &operation, const QJsonObject &ar
         if (operation == "uploads.begin") {
             if (state != "CREATED")
                 throw WebError(409, QStringLiteral("任务已接收或开始，不能重复传输"));
-            checkBudget(kind);
+            checkBudget(kind, 0, taskRoot(task));
             WebUploads::setState(id, "RECEIVING");
             reportVideoUpload(WebUploads::get(id, owner), "STARTED");
-            return {{"part_path", task.value("part_path").toString()},
+            return {{"part_path", Rk3566Platform::dataPath(task.value("part_path").toString())},
                     {"size", double(task.value("expected_bytes").toLongLong())}};
         }
         if (operation == "uploads.progress" || operation == "uploads.received") {
             if (state != "RECEIVING")
                 throw WebError(409, QStringLiteral("上传任务状态不允许继续接收"));
-            const qint64 bytes = QFileInfo(task.value("part_path").toString()).size();
+            const qint64 bytes = QFileInfo(Rk3566Platform::dataPath(task.value("part_path").toString())).size();
             if (bytes > task.value("expected_bytes").toLongLong())
                 throw WebError(400, QStringLiteral("接收长度超过声明大小"));
-            checkBudget(kind);
+            checkBudget(kind, 0, taskRoot(task));
             if (operation == "uploads.received" &&
                 bytes != task.value("expected_bytes").toLongLong())
                 throw WebError(400, QStringLiteral("文件接收不完整"));
@@ -701,7 +703,7 @@ QJsonObject WebService::dispatch(const QString &operation, const QJsonObject &ar
         if (operation == "uploads.cancel") {
             if (state == "READY" || state == "COMMITTING")
                 throw WebError(409, QStringLiteral("任务已经发布或正在发布，不能取消"));
-            const QString part = task.value("part_path").toString();
+            const QString part = Rk3566Platform::dataPath(task.value("part_path").toString());
             WebPaths::inside(part, taskRoot(task));
 #ifdef Q_OS_UNIX
             // daemon 崩溃而 Qt 仍运行时允许取消失去写入者的任务，活跃 flock 不可解除。
@@ -725,7 +727,7 @@ QJsonObject WebService::dispatch(const QString &operation, const QJsonObject &ar
         if (operation == "uploads.failed") {
             if (state != "RECEIVING")
                 throw WebError(409, QStringLiteral("任务已停止接收"));
-            const QString part = task.value("part_path").toString();
+            const QString part = Rk3566Platform::dataPath(task.value("part_path").toString());
             WebPaths::inside(part, taskRoot(task));
             if (QFileInfo::exists(part) && !QFile::remove(part))
                 throw WebError(503, QStringLiteral("临时文件清理失败"));
@@ -745,7 +747,7 @@ QJsonObject WebService::dispatch(const QString &operation, const QJsonObject &ar
     if (operation == "files.get" || operation == "files.delete") {
         WebPaths::mounted(config_.media, config_.mount);
         const auto item = WebMedia::get(id);
-        const QString path = item.value("path").toString();
+        const QString path = Rk3566Platform::dataPath(item.value("path").toString());
         const QString root = MediaContentPolicy::isInDirectory(path, pictureDirectory()) ? pictureDirectory() : config_.media;
         if (root == pictureDirectory() && !MediaContentPolicy::isImage(path))
             throw WebError(400, "小图目录只管理图片");
@@ -886,7 +888,7 @@ void WebService::importBatch(const QString &id, const QJsonArray &extracted)
         if (extracted.isEmpty()) {
             for (const auto &asset : assets) {
                 if (asset.value("kind") != "person_face_archive") continue;
-                const QString archive = asset.value("path").toString();
+                const QString archive = Rk3566Platform::dataPath(asset.value("path").toString());
                 WebPaths::inside(archive, config_.imports, true);
                 const QString destination = QDir(QFileInfo(archive).absolutePath()).filePath("face-images");
                 const qint64 budget = 200 * MiB - WebPaths::usage(config_.imports)
@@ -923,7 +925,7 @@ void WebService::importBatch(const QString &id, const QJsonArray &extracted)
         QString excel;
         for (const auto &asset : assets)
             if (asset.value("kind") == "person_excel")
-                excel = asset.value("path").toString();
+                excel = Rk3566Platform::dataPath(asset.value("path").toString());
         WebPaths::inside(excel, config_.imports, true);
         WebPaths::validateExcel(excel);
         const auto parsed = excel.endsWith(".xls", Qt::CaseInsensitive)
@@ -976,7 +978,7 @@ void WebService::importBatch(const QString &id, const QJsonArray &extracted)
                 continue;
             }
             const auto person = people.value(key);
-            const QString path = asset.value("path").toString();
+            const QString path = Rk3566Platform::dataPath(asset.value("path").toString());
             WebPaths::inside(path, config_.imports, true);
             faces.append(QJsonObject{{"localPersonId", QString::number(person.personId)},
                                      {"personNo", person.personNo},
@@ -1115,7 +1117,7 @@ void WebService::recover()
     // 重启后只尝试幂等的已接收任务；接收中的临时文件按失败清理。
     for (const auto &task : WebUploads::incomplete()) {
         const QString id = task.value("id").toString(), state = task.value("state").toString(),
-                      part = task.value("part_path").toString();
+                      part = Rk3566Platform::dataPath(task.value("part_path").toString());
         try {
             if (task.value("kind") == "resource_package" && state == "COMMITTING") {
                 startResourcePackage(task, true); // 只恢复/回滚中断事务，绝不重放资源包。
@@ -1139,7 +1141,7 @@ void WebService::recover()
     }
     for (const auto &row : WebSql::query(
              QStringLiteral("SELECT id,path FROM web_media_files WHERE state='DELETING'")))
-        if (!QFileInfo::exists(row.value("path").toString()))
+        if (!QFileInfo::exists(Rk3566Platform::dataPath(row.value("path").toString())))
             WebMedia::removed(row.value("id").toString());
     for (const auto &row :
          WebSql::query(QStringLiteral("SELECT id FROM web_person_import_batches WHERE state IN "

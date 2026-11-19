@@ -3,7 +3,7 @@
  * @brief 实现 GStreamer 播放管线、三槽帧邮箱和 Qt OpenGL 视频画布。
  *
  * @author Du lin
- * @note 最近修改：2026-11-13；修改人：Du lin；明确视频 sink 和压缩帧探针的单调毫秒基准及清零语义，供直播看门狗判断和记录。 补充本地自动播放的预卷门控和脱离前台后的管线清理接口契约。
+ * @note 最近修改：2026-11-14；修改人：Du lin；记录当前媒体已打印超时日志的流编号和 SSRC。
  * @date 2026-07-25
  * @par 修改记录
  * 2026-11-05，Du lin：增加共享输出优先门及独立直播 PCM 分支。
@@ -27,6 +27,8 @@
 #include <QElapsedTimer>
 #include <QImage>
 #include <QHash>
+#include <QPair>
+#include <QSet>
 #include <QMutex>
 #include <QOpenGLFunctions>
 #include <QOpenGLShaderProgram>
@@ -179,6 +181,7 @@ public:
      * @param[in] path 待加载的本地路径或 URL。
      * @param[in] playWhenPrepared true 表示完成 PAUSED 预卷后自动播放，默认沿用显式播放。
      * @note GUI 使旧媒体失效，工作线程串行执行 NULL、URI 和 PAUSED；过期结果不报错或启动播放。
+     *       媒体地址变化时重置诊断告警记录。
      */
     void setMedia(const QString &path, bool playWhenPrepared = false);
     /** @brief 异步请求播放；切源失败时丢弃请求，提示音继续遵守原预卷条件。 */
@@ -301,11 +304,13 @@ protected:
     void moveEvent(QMoveEvent *event) override;
 
 private slots:
-    /** @brief 拉取并处理 GStreamer 总线上的状态、EOS 和错误消息。 */
+    /** @brief 拉取并处理 GStreamer 总线上的状态、EOS 和错误消息。
+     * @note 在 GUI 线程按流编号和 SSRC 过滤当前媒体的重复 RTSP 超时日志。
+     */
     void pollBus();
     /** @brief 沿用原周期投递一次后台位置/时长查询；忙碌时跳过，UI只发出仍属于当前源的结果。 */
     void pollPosition();
-    /** @brief 周期输出 RTSP/RTP、解码、RGA 和 GUI 端到端诊断数据。 */
+    /** @brief 在 GUI 线程检查 RTSP 解码失速和时间轴异常，并为每次确认的故障发出恢复信号。 */
     void pollPlaybackDiagnostics();
 
 private:
@@ -401,7 +406,7 @@ private:
     void finishFrameMailboxRead(int slotIndex, quint64 sequence);
     /** @brief 清空邮箱状态并使遗留帧无效。 */
     void resetFrameMailbox();
-    /** @brief 新媒体开始前清空长时运行诊断基线。 */
+    /** @brief 新媒体开始前清空 RTP 和解码采样状态，保留当前媒体的告警标记。 */
     void resetPlaybackDiagnostics();
     /** @brief 清除提示音 preroll 引用和本次静音前导状态。 */
     void resetPromptPrerollState();
@@ -495,7 +500,10 @@ private:
     bool playing_ = false;
     bool playRequested_ = false;
     std::atomic_bool preloadMode_{false}; /**< UI设置、解码回调读取的预加载标志。 */
-    bool invalidRtcpDestinationWarningLogged_ = false;
+    bool invalidRtcpDestinationWarningLogged_ = false; /**< GUI 标记当前媒体已报告 RTCP 端口 0。 */
+    QSet<QPair<qint64, qint64>> loggedRtspTimeouts_; /**< GUI 持有的流编号与 SSRC 对，字段缺失时为 -1，切换地址时清空。 */
+    bool liveCreditWarningLogged_ = false; /**< GUI 标记当前媒体已报告直播解码积压。 */
+    bool liveTimelineWarningLogged_ = false; /**< GUI 标记当前媒体已报告持续的 RTSP 时间轴或输出异常。 */
     std::atomic_bool shuttingDown_ {false}; /**< 析构期间阻止回调继续投递。 */
     float volume01_ = 1.0f;
     QHash<const QObject *, float> audioDuckingFactors_; /**< 各播报入口独立持有的临时压低系数。 */
@@ -600,19 +608,6 @@ private:
     QAtomicInteger<qint64> rtpVideoClockRate_ {0};
     QAtomicInt rtpVideoPreviousPacketValid_ {0};
     int timelineFaultConsecutiveIntervals_ = 0;
-
-    quint64 diagnosticLastAppSinkSamples_ = 0;
-    quint64 diagnosticLastRgaFrames_ = 0;
-    quint64 diagnosticLastRgaSkippedFrames_ = 0;
-    quint64 diagnosticLastMailboxOverwrites_ = 0;
-    quint64 diagnosticLastMailboxNoSlotDrops_ = 0;
-    quint64 diagnosticLastGuiDeliveredFrames_ = 0;
-    quint64 diagnosticLastRtpPushed_ = 0;
-    quint64 diagnosticLastRtpLost_ = 0;
-    quint64 diagnosticLastRtpLate_ = 0;
-    quint64 diagnosticLastRtpDuplicates_ = 0;
-    quint64 diagnosticLastSinkRendered_ = 0;
-    quint64 diagnosticLastSinkDropped_ = 0;
 
     std::array<FrameMailboxSlot, kFrameMailboxSlotCount> frameMailboxSlots_; /**< 帧邮箱固定槽位。 */
     int frameMailboxWidth_ = 0;

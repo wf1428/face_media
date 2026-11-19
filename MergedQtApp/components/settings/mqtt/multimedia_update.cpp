@@ -3,7 +3,7 @@
  * @brief 后台执行 FTP 模板资源下载、大小/MD5 校验和提交屏障后的目录覆盖。
  * @author Du lin
  * @date 2026-10-24
- * @note 最近修改：2026-10-24；修改人：Du lin；清单未提供 logo/net_cfg.ini 时清理 logo 的其他内容并保留原配置，明确提供时才覆盖并同步配置镜像；其余下载、回执及重启流程不变。
+ * @note 最近修改：2026-11-17；修改人：Du lin；资源包按目标分区的实际暂存余量检查容量，并在通知可提交之前复核 95% 保护线。
  */
 #include "multimedia_update.h"
 #include "common/ftp_transfer.h"
@@ -16,7 +16,6 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QStandardPaths>
-#include <QStorageInfo>
 #include <QTemporaryDir>
 #include <QDebug>
 #include <cmath>
@@ -203,12 +202,9 @@ void MultimediaUpdate::run()
         for (const QString &argument : options_.restart)
             if (argument.endsWith("/weston-control") && !QFileInfo(argument).isExecutable())
                 fail("RESTART_UNAVAILABLE", QStringLiteral("Qt 资源生效控制程序不可用"));
-        QStorageInfo storage(root);
-        storage.refresh();
         const qint64 reserve = 64LL * 1024 * 1024;
-        if (!storage.isReady() || storage.isReadOnly() || total > storage.bytesAvailable() - reserve)
+        if (!StoragePolicy::canWriteDownloadBytes(root, total, reserve))
             fail("NO_SPACE", QStringLiteral("资源包暂存空间不足或目录只读"));
-        qint64 mediaDelta = 0;
         for (const QJsonValue &value : files) {
             const QJsonObject file = value.toObject();
             const QString path = file.value("path").toString();
@@ -216,10 +212,7 @@ void MultimediaUpdate::run()
             safeAncestors(target);
             const QFileInfo info(target);
             if (info.exists() && !info.isFile()) fail("INVALID_PATH", QStringLiteral("文件目标不是普通文件：%1").arg(path));
-            if (path.startsWith("video/")) mediaDelta += qint64(file.value("size").toDouble()) - (info.exists() ? info.size() : 0);
         }
-        if (mediaDelta > 0 && StoragePolicy::mediaUsage().bytes > StoragePolicy::mediaLimitBytes() - mediaDelta)
-            fail("NO_SPACE", QStringLiteral("资源包中的媒体超过设备容量限制"));
         QTemporaryDir stage(root + QStringLiteral("/.multimedia-update-XXXXXX"));
         if (!stage.isValid()) fail("LOCAL_IO_ERROR", QStringLiteral("无法创建资源暂存目录"));
         qint64 received = 0;
@@ -284,6 +277,9 @@ void MultimediaUpdate::run()
         while (directories.hasNext()) syncPath(directories.next(), true);
         syncPath(stage.path(), true);
         syncPath(root, true);
+        // 所有暂存字节已计入实际分区占用。复核期间新增的注册照、抓拍及其他文件。
+        if (!StoragePolicy::canWriteDownloadBytes(root, 0, reserve))
+            fail("NO_SPACE", QStringLiteral("资源包暂存后分区达到容量保护阈值"));
         emit prepared();
         {
             QMutexLocker guard(&decisionMutex_);

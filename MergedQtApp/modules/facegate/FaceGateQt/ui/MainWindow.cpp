@@ -4,7 +4,7 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-10；修改人：Du lin；刷脸验证提示走独立开关入口，密码提示和识别业务不变。
+ * @note 最近修改：2026-11-16；修改人：Du lin；本地人员注册照保存到应用业务目录；音量说明与共用数据路径一致。
  */
 
 #include "MainWindow.h"
@@ -830,7 +830,7 @@ void FaceGateMainWindow::startServices()
         writeSystemEvent("audio", "warning", "音频播报错误", message);
     });
     audio_.configure(config_);
-    // 语音播报百分比独立保存在 /home/cat/face_media/volume.dat；旧文件缺少
+    // 语音播报百分比独立保存在当前数据分区的 volume.dat；旧文件缺少
     // prompt_volume 时按 60%（对应旧版固定原始值 230）补齐并在开机时读取。
     config_.audioVolume = audio_.volume();
     livenessEnabled_ = config_.livenessEnabled;
@@ -2646,7 +2646,7 @@ void FaceGateMainWindow::handleEnrollRequest(const PersonInfo &person, const QIm
         }
     }
 
-    QDir dir(Rk3566Platform::applicationRoot());
+    QDir dir(Rk3566Platform::applicationDataRoot());
     if (!dir.exists("enrollments")) {
         dir.mkdir("enrollments");
     }

@@ -1,3 +1,10 @@
+/**
+ * @file local_personnel_store.cpp
+ * @brief 管理本地人员、凭证、授权规则和人脸照片。
+ * @author Du lin
+ * @note 最近修改：2026-11-16；修改人：Du lin；U 盘导入时将人员照片写入应用业务目录，照片配额与入库引用使用该路径。
+ */
+
 #include "local_personnel_store.h"
 
 #include "common/sql/dbstore.h"
@@ -738,7 +745,7 @@ bool LocalPersonnelStore::replaceValidatedFaces(const QJsonArray &validatedFaces
     }
 
     bool allOk = true;
-    QDir enrollmentDir(Rk3566Platform::applicationRoot());
+    QDir enrollmentDir(Rk3566Platform::applicationDataRoot());
     enrollmentDir.mkpath(QStringLiteral("enrollments"));
     for (auto it = facesByPerson.constBegin(); it != facesByPerson.constEnd(); ++it) {
         const qint64 personId = it.key();
@@ -816,7 +823,8 @@ bool LocalPersonnelStore::replaceValidatedFaces(const QJsonArray &validatedFaces
             continue;
         }
         for (const QVariantMap &oldFace : oldFaces) {
-            const QString oldPath = oldFace.value(QStringLiteral("image_path")).toString();
+            const QString oldPath = Rk3566Platform::dataPath(
+                        oldFace.value(QStringLiteral("image_path")).toString());
             if (!oldPath.isEmpty() && !newPaths.contains(oldPath)) QFile::remove(oldPath);
         }
         if (savedCount) *savedCount += prepared.size();

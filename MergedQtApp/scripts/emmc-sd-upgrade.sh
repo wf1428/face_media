@@ -2,12 +2,34 @@
 # @file emmc-sd-upgrade.sh
 # @brief 从 SD 启动后离线写入并校验 eMMC，按配置在成功后关机。
 # @author Du lin
-# @note 最近修改：2026-11-05；修改人：Du lin；成功提示的额外等待默认改为 0 秒，
-#       保留原有 3 秒关机等待；SD 卡配置仍可显式设置额外等待。
+# @note 最近修改：2026-11-17；修改人：Du lin；识别 SD 与 eMMC 的野火 A/B 布局，按槽同步根文件系统与引导，保留全局槽位选择和共享数据。
 # RK3568：从 SD 卡启动 Ubuntu，将系统离线升级到 eMMC（不备份旧系统、不提供自动回滚）。
 # 如果升级被中断，重新插入同一张 SD 启动卡并启动，即可重新执行完整升级。
 
 set -Eeuo pipefail
+
+# 常规输出和工具进度不记录；错误通过显式提交分支进入 journal。
+exec >/dev/null 2>&1
+
+# @brief 每次开机按错误键向 journal 提交一次错误，跨服务重启生效。
+# @param $1 无斜杠的稳定错误键；其余参数为首条错误的详细信息。
+# /run 中仅建立空标记。mkdir 原子占用键；提交失败释放标记，记录故障不影响业务返回值。
+journal_error_once() (
+    error_key=$1
+    shift
+    error_dir=/run/face-media-errors/emmc-sd-upgrade
+    claimed=0
+    if mkdir -p "$error_dir" 2>/dev/null; then
+        if mkdir "$error_dir/$error_key" 2>/dev/null; then
+            claimed=1
+        elif [ -d "$error_dir/$error_key" ]; then
+            exit 0
+        fi
+    fi
+    if ! logger -p daemon.err -t emmc-sd-upgrade -- "$*" 2>/dev/null; then
+        [ "$claimed" -eq 0 ] || rmdir "$error_dir/$error_key" 2>/dev/null || true
+    fi
+)
 
 CONFIG=/etc/default/emmc-sd-upgrade
 [ -f "$CONFIG" ] && . "$CONFIG"
@@ -15,7 +37,7 @@ CONFIG=/etc/default/emmc-sd-upgrade
 AUTO_APPLY=${AUTO_APPLY:-0}
 AUTO_POWEROFF=${AUTO_POWEROFF:-1}
 
-# Linux 文本控制台升级界面；设置 UPGRADE_UI=0 可恢复原始日志输出模式。
+# Linux 文本控制台升级界面；设置 UPGRADE_UI=0 可关闭屏幕进度。
 UPGRADE_UI=${UPGRADE_UI:-1}
 UPGRADE_UI_TTY=${UPGRADE_UI_TTY:-/dev/tty1}
 UPGRADE_UI_FONT=${UPGRADE_UI_FONT:-auto}  # auto=自动选择字体；off=不修改字体；也可指定 .psf 字体的绝对路径
@@ -23,9 +45,10 @@ UPGRADE_UI_SWITCH=${UPGRADE_UI_SWITCH:-1}
 # 成功提示的额外展示时间（秒），默认 0；仅升级界面已启动时叠加到固定的 3 秒等待上。
 UPGRADE_UI_SUCCESS_HOLD=${UPGRADE_UI_SUCCESS_HOLD:-0}
 
-LOG=/run/emmc-sd-upgrade.log
 STATE_DIR=/var/lib/emmc-sd-upgrade
 TARGET_MNT=/mnt/emmc-upgrade-root
+AB_SOURCE_MNT=
+AB_MODE=0
 LOCK_FILE=/run/emmc-sd-upgrade.lock
 
 BUSINESS_SERVICES=(
@@ -35,45 +58,45 @@ BUSINESS_SERVICES=(
     weston-kiosk.service
 )
 
-mkdir -p "$STATE_DIR" "$TARGET_MNT"
-
-# 详细日志始终保存到同一个日志文件。物理控制台可用时，
-# 不在 LCD 上刷屏显示 rsync/dd 的详细输出；界面独立使用文件描述符 8。
+# LCD 进度使用独立的文件描述符 8。
 UI_READY=0
 UI_PID=""
 UI_STARTED=0
 UI_ERROR_LAST=""
 UI_DEMO=0
 UI_STATUS_FILE=/run/emmc-sd-upgrade-ui.status
+
+# @brief 记录未显式处理的失败命令，原命令返回码由 errexit 保留。
+# @param $1 命令退出码；$2 脚本行号；$3 命令文本。键不含时间或 PID。
+on_upgrade_error()
+{
+    [ -z "$UI_ERROR_LAST" ] || return 0
+    UI_ERROR_LAST="Command failed at line $2 (rc=$1): $3"
+    journal_error_once "command-$2-$1" "$UI_ERROR_LAST"
+}
+
+trap 'on_upgrade_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
+mkdir -p "$STATE_DIR" "$TARGET_MNT"
 if [ "$UPGRADE_UI" = "1" ] && [ -c "$UPGRADE_UI_TTY" ] && \
    { exec 8>"$UPGRADE_UI_TTY"; } 2>/dev/null; then
     UI_READY=1
-    exec >>"$LOG" 2>&1
-else
-    exec > >(tee -a "$LOG") 2>&1
 fi
 
 # 使用文件锁，防止多个升级进程同时写入同一块 eMMC。
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
-    echo "Another emmc-sd-upgrade instance is already running."
+    journal_error_once upgrade-lock "Another emmc-sd-upgrade instance is already running."
     exit 1
 fi
 
-log()
-{
-    echo "[$(date '+%F %T')] $*"
-}
-
 # LCD 界面仅负责显示：即使显示出错，也不能影响升级和校验结果。
-# ANSI 控制字符只写入文件描述符 8，不写入日志文件。
+# ANSI 控制字符只写入文件描述符 8；状态文件供仪表盘读取。
 ui_font()
 {
     local candidate
     [ "$UI_READY" = "1" ] || return 0
     [ "$UPGRADE_UI_FONT" != "off" ] || return 0
     command -v setfont >/dev/null 2>&1 || {
-        log "Console font enlargement unavailable: setfont not installed"
         return 0
     }
 
@@ -85,7 +108,6 @@ ui_font()
 
     if [ "$UPGRADE_UI_FONT" != "auto" ]; then
         [ -f "$UPGRADE_UI_FONT" ] || {
-            log "Console font not found: $UPGRADE_UI_FONT"
             return 0
         }
         setfont -C "$UPGRADE_UI_TTY" "$UPGRADE_UI_FONT" >/dev/null 2>&1 || true
@@ -103,16 +125,13 @@ ui_font()
         /usr/share/consolefonts/*Terminus*24x12*.psf*; do
         [ -f "$candidate" ] || continue
         if setfont -C "$UPGRADE_UI_TTY" "$candidate" >/dev/null 2>&1; then
-            log "Console dashboard large font: $candidate"
             return 0
         fi
     done
 
     if setfont -C "$UPGRADE_UI_TTY" -d >/dev/null 2>&1; then
-        log "Console dashboard large font: setfont -d (double-size glyphs)"
         return 0
     fi
-    log "Console dashboard: no supported large console font; keep existing font"
 }
 # 进度条表示五个升级阶段的完成情况，不伪造文件传输百分比。
 # 界面状态文件放在 /run（tmpfs），通过原子重命名避免读取到不完整内容。
@@ -238,7 +257,7 @@ ui_render()
             ui_center 'UPDATE COMPLETE - VERIFIED' "$green"
             ui_center 'REMOVE SD CARD AFTER POWER OFF' "$yellow" ;;
         failed)
-            ui_center 'CHECK LOG - TARGET MAY NOT BOOT' "$red"
+            ui_center 'CHECK JOURNAL - TARGET MAY NOT BOOT' "$red"
             ui_center 'REINSERT SD FOR A FULL RETRY' "$yellow" ;;
         dryrun)
             ui_center 'eMMC WAS NOT MODIFIED' "$yellow"
@@ -289,7 +308,6 @@ ui_begin()
     # 显示子进程关闭文件描述符 9，防止主进程意外退出后升级锁仍被占用。
     ui_dashboard_loop "$BASHPID" 9>&- &
     UI_PID=$!
-    log "Console dashboard active on $UPGRADE_UI_TTY (pid=$UI_PID)"
 }
 
 ui_finish()
@@ -309,7 +327,7 @@ ui_demo()
 {
     local outcome="${1:-success}"
     if [ "$UI_READY" != "1" ]; then
-        echo "Dashboard unavailable: connect a Linux VT or set UPGRADE_UI_TTY."
+        journal_error_once demo-console "Dashboard unavailable: connect a Linux VT or set UPGRADE_UI_TTY."
         return 1
     fi
     ui_begin
@@ -333,11 +351,44 @@ ui_demo()
 }
 
 
+# @brief 保留具体错误供 LCD 显示并终止升级，退出状态为 1。
+# @param $* 出错原因；已记录的下层错误优先用于 LCD 和 journal。
 die()
 {
-    UI_ERROR_LAST="$*"
-    log "ERROR: $*"
+    if [ -z "$UI_ERROR_LAST" ]; then
+        local fingerprint
+        UI_ERROR_LAST="$*"
+        fingerprint=$(printf '%s\n' "$UI_ERROR_LAST" | cksum) || fingerprint=unknown
+        journal_error_once "failure-${fingerprint%% *}" "$UI_ERROR_LAST"
+    fi
     exit 1
+}
+
+# @brief 提交已识别的失败并保留原命令诊断，调用方决定返回码或退出。
+# @param $1 稳定错误键；$2 LCD 错误摘要；$3 可选的工具诊断，仅提交至 journal。
+upgrade_error()
+{
+    local error_key="$1" detail="${3:-}"
+    UI_ERROR_LAST="$2"
+    journal_error_once "$error_key" "$UI_ERROR_LAST${detail:+: $detail}"
+}
+
+# @brief 运行升级工具并保留其退出码；只在失败时提交有限长度的标准错误。
+# @param $1 错误键；$2 步骤说明；其余参数为命令及其参数。
+run_upgrade_command()
+{
+    local error_key="$1" description="$2" detail rc
+    shift 2
+    if detail=$("$@" 2>&1 >/dev/null | LC_ALL=C awk '
+        length(message) < 512 { message = message sep substr($0, 1, 512 - length(message)); sep = " " }
+        END { print message }
+    '); then
+        return 0
+    else
+        rc=$?
+    fi
+    upgrade_error "$error_key" "$description (rc=$rc)" "$detail"
+    return "$rc"
 }
 
 require_commands()
@@ -378,6 +429,7 @@ mmc_type()
     tr -d '\r\n' < "/sys/class/block/$name/device/type"
 }
 
+# @brief 输出唯一 eMMC 节点；无设备返回 1，多个候选返回 2，由主流程记录错误。
 find_emmc()
 {
     local x type found=""
@@ -385,7 +437,7 @@ find_emmc()
         [ -e "$x/device/type" ] || continue
         type=$(cat "$x/device/type" 2>/dev/null || true)
         if [ "$type" = "MMC" ]; then
-            [ -z "$found" ] || die "More than one eMMC/MMC device found"
+            [ -z "$found" ] || return 2
             found="/dev/$(basename "$x")"
         fi
     done
@@ -419,34 +471,27 @@ check_layout()
     local disk="$1" role="$2"
     local p1_start p1_size p2_start p2_size p3_start
 
-    log "Checking $role layout: $disk"
     p1_start=$(part_start "$disk" 1)
     p1_size=$(part_size "$disk" 1)
     p2_start=$(part_start "$disk" 2)
     p2_size=$(part_size "$disk" 2)
     p3_start=$(part_start "$disk" 3)
 
-    log "p1: start=$p1_start size=$p1_size"
-    log "p2: start=$p2_start size=$p2_size"
-    log "p3: start=$p3_start"
 
     [ "$p1_start" = "16384" ] || die "$role p1 start mismatch"
     [ "$p1_size" = "16384" ] || die "$role p1 size mismatch"
     [ "$p2_start" = "32768" ] || die "$role p2 start mismatch"
     [ "$p2_size" = "262144" ] || die "$role p2 size mismatch"
     [ "$p3_start" = "294912" ] || die "$role p3 start mismatch"
-    log "$role layout OK"
 }
 
 unmount_emmc()
 {
     local name mountpoint
-    log "Checking mounted eMMC partitions..."
     while read -r name mountpoint; do
         [ -n "$name" ] || continue
         [ -n "${mountpoint:-}" ] || continue
         if [[ "/dev/$name" == "$EMMC_DISK"* ]]; then
-            log "Unmount /dev/$name from $mountpoint"
             if [ "$AUTO_APPLY" = "1" ]; then
                 umount "/dev/$name"
             fi
@@ -454,8 +499,117 @@ unmount_emmc()
     done < <(lsblk -nr -o NAME,MOUNTPOINT "$EMMC_DISK")
 }
 
+# @brief 校验完整 A/B GPT 布局及分区名称，避免按编号写入其他板型的布局。
+# @param $1 整盘设备节点。@param $2 用于错误输出的设备角色。
+check_ab_layout()
+{
+    local disk="$1" role="$2" i label expected
+    local -a labels=(uboot boot boot_a boot_b rootfs_a rootfs_b data)
+    local partition_table
+    partition_table=$(parted -sm "$disk" unit s print)
+    [ "$(printf '%s\n' "$partition_table" | awk -F: '$1 ~ /^[0-9]+$/ { n++ } END { print n }')" = 7 ] ||
+        die "$role must contain seven A/B partitions"
+    for i in 1 2 3 4 5 6 7; do
+        [ -b "$(partdev "$disk" "$i")" ] || die "$role missing A/B partition p$i"
+        label=$(printf '%s\n' "$partition_table" | awk -F: -v n="$i" '$1 == n {print $6; exit}')
+        expected=${labels[i-1]}
+        case "$i:$label" in
+            2:misc|7:userdata) ;;
+            *) [ "$label" = "$expected" ] || die "$role p$i expected $expected, found $label" ;;
+        esac
+    done
+
+    [ "$(blockdev --getsize64 "$(partdev "$disk" 1)")" -eq $((8 * 1024 * 1024)) ] &&
+    [ "$(blockdev --getsize64 "$(partdev "$disk" 2)")" -eq $((4 * 1024 * 1024)) ] &&
+    [ "$(blockdev --getsize64 "$(partdev "$disk" 3)")" -eq $((128 * 1024 * 1024)) ] &&
+    [ "$(blockdev --getsize64 "$(partdev "$disk" 4)")" -eq $((128 * 1024 * 1024)) ] ||
+        die "$role A/B boot partition sizes do not match the deployed layout"
+}
+
+# @brief 使用实际设备的 PARTUUID 定位槽位及共享分区。
+# @param $1 分区设备。@return 打印 PARTUUID；读取失败中止上层操作。
+read_partuuid()
+{
+    local uuid
+    uuid=$(blkid -s PARTUUID -o value "$1") || return 1
+    [ -n "$uuid" ] || return 1
+    printf '%s\n' "$uuid"
+}
+
+# @brief 确认对应插槽的完整来源及目标信息，刷写前执行。
+# @note 应用识别只依赖 /userdata；实际写盘还需要双盘分区表、挂载和文件系统相符。
+prepare_ab_layout()
+{
+    local userdata boot part root_type boot_type global_boot_fs
+    userdata=$(findmnt -rn -M /userdata -o SOURCE) || die "/userdata exists but is not mounted"
+    [ "$(readlink -f "$userdata")" = "$(partdev "$SD_DISK" 7)" ] ||
+        die "/userdata is not mounted from SD p7"
+    case "$ROOT_SRC" in
+        "$(partdev "$SD_DISK" 5)") SD_ACTIVE_ROOT_PART=5 ;;
+        "$(partdev "$SD_DISK" 6)") SD_ACTIVE_ROOT_PART=6 ;;
+        *) die "SD / is not on A/B rootfs p5 or p6" ;;
+    esac
+    boot=$(findmnt -rn -M /boot -o SOURCE) || die "SD slot /boot is not mounted"
+    [ "$(readlink -f "$boot")" = "$(partdev "$SD_DISK" "$((SD_ACTIVE_ROOT_PART - 2))")" ] ||
+        die "SD /boot does not match its running rootfs slot"
+
+    check_ab_layout "$SD_DISK" SD
+    check_ab_layout "$EMMC_DISK" eMMC
+    global_boot_fs=$(blkid -s TYPE -o value "$(partdev "$EMMC_DISK" 2)" || true)
+    case "$global_boot_fs" in
+        ext2|ext3|ext4) AB_GLOBAL_BOOT_FS=$global_boot_fs ;;
+        *) die "eMMC global boot p2 does not have an ext filesystem" ;;
+    esac
+    AB_DATA_UUID=$(read_partuuid "$(partdev "$EMMC_DISK" 7)") || die "Cannot read target data PARTUUID"
+    AB_DATA_FS=$(blkid -s TYPE -o value "$(partdev "$EMMC_DISK" 7)") || die "Cannot read target data filesystem"
+    [ "$AB_DATA_FS" = ext4 ] || die "eMMC data partition is not ext4"
+    for part in 3 4; do
+        boot_type=$(blkid -s TYPE -o value "$(partdev "$SD_DISK" "$part")" || true)
+        case "$boot_type" in ext2|ext3|ext4) ;; *) die "SD p$part boot filesystem is unsupported" ;; esac
+        AB_BOOT_FS[part]=$boot_type
+        AB_BOOT_UUID[part]=$(read_partuuid "$(partdev "$EMMC_DISK" "$part")") ||
+            die "Cannot read target boot p$part PARTUUID"
+    done
+    for part in 5 6; do
+        [ "$(blkid -s TYPE -o value "$(partdev "$SD_DISK" "$part")" || true)" = ext4 ] ||
+            die "SD rootfs p$part is not ext4"
+        AB_ROOT_UUID[part]=$(read_partuuid "$(partdev "$EMMC_DISK" "$part")") ||
+            die "Cannot read target rootfs p$part PARTUUID"
+        root_type=$(blkid -s TYPE -o value "$(partdev "$EMMC_DISK" "$part")" || true)
+        if [ "$root_type" != ext4 ] && { [ "$AUTO_APPLY" != 1 ] || [ ! -f "$INPROGRESS_FILE" ]; }; then
+            die "eMMC rootfs p$part is not ext4; manual filesystem repair required"
+        fi
+    done
+}
+
+# @brief 确保两套源槽启动文件都可读取。未运行的 SD 槽仅读挂载且禁用日志回放。
+validate_ab_sources()
+{
+    local inactive_part boot_dev boot_options
+    inactive_part=$((11 - SD_ACTIVE_ROOT_PART))
+    AB_SOURCE_MNT=$(mktemp -d /mnt/emmc-upgrade-sd.XXXXXX)
+    mount -o ro,noload "$(partdev "$SD_DISK" "$inactive_part")" "$AB_SOURCE_MNT"
+    [ -e "$AB_SOURCE_MNT/sbin/init" ] && [ -f "$AB_SOURCE_MNT/etc/fstab" ] ||
+        die "Inactive SD slot lacks init or fstab"
+    [ -e /sbin/init ] && [ -f /etc/fstab ] && [ -s /boot/boot.scr ] ||
+        die "Running SD slot lacks init, fstab or boot.scr"
+    boot_dev=$(partdev "$SD_DISK" "$((inactive_part - 2))")
+    boot_options=ro,noload
+    if [ "${AB_BOOT_FS[inactive_part-2]}" = ext2 ]; then boot_options=ro; fi
+    mount -o "$boot_options" "$boot_dev" "$TARGET_MNT"
+    [ -s "$TARGET_MNT/boot.scr" ] || die "Inactive SD slot lacks boot.scr"
+    umount "$TARGET_MNT"
+
+    # p2 保持不写；先确认目标镜像已具备能选择 A/B 的全局引导脚本。
+    boot_options=ro,noload
+    if [ "$AB_GLOBAL_BOOT_FS" = ext2 ]; then boot_options=ro; fi
+    mount -o "$boot_options" "$(partdev "$EMMC_DISK" 2)" "$TARGET_MNT"
+    [ -s "$TARGET_MNT/boot.scr" ] || die "eMMC global boot p2 lacks boot.scr"
+    umount "$TARGET_MNT"
+}
+
 # 使用文件级 rsync 同步 rootfs，不备份旧 eMMC。
-# 排除 SD 系统运行日志及首次启动标志；这些内容不属于待升级的固件文件。
+# 排除共享业务存储、SD 系统运行日志及首次启动标志。
 # -O 不同步目录修改时间，避免运行期间目录时间变化造成不必要的差异。
 rsync_rootfs()
 {
@@ -470,6 +624,7 @@ rsync_rootfs()
         '/run/***'                                 # 排除系统运行时数据
         '/tmp/***'                                 # 排除临时文件
         '/mnt/***'                                 # 排除临时挂载目录
+        '/userdata/***'                            # 排除 A/B 共用业务存储
 
         # 门禁业务数据
         '/home/cat/face_media/*.db*'               # 排除门禁主库文件
@@ -503,7 +658,7 @@ rsync_rootfs()
     done
 
     # 执行根文件系统同步
-    rsync \
+    run_upgrade_command sync-rootfs "Rootfs synchronization failed" rsync \
         -aHAXxSO \
         --numeric-ids \
         --delete \
@@ -547,7 +702,31 @@ fix_emmc_boot_fstab()
     chmod --reference="$fstab" "$tmp"
     mv -f -- "$tmp" "$fstab"
 
-    log "已修复目标 eMMC /boot 自动挂载项：PARTUUID=$partuuid"
+}
+
+# @brief 将两个系统槽绑定至各自 eMMC 的 /、/boot 和同一份 /userdata。
+# @param $1 eMMC 根分区号，5 或 6。
+fix_ab_fstab()
+{
+    local part="$1" boot_part=$(($1 - 2))
+    local fstab="$TARGET_MNT/etc/fstab" tmp
+    [ -f "$fstab" ] || die "Target A/B slot p$part lacks fstab"
+    tmp=$(mktemp "$TARGET_MNT/etc/.fstab.XXXXXX")
+    awk -v root="PARTUUID=${AB_ROOT_UUID[part]}" '
+        /^[[:space:]]*#/ { print; next }
+        $2 == "/boot" || $2 == "/userdata" { next }
+        $2 == "/" {
+            if (!seen++) { sub(/^[[:space:]]*[^[:space:]]+/, root); print }
+            next
+        }
+        { print }
+        END { if (!seen) print root "  /  ext4  defaults  0  1" }
+    ' "$fstab" > "$tmp"
+    printf 'PARTUUID=%s  /boot  %s  defaults  0  2\n' "${AB_BOOT_UUID[boot_part]}" "${AB_BOOT_FS[boot_part]}" >> "$tmp"
+    printf 'PARTUUID=%s  /userdata  %s  defaults  0  2\n' "$AB_DATA_UUID" "$AB_DATA_FS" >> "$tmp"
+    chown --reference="$fstab" "$tmp"
+    chmod --reference="$fstab" "$tmp"
+    mv -f -- "$tmp" "$fstab"
 }
 
 # 不执行 rootfs 逐文件 checksum 全量校验：
@@ -565,17 +744,13 @@ ensure_mountpoints()
 stop_business_services()
 {
     local svc
-    log "Stopping services that must not run during eMMC upgrade..."
     for svc in "${BUSINESS_SERVICES[@]}"; do
         # SD 启动系统可能没有安装某些业务服务，不应因此报错。
         if systemctl cat "$svc" >/dev/null 2>&1; then
-            log "Stop $svc"
             systemctl stop "$svc" || die "Cannot stop $svc"
             if systemctl is-active --quiet "$svc"; then
                 die "$svc is still active"
             fi
-        else
-            log "Service not installed, skip: $svc"
         fi
     done
 }
@@ -589,7 +764,6 @@ cleanup_legacy_backups()
         "$STATE_DIR"/devices/*/backup \
         "$STATE_DIR"/devices/*/backup.tmp; do
         [ -d "$old_dir" ] || continue
-        log "Remove obsolete SD rollback backup: $old_dir"
         rm -rf -- "$old_dir"
     done
 }
@@ -599,20 +773,18 @@ cleanup_legacy_backups()
 # 并由维护人员手动修复或重新格式化。
 repair_interrupted_rootfs()
 {
-    local rc
+    local rc fsck_detail
     [ -f "$INPROGRESS_FILE" ] || return 0
 
-    log "Unfinished upgrade marker detected for CID=$EMMC_CID"
-    log "Checking target ext4 before restarting from scratch..."
     rc=0
-    e2fsck -p "$EMMC_ROOT" || rc=$?
+    fsck_detail=$(e2fsck -p "$EMMC_ROOT" 2>&1) || rc=$?
 
     # e2fsck 返回码：0=文件系统正常，1=已修复错误；其他返回码需人工处理。
     if [ "$rc" -gt 1 ]; then
-        die "eMMC rootfs fsck cannot auto-repair (rc=$rc); manual repair required"
+        upgrade_error "repair-fsck-$rc" "eMMC rootfs fsck cannot auto-repair (rc=$rc); manual repair required" "$fsck_detail"
+        exit 1
     fi
 
-    log "eMMC filesystem is ready for full re-upgrade"
 }
 
 # 以 eMMC CID 区分的标志不是永久“禁止重复升级”标志。
@@ -621,8 +793,6 @@ arm_upgrade_marker()
 {
     mkdir -p "$DEVICE_DIR"
     if [ -f "$INPROGRESS_FILE" ]; then
-        log "Previous upgrade of THIS eMMC was incomplete: $EMMC_CID"
-        log "No rollback is required or attempted. Retrying a complete upgrade."
         return 0
     fi
 
@@ -636,7 +806,6 @@ arm_upgrade_marker()
     sync
     mv -f "$INPROGRESS_FILE.tmp" "$INPROGRESS_FILE"
     sync
-    log "Upgrade marker armed: $INPROGRESS_FILE"
 }
 
 flash_raw_partition()
@@ -646,116 +815,116 @@ flash_raw_partition()
     src_size=$(blockdev --getsize64 "$src")
     dst_size=$(blockdev --getsize64 "$dst")
 
-    log "Flash $name"
-    log "  source : $src"
-    log "  target : $dst"
-    log "  srcsize: $src_size"
-    log "  dstsize: $dst_size"
     [ "$src_size" -le "$dst_size" ] ||
         die "$name source partition is larger than target"
 
-    dd if="$src" of="$dst" bs=4M conv=fsync status=progress
+    run_upgrade_command "flash-$name" "Failed to flash $name" \
+        dd if="$src" of="$dst" bs=4M conv=fsync status=none
     sync
 }
 
 flash_rootfs()
 {
     local src_root="$1" dst_root="$2"
-    log "Updating rootfs..."
-    log "source rootfs: $src_root"
-    log "target rootfs: $dst_root"
 
     umount "$TARGET_MNT" 2>/dev/null || true
-    mount "$dst_root" "$TARGET_MNT"
+    run_upgrade_command mount-target "Failed to mount target rootfs" mount "$dst_root" "$TARGET_MNT"
 
-    # 当前系统根目录 / 来自 SD 卡的 p3 分区。
-    rsync_rootfs / "$TARGET_MNT/"
+    rsync_rootfs "$src_root" "$TARGET_MNT/"
     ensure_mountpoints "$TARGET_MNT"
-    # 修复同步过来的 SD fstab，保证新 eMMC 系统启动后能自动挂载自身 p2。
-    fix_emmc_boot_fstab
+    if [ "$AB_MODE" = 1 ]; then
+        mkdir -p "$TARGET_MNT/userdata"
+        fix_ab_fstab "${dst_root##*p}"
+    else
+        fix_emmc_boot_fstab
+    fi
     sync
     umount "$TARGET_MNT"
-    log "rootfs synchronization finished; pending final verification"
 }
 
+# @brief 校验当前目标根分区的 ext4、一组系统文件以及相应启动分区。
+# @return 完全验证后返回 0。
 verify_new_system()
 {
-    local fsck_rc=0
-    log "===== VERIFY NEW eMMC SYSTEM ====="
+    local fsck_rc=0 fsck_detail
 
     # rsync 完成后，执行 fsck 前必须先卸载 eMMC 的 rootfs 分区。
     if findmnt -rn -S "$EMMC_ROOT" >/dev/null 2>&1; then
-        log "ERROR: target rootfs is still mounted, refuse fsck"
+        upgrade_error verify-mounted "target rootfs is still mounted, refuse fsck"
         return 1
     fi
 
     # -p：按需检查并自动修复，不使用 -f 强制全盘扫描，
     # 也不使用 -n 纯只读检查；e2fsck 返回 0=正常、1=已修复。
-    log "Checking rootfs ext4 (quick, not forced)..."
-    e2fsck -p "$EMMC_ROOT" > /run/emmc-rootfs-fsck.log 2>&1 || fsck_rc=$?
+    fsck_detail=$(e2fsck -p "$EMMC_ROOT" 2>&1) || fsck_rc=$?
     if (( fsck_rc != 0 && fsck_rc != 1 )); then
-        cat /run/emmc-rootfs-fsck.log || true
-        log "ERROR: eMMC rootfs filesystem check failed (rc=$fsck_rc)"
+        upgrade_error "verify-fsck-$fsck_rc" "eMMC rootfs filesystem check failed (rc=$fsck_rc)" "$fsck_detail"
         return 1
     fi
-    log "Rootfs ext4 check OK (rc=$fsck_rc)"
 
     # 通过只读挂载，确认目标 rootfs 文件系统可以正常访问。
     if ! mount -o ro "$EMMC_ROOT" "$TARGET_MNT"; then
-        log "ERROR: cannot mount eMMC rootfs for verification"
+        upgrade_error verify-mount "cannot mount eMMC rootfs for verification"
         return 1
     fi
     if [ ! -e "$TARGET_MNT/sbin/init" ] || \
        [ ! -f "$TARGET_MNT/etc/os-release" ]; then
-        log "ERROR: target rootfs lacks /sbin/init or /etc/os-release"
+        upgrade_error verify-root-files "target rootfs lacks /sbin/init or /etc/os-release"
         umount "$TARGET_MNT" || true
         return 1
     fi
+    if [ "$AB_MODE" = 1 ]; then
+        local part=${EMMC_ROOT##*p}
+        if ! awk -v root="PARTUUID=${AB_ROOT_UUID[part]}" -v boot="PARTUUID=${AB_BOOT_UUID[part-2]}" -v data="PARTUUID=$AB_DATA_UUID" '
+            /^[[:space:]]*#/ { next }
+            $2 == "/" { if ($1 != root) exit 1; root_seen++ }
+            $2 == "/boot" { if ($1 != boot) exit 1; boot_seen++ }
+            $2 == "/userdata" { if ($1 != data) exit 1; data_seen++ }
+            END { if (root_seen != 1 || boot_seen != 1 || data_seen != 1) exit 1 }
+        ' "$TARGET_MNT/etc/fstab"; then
+            upgrade_error verify-fstab "target slot p$part has an invalid fstab"
+            umount "$TARGET_MNT" || true
+            return 1
+        fi
+    fi
     if ! umount "$TARGET_MNT"; then
-        log "ERROR: cannot unmount eMMC rootfs after verification"
+        upgrade_error verify-umount "cannot unmount eMMC rootfs after verification"
         return 1
     fi
-    log "Rootfs basic file checks OK (full checksum intentionally skipped)"
 
-    log "Checking uboot (byte-for-byte)..."
     cmp -n "$(blockdev --getsize64 "$SD_UBOOT")" \
-        "$SD_UBOOT" "$EMMC_UBOOT" || return 1
-    log "Checking boot (byte-for-byte)..."
+        "$SD_UBOOT" "$EMMC_UBOOT" || {
+            upgrade_error verify-uboot "U-Boot partition verification failed"
+            return 1
+        }
     cmp -n "$(blockdev --getsize64 "$SD_BOOT")" \
-        "$SD_BOOT" "$EMMC_BOOT" || return 1
+        "$SD_BOOT" "$EMMC_BOOT" || {
+            upgrade_error verify-boot "Boot partition verification failed"
+            return 1
+        }
 
-    log "New eMMC system basic verification OK"
 }
 
-save_log_copy()
-{
-    local result="$1" stamp
-    mkdir -p "$STATE_DIR/logs"
-    stamp=$(date '+%Y%m%d-%H%M%S')
-    cp "$LOG" "$STATE_DIR/logs/${EMMC_CID:-unknown}-${stamp}-${result}.log" \
-        2>/dev/null || true
-    sync
-}
 
 on_exit()
 {
     local rc=$?
-    trap - EXIT INT TERM
+    trap - EXIT ERR INT TERM
     set +e
     if [ "$UI_DEMO" != "1" ]; then
         umount "$TARGET_MNT" 2>/dev/null || true
     fi
 
+    if [ -n "$AB_SOURCE_MNT" ]; then
+        umount "$AB_SOURCE_MNT" 2>/dev/null || true
+        rmdir "$AB_SOURCE_MNT" 2>/dev/null || true
+    fi
+
     if [ "$rc" -ne 0 ]; then
-        ui_publish failed 0 "UPDATE INTERRUPTED" "${UI_ERROR_LAST:-See log for error details}"
-        log "Upgrade aborted, rc=$rc"
-        if [ -n "${INPROGRESS_FILE:-}" ] && [ -f "$INPROGRESS_FILE" ]; then
-            log "INCOMPLETE: marker retained for this CID; no rollback backup exists."
-            log "Reboot from upgrade SD to perform a fresh full upgrade."
+        if [ -z "$UI_ERROR_LAST" ]; then
+            upgrade_error "exit-$rc" "Upgrade aborted (rc=$rc); see journal for details"
         fi
-        if [ -n "${EMMC_CID:-}" ]; then
-            save_log_copy "failed"
-        fi
+        ui_publish failed 0 "UPDATE INTERRUPTED" "$UI_ERROR_LAST"
     fi
     ui_finish
     exit "$rc"
@@ -767,29 +936,25 @@ trap 'exit 143' TERM
 
 main()
 {
-    log "============================================"
-    log "RK3568 SD -> eMMC offline upgrade (no rollback backup)"
-    log "AUTO_APPLY=$AUTO_APPLY"
-    log "============================================"
     require_commands
     ui_begin
 
     ROOT_SRC=$(findmnt -n -o SOURCE /)
     ROOT_SRC=$(readlink -f "$ROOT_SRC")
-    log "Current root source: $ROOT_SRC"
     SD_DISK=$(parent_disk "$ROOT_SRC") || die "Cannot determine root disk"
     ROOT_TYPE=$(mmc_type "$SD_DISK" || true)
-    log "Current root disk: $SD_DISK"
-    log "Current root type: $ROOT_TYPE"
 
     if [ "$ROOT_TYPE" != "SD" ]; then
-        log "Current system is not booted from SD. Skip eMMC upgrade."
         ui_publish dryrun 1 "NOT BOOTED FROM SD" "No eMMC changes were made"
         return 0
     fi
 
-    EMMC_DISK=$(find_emmc) || die "eMMC not found"
-    log "Detected eMMC: $EMMC_DISK"
+    if EMMC_DISK=$(find_emmc); then
+        :
+    else
+        [ "$?" -ne 2 ] || die "More than one eMMC/MMC device found"
+        die "eMMC not found"
+    fi
     [ "$SD_DISK" != "$EMMC_DISK" ] ||
         die "SD disk and eMMC disk are identical"
 
@@ -798,7 +963,14 @@ main()
     [ -n "$EMMC_CID" ] || die "Cannot read eMMC CID"
     DEVICE_DIR="$STATE_DIR/devices/$EMMC_CID"
     INPROGRESS_FILE="$DEVICE_DIR/upgrade.in_progress"
-    log "eMMC CID: $EMMC_CID"
+
+    if [ -d /userdata ]; then
+        AB_MODE=1
+        prepare_ab_layout
+        upgrade_ab_system
+        if [ "$AUTO_APPLY" = 1 ]; then finish_upgrade; fi
+        return 0
+    fi
 
     check_layout "$SD_DISK" "SD"
     check_layout "$EMMC_DISK" "eMMC"
@@ -810,17 +982,10 @@ main()
     EMMC_BOOT=$(partdev "$EMMC_DISK" 2)
     EMMC_ROOT=$(partdev "$EMMC_DISK" 3)
 
-    log "Upgrade map:"
-    log "$SD_UBOOT -> $EMMC_UBOOT"
-    log "$SD_BOOT  -> $EMMC_BOOT"
-    log "$SD_ROOT  -> $EMMC_ROOT"
 
     SD_BOOT_FS=$(blkid -s TYPE -o value "$SD_BOOT" || true)
     SD_ROOT_FS=$(blkid -s TYPE -o value "$SD_ROOT" || true)
     EMMC_ROOT_FS=$(blkid -s TYPE -o value "$EMMC_ROOT" || true)
-    log "SD boot filesystem   : $SD_BOOT_FS"
-    log "SD root filesystem   : $SD_ROOT_FS"
-    log "eMMC root filesystem : $EMMC_ROOT_FS"
     [ "$SD_ROOT_FS" = "ext4" ] || die "SD rootfs is not ext4"
     # 上次写入中断后，blkid 可能暂时无法识别目标 ext4；
     # 允许在确有本设备未完成标志时，先使用 e2fsck 尝试修复后再确认类型。
@@ -828,7 +993,6 @@ main()
         if [ "$AUTO_APPLY" != "1" ] || [ ! -f "$INPROGRESS_FILE" ]; then
             die "eMMC rootfs is not ext4; manual filesystem repair required"
         fi
-        log "eMMC rootfs type unknown after interrupted upgrade; attempt fsck first"
     fi
 
     [ "$(blockdev --getsize64 "$SD_UBOOT")" -le \
@@ -841,9 +1005,7 @@ main()
     unmount_emmc
 
     if [ "$AUTO_APPLY" != "1" ]; then
-        log "DRY-RUN PASSED. No eMMC data was changed."
         ui_publish dryrun 1 "DRY-RUN PASSED" "No eMMC changes were made"
-        log "Set AUTO_APPLY=1 in /etc/default/emmc-sd-upgrade to apply."
         return 0
     fi
 
@@ -868,13 +1030,10 @@ main()
     # 保留原有写入顺序和传输方式。
     sync
     ui_publish running 3 "SYNCING ROOTFS" "Copying system files to eMMC"
-    log "===== UPDATE ROOTFS ====="
-    flash_rootfs "$SD_ROOT" "$EMMC_ROOT"
+    flash_rootfs / "$EMMC_ROOT"
     ui_publish running 4 "WRITING U-BOOT" "Flashing eMMC bootloader partition"
-    log "===== FLASH UBOOT ====="
     flash_raw_partition "uboot" "$SD_UBOOT" "$EMMC_UBOOT"
     ui_publish running 4 "WRITING BOOT" "Flashing Linux boot partition"
-    log "===== FLASH BOOT ====="
     flash_raw_partition "boot" "$SD_BOOT" "$EMMC_BOOT"
     sync
 
@@ -882,23 +1041,64 @@ main()
     ui_publish running 5 "VERIFYING SYSTEM" "Checking rootfs, U-Boot and Boot"
     verify_new_system || die "Final eMMC verification failed"
 
-    log "Final verification PASSED; committing upgrade"
+    finish_upgrade
+}
+
+# @brief 离线更新两个对应槽，保留 p2 的全局引导/选槽标记和 p7 的共享数据。
+upgrade_ab_system()
+{
+    local part src_root
+    SD_UBOOT=$(partdev "$SD_DISK" 1)
+    EMMC_UBOOT=$(partdev "$EMMC_DISK" 1)
+    if [ "$AUTO_APPLY" != 1 ]; then
+        ui_publish dryrun 1 "DRY-RUN PASSED" "A/B layout validated; no eMMC changes were made"
+        return 0
+    fi
+
+    ui_publish running 2 "PREPARING A/B UPDATE" "Checking both SD system slots"
+    stop_business_services
+    unmount_emmc
+    validate_ab_sources
+    cleanup_legacy_backups
+    for part in 5 6; do
+        EMMC_ROOT=$(partdev "$EMMC_DISK" "$part")
+        repair_interrupted_rootfs
+        [ "$(blkid -s TYPE -o value "$EMMC_ROOT" || true)" = ext4 ] ||
+            die "eMMC rootfs p$part remains invalid after check"
+    done
+    arm_upgrade_marker
+
+    for part in 5 6; do
+        EMMC_ROOT=$(partdev "$EMMC_DISK" "$part")
+        src_root="$AB_SOURCE_MNT/"
+        if [ "$part" -eq "$SD_ACTIVE_ROOT_PART" ]; then src_root=/; fi
+        ui_publish running 3 "SYNCING A/B ROOTFS" "Copying source rootfs p$part to eMMC"
+        flash_rootfs "$src_root" "$EMMC_ROOT"
+    done
+    ui_publish running 4 "WRITING U-BOOT" "Flashing eMMC bootloader partition"
+    flash_raw_partition "uboot" "$SD_UBOOT" "$EMMC_UBOOT"
+    for part in 3 4; do
+        SD_BOOT=$(partdev "$SD_DISK" "$part")
+        EMMC_BOOT=$(partdev "$EMMC_DISK" "$part")
+        EMMC_ROOT=$(partdev "$EMMC_DISK" "$((part + 2))")
+        ui_publish running 4 "WRITING A/B BOOT" "Flashing eMMC boot partition p$part"
+        flash_raw_partition "boot-p$part" "$SD_BOOT" "$EMMC_BOOT"
+        ui_publish running 5 "VERIFYING A/B SYSTEM" "Checking eMMC slot with boot p$part"
+        verify_new_system || die "Final A/B verification failed for boot p$part"
+    done
+    umount "$AB_SOURCE_MNT"
+    rmdir "$AB_SOURCE_MNT"
+    AB_SOURCE_MNT=
+}
+
+# @brief 完成校验后清除中断标记，显示结果并按原配置关机。
+finish_upgrade()
+{
     rm -f "$INPROGRESS_FILE"
     sync
-    save_log_copy "success"
 
-    log "============================================"
-    log "eMMC upgrade SUCCESS"
     ui_publish success 5 "SYSTEM VERIFIED" "eMMC update completed"
     ui_render
-    log "uboot  : updated + verified"
-    log "boot   : updated + verified"
-    log "rootfs : synced + ext4/basic checks (no full checksum)"
-    log "MiniLoader: NOT changed"
-    log "Permanent anti-repeat marker: DISABLED"
-    log "Old-eMMC backup and automatic rollback: DISABLED"
-    log "Please remove SD card before next boot."
-    log "============================================"
 
     if [ "$AUTO_POWEROFF" = "1" ]; then
         # 保留大字体“升级成功 / 关机后拔出 SD 卡”提示画面。

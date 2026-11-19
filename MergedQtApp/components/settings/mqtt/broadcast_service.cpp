@@ -2,9 +2,8 @@
  * @file broadcast_service.cpp
  * @brief 按设备路由管理广播文件、定时播放与直播状态。
  * @author Du lin
- * @note 最近修改：2026-11-12；修改人：Du lin；文件未缓存时按计划和音频仅记录一次启动告警，缓存恢复或配置切换后允许重新报告。
- *       广播全量配置与单条音频 ADD 优先使用下行 FTP 主机，缺省沿用设备主机，非法主机按原传输失败路径回报。
  * @date 2026-11-05
+ * @note 最近修改：2026-11-16；修改人：Du lin；广播计划、单次播放状态和缓存音频统一读写当前数据分区。
  */
 #include "broadcast_service.h"
 #include "broadcast_live.h"
@@ -214,6 +213,11 @@ BroadcastService::~BroadcastService()
 
 std::function<void(const QJsonObject &)> BroadcastService::mediaReceiver() const { return live_->receiver(); }
 
+/**
+ * @brief 切换广播设备并从当前业务分区恢复计划与播放状态。
+ * @param[in] device 设备标识，用于选定广播目录。
+ * @param[in] ftpHost 广播音频下载的 FTP 主机；同设备更新时只替换主机。
+ */
 void BroadcastService::configure(const QString &device, const QString &ftpHost)
 {
     ftpHost_ = ftpHost;
@@ -244,7 +248,8 @@ void BroadcastService::configure(const QString &device, const QString &ftpHost)
         timer_.stop();
         return;
     }
-    directory_ = QDir(Rk3566Platform::configDir()).filePath("broadcast/" + device_);
+    directory_ = QDir(Rk3566Platform::persistentConfigDir())
+            .filePath("broadcast/" + device_);
     QFile saved(QDir(directory_).filePath("config.json"));
     if (saved.open(QIODevice::ReadOnly) && saved.size() <= 512 * 1024) {
         const auto doc = QJsonDocument::fromJson(saved.readAll()).object();

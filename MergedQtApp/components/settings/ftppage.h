@@ -4,7 +4,7 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-10-24；修改人：Du lin；补充媒体传输共享锁的所有权、失败回执和持有周期声明，保留原视频下载接口。
+ * @note 最近修改：2026-11-17；修改人：Du lin；声明受限的 HTTP 临时写入和 HTTP/FTP 共用容量拒绝接口。
  */
 
 #pragma once
@@ -34,6 +34,7 @@
 #include <QIntValidator>
 #include <QDateTime>
 #include <QEvent>
+#include <QFile>
 #include <QFileInfo>
 #include <QDir>
 #include <QMenu>
@@ -41,7 +42,6 @@
 #include <cstdio>
 #include <QStyleOption>
 #include <QSettings>
-#include <QStorageInfo>
 
 #include "appstyle.h"
 #include "components/cursoroverlay/keyboard_dialog.h"
@@ -220,6 +220,8 @@ private:
     void startHttpMp4DownloadByProcess(const QString& url, const QString& localFile);
     /** @brief 根据 URL 文件名和视频目录选择安全的本地保存路径。 */
     QString pickHttpSaveFilePath(const QString& url);
+    /** @brief 将 curl 标准输出的一个数据块写入临时文件，超过字节预算时终止下载。 */
+    void writeHttpDownloadChunk();
     /// @}
 
 
@@ -263,23 +265,12 @@ private:
     QString resolveFtpLocalFilePath(const QString& localBaseDir,
                                     const QString& remotePath) const;
 
-    /** @brief 查询 FTP 远端文件大小，失败返回负值并填写原因。 */
-    qint64 queryFtpRemoteFileSize(const QString &host, int port,
-                                  const QString &user, const QString &pass,
-                                  const QString &remotePath,
-                                  QString *errorMessage = nullptr) const;
-
-    /** @brief 查询目标路径所在挂载点可用空间，并可返回总容量。 */
-    qint64 queryAvailableBytesForPath(const QString &localPath,
-                                      qint64 *totalBytes,
-                                      QString *errorMessage = nullptr) const;
-
-    /** @brief 比较远端大小和本地余量，并统一记录和发送拒绝原因。 */
-    bool checkDownloadSpaceOrReport(const QString &host, int port,
-                                    const QString &user, const QString &pass,
-                                    const QString &remotePath,
-                                    const QString &localPath,
-                                    const QString &displayName);
+    /**
+     * @brief 更新下载提示并发出容量拒绝事件。
+     * @param fileName 对外显示的文件名。
+     * @param reason 拒绝的具体原因。
+     */
+    void reportStorageRejection(const QString &fileName, const QString &reason);
 
     /** @brief 启动自动下载前的异步远端信息和空间预检。 */
     void startAutoDownloadPreflight(const QString &host, int port,
@@ -309,7 +300,7 @@ private:
     int dirPort = 21;
 
     QStringList dirFilesQueue;
-    QString listBuffer;   /**< 累计 curl --list-only 输出，完成后统一拆分。 */
+    QByteArray listBuffer;   /**< 按字节收集目录清单，完成后一次解码 UTF-8。 */
 
 
     /// URL 历史（最多 8 条）。
@@ -386,11 +377,19 @@ private:
     QString lastDirDownloadedFile_;
     QString ftpProgressBuffer_;
     int ftpLastProgress_ = -1;
+    QFile ftpPartFile_; /**< FTP 下载的数据写入本地同目录临时文件。 */
+    qint64 ftpBytesRemaining_ = 0; /**< 本文件在存储预算内还可接收的字节数。 */
+    bool ftpLimitExceeded_ = false; /**< 接收超限时中止并清除临时文件。 */
+    QString ftpWriteError_; /**< 临时文件写入失败原因。 */
     bool ftpProcessStartFailureReported_ = false;
 
     /// HTTP 文件下载进程状态。
     QProcess *httpProc = nullptr;
     QString currentHttpDownloadLocalFile_;
+    QFile httpPartFile_; /**< HTTP 响应体所在的同目录临时文件。 */
+    qint64 httpBytesRemaining_ = 0; /**< 本次 HTTP 响应体可继续写入的字节数。 */
+    bool httpLimitExceeded_ = false; /**< 超限中止，完成回调负责清理及通知。 */
+    QString httpWriteError_; /**< 落盘失败原因，完成回调优先报告。 */
     bool httpDownloading_ = false;
     QString httpProgressBuffer_;
     int httpLastProgress_ = -1;

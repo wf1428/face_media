@@ -4,10 +4,13 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-10；修改人：Du lin；仅摄像头按开机开关建服务；广播常驻，运行时声音开关只控制定时播放。
+ * @note 最近修改：2026-11-18；修改人：Du lin；接入独立 OTA 协调器、QoS2 上行和 GUI 提示，OTA 接收不进入普通业务日志。
  */
 
 #include "mqttmanager.h"
+#include "components/ota/ota_service.h"
+#include "components/ota/ota_progress_dialog.h"
+#include <QApplication>
 #include "camera_screenshot_upload.h"
 #include "broadcast_service.h"
 #include "src/call/CallManager.h"
@@ -50,9 +53,10 @@
 
 namespace {
 
+/** @return 当前数据分区上的默认抓拍目录，用于通行文本清理。 */
 QString accessSnapshotRoot()
 {
-    return QDir(Rk3566Platform::applicationRoot()).filePath(
+    return QDir(Rk3566Platform::applicationDataRoot()).filePath(
                 QStringLiteral("data/snapshots"));
 }
 
@@ -867,6 +871,16 @@ MqttManager::MqttManager(QObject *parent)
     // 创建 IPC 通信对象与 MQTT 业务服务对象
     ipc_ = new MqttIpcClient(this);
     callManager_ = new CallManager(ipc_,this);
+    ota_ = new OtaService([this](const QJsonObject &packet) {
+        return ipc_ && ipc_->isConnected() && ipc_->sendJsonLine(packet);
+    }, this);
+    connect(this, &MqttManager::mqttConnMarkChanged, ota_, [this](int mark) {
+        ota_->setOnline(mark == 2);
+    });
+    // UI updates execute on QApplication's thread even when MQTT ownership moves.
+    connect(ota_, &OtaService::notice, qApp, [](const QString &text, int percent, bool terminal, bool success) {
+        OtaProgressDialog::present(text, percent, terminal, success);
+    }, Qt::QueuedConnection);
     const auto &features=DeviceFeatureSwitches::boot();
     if (features.cameraScreenshot) {
         cameraScreenshot_=new CameraScreenshotUpload(true,this);
@@ -1106,8 +1120,10 @@ MqttManager::MqttManager(QObject *parent)
             Qt::QueuedConnection);
 }
 
+/** @brief 先停止 OTA 准备，独立安装继续；其余工作线程按原次序退出。 */
 MqttManager::~MqttManager()
 {
+    delete ota_; ota_ = nullptr; // 先终止可取消的准备进程，独立安装服务继续运行。
     delete broadcast_;
     broadcast_ = nullptr;
     delete cameraScreenshot_;cameraScreenshot_=nullptr;
@@ -4155,7 +4171,7 @@ bool MqttManager::publishFaceImagesResult(
 void MqttManager::setConfig(const MqttConfig &cfg)
 {
     cfg_ = cfg;
-    // 主题是平台权威身份；仅当前 ycLinux 精确 event 路由开放通话。
+    // 主题是平台权威身份；仅当前 ycLinux 精确 event 路由开放通话和 OTA。
     const QString callEvent=cfg_.publishTopic.trimmed();
     const QString prefix=QStringLiteral("device/ycLinux/");
     QString callDevice;
@@ -4164,6 +4180,7 @@ void MqttManager::setConfig(const MqttConfig &cfg)
         if (callDevice.contains('/') || callDevice.contains('+') || callDevice.contains('#')) callDevice.clear();
     }
     callManager_->configure(callDevice);
+    if (ota_) ota_->configure(callDevice);
     if (cameraScreenshot_) cameraScreenshot_->configure(callEvent);
     if (broadcast_) {
         const QSettings settings(Rk3566Platform::netConfigPath(), QSettings::IniFormat);
@@ -4449,7 +4466,7 @@ void MqttManager::sendConfigToMqttd(bool applyNow)
  * 本函数负责：
  * - 输出统一的接收日志；
  * - 提取 method；
- * - 摄像头协议先交独立控制器，其余按原业务顺序调用各类 handler。
+ * - OTA 先交独立协调器且不记录正文，其他业务按原 handler 顺序执行。
  *
  * @param topic      消息 topic。
  * @param payloadObj 消息 payload 对象。
@@ -4458,6 +4475,7 @@ void MqttManager::sendConfigToMqttd(bool applyNow)
  */
 bool MqttManager::dispatchPayloadMessage(const QString &topic, const QJsonObject &payloadObj)
 {
+    if (ota_ && ota_->handle(topic, payloadObj)) return true;
     if (callManager_ && callManager_->handleSignal(topic,payloadObj)) return true;
     if (cameraScreenshot_ && cameraScreenshot_->handle(topic,payloadObj)) return true;
     if (broadcast_ && broadcast_->handle(topic,payloadObj)) return true;
@@ -4905,7 +4923,8 @@ bool MqttManager::handleMultimediaControl(const QString &topic, const QJsonObjec
                              QStringLiteral("--on-active=3s"), QStringLiteral("--timer-property=AccuracySec=100ms"),
                              QStringLiteral("--timer-property=RemainAfterElapse=no"), QStringLiteral("--collect"),
                              control, QStringLiteral("apply-layout"), QDir(root).filePath("logo/ycest_cfg.ini")};
-    auto *worker = new MultimediaUpdate({data, root, restart, QStringLiteral("/mnt/app/net_cfg.ini")}, this);
+    const QString netConfigMirror = Rk3566Platform::dataPath(QStringLiteral("/mnt/app/net_cfg.ini"));
+    auto *worker = new MultimediaUpdate({data, root, restart, netConfigMirror}, this);
     multimediaUpdate_ = worker;
     multimediaActiveId_ = id;
     auto *submitTimer = new QTimer(worker); // 对象亲和性仍属主线程，只有 run 在后台运行。

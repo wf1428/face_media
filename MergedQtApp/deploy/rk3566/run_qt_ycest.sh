@@ -1,5 +1,21 @@
 #!/bin/sh
+# @file run_qt_ycest.sh
+# @brief 准备板端图形环境并以 EGLFS 启动 Qt。
+# @author Du lin
+# @note 最近修改：2026-11-17；修改人：Du lin；从 Qt 启动脚本加载共享存储函数，启动前导出模式并准备对应配置目录。
 set -eu
+
+storage_script="$(dirname -- "$0")/start_face_media.sh"
+if [ ! -r "$storage_script" ]; then
+    storage_script="$(dirname -- "$0")/../../scripts/start_face_media.sh"
+fi
+if [ ! -r "$storage_script" ]; then
+    printf '%s\n' '[face-media] missing start_face_media.sh' >&2
+    exit 1
+fi
+FACE_MEDIA_LOAD_STORAGE_ONLY=1 . "$storage_script"
+unset FACE_MEDIA_LOAD_STORAGE_ONLY
+face_media_detect_storage
 
 APP_ROOT=${QT_YCEST_APP_ROOT:-/opt/qt_ycest/bin}
 export QT_YCEST_APP_ROOT="$APP_ROOT"
@@ -57,7 +73,7 @@ for backlight in /sys/class/backlight/*; do
     [ -w "$backlight/bl_power" ] && echo 0 > "$backlight/bl_power" || true
 done
 
-mkdir -p "$QT_YCEST_CONFIG_DIR"
+mkdir -p "$(face_media_data_path "$QT_YCEST_CONFIG_DIR")"
 cd "$APP_ROOT"
 
 if [ ! -x ./qt_ycest ]; then

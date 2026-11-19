@@ -4,7 +4,7 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-13；修改人：Du lin；声明网络线程直播重试入口及取消约束，移除闲置的预检播放器。
+ * @note 最近修改：2026-11-17；修改人：Du lin；记录已输出空列表统计的 videoRect 目录，供后续扫描过滤重复日志。
  */
 
 #ifndef MULTIMEDIADEMO_H
@@ -818,6 +818,7 @@ private:
     QLabel *label_videoRectPicture;
     QList<QString> videoRectPictureFileList;
     QList<VideoRectMediaItem> videoRectMediaList;
+    QString m_loggedEmptyVideoRectDir; /**< GUI 线程记录已打印空列表统计的目录，扫描到混播资源后清空。 */
     int currentVideoRectMediaIndex;
     QTimer *videoRectPictureTimer;
     bool m_currentVideoRectIsImage;
@@ -1124,6 +1125,7 @@ private:
     /** @brief 重新扫描 videoRect 专用图片列表。 */
     /**
      * @brief 按配置顺序重建 videoRect 视频/图片混播列表。
+     * @note 同一目录的连续空列表只在首次扫描时打印统计。
      */
     void rebuildVideoRectMediaList();
     /**
