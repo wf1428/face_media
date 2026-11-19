@@ -2,7 +2,7 @@
  * @file mqttd.c
  * @brief libmosquitto 网络连接、配置重建与 Qt 本地 IPC 的守护进程。
  * @author Du lin
- * @note 最近修改：2026-11-06；修改人：Du lin；直播下行单槽改为四帧限时队列，保留通话与业务优先及原通话媒体链路。
+ * @note 最近修改：2026-11-18；修改人：Du lin；OTA 字符串载荷固定 QoS2、保留 long taskId 原值，并抑制安装过程发布日志与普通 ACK。
  */
 /*
  * mqttd.c - minimal MQTT daemon using libmosquitto
@@ -1542,9 +1542,9 @@ static void call_command(mqttd_cfg_t *cfg,const char *line)
     cJSON_Delete(obj);
 }
 
-/** @brief 沿原路径发布 JSON/文本；call.* 事件固定 QoS2，其余保持配置 QoS。
+/** @brief 沿原路径发布 JSON/文本；call.* 和 OTA 固定 QoS2，OTA 文本不重编码。
  * @param cfg 非空配置，只由 IPC 主线程访问客户端生命周期。
- * @param line 完整 publish JSON；字段缺失、离线或发布失败通过原 ack 上报。
+ * @param line 完整 publish JSON；普通业务沿用 ACK，OTA 文本以持久结果重放补偿连接失败。
  */
 static void handle_publish(mqttd_cfg_t *cfg, const char *line)
 {
@@ -1556,16 +1556,18 @@ static void handle_publish(mqttd_cfg_t *cfg, const char *line)
 
     cJSON *topicItem = cJSON_GetObjectItemCaseSensitive(root, "topic");
     cJSON *payloadItem = cJSON_GetObjectItemCaseSensitive(root, "payload");
+    /* OTA has its own durable result path; generic ACK/logs stay enabled for other business. */
+    const bool ota = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "ota"));
 
     if (!cJSON_IsString(topicItem) || topicItem->valuestring == NULL || topicItem->valuestring[0] == '\0') {
         cJSON_Delete(root);
-        ipc_send_ack(cfg, "publish", 0, "missing topic");
+        if (!ota) ipc_send_ack(cfg, "publish", 0, "missing topic");
         return;
     }
 
     if (!payloadItem) {
         cJSON_Delete(root);
-        ipc_send_ack(cfg, "publish", 0, "missing payload");
+        if (!ota) ipc_send_ack(cfg, "publish", 0, "missing payload");
         return;
     }
 
@@ -1575,7 +1577,7 @@ static void handle_publish(mqttd_cfg_t *cfg, const char *line)
 
     if (!m) {
         cJSON_Delete(root);
-        ipc_send_ack(cfg, "publish", 0, "mosq not ready");
+        if (!ota) ipc_send_ack(cfg, "publish", 0, "mosq not ready");
         return;
     }
 
@@ -1585,7 +1587,7 @@ static void handle_publish(mqttd_cfg_t *cfg, const char *line)
 
     if (!connected) {
         cJSON_Delete(root);
-        ipc_send_ack(cfg, "publish", 0, "mqtt not connected");
+        if (!ota) ipc_send_ack(cfg, "publish", 0, "mqtt not connected");
         return;
     }
 
@@ -1601,13 +1603,20 @@ static void handle_publish(mqttd_cfg_t *cfg, const char *line)
 
     if (!payloadText) {
         cJSON_Delete(root);
-        ipc_send_ack(cfg, "publish", 0, "build payload failed");
+        if (!ota) ipc_send_ack(cfg, "publish", 0, "build payload failed");
         return;
     }
 
     //dump_hex("publish-payload", (const unsigned char *)payloadText, (int)strlen(payloadText));
 
     int publish_qos=cfg->qos;
+    if (ota && cJSON_IsString(payloadItem)) {
+        cJSON *ota_payload=cJSON_Parse(payloadText);
+        cJSON *method=ota_payload ? cJSON_GetObjectItemCaseSensitive(ota_payload,"method") : NULL;
+        if (cJSON_IsString(method) && (strcmp(method->valuestring,"ota.progress")==0 ||
+                strcmp(method->valuestring,"ota.result")==0 || strcmp(method->valuestring,"ota.version")==0)) publish_qos=2;
+        cJSON_Delete(ota_payload); /* Parse for method only; never print/re-serialize taskId. */
+    }
     const char *live_method=NULL;
     if (cJSON_IsObject(payloadItem)) {
         cJSON *method=cJSON_GetObjectItemCaseSensitive(payloadItem,"method");
@@ -1633,15 +1642,15 @@ static void handle_publish(mqttd_cfg_t *cfg, const char *line)
         fprintf(stderr,"[mqttd-live] publish method=%s qos=%d rc=%d\n",live_method,publish_qos,r);
 
     if (r == MOSQ_ERR_SUCCESS) {
-        if (cfg->verbose) {
+        if (cfg->verbose && !ota) {
             fprintf(stderr, "[mqttd] IPC publish ok: topic=%s bytes=%zu\n",
                     topicItem->valuestring, strlen(payloadText));
         }
-        ipc_send_ack(cfg, "publish", 1, "published");
+        if (!ota) ipc_send_ack(cfg, "publish", 1, "published");
     } else {
         char msg[128];
         snprintf(msg, sizeof(msg), "publish failed: %s", mosquitto_strerror(r));
-        ipc_send_ack(cfg, "publish", 0, msg);
+        if (!ota) ipc_send_ack(cfg, "publish", 0, msg);
     }
 
     free(payloadText);
