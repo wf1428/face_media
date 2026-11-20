@@ -4,7 +4,10 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-18；修改人：Du lin；接入独立 OTA 协调器、QoS2 上行和 GUI 提示，OTA 接收不进入普通业务日志。
+ * @note 最近修改：2026-11-20；修改人：Du lin；将 OTA 提示时长转发给复用 FTP 下载卡片的 GUI 提示器，MQTT 分派及其他业务连接不变。
+ * @par 修改记录
+ *       2026-11-19；Du lin；为 online_v1 梯控配置接入全局消防状态：
+ *       消防期间继续保存楼层、定时和电梯模式配置，但禁止下发 RS485，并在协议回执中明确返回消防状态。
  */
 
 #include "mqttmanager.h"
@@ -19,6 +22,7 @@
 #include "common/media_content_policy.h"
 #include "common/configuration_work.h"
 #include "common/device_feature_switches.h"
+#include "ic_board/fire_emergency_state.h"
 
 #include <QDebug>
 #include <QCryptographicHash>
@@ -445,9 +449,18 @@ QString onlineV1FloorOpenHex(const QByteArray &openBits)
             + QString::fromLatin1(bytes.toHex().toUpper());
 }
 
+/**
+ * @brief 构造 online_v1 楼层限行回执数据。
+ * @param[in] openBits 业务楼层位序，1 表示开放、0 表示限行。
+ * @param[in] floors 本次回执涉及的楼层。
+ * @param[in] code 业务结果码；423 表示配置已保存但处于消防、未下发 RS485。
+ * @param[in] message 可选的人类可读原因。
+ * @return 包含当前位图、消防状态和逐层状态的 JSON 对象。
+ */
 QJsonObject floorLimitResponseData(const QByteArray &openBits,
                                    const QList<int> &floors,
-                                   int code)
+                                   int code,
+                                   const QString &message = QString())
 {
     QJsonArray statuses;
     for (int floor : floors) {
@@ -462,6 +475,10 @@ QJsonObject floorLimitResponseData(const QByteArray &openBits,
     data.insert(QStringLiteral("code"), code);
     data.insert(QStringLiteral("floors"), statuses);
     data.insert(QStringLiteral("floorHex"), onlineV1FloorOpenHex(openBits));
+    data.insert(QStringLiteral("fireActive"), FireEmergencyState::isActive());
+    if (!message.trimmed().isEmpty()) {
+        data.insert(QStringLiteral("message"), message.trimmed());
+    }
     return data;
 }
 
@@ -878,8 +895,8 @@ MqttManager::MqttManager(QObject *parent)
         ota_->setOnline(mark == 2);
     });
     // UI updates execute on QApplication's thread even when MQTT ownership moves.
-    connect(ota_, &OtaService::notice, qApp, [](const QString &text, int percent, bool terminal, bool success) {
-        OtaProgressDialog::present(text, percent, terminal, success);
+    connect(ota_, &OtaService::notice, qApp, [](const QString &text, int percent, bool terminal, bool success, int displayMs) {
+        OtaProgressDialog::present(text, percent, terminal, success, displayMs);
     }, Qt::QueuedConnection);
     const auto &features=DeviceFeatureSwitches::boot();
     if (features.cameraScreenshot) {
@@ -1410,6 +1427,11 @@ void MqttManager::registerBuiltinMessageHandlers()
     });
 }
 
+/**
+ * @brief 处理 online_v1 楼层限行设置和查询。
+ * @details 消防期间设置仍写入数据库，回执 code=423，并跳过 RS485；查询始终
+ *          返回数据库当前值和 fireActive 状态。
+ */
 bool MqttManager::handleOnlineV1FloorLimit(const QString &topic,
                                            const QJsonObject &payloadObj,
                                            const QString &method)
@@ -1518,7 +1540,8 @@ bool MqttManager::handleOnlineV1FloorLimit(const QString &topic,
     if (!validationError.isEmpty()) {
         const QByteArray state = onlineV1FloorLimitBits();
         publishOnlineV1Event(QStringLiteral("floorLimit"),
-                             floorLimitResponseData(state, responseFloors, -1),
+                             floorLimitResponseData(state, responseFloors, -1,
+                                                    validationError),
                              messageId,
                              QStringLiteral("floorLimit"));
         emit logMessage(QStringLiteral("floorLimit 下行参数错误: %1")
@@ -1541,7 +1564,13 @@ bool MqttManager::handleOnlineV1FloorLimit(const QString &topic,
                         .arg(saveError));
     }
 
-    if (responseCode == 0) {
+    QString responseMessage;
+    if (responseCode == 0 && FireEmergencyState::isActive()) {
+        responseCode = 423;
+        responseMessage = QStringLiteral("处于消防，梯控配置已保存但未下发RS485");
+        emit logMessage(QStringLiteral(
+                            "floorLimit 配置已保存，当前处于消防，跳过RS485下发"));
+    } else if (responseCode == 0) {
         const QByteArray rs485Payload = onlineV1FloorLimitBatchFrame(
                     state);
         const QString sourceTag = QStringLiteral("onlineV1FloorLimit:%1:batch")
@@ -1557,12 +1586,17 @@ bool MqttManager::handleOnlineV1FloorLimit(const QString &topic,
     publishOnlineV1Event(QStringLiteral("floorLimit"),
                          floorLimitResponseData(state,
                                                 responseFloors,
-                                                responseCode),
+                                                responseCode,
+                                                responseMessage),
                          messageId,
                          QStringLiteral("floorLimit"));
     return true;
 }
 
+/**
+ * @brief 处理 online_v1 定时梯控规则的设置、删除和查询。
+ * @details 消防期间规则继续持久化，但不会触发当前分钟的 RS485 执行。
+ */
 bool MqttManager::handleOnlineV1FloorSchedule(const QString &topic,
                                               const QJsonObject &payloadObj,
                                               const QString &method)
@@ -1606,6 +1640,7 @@ bool MqttManager::handleOnlineV1FloorSchedule(const QString &topic,
         QJsonObject data;
         data.insert(QStringLiteral("code"), code);
         data.insert(QStringLiteral("schedules"), schedules);
+        data.insert(QStringLiteral("fireActive"), FireEmergencyState::isActive());
         if (!message.trimmed().isEmpty()) {
             data.insert(QStringLiteral("message"), message.trimmed());
         }
@@ -1674,7 +1709,11 @@ bool MqttManager::handleOnlineV1FloorSchedule(const QString &topic,
         }
 
         if (deletedHashes.isEmpty()) {
-            publishSchedules(200, oldSchedules, QString());
+            const bool fireActive = FireEmergencyState::isActive();
+            publishSchedules(fireActive ? 423 : 200, oldSchedules,
+                             fireActive
+                             ? QStringLiteral("处于消防，梯控配置未下发RS485")
+                             : QString());
             emit logMessage(QStringLiteral(
                                 "floorSchedule.delete 未找到匹配hash，按幂等成功处理"));
             return true;
@@ -1702,7 +1741,11 @@ bool MqttManager::handleOnlineV1FloorSchedule(const QString &topic,
             return true;
         }
 
-        publishSchedules(200, remainingSchedules, QString());
+        const bool fireActive = FireEmergencyState::isActive();
+        publishSchedules(fireActive ? 423 : 200, remainingSchedules,
+                         fireActive
+                         ? QStringLiteral("处于消防，定时配置已保存但未下发RS485")
+                         : QString());
         emit logMessage(QStringLiteral(
                             "floorSchedule.delete 删除完成: deleted=%1 remaining=%2")
                         .arg(deletedHashes.size())
@@ -1735,7 +1778,11 @@ bool MqttManager::handleOnlineV1FloorSchedule(const QString &topic,
     const QByteArray oldJson = QJsonDocument(oldSchedules)
             .toJson(QJsonDocument::Compact);
     if (normalizedJson == oldJson) {
-        publishSchedules(200, oldSchedules, QString());
+        const bool fireActive = FireEmergencyState::isActive();
+        publishSchedules(fireActive ? 423 : 200, oldSchedules,
+                         fireActive
+                         ? QStringLiteral("处于消防，梯控配置未下发RS485")
+                         : QString());
         emit logMessage(QStringLiteral(
                             "floorSchedule 内容未变化，保留当前执行分钟标记"));
         return true;
@@ -1763,16 +1810,26 @@ bool MqttManager::handleOnlineV1FloorSchedule(const QString &topic,
         return true;
     }
 
-    publishSchedules(200, normalizedSchedules, QString());
+    const bool fireActive = FireEmergencyState::isActive();
+    publishSchedules(fireActive ? 423 : 200, normalizedSchedules,
+                     fireActive
+                     ? QStringLiteral("处于消防，定时配置已保存但未下发RS485")
+                     : QString());
     emit logMessage(QStringLiteral("floorSchedule 已全量覆盖: rules=%1 floors=%2")
                     .arg(normalizedSchedules.size())
                     .arg(newScheduleFloors.size()));
 
-    // 新规则若恰好命中当前分钟，应立即执行，不等待下一个5秒周期。
+    // 新规则若恰好命中当前分钟，仍更新数据库中的当前楼层状态；tick 内部会在
+    // 消防期间跳过 RS485，退出消防时 GPIO 状态机再恢复这份最新状态。
     onOnlineV1FloorScheduleTick();
     return true;
 }
 
+/**
+ * @brief 处理 online_v1 电梯模式配置和查询。
+ * @details 消防期间模式配置继续持久化并返回 code=423，退出消防恢复帧会读取
+ *          该最新模式配置。
+ */
 bool MqttManager::handleOnlineV1ElevatorMode(const QString &topic,
                                              const QJsonObject &payloadObj,
                                              const QString &method)
@@ -1824,6 +1881,7 @@ bool MqttManager::handleOnlineV1ElevatorMode(const QString &topic,
         data.insert(QStringLiteral("ext2"), state.ext2 ? 1 : 0);
         data.insert(QStringLiteral("ext3"), state.ext3 ? 1 : 0);
         data.insert(QStringLiteral("ext4"), state.ext4 ? 1 : 0);
+        data.insert(QStringLiteral("fireActive"), FireEmergencyState::isActive());
         if (!message.trimmed().isEmpty()) {
             data.insert(QStringLiteral("message"), message.trimmed());
         }
@@ -1897,6 +1955,14 @@ bool MqttManager::handleOnlineV1ElevatorMode(const QString &topic,
         return true;
     }
 
+    if (FireEmergencyState::isActive()) {
+        const QString message = QStringLiteral(
+                    "处于消防，电梯模式配置已保存但未下发RS485");
+        publishState(423, state, message);
+        emit logMessage(message);
+        return true;
+    }
+
     // 保存后立即下发完整当前状态；串口最终出口会在总开关开启时覆盖高8位，
     // 总开关关闭时则原样恢复113～120层的楼层权限。
     const QByteArray frame = onlineV1FloorLimitBatchFrame(
@@ -1913,6 +1979,11 @@ bool MqttManager::handleOnlineV1ElevatorMode(const QString &topic,
     return true;
 }
 
+/**
+ * @brief 执行命中当前分钟的 online_v1 定时梯控动作。
+ * @note 消防期间仍更新数据库中的当前楼层状态和执行分钟标记，但不发送 RS485；
+ *       退出消防后由消防状态机恢复最新数据库状态。
+ */
 void MqttManager::onOnlineV1FloorScheduleTick()
 {
     const QString eventTopic = cfg_.publishTopic.trimmed();
@@ -1977,6 +2048,14 @@ void MqttManager::onOnlineV1FloorScheduleTick()
                                             &saveError)) {
         emit logMessage(QStringLiteral("floorSchedule 到时状态保存失败: %1")
                         .arg(saveError));
+        return;
+    }
+
+    if (FireEmergencyState::isActive()) {
+        emit logMessage(QStringLiteral(
+                            "floorSchedule 到时状态已保存，当前处于消防，跳过RS485下发: minute=%1 floors=%2")
+                        .arg(minuteKey)
+                        .arg(floors.size()));
         return;
     }
 

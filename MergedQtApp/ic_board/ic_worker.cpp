@@ -3,13 +3,18 @@
  * @brief 在非 UI 线程中运行 IC 串口、二维码、RS485 和协议处理逻辑。
  *
  * @author Du lin
- * @note 最近修改：2026-11-10；修改人：Du lin；将 IC 刷卡结果接到独立播报门，二维码分支继续使用原提示入口。
+ * @note 最近修改：2026-11-20；修改人：Du lin；保持原消防协议帧和非阻塞定时状态机，
+ *       在已确认进入/退出消防时同步发布界面状态，使楼层页复用原消防图标提示。
  * @date 2026-07-25
  */
 
 #include "ic_worker.h"
 
 #include "ic_event_bridge.h"
+#include "device_config_sync.h"
+#include "fire_emergency_state.h"
+#include "fire_gpio_monitor.h"
+#include "rs485_floor_frame_builder.h"
 #include "common/sql/dbstore.h"
 #include "local_access_service.h"
 #include "network_access_service.h"
@@ -66,6 +71,83 @@ RuntimeIcMode runtimeIcModeFromIni()
 bool isOfflineIcMode()
 {
     return runtimeIcModeFromIni() == RuntimeIcMode::OfflineV1;
+}
+
+/** @return sourceTag 对应平台梯控配置发送时返回 true；呼梯和人员通行不在拦截范围内。 */
+bool isTrafficConfigurationTag(const QString &sourceTag)
+{
+    return sourceTag.startsWith(QStringLiteral("onlineV1FloorLimit:"))
+            || sourceTag.startsWith(QStringLiteral("onlineV1FloorSchedule:"))
+            || sourceTag.startsWith(QStringLiteral("onlineV1ElevatorMode:"))
+            || sourceTag == QStringLiteral("ic/openTrafficFloor")
+            || sourceTag == QStringLiteral("ic/closeTrafficFloor");
+}
+
+/**
+ * @brief 把 online_v1 的业务开放位转换为分层板限行位序。
+ * @return 128 字节板端位图；0 表示开放，1 表示限行。
+ */
+QByteArray onlineV1RestrictionBits()
+{
+    QByteArray openBits = DbStore::getConfig(
+                QStringLiteral("online_v1_floor_limit_bits"),
+                QString(128, QLatin1Char('0'))).toString().trimmed().toLatin1();
+    bool valid = openBits.size() == 128;
+    for (char bit : openBits) {
+        if (bit != '0' && bit != '1') {
+            valid = false;
+            break;
+        }
+    }
+    if (!valid) openBits = QByteArray(128, '0');
+
+    QByteArray restrictionBits(128, '1');
+    for (int floor = -8; floor <= -1; ++floor) {
+        restrictionBits[floor + 8] = openBits.at(floor + 128) == '1' ? '0' : '1';
+    }
+    for (int floor = 1; floor <= 120; ++floor) {
+        restrictionBits[floor + 7] = openBits.at(floor - 1) == '1' ? '0' : '1';
+    }
+    return restrictionBits;
+}
+
+/** @brief 把已保存的 online_v1 电梯模式写入分层板最高 8 位。 */
+void applyPersistedElevatorMode(QByteArray *restrictionBits)
+{
+    if (!restrictionBits || restrictionBits->size() != 128) return;
+    const Rs485FloorFrameBuilder::ElevatorModeState state =
+            Rs485FloorFrameBuilder::elevatorModeState();
+    if (!state.masterSwitch) return;
+
+    quint8 value = 0;
+    if (state.delay) value |= 0x80;
+    if (state.parking) value |= 0x40;
+    if (state.driver) value |= 0x20;
+    if (state.independent) value |= 0x10;
+    if (state.ext1) value |= 0x08;
+    if (state.ext2) value |= 0x04;
+    if (state.ext3) value |= 0x02;
+    if (state.ext4) value |= 0x01;
+    for (int i = 0; i < 8; ++i) {
+        (*restrictionBits)[120 + i] = (value & (0x80 >> i)) ? '1' : '0';
+    }
+}
+
+/**
+ * @brief 构造消防退出时的 STM32 兼容 CLOS 恢复帧。
+ * @return 固定 132 字节帧；内容来自当前数据库配置而非消防进入前的内存副本。
+ */
+QByteArray fireRestoreFrame()
+{
+    QByteArray restrictionBits = runtimeIcModeFromIni() == RuntimeIcMode::OnlineV1
+            ? onlineV1RestrictionBits()
+            : DeviceConfigSync::floorFlags128Bits();
+    if (restrictionBits.size() != 128) restrictionBits = QByteArray(128, '1');
+    applyPersistedElevatorMode(&restrictionBits);
+
+    QByteArray frame("CLOS");
+    frame.append(restrictionBits);
+    return frame;
 }
 
 /**
@@ -265,8 +347,8 @@ void IcWorker::finishEmbeddedPermissionCard(const QByteArray &frame)
 /**
  * @brief 在 worker 线程中创建并启动全部 IC 链路对象。
  *
- * @note 刷卡器、二维码、RS485、协议处理和 IC 数据库初始化都归该线程所有；
- *       UI 提示通过 IcEventBridge 发回主线程。
+ * @note 刷卡器、二维码、RS485、消防定时状态机、协议处理和 IC 数据库初始化都归
+ *       该线程所有；定时等待不阻塞事件循环，UI 提示通过 IcEventBridge 发回主线程。
  */
 void IcWorker::start()
 {
@@ -298,6 +380,16 @@ void IcWorker::start()
                 << "sourceTag=" << sourceTag
                 << "len=" << frame.size()
                 << "hex=" << frame.toHex(' ');
+
+        if (FireEmergencyState::isActive()
+                && isTrafficConfigurationTag(sourceTag)) {
+            const QString reason = QStringLiteral("处于消防，梯控配置已保存但未下发RS485");
+            qInfo() << "[FIRE] suppress platform traffic configuration, sourceTag="
+                    << sourceTag;
+            IcEventBridge::instance()->emitRs485SendFinished(
+                        sourceTag, false, reason);
+            return;
+        }
 
         if (!rs485_) {
             IcEventBridge::instance()->emitRs485SendFinished(
@@ -720,16 +812,157 @@ void IcWorker::start()
         }
     });
 
+    // 消防 GPIO 与串口业务共用 IC 工作线程。两个单次定时器只延后状态转换，
+    // 不使用 sleep，也不会阻塞 UI 或 IC 工作线程的事件循环。
+    fireTransitionCooldownTimer_ = new QTimer(this);
+    fireTransitionCooldownTimer_->setSingleShot(true);
+    fireTransitionCooldownTimer_->setInterval(1000);
+    QObject::connect(fireTransitionCooldownTimer_, &QTimer::timeout,
+                     this, &IcWorker::evaluateFireState);
+
+    fireExitConfirmTimer_ = new QTimer(this);
+    fireExitConfirmTimer_->setSingleShot(true);
+    fireExitConfirmTimer_->setInterval(500);
+    QObject::connect(fireExitConfirmTimer_, &QTimer::timeout,
+                     this, [this]() {
+        if (!fireRawStateKnown_ || fireRawActive_
+                || !FireEmergencyState::isActive()) {
+            evaluateFireState();
+            return;
+        }
+        completeFireExit();
+    });
+
+    fireMonitor_ = new FireGpioMonitor(this);
+    QObject::connect(fireMonitor_, &FireGpioMonitor::fireStateChanged,
+                     this, &IcWorker::handleFireStateChanged,
+                     Qt::DirectConnection);
+    fireMonitor_->start();
+
+}
+
+/**
+ * @brief 记录消防 GPIO 的最新原始电平并推进定时状态机。
+ * @param[in] active true 表示高电平，false 表示低电平。
+ * @note 高电平会取消尚未完成的退出确认；1000 ms 冷却期间只记录电平，待定时器
+ *       到时再处理，因此不会连续发送相反的 132 字节帧。
+ */
+void IcWorker::handleFireStateChanged(bool active)
+{
+    fireRawStateKnown_ = true;
+    fireRawActive_ = active;
+
+    if (active && fireExitConfirmTimer_ && fireExitConfirmTimer_->isActive()) {
+        fireExitConfirmTimer_->stop();
+        qInfo() << "[FIRE] exit confirmation cancelled: GPIO returned high";
+    }
+
+    evaluateFireState();
+}
+
+/**
+ * @brief 在不阻塞事件循环的前提下评估消防状态转换。
+ * @details 已执行变化后的 1000 ms 内不处理反向电平；消防中低电平先进入
+ *          500 ms 确认阶段，高电平恢复会取消该确认。
+ */
+void IcWorker::evaluateFireState()
+{
+    if (!fireRawStateKnown_) return;
+    if (fireTransitionCooldownTimer_
+            && fireTransitionCooldownTimer_->isActive()) {
+        return;
+    }
+
+    const bool fireActive = FireEmergencyState::isActive();
+    if (fireRawActive_) {
+        if (!fireActive) enterFireState();
+        return;
+    }
+
+    if (!fireActive) return;
+    if (fireExitConfirmTimer_ && !fireExitConfirmTimer_->isActive()) {
+        qInfo() << "[FIRE] low level detected, confirm for 500ms before exit";
+        fireExitConfirmTimer_->start();
+    }
+}
+
+/**
+ * @brief 进入消防并发送全楼层开放帧。
+ * @note 发送后启动 1000 ms 冷却；期间 GPIO 的最新状态仍会被记录，但不会立即
+ *       触发恢复帧，从而保持与 STM32 vTaskDelay(1000) 等效的状态变化间隔。
+ */
+void IcWorker::enterFireState()
+{
+    if (FireEmergencyState::exchangeActive(true)) return;
+    IcEventBridge::instance()->emitFireEmergencyChanged(true);
+
+    QByteArray frame("OPEN");
+    frame.append(QByteArray(128, '0'));
+    const bool sent = rs485_ && rs485_->sendFireFrame(frame);
+    if (fireTransitionCooldownTimer_) fireTransitionCooldownTimer_->start();
+    qInfo() << "[FIRE] entered, all floors open"
+            << "sent=" << sent
+            << "cooldownMs=" << 1000
+            << "len=" << frame.size()
+            << "frame=" << frame;
+    if (!sent) {
+        qWarning() << "[FIRE] all-open RS485 send failed; fire state remains active";
+    }
+}
+
+/**
+ * @brief 完成消防退出并恢复数据库中的最新梯控状态。
+ * @note 本方法只会在低电平连续保持 500 ms 后调用；仍使用原 CLOS 恢复协议，
+ *       不处理本轮明确排除的协议头兼容问题。
+ */
+void IcWorker::completeFireExit()
+{
+    if (!FireEmergencyState::isActive() || fireRawActive_) return;
+
+    // 保持消防标志到恢复帧发送完成：并发到达的平台配置会先落库但不会抢先发板。
+    const QByteArray frame = fireRestoreFrame();
+    bool sent = rs485_ && rs485_->sendFireFrame(frame);
+    FireEmergencyState::exchangeActive(false);
+    IcEventBridge::instance()->emitFireEmergencyChanged(false);
+
+    // 解除消防标志后再读取一次：若平台配置恰好在第一次构帧后完成落库，补发
+    // 最新状态；若配置在此后到达，其普通发送请求会排在本槽函数之后执行。
+    const QByteArray latestFrame = fireRestoreFrame();
+    if (!sent || latestFrame != frame) {
+        sent = rs485_ && rs485_->sendFireFrame(latestFrame);
+    }
+    qInfo() << "[FIRE] exited, persisted traffic state restored"
+            << "sent=" << sent
+            << "len=" << latestFrame.size()
+            << "frame=" << latestFrame;
+    if (!sent) {
+        qWarning() << "[FIRE] persisted traffic state restore RS485 send failed";
+    }
+    if (fireTransitionCooldownTimer_) fireTransitionCooldownTimer_->start();
 }
 
 /**
  * @brief 停止 IC 串口设备，并关闭当前线程的数据库连接。
  *
- * @note 该槽函数必须在 worker 线程执行，因为 QSerialPort 和 QSqlDatabase
- *       连接都绑定到创建它们的线程。
+ * @note 该槽函数必须在 worker 线程执行，因为消防监视器、QSerialPort 和
+ *       QSqlDatabase 连接都绑定到创建它们的线程。
  */
 void IcWorker::stop()
 {
+    if (fireMonitor_) {
+        fireMonitor_->stop();
+    }
+    if (fireTransitionCooldownTimer_) {
+        fireTransitionCooldownTimer_->stop();
+    }
+    if (fireExitConfirmTimer_) {
+        fireExitConfirmTimer_->stop();
+    }
+    fireRawStateKnown_ = false;
+    fireRawActive_ = false;
+    if (FireEmergencyState::exchangeActive(false)) {
+        IcEventBridge::instance()->emitFireEmergencyChanged(false);
+    }
     if (readerHeartbeatTimer_) {
         readerHeartbeatTimer_->stop();
     }

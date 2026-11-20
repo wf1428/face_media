@@ -2,8 +2,10 @@
  * @file ic_mqtt_gateway.cpp
  * @brief MQTT 在线协议与本地 IC/二维码/RS485 事件之间的双向网关的实现。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-11-19；修改人：Du lin；online_v2 开放/限行配置在消防期间仍保存数据库，
+ *       但不发送 RS485，并通过原响应方法返回 code=423、fireActive=true 和具体原因。
  */
 
 #include "ic_mqtt_gateway.h"
@@ -18,6 +20,7 @@
 
 #include "ic_board/ic_offline_checker.h"
 #include "ic_board/ic_event_bridge.h"
+#include "ic_board/fire_emergency_state.h"
 #include "ic_board/core_migration_audit/core_migration_sync.h"
 #include "ic_board/rs485_floor_frame_builder.h"
 #include "platform/rk3566_platform.h"
@@ -675,7 +678,14 @@ void IcMqttGateway::onKeepAliveTimeout()
 }
 
 
-// 属性上报 发布
+/**
+ * @brief 分发 online_v2/旧版 IC 平台下行消息。
+ * @param[in] topic 消息来源主题；当前网关只按已启用状态和方法分发。
+ * @param[in] payloadObj 已解析的下行 JSON 对象。
+ * @return 方法属于本 IC 网关并已处理时返回 true，否则返回 false。
+ * @note openTrafficFloor/closeTrafficFloor 在消防期间仍保存楼层位图，但不会
+ *       下发 RS485，并通过原成功方法携带 code=423 和 fireActive=true。
+ */
 bool IcMqttGateway::handleIncoming(const QString &topic, const QJsonObject &payloadObj)
 {
     Q_UNUSED(topic);
@@ -764,11 +774,26 @@ bool IcMqttGateway::handleIncoming(const QString &topic, const QJsonObject &payl
         QByteArray rs485Payload;
 
         if (applyTrafficCmdLikeStm32(cmd, &rs485Payload, &err)) {
-            IcEventBridge::instance()->requestRs485Send(rs485Payload);
-            emit logMessage(QString("openTrafficFloor -> RS485 len=%1 hex=%2")
-                            .arg(rs485Payload.size())
-                            .arg(QString::fromLatin1(rs485Payload.toHex(' '))));
-            publishSuccess("openTrafficFloorSuccess", msg.id, QJsonObject{}, "ic/openTrafficFloor");
+            if (FireEmergencyState::isActive()) {
+                QJsonObject extra;
+                extra.insert(QStringLiteral("code"), 423);
+                extra.insert(QStringLiteral("result"), false);
+                extra.insert(QStringLiteral("fireActive"), true);
+                extra.insert(QStringLiteral("msg"),
+                             QStringLiteral("处于消防，梯控配置已保存但未下发RS485"));
+                publishSuccess("openTrafficFloorSuccess", msg.id, extra,
+                               "ic/openTrafficFloor");
+                emit logMessage(QStringLiteral(
+                                    "openTrafficFloor 配置已保存，当前处于消防，跳过RS485下发"));
+            } else {
+                IcEventBridge::instance()->requestRs485Send(
+                            rs485Payload, QStringLiteral("ic/openTrafficFloor"));
+                emit logMessage(QString("openTrafficFloor -> RS485 len=%1 hex=%2")
+                                .arg(rs485Payload.size())
+                                .arg(QString::fromLatin1(rs485Payload.toHex(' '))));
+                publishSuccess("openTrafficFloorSuccess", msg.id, QJsonObject{},
+                               "ic/openTrafficFloor");
+            }
         } else {
             emit logMessage(QString("openTrafficFloor 失败: %1").arg(err));
         }
@@ -786,11 +811,26 @@ bool IcMqttGateway::handleIncoming(const QString &topic, const QJsonObject &payl
         QByteArray rs485Payload;
 
         if (applyTrafficCmdLikeStm32(cmd, &rs485Payload, &err)) {
-            IcEventBridge::instance()->requestRs485Send(rs485Payload);
-            emit logMessage(QString("closeTrafficFloor -> RS485 len=%1 hex=%2")
-                            .arg(rs485Payload.size())
-                            .arg(QString::fromLatin1(rs485Payload.toHex(' '))));
-            publishSuccess("closeTrafficFloorSuccess", msg.id, QJsonObject{}, "ic/closeTrafficFloor");
+            if (FireEmergencyState::isActive()) {
+                QJsonObject extra;
+                extra.insert(QStringLiteral("code"), 423);
+                extra.insert(QStringLiteral("result"), false);
+                extra.insert(QStringLiteral("fireActive"), true);
+                extra.insert(QStringLiteral("msg"),
+                             QStringLiteral("处于消防，梯控配置已保存但未下发RS485"));
+                publishSuccess("closeTrafficFloorSuccess", msg.id, extra,
+                               "ic/closeTrafficFloor");
+                emit logMessage(QStringLiteral(
+                                    "closeTrafficFloor 配置已保存，当前处于消防，跳过RS485下发"));
+            } else {
+                IcEventBridge::instance()->requestRs485Send(
+                            rs485Payload, QStringLiteral("ic/closeTrafficFloor"));
+                emit logMessage(QString("closeTrafficFloor -> RS485 len=%1 hex=%2")
+                                .arg(rs485Payload.size())
+                                .arg(QString::fromLatin1(rs485Payload.toHex(' '))));
+                publishSuccess("closeTrafficFloorSuccess", msg.id, QJsonObject{},
+                               "ic/closeTrafficFloor");
+            }
         } else {
             emit logMessage(QString("closeTrafficFloor 失败: %1").arg(err));
         }

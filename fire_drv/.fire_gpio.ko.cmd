@@ -1,0 +1,1 @@
+cmd_/home/lubancat/face_media/fire_drv/fire_gpio.ko := aarch64-linux-gnu-ld -r  -EL  -maarch64elf -T ./scripts/module-common.lds -T ./arch/arm64/kernel/module.lds  --build-id  -o /home/lubancat/face_media/fire_drv/fire_gpio.ko /home/lubancat/face_media/fire_drv/fire_gpio.o /home/lubancat/face_media/fire_drv/fire_gpio.mod.o ;  true

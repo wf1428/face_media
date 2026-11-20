@@ -2,8 +2,10 @@
  * @file ic_worker.h
  * @brief IC 链路工作线程对象。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-11-20；修改人：Du lin；将消防电平切换改为非阻塞定时状态机：
+ *       每次已执行变化后冷却 1000 ms，解除消防前再确认低电平稳定 500 ms，避免连续下发两条 132 字节帧。
  */
 
 #ifndef IC_WORKER_H
@@ -20,6 +22,7 @@ class OfflineQr;
 class NetworkAccessService;
 class LocalAccessService;
 class QTimer;
+class FireGpioMonitor;
 struct NetworkAccessResult;
 
 /**
@@ -39,10 +42,10 @@ public:
     ~IcWorker() override;
 
 public slots:
-    /** @brief 初始化数据库配置并启动 RS485、刷卡器和二维码链路。 */
+    /** @brief 初始化数据库配置，并启动 RS485、刷卡器、二维码及非阻塞消防定时状态机。 */
     void start();
 
-    /** @brief 关闭全部串口及数据库；必须在 worker 所属线程执行。 */
+    /** @brief 停止消防定时器、关闭全部串口及数据库；必须在 worker 所属线程执行。 */
     void stop();
 
 private:
@@ -55,6 +58,25 @@ private:
     /** @brief 两个人员库均无卡号时使用 103/115 字节卡内权限。 */
     void finishEmbeddedPermissionCard(const QByteArray &frame);
 
+    /**
+     * @brief 记录消防 GPIO 原始状态并驱动非阻塞定时状态机。
+     * @param[in] active true 表示采样为高电平，false 表示采样为低电平。
+     * @note 本方法只在 IC 工作线程执行；等待过程使用 QTimer，不阻塞 UI 或 IC 事件循环。
+     */
+    void handleFireStateChanged(bool active);
+
+    /**
+     * @brief 根据当前原始电平、消防状态和定时器状态决定下一步动作。
+     * @note 1000 ms 冷却期间只记录最新电平；消防中检测到低电平后启动 500 ms 退出确认。
+     */
+    void evaluateFireState();
+
+    /** @brief 发送全开放帧、置位消防状态并启动 1000 ms 状态变化冷却。 */
+    void enterFireState();
+
+    /** @brief 低电平稳定 500 ms 后恢复数据库梯控配置并启动 1000 ms 冷却。 */
+    void completeFireExit();
+
     NetworkAccessService *networkAccess_ = nullptr;
     LocalAccessService *localAccess_ = nullptr;
     IcSerialConfig io_;              /**< 数据库路径和硬件串口参数。 */
@@ -65,6 +87,11 @@ private:
     QrSerialReceiver *qrReceiver_ = nullptr; /**< 二维码串口报文接收器。 */
     OfflineQr *qr_ = nullptr;                /**< 离线二维码业务解析器。 */
     QTimer *readerHeartbeatTimer_ = nullptr; /**< 每秒检查读头心跳，故障提示限频为30秒。 */
+    FireGpioMonitor *fireMonitor_ = nullptr; /**< 单路消防 GPIO 监视器，由 this 托管并运行在 IC 工作线程。 */
+    QTimer *fireTransitionCooldownTimer_ = nullptr; /**< 已执行消防变化后的1000 ms非阻塞冷却定时器。 */
+    QTimer *fireExitConfirmTimer_ = nullptr; /**< 解除消防前确认低电平持续500 ms的单次定时器。 */
+    bool fireRawStateKnown_ = false; /**< 是否已经取得GPIO有效样本；false时不执行状态转换。 */
+    bool fireRawActive_ = false; /**< 最近GPIO原始电平；true为高电平，false为低电平。 */
     QElapsedTimer readerHeartbeatElapsed_;   /**< 最近一次收到 &B 帧后的单调计时。 */
     QElapsedTimer readerHeartbeatWarningElapsed_; /**< 最近一次故障提示后的单调计时。 */
     bool readerHeartbeatFault_ = false;      /**< 是否已进入一分钟无心跳故障状态。 */

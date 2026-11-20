@@ -3,7 +3,7 @@
  * @brief 将 OTA 下行交给独立执行器，按持久状态回报阶段及重启结果。
  * @author Du lin
  * @date 2026-11-18
- * @note 最近修改：2026-11-18；修改人：Du lin；修复 Unix 锁路径局部变量与 name 参数重名，显式保存 QByteArray 编码后传给 open，保持锁及 OTA 流程不变；同步 Shell 执行器的依赖错误提示和锁说明，MQTT 协议与调用入口不变。
+ * @note 最近修改：2026-11-20；修改人：Du lin；终态 MQTT 重放与本地提示分离，历史本地错误不再弹窗；当前预写入失败提示5秒，其他终态用独立提示记录避免 Qt 重启重复显示；显示按阶段0..100刷新，MQTT 独立按整体至少5%上报，本地进度仅用于界面。
  */
 #include "ota_service.h"
 #include "ota_protocol.h"
@@ -88,6 +88,19 @@ bool writableStorage(const QString &root)
 }
 /** @return 只允许固定路径使用的 boot ID；读取失败时为空。 */
 QString bootId() { QFile file(QStringLiteral("/proc/sys/kernel/random/boot_id")); return file.open(QIODevice::ReadOnly) ? QString::fromLatin1(file.read(128)).trimmed() : QString(); }
+/** @brief 兼容旧执行器：将其整体权重还原为本地阶段百分比，不产生模拟计时进度。
+ * @param stage 平台阶段。
+ * @param overall 执行器整体进度。
+ * @return 当前阶段的0..100；接收、重启等待等阶段没有可量化工作时为0。
+ */
+int stagePercent(const QString &stage, int overall)
+{
+    int start = 0, span = 0;
+    if (stage == "downloading") { start = 5; span = 50; }
+    else if (stage == "verifying") { start = 60; span = 25; }
+    else if (stage == "installing") { start = 86; span = 10; }
+    return span > 0 ? qBound(0, (overall - start) * 100 / span, 100) : 0;
+}
 /** @return 可在失败终态后由平台重新派发的错误码。 */
 bool retryable(int code) { return code == -1 || code == -2 || code == -4; }
 }
@@ -140,6 +153,13 @@ void OtaService::setOnline(bool online)
 
 QString OtaService::runningVersion() const
 {
+    // 候选镜像可能残留旧记录；跨重启的本地验证完成前不把它当成已确认版本。
+    const auto activeId = OtaProtocol::taskId(read(environment_.stateRoot + "/active.json"));
+    const auto state = activeId.isEmpty() ? QJsonObject() : read(taskPath(activeId));
+    const auto phase = state.value("phase").toString();
+    if (phase == "trial" || phase == "confirming" || phase == "recovering"
+            || (phase == "awaiting_boot" && (bootId().isEmpty() || state.value("beforeBootId").toString() != bootId())))
+        return {};
     QFile file(environment_.versionFile);
     if (!file.open(QIODevice::ReadOnly)) return {};
     const auto value = QString::fromUtf8(file.read(256)).trimmed();
@@ -223,7 +243,10 @@ bool OtaService::handle(const QString &topic, const QJsonObject &payload)
     const auto activeState = activeId.isEmpty() ? QJsonObject() : read(taskPath(activeId));
     const auto phase = activeState.value("phase").toString();
     if (!activeState.isEmpty() && phase != "finished") {
-        if (activeId == id) { currentId_ = id; progress(activeState); }
+        if (activeId == id) {
+            if (currentId_ != id) { noticeStage_.clear(); noticeText_.clear(); noticePercent_ = 0; }
+            currentId_ = id; progress(activeState);
+        }
         else publish("ota.result", {{"taskId", id}, {"result", "failed"}, {"resultCode", -5}, {"errorMsg", QStringLiteral("已有 OTA 任务正在执行")}});
         return true;
     }
@@ -245,6 +268,7 @@ bool OtaService::handle(const QString &topic, const QJsonObject &payload)
 void OtaService::prepare(const QJsonObject &data)
 {
     currentId_ = OtaProtocol::taskId(data);
+    visibleTaskId_ = currentId_;
     credentialDigest_ = QCryptographicHash::hash(QJsonDocument(data.value("ftp").toObject()).toJson(QJsonDocument::Compact), QCryptographicHash::Md5);
     request_ = {};
     for (const auto *key : {"taskId", "version", "md5", "action", "size", "policy", "notificationId", "deviceId"})
@@ -252,6 +276,7 @@ void OtaService::prepare(const QJsonObject &data)
     request_.insert("taskId", currentId_);
     request_.insert("md5", data.value("md5").toString().toLower());
     output_.clear(); lastError_ = {}; prepared_ = false; stage_.clear(); percent_ = -10;
+    noticeStage_.clear(); noticeText_.clear(); noticePercent_ = 0;
     terminalToken_.clear(); launchToken_.clear();
     const auto prior = read(taskPath(currentId_));
     const int previousPercent = prior.value("percent").toInt();
@@ -335,6 +360,7 @@ void OtaService::fail(int code, const QString &message)
     const bool storage = writableStorage(environment_.stateRoot);
     TaskGate owner(environment_.stateRoot, QStringLiteral("executor.lock"));
     if (storage && !owner.acquired()) return; // An independent executor owns the state.
+    visibleTaskId_ = currentId_;
     auto state = read(taskPath(currentId_));
     if (state.isEmpty()) state = request_;
     state.remove("ftp");
@@ -356,11 +382,13 @@ void OtaService::progress(const QJsonObject &state)
 {
     const auto stage = state.value("state").toString();
     const int percent = qBound(0, state.value("percent").toInt(), 100);
-    if (stage == stage_ && percent < percent_ + 5) return;
     const int next = qMax(percent, qMax(0, percent_));
-    if (request_.value("deviceId").toString().isEmpty() || request_.value("deviceId").toString() == device_)
-        publish("ota.progress", {{"taskId", currentId_}, {"state", stage}, {"percent", next}});
-    stage_ = stage; percent_ = next;
+    // 只有 MQTT 使用原有整体进度及5%节流；更细的本地更新不能被这里过滤。
+    if (stage != stage_ || percent >= percent_ + 5) {
+        if (request_.value("deviceId").toString().isEmpty() || request_.value("deviceId").toString() == device_)
+            publish("ota.progress", {{"taskId", currentId_}, {"state", stage}, {"percent", next}});
+        stage_ = stage; percent_ = next;
+    }
     QString text;
     if (stage == "received") text = QStringLiteral("已收到系统升级任务");
     else if (stage == "downloading") text = QStringLiteral("正在下载系统升级包");
@@ -368,16 +396,45 @@ void OtaService::progress(const QJsonObject &state)
     else if (stage == "installing") text = QStringLiteral("正在安装系统更新，请勿断电");
     else if (stage == "rebooting") text = QStringLiteral("系统更新已写入，即将重启验证");
     else return;
-    emit notice(text, next, false, false);
+    auto localPercent = state.value("stagePercent");
+    if (!localPercent.isDouble()) {
+        // 安装独立执行器的细进度放在 /run，不增加 userdata 的状态同步频率。
+        const auto local = read(environment_.progressRoot + '/' + currentId_ + QStringLiteral(".json"));
+        if (OtaProtocol::taskId(local) == currentId_ && local.value("state").toString() == stage
+                && local.value("attempt").toInt() == state.value("attempt").toInt()
+                && local.value("beforeBootId").toString() == state.value("beforeBootId").toString())
+            localPercent = local.value("stagePercent");
+    }
+    visibleTaskId_ = currentId_;
+    displayProgress(stage, text, localPercent.isDouble() ? localPercent.toInt() : stagePercent(stage, percent));
+}
+
+void OtaService::displayProgress(const QString &stage, const QString &text, int percent)
+{
+    const int bounded = qBound(0, percent, 100);
+    if (noticeStage_ != stage) {
+        const bool completed = (noticeStage_ == "downloading" && stage == "verifying")
+                || (noticeStage_ == "verifying" && stage == "installing")
+                || (noticeStage_ == "installing" && stage == "rebooting");
+        if (completed && noticePercent_ < 100) emit notice(noticeText_, 100, false, false, 0);
+        noticeStage_ = stage; noticeText_ = text; noticePercent_ = 0;
+        emit notice(text, 0, false, false, 0);
+    }
+    const int shown = qMax(bounded, noticePercent_);
+    if (shown != noticePercent_ || text != noticeText_) {
+        noticeText_ = text; noticePercent_ = shown;
+        emit notice(text, shown, false, false, 0);
+    }
 }
 
 void OtaService::reportVersion(const QString &id)
 {
-    QJsonObject data{{"version", runningVersion()}, {"reason", "query_reply"}};
+    const auto recorded = runningVersion();
+    QJsonObject data{{"version", recorded}, {"reason", "query_reply"}};
     if (!id.isEmpty()) data.insert("taskId", id);
     const auto activeId = OtaProtocol::taskId(read(environment_.stateRoot + "/active.json"));
     const auto state = activeId.isEmpty() ? QJsonObject() : read(taskPath(activeId));
-    if (state.value("result").toString() == "success" && state.value("actualVersion").toString() == runningVersion()) data.insert("md5", state.value("md5"));
+    if (!recorded.isEmpty() && state.value("result").toString() == "success" && state.value("actualVersion").toString() == recorded) data.insert("md5", state.value("md5"));
     publish("ota.version", data);
 }
 
@@ -389,23 +446,36 @@ void OtaService::replay(const QJsonObject &state)
     QJsonObject data{{"taskId", id}, {"result", state.value("result")}, {"resultCode", state.value("resultCode")}};
     if (!state.value("errorMsg").toString().isEmpty()) data.insert("errorMsg", state.value("errorMsg"));
     if (state.value("result").toString() == "success") data.insert("md5", state.value("md5"));
+    const auto recorded = runningVersion();
     const bool queued = publish("ota.result", data);
     // Send version only after result was accepted in the same ordered IPC queue.
     if (queued && !state.value("outcomeBootId").toString().isEmpty()) {
-        QJsonObject version{{"taskId", id}, {"version", runningVersion()}, {"reason", "after_ota"}};
-        if (state.value("result").toString() == "success" && state.value("actualVersion").toString() == runningVersion()) version.insert("md5", state.value("md5"));
+        QJsonObject version{{"taskId", id}, {"version", recorded}, {"reason", "after_ota"}};
+        if (!recorded.isEmpty() && state.value("result").toString() == "success" && state.value("actualVersion").toString() == recorded) version.insert("md5", state.value("md5"));
         publish("ota.version", version);
     }
     if (id != currentId_) return;
-    const auto token = id + ':' + state.value("result").toString() + ':' + QString::number(state.value("resultCode").toInt());
+    const auto token = id + ':' + QString::number(state.value("attempt").toInt()) + ':'
+            + state.value("result").toString() + ':' + QString::number(state.value("resultCode").toInt()) + ':'
+            + state.value("outcomeBootId").toString();
     if (token == terminalToken_) return;
     terminalToken_ = token;
+    const bool preWriteFailure = state.value("result").toString() == "failed"
+            && !state.value("writeStarted").toBool() && state.value("outcomeBootId").toString().isEmpty();
+    // 历史本地错误只补报 MQTT；新进程没有亲历的失败不重新弹到用户面前。
+    const bool localFailure = state.value("result").toString() == "failed" && state.value("outcomeBootId").toString().isEmpty();
+    if (localFailure && visibleTaskId_ != id) return;
+    const auto noticePath = QFileInfo(taskPath(id)).absolutePath() + QStringLiteral("/notice.json");
+    if (read(noticePath).value("token").toString() == token) return;
+    // 与脚本 state.json 分开保存，不争用安装器的状态写入权。
+    if (writableStorage(environment_.stateRoot)) save(noticePath, {{"token", token}});
     const bool success = state.value("result").toString() == "success";
     const bool restored = state.value("result").toString() == "rolled_back";
-    const auto text = success ? QStringLiteral("系统升级成功，当前版本：%1").arg(runningVersion())
-                    : restored ? QStringLiteral("系统升级未通过，已恢复原版本：%1").arg(runningVersion())
+    const auto shownVersion = recorded.isEmpty() ? QStringLiteral("未登记") : recorded;
+    const auto text = success ? QStringLiteral("系统升级成功，当前版本：%1").arg(shownVersion)
+                    : restored ? QStringLiteral("系统升级未通过，已恢复原版本：%1").arg(shownVersion)
                     : QStringLiteral("系统升级失败：%1").arg(state.value("errorMsg").toString());
-    emit notice(text, success ? 100 : qMax(0, percent_), true, success);
+    emit notice(text, (success || restored) ? 100 : noticePercent_, true, success, preWriteFailure ? 5000 : (success ? 10000 : 0));
 }
 
 void OtaService::poll()
@@ -417,7 +487,10 @@ void OtaService::poll()
     const auto state = read(taskPath(id));
     if (state.isEmpty()) return;
     if (!state.value("deviceId").toString().isEmpty() && state.value("deviceId").toString() != device_) return;
-    if (currentId_ != id) { currentId_ = id; stage_.clear(); percent_ = -10; terminalToken_.clear(); }
+    if (currentId_ != id) {
+        currentId_ = id; stage_.clear(); percent_ = -10; terminalToken_.clear();
+        noticeStage_.clear(); noticeText_.clear(); noticePercent_ = 0;
+    }
     const auto phase = state.value("phase").toString();
     if (phase == "finished") {
         percent_ = qMax(percent_, state.value("percent").toInt());
@@ -428,7 +501,7 @@ void OtaService::poll()
     }
     if (phase == "trial" || phase == "confirming" || phase == "recovering") {
         const auto text = phase == "recovering" ? QStringLiteral("系统升级验证未通过，正在恢复原分区") : QStringLiteral("系统更新已启动，正在验证运行状态");
-        if (stage_ != phase) { stage_ = phase; emit notice(text, 99, false, false); }
+        if (stage_ != phase) { stage_ = phase; visibleTaskId_ = currentId_; displayProgress(phase, text, 0); }
         return;
     }
     if ((phase == "received" || phase == "downloading" || phase == "verifying" || phase == "extracting")

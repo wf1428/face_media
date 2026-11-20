@@ -3,7 +3,8 @@
  * @brief IC 本地链路、UI 与 MQTT 网关之间的进程内事件总线。
  *
  * @author Du lin
- * @note 最近修改：2026-11-10；修改人：Du lin；结果提示信号携带刷卡来源，用于界面应用即时声音开关。
+ * @note 最近修改：2026-11-20；修改人：Du lin；新增消防业务状态通知，使 GPIO 消防状态
+ *       可排队传递到楼层状态界面；原信号板状态、提示和硬件请求事件保持不变。
  * @date 2026-07-25
  */
 
@@ -123,12 +124,25 @@ public:
     /** @brief 请求多媒体页底部显示读头心跳异常。 */
     void emitCardReaderHeartbeatWarning(const QString &message);
 
+    /**
+     * @brief 向界面发布已确认的消防业务状态。
+     * @param[in] active true 表示消防已进入，false 表示恢复帧已发送并退出消防。
+     * @note 调用线程可以是 IC 工作线程；界面接收者必须使用排队连接。
+     */
+    void emitFireEmergencyChanged(bool active);
+
 signals:
     /** @brief 网络可用状态实际发生变化。 */
     void networkAvailabilityChanged(bool available);
 
     /** @brief 读头心跳超时，需要在多媒体页底部显示提示。 */
     void cardReaderHeartbeatWarning(const QString &message);
+
+    /**
+     * @brief 已确认消防状态发生变化。
+     * @param[in] active true 时显示消防状态，false 时恢复原信号板状态判断。
+     */
+    void fireEmergencyChanged(bool active);
 
     /** @brief 在线模式卡片通过事件。 */
     void cardPassed(const QString &cardId, const QString &floor, const QByteArray &rawFrame);

@@ -1,7 +1,8 @@
 # @file qt_ycest.pro
 # @brief RK3566 融合 Qt 应用构建入口与模块登记。
 # @author Du lin
-# @note 最近修改：2026-11-18；修改人：Du lin；登记 OTA 协议、异步协调器和进度窗口，保留原模块配置。
+# @note 最近修改：2026-11-19；修改人：Du lin；登记消防 GPIO 非阻塞监视器和进程级消防状态模块，
+#       使消防逻辑随 IC 工作线程构建且不进入主 UI 线程。
 TARGET = MergedQtApp
 QT += core gui widgets opengl serialport network sql virtualkeyboard qml quick quickwidgets
 
@@ -130,6 +131,8 @@ SOURCES += \
     ic_board/core_migration_audit/core_migration_sync.cpp \
     ic_board/core_migration_audit/core_network_card_compat.cpp \
     ic_board/device_config_sync.cpp \
+    ic_board/fire_emergency_state.cpp \
+    ic_board/fire_gpio_monitor.cpp \
     ic_board/ic_board.cpp \
     ic_board/ic_event_bridge.cpp \
     ic_board/ic_offline.cpp \
@@ -250,6 +253,8 @@ HEADERS += \
     ic_board/core_migration_audit/core_migration_sync.h \
     ic_board/core_migration_audit/core_network_card_compat.h \
     ic_board/device_config_sync.h \
+    ic_board/fire_emergency_state.h \
+    ic_board/fire_gpio_monitor.h \
     ic_board/ic_board.h \
     ic_board/ic_event_bridge.h \
     ic_board/ic_offline.h \

@@ -4,7 +4,8 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-17；修改人：Du lin；videoRect 连续扫描到同一空混播目录时仅首次打印统计，发现资源后恢复原日志。
+ * @note 最近修改：2026-11-20；修改人：Du lin；订阅已确认的 GPIO 消防状态并立即刷新
+ *       原楼层状态区域，高电平复用既有消防图标，低电平恢复原信号板/演示模式判断。
  */
 
 #include "multimediademo.h"
@@ -47,6 +48,7 @@
 #include "components/dialogs/ui_message_box.h"
 #include "modules/facegate/FaceGateQt/ui/CameraPreviewWidget.h"
 #include "ic_board/ic_event_bridge.h"
+#include "ic_board/fire_emergency_state.h"
 #include "platform/rk3566_platform.h"
 #include "shell/QuickUiRuntime.h"
 #include "volumepopup.h"
@@ -331,6 +333,15 @@ MultimediaDemo::MultimediaDemo(QWidget *parent) :
             this, [this](const QString &message) {
         showTransientStatus(message, 3000);
     }, Qt::QueuedConnection);
+
+    // 先连接变化通知，再读取当前原子状态，兼容页面创建前消防已经触发的场景。
+    connect(IcEventBridge::instance(), &IcEventBridge::fireEmergencyChanged,
+            this, [this](bool active) {
+        if (m_gpioFireActive == active) return;
+        m_gpioFireActive = active;
+        if (m_signalUiReady) onTimeout();
+    }, Qt::QueuedConnection);
+    m_gpioFireActive = FireEmergencyState::isActive();
 
     // initializeComponents() 早于配置文件读取，先使用与 videoRect 相同的
     // 默认值，避免用未初始化坐标创建 X11 原生视频子窗口。读取配置后会
@@ -3408,6 +3419,8 @@ void MultimediaDemo::onElevatorDemoTimeout()
 // 信号到达时立即调用；300ms定时器只作为兜底，相同数据不会重复绘制。
 /**
  * @brief 刷新当前楼层、方向和状态标志，复用已缓存的界面资源。
+ * @details 已确认的 GPIO 消防状态优先于信号板/演示模式状态；GPIO 未触发或解除后，
+ *          原有满载、超载、消防、检修判断顺序和图片资源保持不变。
  */
 void MultimediaDemo::onTimeout()
 {
@@ -3585,7 +3598,11 @@ void MultimediaDemo::onTimeout()
 
     // 3) 状态显示：先确定目标状态，再判断是否需要更新，避免持续状态反复显隐。
     StateStatus targetState = NORMAL;
-    if (displayFrameReady) {
+    // GPIO 消防只增加一个更高优先级的状态来源，图标资源、Flag2_en、几何及
+    // 信号板原优先顺序均保持不变；GPIO解除后立即回到下面的原判断。
+    if (m_gpioFireActive && Flag2_en) {
+        targetState = FIRE;
+    } else if (displayFrameReady) {
         if (displayModeAscii == 0x31 && Flag1_en) {
             targetState = FULL;
         } else if (displayModeAscii == 0x32 && Flag1_en) {

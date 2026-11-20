@@ -2,8 +2,10 @@
  * @file rs485_driver_port.h
  * @brief RK3566 RS485 串口收发封装。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-11-19；修改人：Du lin；新增消防状态帧专用的原始发送接口，
+ *       允许全开放和恢复帧绕过在线电梯模式位覆盖；普通业务发送行为不变。
  */
 
 #ifndef RS485_DRIVER_PORT_H
@@ -45,10 +47,20 @@ public:
 
     /**
      * @brief 完整发送一帧，收发方向由内核 UART 驱动自动控制。
-     * @param frame 待发送数据；空帧视为成功。
-     * @param writeTimeoutMs 每次等待串口发送完成的超时，单位 ms。
+     * @param[in] frame 待发送数据；空帧视为成功。
+     * @param[in] writeTimeoutMs 每次等待串口发送完成的超时，单位 ms。
+     * @return 串口已打开且完整写入时返回 true；打开、写入或等待失败时返回 false。
      */
     bool sendFrame(const QByteArray& frame, int writeTimeoutMs = 1000);
+
+    /**
+     * @brief 原样发送消防状态帧，不应用电梯模式位覆盖。
+     * @param[in] frame 已完成全部位序转换的消防帧；空帧视为成功。
+     * @param[in] writeTimeoutMs 每次等待串口发送完成的超时，单位 ms。
+     * @return 串口已打开且完整写入时返回 true；打开、写入或等待失败时返回 false。
+     * @warning 仅消防进入全开放和退出恢复使用，普通业务必须调用 sendFrame()。
+     */
+    bool sendFireFrame(const QByteArray& frame, int writeTimeoutMs = 1000);
 
     /** @brief 设置接收字节间空闲成帧时间，最小 1 ms。 */
     void setInterByteTimeoutMs(int ms);
@@ -70,6 +82,14 @@ private slots:
 private:
     /** @brief 对串口文件描述符应用 TIOCSRS485 自动方向配置。 */
     bool configureKernelRs485();
+
+    /**
+     * @brief 执行共同的串口完整写入流程。
+     * @param[in] wireFrame 已确定的最终线上帧，不再做业务位覆盖。
+     * @param[in] writeTimeoutMs 每次等待发送完成的超时，单位 ms。
+     * @return 完整发送成功时返回 true，否则返回 false。
+     */
+    bool writeWireFrame(const QByteArray &wireFrame, int writeTimeoutMs);
 
     QSerialPort serial_;              /**< RS485 数据串口。 */
     QTimer rxIdleTimer_;              /**< 接收字节间空闲成帧单次定时器。 */

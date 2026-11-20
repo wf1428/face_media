@@ -4,7 +4,8 @@
  *
  * @author Du lin
  * @date 2026-07-25
- * @note 最近修改：2026-11-17；修改人：Du lin；记录已输出空列表统计的 videoRect 目录，供后续扫描过滤重复日志。
+ * @note 最近修改：2026-11-20；修改人：Du lin；将 GPIO 消防业务状态合并到原楼层状态图标判断，
+ *       消防高电平复用原 fire.png、坐标和开关，解除后继续按原信号板/演示状态显示。
  */
 
 #ifndef MULTIMEDIADEMO_H
@@ -312,7 +313,9 @@ public slots:
 
 private slots:
     /**
-     * @brief 更新信号板演示数据或界面轮询状态。
+     * @brief 更新楼层、方向及状态图标。
+     * @details GPIO 消防状态优先复用原消防图标；未触发时继续使用原信号板或演示数据。
+     * @note 仅在 GUI 线程调用，相同目标状态不会重复重绘。
      */
     void onTimeout();
     /**
@@ -633,6 +636,7 @@ private:
     // 状态变量
     DirectionStatus dir_status;
     StateStatus state_status;
+    bool m_gpioFireActive = false; /**< true 时优先显示原消防图标；false 时完全沿用信号板/演示状态。 */
     bool RunMode; /**< false 为正常运行，true 为演示运行。 */
     QTimer *m_elevatorDemoTimer = nullptr; /**< 演示模式下每秒推进楼层和状态标志。 */
     int m_demoFloor = -8;                  /**< 当前演示楼层，范围 -8～32。 */

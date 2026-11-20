@@ -2,8 +2,10 @@
  * @file rs485_driver_port.cpp
  * @brief RK3566 RS485 串口收发封装的实现。
  *
- * @author Dulin
+ * @author Du lin
  * @date 2026-07-25
+ * @note 最近修改：2026-11-19；修改人：Du lin；抽取最终串口写入流程，并为消防全开放、
+ *       退出恢复提供不叠加在线电梯模式位的专用发送路径。
  */
 
 #include "rs485_driver_port.h"
@@ -99,21 +101,44 @@ void Rs485DriverPort::setInterByteTimeoutMs(int ms)
 
 /**
  * @brief 完整发送一帧，收发方向由内核 UART 驱动自动控制。
- * @param frame 待发送数据；空帧视为成功。
- * @param writeTimeoutMs 每次等待串口发送完成的超时，单位 ms。
+ * @param[in] frame 待发送数据；空帧视为成功。
+ * @param[in] writeTimeoutMs 每次等待串口发送完成的超时，单位 ms。
+ * @return 应用在线电梯模式保护后完整写入串口时返回 true，否则返回 false。
  */
 bool Rs485DriverPort::sendFrame(const QByteArray& frame, int writeTimeoutMs)
+{
+    // 所有业务最终都在串口出口执行一次模式位保护，覆盖事件桥直发、
+    // 人脸/密码/刷卡直发、访客二维码、呼梯和定时控梯等路径。
+    const QByteArray wireFrame =
+            Rs485FloorFrameBuilder::applyElevatorModeOverlay(frame);
+    return writeWireFrame(wireFrame, writeTimeoutMs);
+}
+
+/**
+ * @brief 原样发送已构造完成的消防帧。
+ * @param[in] frame 消防全开放或退出恢复帧；不应用在线电梯模式覆盖。
+ * @param[in] writeTimeoutMs 每次等待串口发送完成的超时，单位 ms。
+ * @return 完整写入串口时返回 true，否则返回 false。
+ */
+bool Rs485DriverPort::sendFireFrame(const QByteArray &frame, int writeTimeoutMs)
+{
+    return writeWireFrame(frame, writeTimeoutMs);
+}
+
+/**
+ * @brief 将最终线上帧完整写入串口并等待驱动排空。
+ * @param[in] wireFrame 已完成业务转换的最终帧。
+ * @param[in] writeTimeoutMs 每次等待串口写完的超时，单位 ms。
+ * @return 全部字节写入并完成排空时返回 true，否则返回 false。
+ */
+bool Rs485DriverPort::writeWireFrame(const QByteArray &wireFrame,
+                                     int writeTimeoutMs)
 {
     if (!serial_.isOpen()) {
         emit errorOccured(QStringLiteral("RS485 串口未打开"));
         return false;
     }
-    if (frame.isEmpty()) return true;
-
-    // 所有业务最终都在串口出口执行一次模式位保护，覆盖事件桥直发、
-    // 人脸/密码/刷卡直发、访客二维码、呼梯和定时控梯等路径。
-    const QByteArray wireFrame =
-            Rs485FloorFrameBuilder::applyElevatorModeOverlay(frame);
+    if (wireFrame.isEmpty()) return true;
 
     qint64 total = 0;
     while (total < wireFrame.size()) {

@@ -3,9 +3,8 @@
 # @brief 保留原 Bash 手动升级入口，提供 MQTT OTA 准备、独立安装和启动健康检查。
 # @author Du lin
 # @date 2026-11-18
-# @note 最近修改：2026-11-18；修改人：Du lin；以原附件 Bash 脚本为基线，移除内嵌解释器；
-#       使用 curl/jq/tar/unzip/dd/md5sum/flock/sqlite3 等命令实现 OTA，保留入口及状态字段。
-#       FTP 凭据仅经内存和 stdin 传递；中间阶段只更新状态，跨重启终态才写 journal。
+# @note 最近修改：2026-11-20；修改人：Du lin；ZIP/tar.gz 同时接受根目录及统一一级目录，扫描时交叉核对路径和目录布局，保持固定叶文件提取与原有升级逻辑；移除镜像及本机 board-model 文件依赖，保留可选清单与设备树的匹配；OTA 不再静态推断镜像 fstab/boot.scr 的槽绑定，沿用 BSP 引导及启动挂载；界面按阶段0..100刷新，本地细进度写 /run，整体持久进度仍按5%节流。
+#       目标槽健康通过后原子记录版本，记录失败恢复旧槽；保留 MD5、可选清单设备树匹配、实际挂载核对和终态 journal。
 #       --format-data 仍仅限显式本地维护使用；远程 OTA 始终保留共享数据。
 
 SCRIPT=/usr/local/sbin/update_ab_system.sh
@@ -20,6 +19,8 @@ STATE='' TASK_ID='' TASK_DIR='' TASK_READY=0 OTA_MODE=''
 ERROR_CODE=-5 ERROR_MESSAGE='' WORK='' JOB_PID='' JOB_RC=0 GLOBAL_MOUNT=''
 EXEC_FD='' RESOURCE_FD='' GATE_FD='' LAST_STAGE='' LAST_PERCENT=-10
 PREP_PARENT=0 HEARTBEAT_TOKEN='' HEARTBEAT_SEEN=0
+# 仅对本地界面阶段进度去重，不替代整体进度的持久化/上报节流基准。
+LAST_GUI_STAGE='' LAST_GUI_PERCENT=-1
 export LC_ALL=C
 
 # @brief 保存净化后的协议错误，不执行退出；调用者用 || return 传播失败。
@@ -41,9 +42,9 @@ positive_long() {
     [[ $1 =~ ^[1-9][0-9]*$ && ${#1} -le 19 ]] || return 1
     [[ ${#1} -lt 19 || ! $1 > 9223372036854775807 ]]
 }
-# @brief 校验发布版本字符串；不从下发目标伪造当前实际版本。
+# @brief 校验平台发布版本/本槽已登记版本字符串；未确认的目标版本不能代替当前记录。
 valid_version() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,95}$ ]]; }
-# @return 运行 rootfs 中的实际固件版本；缺失/无效返回失败。
+# @return 当前 rootfs 已登记的固件版本；缺失/无效返回失败，由调用者作为未登记处理。
 real_version() {
     local value; [[ -r $VERSION_FILE ]] || return 1
     value=$(head -c 256 "$VERSION_FILE"); valid_version "$value" || return 1
@@ -165,15 +166,52 @@ finish_failure() {
     state_update '.phase="finished"|.result="failed"|.resultCode=$code|.errorMsg=$message|if $code==-4 then .md5Failures=((.md5Failures//0)+1) else . end' --argjson code "$code" --arg message "$message" || return
     state_save || return; cleanup_artifacts "$TASK_DIR"
 }
-# @brief 保存整体单调进度；阶段切换或至少增加 5% 才输出安全 JSON 行。
+# @brief 将执行器权重映射成界面阶段百分比；额外字节分数避免先截断整体进度造成跳变。
+# @param $1 阶段。$2 整体起始百分比。$3 已处理字节（默认0）。$4 总字节（默认1）。$5 本作业整体跨度（默认0）。
+# @return 输出当前阶段的0..100；没有字节计量的等待阶段输出0，不按时间模拟增长。
+gui_stage_percent() {
+    local stage=$1 base=$2 written=0 total=1 span=0 start range value
+    if (($#>=3)); then written=$3; fi
+    if (($#>=4)); then total=$4; fi
+    if (($#>=5)); then span=$5; fi
+    case $stage in
+        downloading) start=5; range=50 ;;
+        verifying) start=60; range=25 ;;
+        installing) start=86; range=10 ;;
+        *) printf '0\n'; return 0 ;;
+    esac
+    ((total>0)) || total=1
+    value=$(( ((base-start)*100 + written*span*100/total) / range ))
+    ((value<0)) && value=0; ((value>100)) && value=100
+    printf '%s\n' "$value"
+}
+# @brief 保持原整体进度与持久化节流，同时向本地 GUI 提供更细的阶段进度。
+# @param $1 平台阶段。$2 整体百分比。$3 可选内部 phase。$4 可选精确阶段百分比0..100。
+# @note 本地进度写到 /run 的任务文件，不写 journal；显示文件失败不影响升级状态或结果。
 progress() {
-    local stage=$1 percent=$2 phase=${3:-} old
+    local stage=$1 percent=$2 phase='' ui_percent='' old reported=0 payload directory temporary
+    if (($#>=3)); then phase=$3; fi
+    if (($#>=4)); then ui_percent=$4; fi
+    [[ -n $ui_percent ]] || ui_percent=$(gui_stage_percent "$stage" "$percent")
+    ((ui_percent<0)) && ui_percent=0; ((ui_percent>100)) && ui_percent=100
     old=$(printf '%s' "$STATE" | jq -r '.percent//0'); ((percent<old)) && percent=$old
     state_update '.state=$stage|.percent=$percent|if $phase!="" then .phase=$phase else . end' --arg stage "$stage" --argjson percent "$percent" --arg phase "$phase" || return
     if [[ $stage != "$LAST_STAGE" ]] || ((percent>=LAST_PERCENT+5)); then
         state_save || return
-        [[ $OTA_MODE == prepare ]] && printf '{"state":"%s","percent":%s}\n' "$stage" "$percent"
-        LAST_STAGE=$stage; LAST_PERCENT=$percent
+        LAST_STAGE=$stage; LAST_PERCENT=$percent; reported=1
+    fi
+    if [[ $stage != "$LAST_GUI_STAGE" ]] || ((ui_percent!=LAST_GUI_PERCENT || reported)); then
+        payload=$(printf '%s' "$STATE" | jq -c --argjson localPercent "$ui_percent" '{taskId,state,percent,attempt,beforeBootId}|.stagePercent=$localPercent') || return 0
+        if positive_long "$TASK_ID"; then
+            directory=$RUNTIME/progress; temporary=$directory/$TASK_ID.json.tmp.$$
+            if mkdir -p -- "$directory" 2>/dev/null; then
+                if ! printf '%s\n' "$payload" >"$temporary" || ! mv -f -- "$temporary" "$directory/$TASK_ID.json"; then
+                    rm -f -- "$temporary" 2>/dev/null || true
+                fi
+            fi
+        fi
+        [[ $OTA_MODE == prepare ]] && printf '%s\n' "$payload"
+        LAST_GUI_STAGE=$stage; LAST_GUI_PERCENT=$ui_percent
     fi
     return 0
 }
@@ -209,7 +247,7 @@ stop_job() {
 # @param $1 监控文件或 @io。@param $2 预期字节数。@param $3/$4 整体进度基数/跨度。
 # @param $5 stdout 文件或 /dev/null。@param 后续参数 固定程序及独立 argv，不拼接平台命令。
 run_job() {
-    local watch=$1 total=$2 base=$3 span=$4 output=$5 written=0 worker='' status
+    local watch=$1 total=$2 base=$3 span=$4 output=$5 written=0 worker='' status current_stage ui_percent
     shift 5; rm -f -- "$WORK/child.pid"
     setsid bash -c '
         parent=$1; pidfile=$2; shift 2
@@ -231,7 +269,9 @@ run_job() {
             elif [[ -f $watch ]]; then written=$(stat -c %s "$watch"); fi
             [[ $written =~ ^[0-9]+$ ]] || written=0
             if ((written>total)); then stop_job; fail -5 '文件超过声明的字节数'; return; fi
-            progress "$(printf '%s' "$STATE" | jq -r '.state')" "$((base+written*span/total))" || { stop_job; return; }
+            current_stage=$(printf '%s' "$STATE" | jq -r '.state')
+            ui_percent=$(gui_stage_percent "$current_stage" "$base" "$written" "$total" "$span")
+            progress "$current_stage" "$((base+written*span/total))" '' "$ui_percent" || { stop_job; return; }
             [[ $OTA_MODE == prepare ]] && { check_space "$TASK_DIR" 0 || { stop_job; return; }; }
         fi
         sleep 1
@@ -286,50 +326,94 @@ unmounted() {
 }
 # @return 块设备容量（字节）。
 device_size() { blockdev --getsize64 "$1"; }
-# @brief 固定允许的包内文件名；允许 tar 常见的单个 ./ 前缀，不接受目录跳转。
-archive_name() {
-    local name=$1
-    [[ $name != *\\* && $name != /* && $name != *:* ]] || return 1
+# @brief 规范化归档路径，只允许根或一个一级目录；拒绝路径跳转、控制字符和 unzip 通配符。
+# @param $1 归档中的原始路径。@return 输出规范路径，归档根目录输出 .；非法返回 1。
+archive_path() {
+    local name=$1 component
+    [[ -n $name && $name != /* && $name != *\\* && $name != *:* && $name != *[[:cntrl:]]* ]] || return 1
+    case $name in *'*'*|*'?'*|*'['*|*']'*) return 1 ;; esac
     while [[ $name == ./* ]]; do name=${name#./}; done
+    [[ -n $name && $name != . ]] || { printf '.\n'; return 0; }
+    [[ $name != */ ]] || name=${name%/}
+    [[ -n $name && $name != -* && $name != .. && $name != . ]] || return 1
+    if [[ $name == */* ]]; then
+        component=${name%%/*}; local leaf=${name#*/}
+        [[ -n $component && $component != . && $component != .. && -n $leaf && $leaf != . && $leaf != .. && $leaf != */* ]] || return 1
+    fi
+    printf '%s\n' "$name"
+}
+# @brief 根目录或统一一级目录内只允许固定镜像和元数据；输出统一的叶文件名。
+# @param $1 待验证路径。@return 合法时输出固定叶文件名；否则返回 1。
+archive_name() {
+    local name; name=$(archive_path "$1") || return 1; name=${name##*/}
     case $name in boot_a.img|boot_b.img|rootfs_a.img|rootfs_b.img|package.ini|MD5SUMS) printf '%s\n' "$name" ;; *) return 1 ;; esac
 }
-# @brief 扫描全部条目类型、数量及展开大小；先扫描完毕再创建提取文件。
+# @brief 扫描完整归档后确定根/统一一级目录布局；记录原始条目名，展开仍写受控平铺目录。
+# @param $1 压缩包路径。$2 格式 zip 或 tar.gz。
+# @return 成功返回 0 并填充 ENTRY_NAME/ENTRY_SIZE；失败设置协议错误并返回非零。
 scan_archive() {
-    local archive=$1 format=$2 name normalized bytes mode count=0 listing raw
+    local archive=$1 format=$2 name normalized bytes mode count=0 raw path prefix='' selected=0 directory entry_prefix
     declare -gA ENTRY_NAME=() ENTRY_SIZE=()
+    local -A listed=() seen=() directories=()
     if [[ $format == zip ]]; then
         run_job '' 0 0 0 "$WORK/archive.list" unzip -Z -l "$archive" || { fail -5 'ZIP 目录读取失败'; return; }
-        # Info-ZIP -l: mode/version/host/uncompressed-size/flags/.../name.
-        # B/T uppercase denotes encryption; only ordinary binary/text entries are accepted.
-        awk '
-            $1 ~ /^[-dlcbps]/ {
-                if(substr($1,1,1)!="-" || $4!~/^[0-9]+$/ || $5!~/^[bt][x-]$/)exit 1
-                print $4 "\t" $NF; count++
+        # 第一标志 B/T 表示加密；-/x/l/X 是扩展字段和数据描述符。目录只用于布局识别。
+        if awk '
+            $1 ~ /^[-?dlcbps]/ {
+                count++; kind=substr($1,1,1)
+                if($4!~/^[0-9]+$/)exit 4
+                if($5~/^[BT]/)exit 2
+                if($5!~/^[bt][-xlX]$/)exit 4
+                if(kind!="-" && kind!="d" && !(kind=="?" && length($1)==10 && substr($1,2)~/^[rwxstST-]+$/))exit 3
+                name=$0; for(i=0;i<9;i++)sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+/,"",name)
+                type=(kind=="d" || name~/\/$/ || name=="." || name=="./")?"d":"f"
+                print type "\t" $4 "\t" name
             }
-            END {if(!count)exit 1}
-        ' "$WORK/archive.list" >"$WORK/archive.entries" || { fail -5 'ZIP 含加密文件、链接或特殊文件'; return; }
+            END {if(!count)exit 4}
+        ' "$WORK/archive.list" >"$WORK/archive.entries"; then :
+        else
+            case $? in
+                2) fail -5 'ZIP 包含加密条目，不支持密码保护的升级包' ;;
+                3) fail -5 'ZIP 含链接或特殊文件' ;;
+                *) fail -5 'ZIP 条目信息无法识别' ;;
+            esac
+            return 1
+        fi
     else
         run_job '' 0 0 0 /dev/null gzip -t "$archive" || { fail -5 '压缩包完整性检查失败'; return; }
-        run_job '' 0 0 0 "$WORK/archive.list" tar --numeric-owner --quoting-style=escape -tvzf "$archive" || { fail -5 'TAR 目录读取失败'; return; }
+        run_job '' 0 0 0 "$WORK/archive.list" tar --numeric-owner --quoting-style=literal -tvzf "$archive" || { fail -5 'TAR 目录读取失败'; return; }
         awk '
-            substr($1,1,1)=="d" && ($NF=="./" || $NF==".") {next}
-            {if(substr($1,1,1)!="-" || $3!~/^[0-9]+$/)exit 1; print $3 "\t" $NF; count++}
+            {kind=substr($1,1,1); if((kind!="-" && kind!="d") || $3!~/^[0-9]+$/)exit 1
+             name=$0; for(i=0;i<5;i++)sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+/,"",name)
+             print (kind=="d"?"d":"f") "\t" $3 "\t" name; count++}
             END {if(!count)exit 1}
-        ' "$WORK/archive.list" >"$WORK/archive.entries" || { fail -5 'TAR 含链接、目录或特殊文件'; return; }
+        ' "$WORK/archive.list" >"$WORK/archive.entries" || { fail -5 'TAR 含链接或特殊文件，或条目信息无效'; return; }
     fi
-    # A separate name listing detects newline names and listing-format ambiguities.
+    # 独立名称列表与元数据逐项交叉检查，防止空白/换行和长列表解析歧义。
     if [[ $format == zip ]]; then unzip -Z -1 "$archive" >"$WORK/archive.names" 2>/dev/null
-    else tar --quoting-style=escape -tzf "$archive" >"$WORK/archive.names" 2>/dev/null; fi || { fail -5 '归档文件列表无效'; return; }
+    else tar --quoting-style=literal -tzf "$archive" >"$WORK/archive.names" 2>/dev/null; fi || { fail -5 '归档文件列表无效'; return; }
     local names=0
     while IFS= read -r raw; do
-        [[ $format != zip && ( $raw == ./ || $raw == . ) ]] && continue
-        normalized=$(archive_name "$raw") || { fail -5 '压缩包包含不安全或非约定文件名'; return; }
-        ((names+=1))
+        path=$(archive_path "$raw") || { fail -5 '压缩包包含不安全路径或多层目录'; return; }
+        [[ -z ${listed[$path]:-} ]] || { fail -5 '压缩包包含重复路径'; return; }
+        listed[$path]=1; ((names+=1)); ((names<=64)) || { fail -5 '升级包条目过多'; return; }
     done <"$WORK/archive.names"
-    while IFS=$'\t' read -r bytes name; do
+    while IFS=$'\t' read -r mode bytes name; do
         ((count+=1)); ((count<=64)) || { fail -5 '升级包条目过多'; return; }
-        normalized=$(archive_name "$name") || { fail -5 '压缩包文件名无效'; return; }
-        [[ -z ${ENTRY_NAME[$normalized]:-} ]] || { fail -5 '压缩包包含重复路径'; return; }
+        path=$(archive_path "$name") || { fail -5 '压缩包路径无效'; return; }
+        [[ -n ${listed[$path]:-} && -z ${seen[$path]:-} ]] || { fail -5 '归档名称与条目信息不一致或路径重复'; return; }
+        seen[$path]=1
+        if [[ $mode == d ]]; then
+            [[ $bytes == 0 ]] || { fail -5 '归档目录条目含非空数据'; return; }
+            [[ $path != . ]] || continue
+            [[ $path != */* ]] || { fail -5 '升级包仅支持统一一级目录'; return; }
+            directories[$path]=1; continue
+        fi
+        normalized=$(archive_name "$path") || { fail -5 '压缩包包含非约定文件名'; return; }
+        entry_prefix=''; [[ $path != */* ]] || entry_prefix=${path%/*}
+        if ((selected==0)); then prefix=$entry_prefix; selected=1
+        else [[ $prefix == "$entry_prefix" ]] || { fail -5 '镜像和元数据必须位于根目录或同一个一级目录'; return; }; fi
+        [[ -z ${ENTRY_NAME[$normalized]:-} ]] || { fail -5 '压缩包包含重复镜像或元数据'; return; }
         positive_long "$bytes" || { fail -5 '镜像或元数据长度无效'; return; }
         case $normalized in
             *.img)
@@ -340,6 +424,9 @@ scan_archive() {
         ENTRY_NAME[$normalized]=$name; ENTRY_SIZE[$normalized]=$bytes
     done <"$WORK/archive.entries"
     ((count==names)) || { fail -5 '归档文件名与条目元数据不一致'; return; }
+    for directory in "${!directories[@]}"; do
+        [[ -n $prefix && $directory == "$prefix" ]] || { fail -5 '压缩包包含与镜像布局无关的目录'; return; }
+    done
     for name in boot_a.img boot_b.img rootfs_a.img rootfs_b.img; do
         [[ -n ${ENTRY_NAME[$name]:-} ]] || { fail -5 '缺少完整 A/B 镜像'; return; }
     done
@@ -374,10 +461,10 @@ ini_value() {
         END{if(!found)exit 1;print value}
     ' "$1"
 }
-# @return 本机固件产品 ID 和设备树 compatible/model，包括无厂商前缀别名。
+# @return 本机设备树 compatible/model，包括无厂商前缀别名；不读取发布标识文件。
 board_models() {
     local file item
-    for file in /etc/face-media/board-model /proc/device-tree/model /proc/device-tree/compatible; do
+    for file in /proc/device-tree/model /proc/device-tree/compatible; do
         [[ -r $file ]] || continue
         while IFS= read -r item; do
             [[ -n $item ]] || continue; printf '%s\n' "$item"
@@ -419,7 +506,7 @@ image_read() {
     run_job '' 0 0 0 "$IMAGE_OUTPUT" debugfs -R "cat $path" "$image" || { fail -5 '镜像文件读取失败'; return; }
     [[ -s $IMAGE_OUTPUT && $(stat -c %s "$IMAGE_OUTPUT") -le 2097152 ]] || { fail -5 '镜像缺少必需运行文件'; return; }
 }
-# @brief 校验 fstab 中的每个关键挂载源，兼容现有 SD 脚本的 PARTUUID。
+# @brief 独立的 fstab 静态匹配辅助；仅显式调用时检查，OTA 预检不使用此规则。
 fstab_binding() {
     local fstab=$1 mountpoint=$2 key=$3 uuid
     local -a sources=(); mapfile -t sources < <(awk -v target="$mountpoint" '!/^[ \t]*#/ && $2==target {print $1}' "$fstab")
@@ -427,7 +514,7 @@ fstab_binding() {
     uuid=$(blkid -s PARTUUID -o value "${DEV[$key]}") || return 1
     [[ ${sources[0]} == "PARTLABEL=$key" || ${sources[0]} == "PARTUUID=$uuid" || ${sources[0]} == "${DEV[$key]}" ]]
 }
-# @brief 验证 boot.scr 中可以静态识别的 root=/setenv rootdev 目标绑定。
+# @brief 独立的 boot.scr 静态匹配辅助；OTA 预检不使用此规则，允许 BSP 通过变量选择根分区。
 boot_binding() {
     local file=$1 slot=$2 uuid value count=0
     local pattern="(root=[\"']?|setenv[[:space:]]+rootdev[[:space:]]+[\"']?)(PARTLABEL=[A-Za-z0-9_-]+|PARTUUID=[A-Za-z0-9_-]+|/dev/[A-Za-z0-9_/-]+)"
@@ -438,24 +525,19 @@ boot_binding() {
     done < <(grep -aEo "$pattern" "$file" | sed -E "s/^root=[\"']?//;s/^setenv[[:space:]]+rootdev[[:space:]]+[\"']?//")
     ((count>0))
 }
-# @brief 校验 raw ext2/ext4、镜像发布版本/型号/架构、槽绑定和独立健康入口。
+# @brief 校验 raw ext2/ext4、架构和独立健康入口；BSP 决定启动及挂载，不从镜像配置静态推断槽绑定。
+# @note 不读取镜像 board-model 或版本文件；版本由平台指定，实际槽位及挂载仍由 discover_partitions 核对。
 verify_rootfs() {
-    local root=$TASK_DIR/images/rootfs_$TARGET_SLOT.img boot=$TASK_DIR/images/boot_$TARGET_SLOT.img file value data_key=data
+    local root=$TASK_DIR/images/rootfs_$TARGET_SLOT.img boot=$TASK_DIR/images/boot_$TARGET_SLOT.img file value
     for file in "$root" "$boot"; do
         [[ $(od -An -tx1 -j1080 -N2 "$file" | tr -d ' \n') == 53ef ]] || { fail -5 '仅支持原始 ext2/ext4 镜像'; return; }
     done
-    image_read "$root" /etc/face-media/firmware-version || return
-    value=$(cat "$IMAGE_OUTPUT"); [[ $value == "$(printf '%s' "$STATE" | jq -r '.version')" ]] || { fail -5 'rootfs 内实际版本与目标不一致'; return; }
-    image_read "$root" /etc/face-media/board-model || return
-    value=$(cat "$IMAGE_OUTPUT"); board_models | grep -Fxq -- "$value" || { fail -5 'rootfs 产品身份不匹配'; return; }
     image_read "$root" /usr/bin/dash || image_read "$root" /bin/dash || return
     value=$(od -An -tx1 -N20 "$IMAGE_OUTPUT" | tr -d ' \n')
     [[ $value == 7f454c460201* && ${value:36:4} == b700 ]] || { fail -5 'rootfs 不是 AArch64 小端系统'; return; }
-    image_read "$root" /etc/fstab || return; cp -- "$IMAGE_OUTPUT" "$WORK/fstab" || return 1
-    [[ -n ${DEV[data]:-} ]] || data_key=userdata
-    fstab_binding "$WORK/fstab" / rootfs_$TARGET_SLOT && fstab_binding "$WORK/fstab" /boot boot_$TARGET_SLOT && fstab_binding "$WORK/fstab" /userdata "$data_key" || { fail -5 'rootfs fstab 未绑定目标槽及共享分区'; return; }
-    image_read "$boot" /boot.scr || return
-    boot_binding "$IMAGE_OUTPUT" "$TARGET_SLOT" || { fail -5 'boot.scr 未明确绑定目标根分区'; return; }
+    # LubanCat BSP 根据全局 boot 槽标记、启动参数及启动流程选择系统与挂载。
+    # 镜像可使用 /dev/root、缺省 /boot 和 /userdata 项，boot.scr 也可动态拼接 root=。
+    # 不读取或改写这些配置；刷写前和重启后的真实分区/挂载核对沿用原流程。
     image_read "$root" "$SCRIPT" || return
     grep -q '^#!/bin/bash' "$IMAGE_OUTPUT" && grep -q -- '--ota-health' "$IMAGE_OUTPUT" || { fail -5 'rootfs 未包含 Shell OTA 执行器'; return; }
     image_read "$root" /etc/systemd/system/face-media-ota-health.service || return
@@ -468,6 +550,7 @@ verify_rootfs() {
 }
 
 # @brief 规范化平台请求，保留 taskId 原始十进制；FTP 只留在本 Shell 内存。
+# @note FTP 字符串按码点排除 NUL(0)、LF(10)、CR(13)，避免正则转义误拒绝普通 u/0。
 read_request() {
     local raw id
     raw=$(head -c 65537); ((${#raw}<=65536)) || { fail -5 'OTA 请求过大'; return; }
@@ -479,7 +562,7 @@ read_request() {
           (.version|type=="string" and test("^[A-Za-z0-9][A-Za-z0-9._+-]{0,95}$")) and
           (.md5|type=="string" and test("^[a-fA-F0-9]{32}$")) and
           (.size|type=="number" and floor==. and .>0) and (.ftp|type=="object") and
-          ([.ftp.host,.ftp.user,.ftp.pwd,.ftp.root,.ftp.file]|all(.[];type=="string" and length>0 and length<=2048 and (test("[\\r\\n\\u0000]")|not))) and
+          ([.ftp.host,.ftp.user,.ftp.pwd,.ftp.root,.ftp.file]|all(.[];type=="string" and length>0 and length<=2048 and (explode|all(.[];.!=0 and .!=10 and .!=13)))) and
           (.ftp.host|test("^[A-Za-z0-9.:_-]+$")) and
           (.ftp.port|type=="number" and floor==. and .>=1 and .<=65535) and
           .ftp.root=="." and (.ftp.file|test("[/\\\\]")|not) and
@@ -538,6 +621,7 @@ download_package() {
     unset FTP_PASSWORD FTP_USER fields REQUEST
     [[ $(stat -c %s "$part") == "$expected" ]] || { fail -1 'FTP 文件未完整下载'; return; }
     sync -f "$part" && mv -f -- "$part" "$TASK_DIR/package.bin" || { fail -3 '升级包保存失败'; return; }
+    progress downloading 55 downloading 100
 }
 # @brief 一次下发对应一次准备，平台重试必须使用新通知的凭据，不自行循环重试。
 ota_prepare() {
@@ -557,7 +641,8 @@ ota_prepare() {
         fi
     else status=$?; ((status==2)) || return 1; fi
     cleanup_finished_tasks || return; discover_partitions || return
-    current=$(real_version) || { fail -5 '当前系统缺少真实固件版本'; return; }
+    # 首次接入可以没有登记版本；不借用目标版本或平台 fromVersion 冒充旧版本。
+    current=$(real_version) || current=''
     action=$(printf '%s' "$REQUEST" | jq -r '.action'); version=$(printf '%s' "$REQUEST" | jq -r '.version')
     if [[ $action == upgrade ]] && is_downgrade "$current" "$version"; then fail -8 '普通升级任务不能降级，请使用 rollback'; return; fi
     systemctl is-enabled face-media-ota-health.service >/dev/null 2>&1 || { fail -5 '请先安装并启用 OTA 健康服务'; return; }
@@ -649,10 +734,11 @@ database_ready() {
     check=$(timeout 3 sqlite3 -readonly -cmd '.timeout 2000' /userdata/home/cat/face_media/access_control.db "PRAGMA quick_check(1); SELECT count(*) FROM sqlite_master WHERE type='table' AND name='network_person';" 2>/dev/null) || return 1
     [[ $check == $'ok\n1' ]]
 }
-# @brief 观察既有 Qt PID/心跳和只读数据库，心跳变化使用单调时钟，不改业务库。
+# @brief 观察 Qt PID/心跳和只读数据库；非空 wanted 仅用于核对已知的旧槽版本。
+# @param $1 可选已登记版本；候选槽和未登记旧槽传空，不依赖镜像中的版本文本。
 qt_ready() {
-    local wanted=$1 pid sequence timestamp token now
-    [[ $(real_version) == "$wanted" ]] || return 1
+    local wanted=${1:-} pid sequence timestamp token now
+    [[ -z $wanted || $(real_version) == "$wanted" ]] || return 1
     read -r pid sequence timestamp </run/face-media/heartbeat 2>/dev/null || return 1
     [[ $pid =~ ^[0-9]+$ && $sequence =~ ^[0-9]+$ && $pid -gt 1 && $sequence -ge 1 && -d /proc/$pid ]] || return 1
     [[ $(cat /run/face-media/app.pid 2>/dev/null) == "$pid" ]] || return 1
@@ -661,9 +747,9 @@ qt_ready() {
     ((now-HEARTBEAT_SEEN<=15)) || return 1
     database_ready
 }
-# @brief 最长 180 秒等待连续 30 秒健康；既有 10 秒 GUI 心跳无需修改。
+# @brief 最长 180 秒等待连续 30 秒健康；候选槽传空版本，成功后才记录平台版本。
 observe_health() {
-    local version=$1 deadline=$(($(mono_now)+HEALTH_SECONDS)) stable=-1 now
+    local version=${1:-} deadline=$(($(mono_now)+HEALTH_SECONDS)) stable=-1 now
     while (($(mono_now)<deadline)); do
         now=$(mono_now)
         if qt_ready "$version"; then ((stable<0)) && stable=$now; ((now-stable>=STABLE_SECONDS)) && return 0
@@ -683,15 +769,37 @@ journal_outcome() {
     if printf '%s\n' "$data" | timeout 10 systemd-cat -t face-media-ota -p "$priority"; then state_update '.journalOutcome=$token' --arg token "$token" && state_save; fi
     return 0
 }
-# @brief 在实际启动槽持久化结果，再写该槽 journal，最后清理包和镜像。
+# @brief 仅在本次候选槽健康通过后的 confirming 阶段记录平台版本，不改旧槽。
+# @param $1 本任务已验证格式的目标版本。@return 成功为 0；失败为 1 并设置 ERROR_CODE=-6，保留恢复来源。
+record_confirmed_version() {
+    local value=$1 parent=${VERSION_FILE%/*} temporary phase before target
+    phase=$(printf '%s' "$STATE" | jq -r '.phase'); before=$(printf '%s' "$STATE" | jq -r '.beforeBootId')
+    target=$(printf '%s' "$STATE" | jq -r '.toSlot')
+    [[ $OTA_MODE == health && $phase == confirming && $CURRENT_SLOT == "$target" && $(boot_id) != "$before" ]] &&
+        valid_version "$value" && [[ $value == "$(printf '%s' "$STATE" | jq -r '.version')" ]] || { fail -6 '版本记录时机或目标槽不匹配'; return; }
+    [[ ! -L $parent && ! -L $VERSION_FILE && ( ! -e $VERSION_FILE || -f $VERSION_FILE ) ]] || { fail -6 '版本记录路径无效'; return; }
+    mkdir -p -- "$parent" || { fail -6 '版本目录不可写'; return; }
+    temporary=$(mktemp "$parent/.firmware-version.XXXXXXXX") || { fail -6 '版本临时文件创建失败'; return; }
+    if ! printf '%s\n' "$value" >"$temporary" || ! chmod 0644 "$temporary" || ! sync -f "$temporary" ||
+        ! mv -fT -- "$temporary" "$VERSION_FILE" || ! sync -f "$parent"; then
+        rm -f -- "$temporary"; fail -6 '版本文件保存或同步失败'; return
+    fi
+}
+
+# @brief 在实际启动槽保存结果及已登记版本；未登记留空，不用目标或旧任务版本推断。
 finish_boot() {
-    state_update '.phase="finished"|.result=$result|.resultCode=$code|.errorMsg=$message|.actualVersion=$version|.outcomeBootId=$boot|if $result=="success" then .percent=100 else . end' --arg result "$1" --argjson code "$2" --arg message "$3" --arg version "$(real_version)" --arg boot "$(boot_id)" || return
+    local recorded
+    recorded=$(real_version) || recorded=''
+    if [[ $1 == success ]]; then
+        [[ -n $recorded && $recorded == "$(printf '%s' "$STATE" | jq -r '.version')" ]] || { fail -6 '确认成功前尚未保存目标版本'; return; }
+    fi
+    state_update '.phase="finished"|.result=$result|.resultCode=$code|.errorMsg=$message|.actualVersion=$version|.outcomeBootId=$boot|if $result=="success" then .percent=100 else . end' --arg result "$1" --argjson code "$2" --arg message "$3" --arg version "$recorded" --arg boot "$(boot_id)" || return
     state_save || return; journal_outcome; cleanup_artifacts "$TASK_DIR"
 }
 # @brief 开机独立检查；先预设回旧槽，健康后提交新槽；Qt 无法启动时仍能回退。
 # @note 健康服务之前的坏内核/根挂载失败仍依赖 BSP 的引导计数和看门狗。
 ota_health() {
-    local status phase before from to current=$(boot_id) version trials last
+    local status phase before from to current=$(boot_id) version trials last reason
     ensure_shared || return; acquire_lock "$BASE/executor.lock" EXEC_FD || return
     if ! load_active; then status=$?; [[ -z $ERROR_MESSAGE ]] && return 0; return 1; fi
     phase=$(printf '%s' "$STATE" | jq -r '.phase')
@@ -704,8 +812,10 @@ ota_health() {
     case $phase in received|downloading|verifying|extracting|prepared|installing) finish_failure -5 'OTA 在切槽前因重启中断'; return ;; esac
     from=$(printf '%s' "$STATE" | jq -r '.fromSlot'); to=$(printf '%s' "$STATE" | jq -r '.toSlot')
     if [[ $CURRENT_SLOT == "$from" ]]; then
-        version=$(printf '%s' "$STATE" | jq -r '.oldVersion')
-        if observe_health "$version"; then select_slot "$CURRENT_SLOT" && finish_boot rolled_back -7 '新固件未确认，已恢复并确认原分区'
+        version=$(printf '%s' "$STATE" | jq -r '.oldVersion//""')
+        reason=$(printf '%s' "$STATE" | jq -r '.recoveryReason//""')
+        [[ -z $reason ]] || reason="：$reason"
+        if observe_health "$version"; then select_slot "$CURRENT_SLOT" && finish_boot rolled_back -7 "新固件未确认，已恢复并确认原分区$reason"
         else finish_boot failed -6 '回退分区启动后健康检查未通过'; fi
         return
     fi
@@ -716,8 +826,14 @@ ota_health() {
     state_update '.trials=$trials|.lastTrialBootId=$boot|.phase="trial"' --argjson trials "$trials" --arg boot "$current" || return
     state_save || return; select_slot "$from" || return
     version=$(printf '%s' "$STATE" | jq -r '.version')
-    if ((trials<=MAX_TRIALS)) && observe_health "$version"; then
-        state_update '.phase="confirming"' && state_save && select_slot "$to" && finish_boot success 0 ''
+    if ((trials<=MAX_TRIALS)) && observe_health ''; then
+        state_update '.phase="confirming"' && state_save || return
+        if record_confirmed_version "$version"; then
+            select_slot "$to" && finish_boot success 0 ''
+        else
+            reason=$ERROR_MESSAGE
+            state_update '.phase="recovering"|.recoveryReason=$reason|.errorMsg=$reason' --arg reason "$reason" && state_save && request_reboot
+        fi
     else
         state_update '.phase="recovering"' && state_save && request_reboot
     fi
@@ -780,7 +896,7 @@ ota_entry() {
     OTA_MODE=$1; shift; PREP_PARENT=$PPID
     trap 'ota_cleanup $?' EXIT; trap on_signal TERM INT HUP
     ((EUID==0)) || { fail -5 '需要 root 权限执行 A/B 更新'; return; }
-    need_tools bash jq awk sed grep head cat stat readlink mkdir mktemp mv rm sync flock findmnt lsblk blkid blockdev mount umount mountpoint timeout setsid md5sum dd od cp tr touch tee systemctl || return
+    need_tools bash jq awk sed grep head cat stat readlink mkdir mktemp mv rm sync flock findmnt lsblk blkid blockdev mount umount mountpoint timeout setsid md5sum dd od cp tr touch tee chmod systemctl || return
     mkdir -p -- "$RUNTIME" || { fail -5 '运行目录不可写'; return; }
     WORK=$(mktemp -d "$RUNTIME/work.XXXXXXXX") || { fail -5 '无法创建临时作业目录'; return; }
     case $OTA_MODE in

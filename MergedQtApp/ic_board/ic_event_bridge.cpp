@@ -3,11 +3,18 @@
  * @brief IC 本地链路、UI 与 MQTT 网关之间的进程内事件总线的实现。
  *
  * @author Du lin
- * @note 最近修改：2026-11-10；修改人：Du lin；传递刷卡来源而非旧的音频快照，界面按即时开关决定是否播报。
+ * @note 最近修改：2026-11-20；修改人：Du lin；增加消防业务状态转发接口，供 IC 工作线程
+ *       以排队信号刷新楼层页消防图标；未改变既有事件的参数和触发行为。
  * @date 2026-07-25
  */
 
 #include "ic_event_bridge.h"
+
+/** @brief 转发已确认消防状态；跨线程调度策略由接收端连接类型决定。 */
+void IcEventBridge::emitFireEmergencyChanged(bool active)
+{
+    emit fireEmergencyChanged(active);
+}
 
 /** @return 进程生命周期内唯一的事件桥；故意不随业务窗口销毁。 */
 IcEventBridge *IcEventBridge::instance()

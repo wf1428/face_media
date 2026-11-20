@@ -1097,6 +1097,7 @@ start_log_maintenance
 
 load_driver 2h_sr505_drv.ko
 load_driver 2h_led_drv.ko
+load_driver fire_gpio.ko
 
 if [ ! -x "$APP_DIR/mqttd" ]; then
     log "mqttd is missing or not executable: $APP_DIR/mqttd"
